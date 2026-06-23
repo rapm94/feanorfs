@@ -75,17 +75,32 @@ cargo build --release
 
 ```bash
 cargo run --bin feanorfs-server
-# Listening on http://localhost:3030
+# Listens on http://0.0.0.0:3030, advertises via mDNS on local network
 ```
 
-### 2. Initialize a workspace
+For internet deployments, add `--password` and put Caddy in front for TLS:
+```bash
+feanorfs-server --password "server-secret" --no-mdns
+caddy reverse-proxy localhost:3030   # auto-HTTPS on port 443
+```
 
+### 2. Connect + initialize a workspace
+
+**On a LAN (mDNS auto-discovery):**
 ```bash
 cd /path/to/your/project
-cargo run --bin feanorfs -- init http://localhost:3030 \
-  --workspace my-workspace \
-  --password "your-master-password"
+feanorfs connect                          # auto-discovers server
+feanorfs init --workspace my-workspace    # E2EE password auto-generated
 ```
+
+**On the internet:**
+```bash
+cd /path/to/your/project
+feanorfs connect https://my-server.com --password "server-secret"
+feanorfs init --workspace my-workspace --password "your-e2ee-password"
+```
+
+The E2EE password is auto-generated if you don't provide one. Save it — other machines must use the same password to decrypt your files.
 
 ### 3. Sync
 
@@ -124,12 +139,16 @@ See [docs/usage.md](docs/usage.md) for the full CLI reference.
 
 FeanorFS provides end-to-end encryption using a symmetric XOR cipher driven by Blake3's XOF. The server is zero-knowledge: it cannot read your file contents.
 
+**E2EE is always on.** Every workspace has an encryption password — if you don't provide one, a 64-character CSPRNG-generated key is created automatically. The same E2EE password must be used on all machines sharing a workspace.
+
+**Server authentication** is optional. Run `feanorfs-server --password <PASS>` to require a Bearer token on all API requests. On LAN, the server advertises itself via mDNS so clients can discover without typing an IP. On the internet, use `--no-mdns` and put a TLS-terminating reverse proxy (Caddy, nginx) in front.
+
 **Important limitations** (see [docs/threat-model.md](docs/threat-model.md) for the full analysis):
 
 - The encryption is **stream cipher based on Blake3 XOF**, not an authenticated encryption scheme (AES-GCM, ChaCha20-Poly1305). It does not provide integrity verification of ciphertext.
 - The server can observe metadata: file paths, sizes, modification times, and encrypted hashes. Path confidentiality is NOT protected.
-- There is no authentication or authorization on the server API. Anyone with network access can upload/download blobs or query sync state. Run the server on a trusted network or behind a VPN.
-- Passwords are stored in plaintext in `.feanorfs/config.json`. Protect your workspace directory accordingly.
+- The server password travels in cleartext over HTTP. For internet deployments, always use TLS (Caddy/nginx reverse proxy).
+- Passwords are stored in plaintext in `.feanorfs/config.json` and `~/.feanorfs/global.json`. Protect your workspace directory accordingly.
 
 To report a security vulnerability, see [SECURITY.md](SECURITY.md).
 
@@ -141,7 +160,17 @@ The client stores its configuration in `.feanorfs/config.json`:
 {
   "server_url": "http://localhost:3030",
   "workspace_id": "my-workspace",
-  "encryption_password": "your-master-password"
+  "encryption_password": "auto-generated-or-user-provided-e2ee-key",
+  "server_password": "optional-server-access-password"
+}
+```
+
+The global server connection is cached in `~/.feanorfs/global.json`:
+
+```json
+{
+  "server_url": "http://192.168.1.50:3030",
+  "server_password": "optional-server-access-password"
 }
 ```
 
