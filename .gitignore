@@ -1,5 +1,7 @@
 /target
 /server-data
-/.fs-sync
+/.feanorfs
 /test-client-a
 /test-client-b
+/.sisyphus
+
