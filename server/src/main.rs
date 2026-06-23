@@ -30,6 +30,14 @@ struct UploadParams {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "feanorfs_server=info,tower_http=info".into()),
+        )
+        .init();
+
     // Setup directories
     let base_dir = PathBuf::from("server-data");
     let db_path = base_dir.join("db.sqlite");
@@ -43,15 +51,16 @@ async fn main() -> anyhow::Result<()> {
         storage_dir: base_dir,
     };
 
-    // Build router
+    // Build router with TraceLayer
     let app = Router::new()
         .route("/api/sync/diff", post(handle_sync_diff))
         .route("/api/upload", post(handle_upload))
         .route("/api/download/:hash", get(handle_download))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3030));
-    println!("Standalone Sync Server starting on http://{}", addr);
+    tracing::info!("FeanorFS Sync Server starting on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -71,7 +80,7 @@ async fn handle_sync_diff(
         .get_workspace_files(&workspace_id)
         .await
         .map_err(|e| {
-            eprintln!("Error fetching workspace files: {:?}", e);
+            tracing::error!("Error fetching workspace files: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -156,7 +165,7 @@ async fn handle_upload(
     // Verify hash matches uploaded body
     let computed_hash = feanorfs_common::hash_bytes(&body);
     if computed_hash != params.hash {
-        eprintln!(
+        tracing::warn!(
             "Hash mismatch for {}: expected {}, computed {}",
             params.path, params.hash, computed_hash
         );
@@ -166,7 +175,7 @@ async fn handle_upload(
     // Write file content to blobs directory
     let blob_path = state.storage_dir.join("blobs").join(&params.hash);
     if let Err(e) = fs::write(&blob_path, &body).await {
-        eprintln!("Failed to write blob: {:?}", e);
+        tracing::error!("Failed to write blob: {:?}", e);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -184,7 +193,7 @@ async fn handle_upload(
         .upsert_file(&params.workspace_id, &file_state)
         .await
     {
-        eprintln!("Failed to upsert file in db: {:?}", e);
+        tracing::error!("Failed to upsert file in db: {:?}", e);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -201,7 +210,7 @@ async fn handle_download(
     }
 
     let file_content = fs::read(&blob_path).await.map_err(|e| {
-        eprintln!("Failed to read blob file: {:?}", e);
+        tracing::error!("Failed to read blob file: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
