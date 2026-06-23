@@ -97,4 +97,27 @@ impl ApiClient {
 
         Ok(bytes.to_vec())
     }
+
+    pub async fn get_workspaces(&self) -> Result<Vec<String>> {
+        let url = format!("{}/api/workspaces", self.server_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to send workspaces request")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Fetch workspaces failed with status {}: {}", status, body);
+        }
+
+        let workspaces: Vec<String> = resp
+            .json()
+            .await
+            .context("Failed to parse workspaces response")?;
+
+        Ok(workspaces)
+    }
 }

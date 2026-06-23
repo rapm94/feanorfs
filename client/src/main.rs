@@ -82,6 +82,10 @@ enum Commands {
         /// Defer downloading raw blob contents and create 0-byte placeholders instead
         #[arg(long)]
         lazy: bool,
+
+        /// Perform the sync once and exit without entering the real-time watch loop
+        #[arg(long)]
+        no_watch: bool,
     },
     /// Download and decrypt deferred lazy placeholder files
     Hydrate {
@@ -95,6 +99,11 @@ enum Commands {
     },
     /// Watch for local changes and sync them in real time
     Watch,
+    /// List all active workspaces tracked on the server
+    Workspaces {
+        /// Optional Server URL (overrides config URL)
+        server_url: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -231,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
-        Commands::Sync { lazy } => {
+        Commands::Sync { lazy, no_watch } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url);
@@ -245,6 +254,18 @@ async fn main() -> anyhow::Result<()> {
                 lazy,
             )
             .await?;
+
+            if !no_watch {
+                println!("\nEntering real-time watch mode. Press Ctrl+C to stop...");
+                watch::run_watch(
+                    &api,
+                    &db,
+                    &current_dir,
+                    &config.workspace_id,
+                    config.encryption_password.as_deref(),
+                )
+                .await?;
+            }
         }
         Commands::Hydrate { path } => {
             let config = load_config(&current_dir)?;
@@ -287,6 +308,32 @@ async fn main() -> anyhow::Result<()> {
                 config.encryption_password.as_deref(),
             )
             .await?;
+        }
+        Commands::Workspaces { server_url } => {
+            let url = if let Some(u) = server_url {
+                u
+            } else {
+                let config = load_config(&current_dir)?;
+                config.server_url
+            };
+
+            let api = ApiClient::new(&url);
+            println!("Querying workspaces from server at {}...", url);
+            match api.get_workspaces().await {
+                Ok(workspaces) => {
+                    if workspaces.is_empty() {
+                        println!("No active workspaces found on the server.");
+                    } else {
+                        println!("\nActive Workspaces:");
+                        for w in workspaces {
+                            println!("  * {}", w);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: failed to fetch workspaces: {:?}", e);
+                }
+            }
         }
     }
 
