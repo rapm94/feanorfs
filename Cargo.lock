@@ -572,6 +572,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "feanorfs-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "feanorfs-common",
+ "ignore",
+ "notify",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
+name = "feanorfs-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "feanorfs-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "feanorfs-common",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower-http 0.5.2",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -632,51 +677,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fs-sync-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "fs-sync-common",
- "ignore",
- "notify",
- "reqwest",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "walkdir",
-]
-
-[[package]]
-name = "fs-sync-common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "fs-sync-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "fs-sync-common",
- "futures-util",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tower-http 0.5.2",
 ]
 
 [[package]]
