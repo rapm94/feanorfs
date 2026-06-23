@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
+use feanorfs_common::{SyncRequest, SyncResponse};
 use reqwest::Client;
-use fs_sync_common::{SyncRequest, SyncResponse};
 
 pub struct ApiClient {
     client: Client,
@@ -17,7 +17,8 @@ impl ApiClient {
 
     pub async fn negotiate_sync(&self, request: &SyncRequest) -> Result<SyncResponse> {
         let url = format!("{}/api/sync/diff", self.server_url);
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .json(request)
             .send()
@@ -30,7 +31,8 @@ impl ApiClient {
             bail!("Sync negotiation failed with status {}: {}", status, body);
         }
 
-        let response: SyncResponse = resp.json()
+        let response: SyncResponse = resp
+            .json()
             .await
             .context("Failed to parse sync diff response")?;
 
@@ -47,8 +49,9 @@ impl ApiClient {
         content: Vec<u8>,
     ) -> Result<()> {
         let url = format!("{}/api/upload", self.server_url);
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(&url)
             .query(&[
                 ("workspace_id", workspace_id),
@@ -73,8 +76,9 @@ impl ApiClient {
 
     pub async fn download_file(&self, hash: &str) -> Result<Vec<u8>> {
         let url = format!("{}/api/download/{}", self.server_url, hash);
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .get(&url)
             .send()
             .await
@@ -86,11 +90,11 @@ impl ApiClient {
             bail!("Download failed with status {}: {}", status, body);
         }
 
-        let bytes = resp.bytes()
+        let bytes = resp
+            .bytes()
             .await
             .context("Failed to read download body bytes")?;
 
         Ok(bytes.to_vec())
     }
 }
-

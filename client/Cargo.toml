@@ -1,10 +1,23 @@
 [package]
-name = "fs-sync-client"
-version = "0.1.0"
-edition = "2021"
+name = "feanorfs-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Developer-focused zero-knowledge filesystem sync CLI"
+
+[[bin]]
+name = "feanorfs"
+path = "src/main.rs"
 
 [dependencies]
-fs-sync-common = { path = "../common" }
+feanorfs-common = { path = "../common" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }
