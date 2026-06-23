@@ -8,14 +8,9 @@ use axum::{
     Json, Router,
 };
 use db::Db;
-use fs_sync_common::{FileState, SyncRequest, SyncResponse};
+use feanorfs_common::{FileState, SyncRequest, SyncResponse};
 use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::fs;
 
 #[derive(Clone)]
@@ -57,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3030));
     println!("Standalone Sync Server starting on http://{}", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
@@ -120,10 +115,8 @@ async fn handle_sync_diff(
                 }
             } else {
                 // Mtimes are equal, verify hash consistency
-                if client_file.hash != server_file.hash {
-                    if !client_file.deleted {
-                        upload_required.push(path.clone());
-                    }
+                if client_file.hash != server_file.hash && !client_file.deleted {
+                    upload_required.push(path.clone());
                 }
             }
         } else {
@@ -143,10 +136,8 @@ async fn handle_sync_diff(
 
     // 2. Process server files that client does not know about
     for (path, server_file) in &server_map {
-        if !client_map.contains_key(path) {
-            if !server_file.deleted {
-                download_required.push(server_file.clone());
-            }
+        if !client_map.contains_key(path) && !server_file.deleted {
+            download_required.push(server_file.clone());
         }
     }
 
@@ -163,7 +154,7 @@ async fn handle_upload(
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Verify hash matches uploaded body
-    let computed_hash = fs_sync_common::hash_bytes(&body);
+    let computed_hash = feanorfs_common::hash_bytes(&body);
     if computed_hash != params.hash {
         eprintln!(
             "Hash mismatch for {}: expected {}, computed {}",
@@ -188,7 +179,11 @@ async fn handle_upload(
         deleted: false,
     };
 
-    if let Err(e) = state.db.upsert_file(&params.workspace_id, &file_state).await {
+    if let Err(e) = state
+        .db
+        .upsert_file(&params.workspace_id, &file_state)
+        .await
+    {
         eprintln!("Failed to upsert file in db: {:?}", e);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
