@@ -95,4 +95,20 @@ impl Db {
 
         Ok(())
     }
+
+    pub async fn get_workspaces(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT workspace_id FROM files WHERE deleted = 0"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let workspaces = rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("workspace_id"))
+            .collect();
+
+        Ok(workspaces)
+    }
 }
+

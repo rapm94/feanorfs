@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sync/diff", post(handle_sync_diff))
         .route("/api/upload", post(handle_upload))
         .route("/api/download/:hash", get(handle_download))
+        .route("/api/workspaces", get(handle_get_workspaces))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
@@ -216,3 +217,14 @@ async fn handle_download(
 
     Ok(file_content)
 }
+
+async fn handle_get_workspaces(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let workspaces = state.db.get_workspaces().await.map_err(|e| {
+        tracing::error!("Error fetching workspaces: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(workspaces))
+}
+
