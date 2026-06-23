@@ -5,28 +5,38 @@ use reqwest::Client;
 pub struct ApiClient {
     client: Client,
     server_url: String,
+    server_password: Option<String>,
 }
 
 impl ApiClient {
-    pub fn new(server_url: &str) -> Self {
+    pub fn new(server_url: &str, server_password: Option<&str>) -> Self {
         Self {
             client: Client::new(),
             server_url: server_url.trim_end_matches('/').to_string(),
+            server_password: server_password.map(|s| s.to_string()),
+        }
+    }
+
+    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.server_password {
+            Some(pass) => req.bearer_auth(pass),
+            None => req,
         }
     }
 
     pub async fn negotiate_sync(&self, request: &SyncRequest) -> Result<SyncResponse> {
         let url = format!("{}/api/sync/diff", self.server_url);
         let resp = self
-            .client
-            .post(&url)
-            .json(request)
+            .authed(self.client.post(&url).json(request))
             .send()
             .await
             .context("Failed to send sync diff request")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                bail!("Server requires a password. Run 'feanorfs connect <URL> --password <PASS>'");
+            }
             let body = resp.text().await.unwrap_or_default();
             bail!("Sync negotiation failed with status {}: {}", status, body);
         }
@@ -51,22 +61,27 @@ impl ApiClient {
         let url = format!("{}/api/upload", self.server_url);
 
         let resp = self
-            .client
-            .post(&url)
-            .query(&[
-                ("workspace_id", workspace_id),
-                ("path", path),
-                ("hash", hash),
-                ("size", &size.to_string()),
-                ("mtime", &mtime.to_string()),
-            ])
-            .body(content)
+            .authed(
+                self.client
+                    .post(&url)
+                    .query(&[
+                        ("workspace_id", workspace_id),
+                        ("path", path),
+                        ("hash", hash),
+                        ("size", &size.to_string()),
+                        ("mtime", &mtime.to_string()),
+                    ])
+                    .body(content),
+            )
             .send()
             .await
             .context("Failed to send upload request")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                bail!("Server requires a password. Run 'feanorfs connect <URL> --password <PASS>'");
+            }
             let body = resp.text().await.unwrap_or_default();
             bail!("Upload failed with status {}: {}", status, body);
         }
@@ -78,14 +93,16 @@ impl ApiClient {
         let url = format!("{}/api/download/{}", self.server_url, hash);
 
         let resp = self
-            .client
-            .get(&url)
+            .authed(self.client.get(&url))
             .send()
             .await
             .context("Failed to send download request")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                bail!("Server requires a password. Run 'feanorfs connect <URL> --password <PASS>'");
+            }
             let body = resp.text().await.unwrap_or_default();
             bail!("Download failed with status {}: {}", status, body);
         }
@@ -101,14 +118,16 @@ impl ApiClient {
     pub async fn get_workspaces(&self) -> Result<Vec<String>> {
         let url = format!("{}/api/workspaces", self.server_url);
         let resp = self
-            .client
-            .get(&url)
+            .authed(self.client.get(&url))
             .send()
             .await
             .context("Failed to send workspaces request")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                bail!("Server requires a password. Run 'feanorfs connect <URL> --password <PASS>'");
+            }
             let body = resp.text().await.unwrap_or_default();
             bail!("Fetch workspaces failed with status {}: {}", status, body);
         }

@@ -4,10 +4,19 @@ use anyhow::Result;
 use std::path::Path;
 use tokio::fs;
 
-const DEFAULT_PASSWORD: &str = "default-secret-key";
+const LEGACY_DEFAULT_PASSWORD: &str = "default-secret-key";
 
 pub(crate) fn password_or_default(password: Option<&str>) -> &str {
-    password.unwrap_or(DEFAULT_PASSWORD)
+    match password {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "No E2EE password set in config. Using insecure legacy default. \
+                 Run 'feanorfs init' to set a proper password."
+            );
+            LEGACY_DEFAULT_PASSWORD
+        }
+    }
 }
 
 pub async fn do_push_only(

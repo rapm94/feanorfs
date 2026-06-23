@@ -5,8 +5,12 @@ mod watch;
 
 use api::ApiClient;
 use clap::{Parser, Subcommand};
-use local::{load_config, save_config, ClientDb, Config};
+use local::{
+    load_config, load_global_config, save_config, save_global_config, ClientDb, Config,
+    GlobalConfig,
+};
 use std::fs::OpenOptions;
+use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 
 fn setup_logging(current_dir: &std::path::Path) -> anyhow::Result<()> {
@@ -53,6 +57,41 @@ fn setup_logging(current_dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn discover_server_mdns(timeout: Duration) -> anyhow::Result<String> {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+
+    let daemon =
+        ServiceDaemon::new().map_err(|e| anyhow::anyhow!("Failed to start mDNS daemon: {}", e))?;
+    let receiver = daemon
+        .browse("_feanorfs._tcp.local.")
+        .map_err(|e| anyhow::anyhow!("Failed to browse mDNS: {}", e))?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_default();
+        match receiver.recv_timeout(remaining) {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                if let Some(ip) = info.addresses.iter().next() {
+                    let url = format!("http://{}:{}", ip, info.port);
+                    let _ = daemon.shutdown();
+                    return Ok(url);
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+
+    let _ = daemon.shutdown();
+    anyhow::bail!(
+        "No FeanorFS server found on local network within {} seconds. \
+         Specify URL explicitly: feanorfs connect <URL>",
+        timeout.as_secs()
+    )
+}
+
 #[derive(Parser)]
 #[command(name = "feanorfs")]
 #[command(about = "FeanorFS: Developer-focused filesystem sync tool (client)", long_about = None)]
@@ -63,18 +102,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Connect to a FeanorFS server (cached for future commands)
+    Connect {
+        /// Server URL (e.g. http://192.168.1.50:3030). If omitted, auto-discovers via mDNS on local network.
+        url: Option<String>,
+
+        /// Server access password (for servers that require authentication)
+        #[arg(long)]
+        password: Option<String>,
+    },
     /// Initialize the current directory as a synced workspace
     Init {
-        /// Server URL (e.g. http://localhost:3030)
-        server_url: String,
+        /// Server URL. If omitted, uses the URL cached by `feanorfs connect`.
+        server_url: Option<String>,
 
         /// Workspace ID to sync with
         #[arg(short, long, default_value = "default")]
         workspace: String,
 
-        /// Encryption password for end-to-end zero-knowledge secrecy
+        /// E2EE encryption password. If omitted, one is auto-generated and saved.
         #[arg(short, long)]
         password: Option<String>,
+
+        /// Server access password (overrides the one cached by `feanorfs connect`)
+        #[arg(long)]
+        server_password: Option<String>,
     },
     /// Show local and remote differences
     Status,
@@ -126,33 +178,78 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
+        Commands::Connect { url, password } => {
+            let server_url = match url {
+                Some(u) => u,
+                None => {
+                    println!("Searching for FeanorFS server on local network...");
+                    discover_server_mdns(Duration::from_secs(3))?
+                }
+            };
+
+            let global = GlobalConfig {
+                server_url: server_url.clone(),
+                server_password: password.clone(),
+            };
+            save_global_config(&global)?;
+
+            println!("Connected to FeanorFS server at {}", server_url);
+            if password.is_some() {
+                println!("  Server password: saved");
+            }
+            println!("\nNow run: feanorfs init --workspace <name>");
+        }
         Commands::Init {
             server_url,
             workspace,
             password,
+            server_password,
         } => {
+            let (url, srv_pass) = match server_url {
+                Some(u) => (u, server_password),
+                None => {
+                    let global = load_global_config()?;
+                    (
+                        global.server_url,
+                        server_password.or(global.server_password),
+                    )
+                }
+            };
+
+            let e2ee_password = match password {
+                Some(p) => p,
+                None => {
+                    let generated = feanorfs_common::generate_password()?;
+                    println!("Generated E2EE password: {}", generated);
+                    println!(
+                        "Save this password! Other machines must use the same one to decrypt your files."
+                    );
+                    generated
+                }
+            };
+
             let config = Config {
-                server_url: server_url.clone(),
+                server_url: url.clone(),
                 workspace_id: workspace.clone(),
-                encryption_password: password.clone(),
+                encryption_password: Some(e2ee_password),
+                server_password: srv_pass.clone(),
             };
             save_config(&current_dir, &config)?;
 
             let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
 
-            println!("Initialized standalone FeanorFS workspace!");
-            println!("  Blob Server:  {}", server_url);
+            println!("Initialized FeanorFS workspace!");
+            println!("  Blob Server:  {}", url);
             println!("  Workspace ID: {}", workspace);
-            if password.is_some() {
-                println!("  Encryption:   Enabled (Blake3 symmetric stream)");
-            } else {
-                println!("  Encryption:   Disabled (default credentials)");
+            println!("  Encryption:   Enabled (Blake3 XOF E2EE)");
+            if srv_pass.is_some() {
+                println!("  Server auth:  Enabled");
             }
         }
         Commands::Status => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::new(&config.server_url);
+            let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
             println!("Scanning workspace directory...");
             let local_files = local::scan_local_directory(
@@ -223,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Push => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::new(&config.server_url);
+            let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
             commands::do_push_only(
                 &api,
@@ -237,7 +334,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Pull { lazy } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::new(&config.server_url);
+            let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
             commands::do_pull_only(
                 &api,
@@ -252,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Sync { lazy, no_watch } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::new(&config.server_url);
+            let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
             commands::do_sync(
                 &api,
@@ -278,7 +375,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Hydrate { path } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::new(&config.server_url);
+            let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
             commands::do_hydrate(
                 &api,
@@ -292,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Cat { path } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::new(&config.server_url);
+            let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
             commands::do_cat(
                 &api,
@@ -306,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Watch => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::new(&config.server_url);
+            let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
             watch::run_watch(
                 &api,
@@ -318,14 +415,14 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Commands::Workspaces { server_url } => {
-            let url = if let Some(u) = server_url {
-                u
+            let (url, srv_pass) = if let Some(u) = server_url {
+                (u, None)
             } else {
                 let config = load_config(&current_dir)?;
-                config.server_url
+                (config.server_url, config.server_password)
             };
 
-            let api = ApiClient::new(&url);
+            let api = ApiClient::new(&url, srv_pass.as_deref());
             println!("Querying workspaces from server at {}...", url);
             let workspaces = api.get_workspaces().await?;
             if workspaces.is_empty() {
