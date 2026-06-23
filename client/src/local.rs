@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use fs_sync_common::{normalize_path, FileState};
+use feanorfs_common::{normalize_path, FileState};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool, Row};
+use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -62,7 +62,7 @@ impl ClientDb {
                 mtime INTEGER NOT NULL,
                 server_mtime INTEGER NOT NULL DEFAULT 0,
                 hydrated INTEGER NOT NULL DEFAULT 1
-            );"
+            );",
         )
         .execute(&self.pool)
         .await?;
@@ -122,7 +122,7 @@ impl ClientDb {
 }
 
 pub fn load_config(base_path: &Path) -> Result<Config> {
-    let config_path = base_path.join(".fs-sync").join("config.json");
+    let config_path = base_path.join(".feanorfs").join("config.json");
     let content = fs::read_to_string(&config_path)
         .context("Could not read config file. Make sure you have initialized the client.")?;
     let config: Config = serde_json::from_str(&content)?;
@@ -130,7 +130,7 @@ pub fn load_config(base_path: &Path) -> Result<Config> {
 }
 
 pub fn save_config(base_path: &Path, config: &Config) -> Result<()> {
-    let fs_dir = base_path.join(".fs-sync");
+    let fs_dir = base_path.join(".feanorfs");
     fs::create_dir_all(&fs_dir)?;
     let config_path = fs_dir.join("config.json");
     let content = serde_json::to_string_pretty(config)?;
@@ -146,11 +146,11 @@ pub async fn scan_local_directory(
 ) -> Result<HashMap<String, FileState>> {
     // 1. Load cached files from SQLite DB
     let mut cached_entries = db.get_cache_entries().await?;
-    
+
     // 2. Scan physical files on disk
     let mut disk_files = HashMap::new();
     let walker = WalkBuilder::new(base_path)
-        .hidden(false) // don't skip hidden files entirely, but we skip .git and .fs-sync manually
+        .hidden(false) // don't skip hidden files entirely, but we skip .git and .feanorfs manually
         .build();
 
     let password_str = password.unwrap_or("default-secret-key");
@@ -161,7 +161,7 @@ pub async fn scan_local_directory(
             Err(_) => continue,
         };
 
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
@@ -179,10 +179,10 @@ pub async fn scan_local_directory(
         let normalized = normalize_path(rel_path_str);
 
         // Skip our control directories
-        if normalized.starts_with(".fs-sync")
+        if normalized.starts_with(".feanorfs")
             || normalized.starts_with(".git")
             || normalized.contains("/.git/")
-            || normalized.contains("/.fs-sync/")
+            || normalized.contains("/.feanorfs/")
         {
             continue;
         }
@@ -201,29 +201,46 @@ pub async fn scan_local_directory(
             .unwrap_or(0);
 
         // Determine if we need to rehash/re-encrypt
-        let (plaintext_hash, encrypted_hash, final_size, final_mtime, final_server_mtime, hydrated) = if let Some(cached) = cached_entries.get(&normalized) {
-            if cached.hydrated && cached.size == size && cached.mtime == mtime {
-                // Cache hit! Skip hashing and encryption
-                (cached.plaintext_hash.clone(), cached.encrypted_hash.clone(), size, mtime, cached.server_mtime, true)
-            } else if !cached.hydrated && size == 0 {
-                // Unhydrated placeholder that has not been modified (size is still 0)
-                (cached.plaintext_hash.clone(), cached.encrypted_hash.clone(), cached.size, cached.mtime, cached.server_mtime, false)
+        let (plaintext_hash, encrypted_hash, final_size, final_mtime, final_server_mtime, hydrated) =
+            if let Some(cached) = cached_entries.get(&normalized) {
+                if cached.hydrated && cached.size == size && cached.mtime == mtime {
+                    // Cache hit! Skip hashing and encryption
+                    (
+                        cached.plaintext_hash.clone(),
+                        cached.encrypted_hash.clone(),
+                        size,
+                        mtime,
+                        cached.server_mtime,
+                        true,
+                    )
+                } else if !cached.hydrated && size == 0 {
+                    // Unhydrated placeholder that has not been modified (size is still 0)
+                    (
+                        cached.plaintext_hash.clone(),
+                        cached.encrypted_hash.clone(),
+                        cached.size,
+                        cached.mtime,
+                        cached.server_mtime,
+                        false,
+                    )
+                } else {
+                    // Cache miss (modified file or placeholder that has local modifications)
+                    let bytes = fs::read(abs_path)?;
+                    let ph = feanorfs_common::hash_bytes(&bytes);
+                    let encrypted_bytes =
+                        feanorfs_common::crypt_bytes(&bytes, password_str, &normalized);
+                    let eh = feanorfs_common::hash_bytes(&encrypted_bytes);
+                    (ph, eh, size, mtime, mtime, true)
+                }
             } else {
-                // Cache miss (modified file or placeholder that has local modifications)
+                // New file
                 let bytes = fs::read(abs_path)?;
-                let ph = fs_sync_common::hash_bytes(&bytes);
-                let encrypted_bytes = fs_sync_common::crypt_bytes(&bytes, password_str, &normalized);
-                let eh = fs_sync_common::hash_bytes(&encrypted_bytes);
+                let ph = feanorfs_common::hash_bytes(&bytes);
+                let encrypted_bytes =
+                    feanorfs_common::crypt_bytes(&bytes, password_str, &normalized);
+                let eh = feanorfs_common::hash_bytes(&encrypted_bytes);
                 (ph, eh, size, mtime, mtime, true)
-            }
-        } else {
-            // New file
-            let bytes = fs::read(abs_path)?;
-            let ph = fs_sync_common::hash_bytes(&bytes);
-            let encrypted_bytes = fs_sync_common::crypt_bytes(&bytes, password_str, &normalized);
-            let eh = fs_sync_common::hash_bytes(&encrypted_bytes);
-            (ph, eh, size, mtime, mtime, true)
-        };
+            };
 
         let disk_entry = CacheEntry {
             path: normalized.clone(),
