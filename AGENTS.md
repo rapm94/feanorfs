@@ -23,8 +23,10 @@ feanorfs/
 │   └── src/main.rs      # Axum routes for sync negotiation, blob uploads & downloads
 ├── client/              # CLI terminal client
 │   ├── src/api.rs       # HTTP client request wrappers for blob transport
+│   ├── src/commands.rs  # Push/pull/sync/hydrate/cat command implementations
 │   ├── src/local.rs     # Client-side configuration, ignore rules, and local cache DB
-│   └── src/main.rs      # CLI subcommand routing and debounced change watching
+│   ├── src/main.rs      # CLI subcommand routing
+│   └── src/watch.rs     # Debounced real-time change watcher
 └── server-data/         # Created by server to store file blobs and sqlite metadata (git-ignored)
 ```
 
@@ -44,28 +46,30 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 
 | Task / Feature | Location | Notes |
 | :--- | :--- | :--- |
-| FileState definition | [lib.rs](file:///Users/raulpuigbo/p/fs-sync/common/src/lib.rs#L8-L14) | Tracks relative path, Blake3 hash (encrypted), size, mtime, and deleted status. |
-| Blake3 XOF E2EE | [lib.rs](file:///Users/raulpuigbo/p/fs-sync/common/src/lib.rs#L56-L70) | Symmetric XOR cipher driven by Blake3 Extendable Output Function (XOF). |
-| Local Cache DB | [local.rs](file:///Users/raulpuigbo/p/fs-sync/client/src/local.rs#L31-L118) | Spins up the cache database using SQLx and exposes CRUD methods. |
-| Directory Scanning | [local.rs](file:///Users/raulpuigbo/p/fs-sync/client/src/local.rs#L138-L269) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
-| HTTP API Wrappers | [api.rs](file:///Users/raulpuigbo/p/fs-sync/client/src/api.rs) | Wraps `/api/sync/diff`, `/api/upload`, and `/api/download/:hash`. |
-| CLI Actions & Watching | [main.rs](file:///Users/raulpuigbo/p/fs-sync/client/src/main.rs#L73-L330) | Subcommand routers, watch debounce (500ms), and push/pull sync loops. |
-| Hydration & Cat | [main.rs](file:///Users/raulpuigbo/p/fs-sync/client/src/main.rs#L552-L641) | Lazy download triggers and file decryption routines. |
+| FileState definition | [lib.rs](file:///Users/raulpuigbo/p/feanorfs/common/src/lib.rs#L8-L14) | Tracks relative path, Blake3 hash (encrypted), size, mtime, and deleted status. |
+| Blake3 XOF E2EE | [lib.rs](file:///Users/raulpuigbo/p/feanorfs/common/src/lib.rs#L56-L70) | Symmetric XOR cipher driven by Blake3 Extendable Output Function (XOF). |
+| Local Cache DB | [local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs#L31-L118) | Spins up the cache database using SQLx and exposes CRUD methods. |
+| Directory Scanning | [local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs#L138-L269) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
+| HTTP API Wrappers | [api.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/api.rs) | Wraps `/api/sync/diff`, `/api/upload`, `/api/download/:hash`, and `/api/workspaces`. |
+| CLI Actions | [main.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/main.rs) | Subcommand router (`init`, `status`, `push`, `pull`, `sync`, `hydrate`, `cat`, `watch`, `workspaces`). |
+| Change Watching | [watch.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
+| Hydration & Cat | [commands.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/commands.rs) | Lazy download triggers and file decryption routines. |
 
 ---
 
 ## CODE MAP
 
-### Core Data Models ([common/src/lib.rs](file:///Users/raulpuigbo/p/fs-sync/common/src/lib.rs))
+### Core Data Models ([common/src/lib.rs](file:///Users/raulpuigbo/p/feanorfs/common/src/lib.rs))
 - `FileState`: Schema for paths, hashes, sizes, mtimes, and deleted states.
 - `SyncRequest` & `SyncResponse`: Serialization structs for endpoint negotiation.
 
-### Server API Endpoints ([server/src/main.rs](file:///Users/raulpuigbo/p/fs-sync/server/src/main.rs))
+### Server API Endpoints ([server/src/main.rs](file:///Users/raulpuigbo/p/feanorfs/server/src/main.rs))
 - `POST /api/sync/diff`: Compares incoming client list with `files` table and returns a delta response.
 - `POST /api/upload?workspace_id=...`: Receives raw encrypted bytes, writes them to `server-data/blobs/<hash>`, and upserts DB metadata.
 - `GET /api/download/:hash`: Streams raw file contents.
+- `GET /api/workspaces`: Lists all workspace IDs that have at least one non-deleted file.
 
-### Client Database Schema ([client/src/local.rs](file:///Users/raulpuigbo/p/fs-sync/client/src/local.rs))
+### Client Database Schema ([client/src/local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs))
 - `local_files` table: `path` (PK), `plaintext_hash`, `encrypted_hash`, `size`, `mtime` (disk), `server_mtime` (remote), `hydrated`.
 
 ---
@@ -126,6 +130,9 @@ cargo run --bin feanorfs -- sync
 # Perform a lazy bidirectional sync
 cargo run --bin feanorfs -- sync --lazy
 
+# Perform a single sync pass without entering watch mode (for scripts/CI)
+cargo run --bin feanorfs -- sync --no-watch
+
 # Download and decrypt a specific placeholder file
 cargo run --bin feanorfs -- hydrate src/main.rs
 
@@ -137,4 +144,7 @@ cargo run --bin feanorfs -- cat src/main.rs
 
 # Start real-time watch and sync loop
 cargo run --bin feanorfs -- watch
+
+# List all active workspaces on the server
+cargo run --bin feanorfs -- workspaces
 ```

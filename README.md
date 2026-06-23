@@ -99,8 +99,8 @@ feanorfs push
 # Download remote changes
 feanorfs pull
 
-# Bidirectional sync
-feanorfs sync
+# Bidirectional sync (one-shot, no watch loop)
+feanorfs sync --no-watch
 
 # Lazy sync (metadata only, 0-byte placeholders)
 feanorfs sync --lazy
@@ -113,6 +113,9 @@ feanorfs cat src/main.rs
 
 # Real-time watch + auto-sync
 feanorfs watch
+
+# List active workspaces on the server
+feanorfs workspaces
 ```
 
 See [docs/usage.md](docs/usage.md) for the full CLI reference.

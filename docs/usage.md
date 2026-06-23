@@ -24,7 +24,7 @@ server-data/
 └── blobs/          # content-addressed ciphertext blobs
 ```
 
-There are no configuration flags yet. To change the port, modify `server/src/main.rs` or run behind a reverse proxy.
+There are no server configuration flags yet. To change the port, modify `server/src/main.rs` or run behind a reverse proxy. Log verbosity can be tuned via the `RUST_LOG` environment variable (see [Environment](#environment) below).
 
 ## Client
 
@@ -82,10 +82,17 @@ Downloads all remote changes and applies remote deletions. With `--lazy`, create
 ### `sync` — bidirectional sync
 
 ```bash
-feanorfs sync [--lazy]
+feanorfs sync [--lazy] [--no-watch]
 ```
 
+| Flag | Description |
+|---|---|
+| `--lazy` | Fetch metadata only; create 0-byte placeholder files instead of downloading full contents |
+| `--no-watch` | Perform a single sync pass and exit. Do not enter the real-time watch loop. |
+
 Performs `pull` then `push` in a single pass. Downloads are processed first so that local state is aligned before uploading.
+
+By default, `sync` enters real-time watch mode after the initial pass (same as `feanorfs watch`). This is the intended seamless workflow — run `feanorfs sync` once and it keeps your workspace mirrored across machines as you work. Pass `--no-watch` to run a single sync and exit — useful in scripts, CI, or cron jobs where blocking forever is undesirable.
 
 ### `hydrate` — download and decrypt placeholders
 
@@ -116,6 +123,20 @@ feanorfs watch
 Monitors the workspace for filesystem changes and auto-syncs with the server. Uses a 500ms debounce to coalesce burst events (e.g., editor save sequences).
 
 Performs an initial sync on startup to ensure state is aligned. Press `Ctrl+C` to stop.
+
+### `workspaces` — show server workspaces
+
+```bash
+feanorfs workspaces [SERVER_URL]
+```
+
+| Argument | Description |
+|---|---|
+| `SERVER_URL` (optional) | Server URL to query. If omitted, uses the configured workspace's server. |
+
+Queries the server and prints all workspace IDs that have at least one non-deleted file. Aliased as `feanorfs list` and `feanorfs ls` for convenience.
+
+**Note:** workspaces are listed based on file metadata on the server. A freshly `init`-ed workspace that has never pushed any files will not appear in the list.
 
 ## Examples
 
@@ -151,9 +172,9 @@ vim src/lib.rs
 ```bash
 feanorfs status
 # Output:
-#   Local changes to push (run 'fs-sync push'):
+#   Local changes to push (run 'feanorfs push'):
 #     [modify/add] src/lib.rs
-#   Remote changes to pull (run 'fs-sync pull'):
+#   Remote changes to pull (run 'feanorfs pull'):
 #     [download]   README.md (2.3 KB)
 ```
 
@@ -174,4 +195,16 @@ The following directories are **always skipped** regardless of `.gitignore`:
 
 ## Environment
 
-FeanorFS does not read any environment variables. All configuration is stored in `.feanorfs/config.json`.
+The server respects `RUST_LOG` for controlling log verbosity. The client writes trace-level logs to `.feanorfs/feanorfs.log` regardless of `RUST_LOG`.
+
+```bash
+# Server: enable debug logging for the server crate and tower-http
+RUST_LOG=feanorfs_server=debug,tower_http=debug cargo run --bin feanorfs-server
+
+# Server: silence everything except warnings
+RUST_LOG=warn cargo run --bin feanorfs-server
+```
+
+If `RUST_LOG` is unset, the server defaults to `feanorfs_server=info,tower_http=info`.
+
+All other client configuration is stored in `.feanorfs/config.json`.
