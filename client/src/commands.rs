@@ -17,8 +17,11 @@ pub async fn do_push_only(
     workspace_id: &str,
     password: Option<&str>,
 ) -> Result<()> {
+    tracing::info!("Push started");
+    tracing::debug!("Scanning directory: {:?}", base_path);
     println!("Scanning directory...");
     let local_files = crate::local::scan_local_directory(base_path, db, password).await?;
+    tracing::debug!("Scanned local directory: {} entries found", local_files.len());
 
     let files_vec: Vec<feanorfs_common::FileState> = local_files.values().cloned().collect();
     let request = feanorfs_common::SyncRequest {
@@ -26,8 +29,15 @@ pub async fn do_push_only(
         files: files_vec,
     };
 
+    tracing::debug!("Querying server for diff...");
     println!("Querying server for diff...");
     let response = api.negotiate_sync(&request).await?;
+    tracing::debug!(
+        "Sync diff response: upload_required={}, download_required={}, delete_local={}",
+        response.upload_required.len(),
+        response.download_required.len(),
+        response.delete_local.len()
+    );
 
     let mut uploads = 0;
     let mut deletes = 0;
@@ -37,6 +47,7 @@ pub async fn do_push_only(
     for path in &response.upload_required {
         if let Some(local_file) = local_files.get(path) {
             if !local_file.deleted {
+                tracing::info!("Uploading {} (size: {} bytes, hash: {})", path, local_file.size, local_file.hash);
                 println!("Uploading {}...", path);
                 let plain_content = fs::read(base_path.join(path)).await?;
                 let encrypted_content =
@@ -58,18 +69,20 @@ pub async fn do_push_only(
 
     for (path, local_file) in &local_files {
         if local_file.deleted {
+            tracing::info!("Deleting cache entry for deleted local file: {}", path);
             db.delete_cache_entry(path).await?;
             deletes += 1;
         }
     }
 
+    tracing::info!("Push completed. Uploaded {} files, processed {} deletions.", uploads, deletes);
     println!(
         "Push completed. Uploaded {} files, processed {} deletions.",
         uploads, deletes
     );
 
     if !response.download_required.is_empty() || !response.delete_local.is_empty() {
-        println!("Note: There are remote updates available. Run 'fs-sync pull' to apply them.");
+        println!("Note: There are remote updates available. Run 'feanorfs pull' to apply them.");
     }
 
     Ok(())
@@ -83,8 +96,11 @@ pub async fn do_pull_only(
     password: Option<&str>,
     lazy: bool,
 ) -> Result<()> {
+    tracing::info!("Pull started (lazy={})", lazy);
+    tracing::debug!("Scanning directory: {:?}", base_path);
     println!("Scanning directory...");
     let local_files = crate::local::scan_local_directory(base_path, db, password).await?;
+    tracing::debug!("Scanned local directory: {} entries found", local_files.len());
 
     let files_vec: Vec<feanorfs_common::FileState> = local_files.values().cloned().collect();
     let request = feanorfs_common::SyncRequest {
@@ -92,8 +108,15 @@ pub async fn do_pull_only(
         files: files_vec,
     };
 
+    tracing::debug!("Querying server for diff...");
     println!("Querying server for diff...");
     let response = api.negotiate_sync(&request).await?;
+    tracing::debug!(
+        "Sync diff response: upload_required={}, download_required={}, delete_local={}",
+        response.upload_required.len(),
+        response.download_required.len(),
+        response.delete_local.len()
+    );
 
     let mut downloads = 0;
     let mut deletes = 0;
@@ -104,6 +127,7 @@ pub async fn do_pull_only(
     for replica_file in &response.download_required {
         let path = &replica_file.path;
         if lazy {
+            tracing::info!("Creating lazy placeholder: {} (remote size: {} bytes, hash: {})", path, replica_file.size, replica_file.hash);
             println!("Creating lazy placeholder for {}...", path);
             let full_path = base_path.join(path);
             if let Some(parent) = full_path.parent() {
@@ -123,6 +147,7 @@ pub async fn do_pull_only(
             db.upsert_cache_entry(&cache_entry).await?;
             placeholders += 1;
         } else {
+            tracing::info!("Downloading {} (size: {} bytes, hash: {})", path, replica_file.size, replica_file.hash);
             println!("Downloading {}...", path);
             let encrypted_content = api.download_file(&replica_file.hash).await?;
             let plain_content =
@@ -161,6 +186,7 @@ pub async fn do_pull_only(
     for path in &response.delete_local {
         let full_path = base_path.join(path);
         if full_path.exists() {
+            tracing::info!("Applying remote deletion of {}", path);
             println!("Deleting {} (remote deletion)...", path);
             let _ = fs::remove_file(full_path).await;
         }
@@ -170,10 +196,15 @@ pub async fn do_pull_only(
 
     for (path, local_file) in &local_files {
         if local_file.deleted {
+            tracing::info!("Cleaning up cache entry for locally deleted file: {}", path);
             db.delete_cache_entry(path).await?;
         }
     }
 
+    tracing::info!(
+        "Pull completed. Downloaded {} files, created {} lazy placeholders, deleted {} files.",
+        downloads, placeholders, deletes
+    );
     println!(
         "Pull completed. Downloaded {} files, created {} lazy placeholders, deleted {} files.",
         downloads, placeholders, deletes
@@ -189,8 +220,11 @@ pub async fn do_sync(
     password: Option<&str>,
     lazy: bool,
 ) -> Result<()> {
+    tracing::info!("Bidirectional sync started (lazy={})", lazy);
+    tracing::debug!("Scanning directory: {:?}", base_path);
     println!("Scanning directory...");
     let local_files = crate::local::scan_local_directory(base_path, db, password).await?;
+    tracing::debug!("Scanned local directory: {} entries found", local_files.len());
 
     let files_vec: Vec<feanorfs_common::FileState> = local_files.values().cloned().collect();
     let request = feanorfs_common::SyncRequest {
@@ -198,8 +232,15 @@ pub async fn do_sync(
         files: files_vec,
     };
 
+    tracing::debug!("Querying server for diff...");
     println!("Querying server for diff...");
     let response = api.negotiate_sync(&request).await?;
+    tracing::debug!(
+        "Sync diff response: upload_required={}, download_required={}, delete_local={}",
+        response.upload_required.len(),
+        response.download_required.len(),
+        response.delete_local.len()
+    );
 
     let mut uploads = 0;
     let mut downloads = 0;
@@ -212,6 +253,7 @@ pub async fn do_sync(
     for replica_file in &response.download_required {
         let path = &replica_file.path;
         if lazy {
+            tracing::info!("Creating lazy placeholder (sync): {} (size: {})", path, replica_file.size);
             println!("Creating lazy placeholder for {}...", path);
             let full_path = base_path.join(path);
             if let Some(parent) = full_path.parent() {
@@ -231,6 +273,7 @@ pub async fn do_sync(
             db.upsert_cache_entry(&cache_entry).await?;
             placeholders += 1;
         } else {
+            tracing::info!("Downloading (sync): {} (size: {})", path, replica_file.size);
             println!("Downloading {}...", path);
             let encrypted_content = api.download_file(&replica_file.hash).await?;
             let plain_content =
@@ -269,6 +312,7 @@ pub async fn do_sync(
     for path in &response.delete_local {
         let full_path = base_path.join(path);
         if full_path.exists() {
+            tracing::info!("Applying remote deletion (sync): {}", path);
             println!("Deleting {} (remote deletion)...", path);
             let _ = fs::remove_file(full_path).await;
         }
@@ -279,6 +323,7 @@ pub async fn do_sync(
     for path in &response.upload_required {
         if let Some(local_file) = local_files.get(path) {
             if !local_file.deleted {
+                tracing::info!("Uploading (sync): {} (size: {})", path, local_file.size);
                 println!("Uploading {}...", path);
                 let plain_content = fs::read(base_path.join(path)).await?;
                 let encrypted_content =
@@ -300,11 +345,16 @@ pub async fn do_sync(
 
     for (path, local_file) in &local_files {
         if local_file.deleted {
+            tracing::info!("Cleaning up cache entry for local deletion (sync): {}", path);
             db.delete_cache_entry(path).await?;
             deletes_remote += 1;
         }
     }
 
+    tracing::info!(
+        "Sync completed. Uploaded {}, Downloaded {} (lazy placeholders: {}), Local Deletes {}, Remote Deletes {}.",
+        uploads, downloads, placeholders, deletes_local, deletes_remote
+    );
     println!(
         "Sync completed. Uploaded {}, Downloaded {} (lazy placeholders: {}), Local Deletes {}, Remote Deletes {}.",
         uploads, downloads, placeholders, deletes_local, deletes_remote
@@ -319,6 +369,7 @@ pub async fn do_hydrate(
     target_path: Option<String>,
     password: Option<&str>,
 ) -> Result<()> {
+    tracing::info!("Hydration started (target={:?})", target_path);
     let password_str = password_or_default(password);
     let cache_entries = db.get_cache_entries().await?;
 
@@ -332,6 +383,7 @@ pub async fn do_hydrate(
         }
 
         if !entry.hydrated {
+            tracing::info!("Hydrating file: {} (hash: {})", path, entry.encrypted_hash);
             println!("Hydrating {}...", path);
             let encrypted_content = api.download_file(&entry.encrypted_hash).await?;
             let plain_content =
@@ -374,6 +426,7 @@ pub async fn do_hydrate(
             println!("All files are already hydrated.");
         }
     } else {
+        tracing::info!("Hydrated {} files.", hydrated_count);
         println!("Hydrated {} files.", hydrated_count);
     }
 
@@ -387,12 +440,15 @@ pub async fn do_cat(
     target_path: &str,
     password: Option<&str>,
 ) -> Result<()> {
+    tracing::info!("Cat file started (path={})", target_path);
     let cache_entries = db.get_cache_entries().await?;
     if let Some(entry) = cache_entries.get(target_path) {
         if !entry.hydrated {
+            tracing::info!("File {} is not hydrated, triggering hydration", target_path);
             do_hydrate(api, db, base_path, Some(target_path.to_string()), password).await?;
         }
     } else {
+        tracing::warn!("File '{}' is not tracked in cache. Reading directly.", target_path);
         println!(
             "Warning: file '{}' is not tracked. Reading directly.",
             target_path
@@ -404,6 +460,7 @@ pub async fn do_cat(
         let content = fs::read_to_string(full_path).await?;
         print!("{}", content);
     } else {
+        tracing::error!("File '{}' does not exist on disk", target_path);
         println!("Error: file '{}' does not exist.", target_path);
     }
     Ok(())

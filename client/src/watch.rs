@@ -13,6 +13,7 @@ pub async fn run_watch(
     workspace_id: &str,
     password: Option<&str>,
 ) -> Result<()> {
+    tracing::info!("Starting change watcher on {}...", current_dir.display());
     println!("Starting change watcher on {}...", current_dir.display());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(100);
 
@@ -21,7 +22,7 @@ pub async fn run_watch(
         notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
                 let mut interest = false;
-                for path in event.paths {
+                for path in &event.paths {
                     if let Some(path_str) = path.to_str() {
                         let normalized = normalize_path(path_str);
                         if !normalized.contains("/.feanorfs/")
@@ -35,6 +36,7 @@ pub async fn run_watch(
                     }
                 }
                 if interest {
+                    tracing::debug!("Detected filesystem event of interest: {:?}", event);
                     let _ = tx_clone.try_send(());
                 }
             }
@@ -43,8 +45,10 @@ pub async fn run_watch(
     watcher.watch(Path::new("."), notify::RecursiveMode::Recursive)?;
     println!("Watching for changes... (Press Ctrl+C to stop)");
 
+    tracing::info!("Performing initial sync...");
     println!("Performing initial sync...");
     if let Err(e) = do_sync(api, db, current_dir, workspace_id, password, false).await {
+        tracing::error!("Initial sync failed: {:?}", e);
         eprintln!("Initial sync failed: {:?}", e);
     }
 
@@ -57,10 +61,13 @@ pub async fn run_watch(
 
         while rx.try_recv().is_ok() {}
 
+        tracing::info!("Changes detected! Syncing with server...");
         println!("Changes detected! Syncing with server...");
         if let Err(e) = do_sync(api, db, current_dir, workspace_id, password, false).await {
+            tracing::error!("Auto-sync failed: {:?}", e);
             eprintln!("Auto-sync failed: {:?}", e);
         } else {
+            tracing::info!("Auto-sync complete.");
             println!("Sync complete.");
         }
     }
