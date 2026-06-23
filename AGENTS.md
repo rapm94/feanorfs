@@ -1,12 +1,12 @@
-# FS-SYNC KNOWLEDGE BASE
+# FEANORFS KNOWLEDGE BASE
 
 **Generated:** 2026-06-23T18:15:00+02:00
 **Branch:** main
 **Status:** Standalone SQLx/SQLite Integration + E2EE + Lazy Hydration Verified
 
 ## OVERVIEW
-`fs-sync` is a developer-focused uncommitted-code synchronization tool written in Rust. It utilizes a **self-contained local-first architecture**:
-1. **Metadata Synchronization**: Coordinated via standard SQLite databases on both sides. The server maintains metadata in `server-data/db.sqlite`, and the client tracks cache status in `.fs-sync/local_cache.db`. Clients query the server's `/api/sync/diff` endpoint sending their local metadata to negotiate differences.
+`FeanorFS` is a developer-focused uncommitted-code synchronization tool written in Rust. It utilizes a **self-contained local-first architecture**:
+1. **Metadata Synchronization**: Coordinated via standard SQLite databases on both sides. The server maintains metadata in `server-data/db.sqlite`, and the client tracks cache status in `.feanorfs/local_cache.db`. Clients query the server's `/api/sync/diff` endpoint sending their local metadata to negotiate differences.
 2. **Blob Storage**: File contents are saved in content-addressed storage (CAS) blobs on a lightweight Axum server, identified by their Blake3 hashes.
 3. **End-to-End Encryption (E2EE)**: Zero-knowledge protection. Files are encrypted on upload and decrypted on download using a symmetric key stream generated from a password and relative path via **Blake3's Extendable Output Function (XOF)**. The cloud database and blob server only ever see encrypted hashes and scrambled bytes.
 4. **On-Demand Hydration (Lazy Sync)**: Pulling with `--lazy` fetches metadata and creates 0-byte placeholders on disk. The actual file bytes are downloaded and decrypted on-demand via the `hydrate` or `cat` commands.
@@ -15,7 +15,7 @@
 
 ## STRUCTURE
 ```
-fs-sync/
+feanorfs/
 ├── common/              # Shared data models and utilities
 │   └── src/lib.rs       # Base FileState, Blake3 XOF crypt_bytes and hashing
 ├── server/              # Pure blob storage server
@@ -71,14 +71,14 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 ---
 
 ## CONVENTIONS
-1. **Cross-Platform Paths**: All files are tracked and uploaded using forward slashes (`/`). Always normalize path slashes using `fs_sync_common::normalize_path` before doing DB operations.
+1. **Cross-Platform Paths**: All files are tracked and uploaded using forward slashes (`/`). Always normalize path slashes using `feanorfs_common::normalize_path` before doing DB operations.
 2. **No Redundant Hashing**: Check disk files against `local_cache.db` first. Rehash only if `mtime` or `size` differs.
 3. **Zero-Knowledge Encryption**: Always encrypt file contents using `crypt_bytes` before calling `api.upload_file` and store the resulting `encrypted_hash` in the database.
 
 ---
 
 ## ANTI-PATTERNS (THIS PROJECT)
-- **DO NOT** scan the `.fs-sync` or `.git` directories. These must be hardcoded as skipped in directory scanning.
+- **DO NOT** scan the `.feanorfs` or `.git` directories. These must be hardcoded as skipped in directory scanning.
 - **DO NOT** trigger syncs on every raw filesystem change event. Filesystem saves are noisy. Debounce updates for 500ms using a channel.
 - **DO NOT** download remote file bytes immediately during sync if `--lazy` is enabled. Write 0-byte placeholders instead.
 
@@ -98,43 +98,43 @@ cargo test
 ### Starting the Blob Server
 ```bash
 # Runs the Axum server on port 3030
-cargo run --bin fs-sync-server
+cargo run --bin feanorfs-server
 ```
 
 ### Client CLI Usage
 ```bash
 # Initialize a workspace with Server URL, workspace name, and master password
-cargo run --bin fs-sync-client -- init http://localhost:3030 \
+cargo run --bin feanorfs -- init http://localhost:3030 \
   --workspace my-workspace \
   --password "my-master-password"
 
 # Check differences between local directory and server
-cargo run --bin fs-sync-client -- status
+cargo run --bin feanorfs -- status
 
 # Upload local additions, updates, and deletes
-cargo run --bin fs-sync-client -- push
+cargo run --bin feanorfs -- push
 
 # Download remote updates and deletes (fully hydrated)
-cargo run --bin fs-sync-client -- pull
+cargo run --bin feanorfs -- pull
 
 # Perform a lazy pull (downloads metadata only, creating placeholder files)
-cargo run --bin fs-sync-client -- pull --lazy
+cargo run --bin feanorfs -- pull --lazy
 
 # Perform a bidirectional sync (pull + push)
-cargo run --bin fs-sync-client -- sync
+cargo run --bin feanorfs -- sync
 
 # Perform a lazy bidirectional sync
-cargo run --bin fs-sync-client -- sync --lazy
+cargo run --bin feanorfs -- sync --lazy
 
 # Download and decrypt a specific placeholder file
-cargo run --bin fs-sync-client -- hydrate src/main.rs
+cargo run --bin feanorfs -- hydrate src/main.rs
 
 # Download and decrypt all unhydrated placeholder files
-cargo run --bin fs-sync-client -- hydrate
+cargo run --bin feanorfs -- hydrate
 
 # Print a file's contents, automatically hydrating it if it is a placeholder
-cargo run --bin fs-sync-client -- cat src/main.rs
+cargo run --bin feanorfs -- cat src/main.rs
 
 # Start real-time watch and sync loop
-cargo run --bin fs-sync-client -- watch
+cargo run --bin feanorfs -- watch
 ```
