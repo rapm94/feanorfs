@@ -1,7 +1,16 @@
 [package]
-name = "fs-sync-common"
-version = "0.1.0"
-edition = "2021"
+name = "feanorfs-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Shared data models and Blake3 XOF encryption primitives for FeanorFS"
 
 [dependencies]
 serde.workspace = true
