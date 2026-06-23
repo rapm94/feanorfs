@@ -6,31 +6,41 @@ mod watch;
 use api::ApiClient;
 use clap::{Parser, Subcommand};
 use local::{load_config, save_config, ClientDb, Config};
-use tracing_subscriber::{fmt, prelude::*, Registry, EnvFilter};
 use std::fs::OpenOptions;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 
 fn setup_logging(current_dir: &std::path::Path) -> anyhow::Result<()> {
     let log_dir = current_dir.join(".feanorfs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    
+    let _ = std::fs::create_dir_all(&log_dir)
+        .map_err(|e| eprintln!("Warning: could not create log directory: {e:?}"));
+
     let log_file = OpenOptions::new()
         .create(true)
-        .write(true)
         .append(true)
         .open(log_dir.join("feanorfs.log"))?;
 
     let log_file_clone = log_file.try_clone()?;
 
-    // Standard output layer: simple CLI output without targets or times
+    // Standard output layer: warnings and errors only.
+    // User-facing progress output is handled by println! in commands.rs/watch.rs.
+    // tracing::info!/debug! go to the file layer only, avoiding double output.
     let stdout_layer = fmt::layer()
         .with_writer(std::io::stdout)
         .with_target(false)
         .without_time()
-        .with_filter(EnvFilter::new("info"));
+        .with_filter(EnvFilter::new("warn"));
 
-    // File logging layer: detailed debug traces
+    // File logging layer: detailed debug traces.
+    // The writer closure must never panic — if the file handle becomes invalid
+    // mid-run, fall back to a sink so log events are dropped silently rather
+    // than crashing the process.
     let file_layer = fmt::layer()
-        .with_writer(move || log_file_clone.try_clone().expect("Failed to clone log file"))
+        .with_writer(move || -> Box<dyn std::io::Write + Send> {
+            match log_file_clone.try_clone() {
+                Ok(f) => Box::new(f),
+                Err(_) => Box::new(std::io::sink()),
+            }
+        })
         .with_target(true)
         .with_ansi(false)
         .with_filter(EnvFilter::new("debug"));
@@ -42,7 +52,6 @@ fn setup_logging(current_dir: &std::path::Path) -> anyhow::Result<()> {
 
     Ok(())
 }
-
 
 #[derive(Parser)]
 #[command(name = "feanorfs")]
@@ -100,6 +109,7 @@ enum Commands {
     /// Watch for local changes and sync them in real time
     Watch,
     /// List all active workspaces tracked on the server
+    #[command(aliases = ["list", "ls"])]
     Workspaces {
         /// Optional Server URL (overrides config URL)
         server_url: Option<String>,
@@ -114,7 +124,6 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = setup_logging(&current_dir) {
         eprintln!("Warning: failed to initialize log file: {:?}", e);
     }
-
 
     match cli.command {
         Commands::Init {
@@ -173,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
 
             if !response.upload_required.is_empty() {
                 has_changes = true;
-                println!("\nLocal changes to push (run 'fs-sync push'):");
+                println!("\nLocal changes to push (run 'feanorfs push'):");
                 for path in &response.upload_required {
                     if let Some(f) = local_files.get(path) {
                         if f.deleted {
@@ -189,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
 
             if !response.download_required.is_empty() {
                 has_changes = true;
-                println!("\nRemote changes to pull (run 'fs-sync pull'):");
+                println!("\nRemote changes to pull (run 'feanorfs pull'):");
                 for f in &response.download_required {
                     println!(
                         "  [download]   {} ({:.1} KB)",
@@ -201,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
 
             if !response.delete_local.is_empty() {
                 has_changes = true;
-                println!("\nRemote deletions to apply (run 'fs-sync pull'):");
+                println!("\nRemote deletions to apply (run 'feanorfs pull'):");
                 for path in &response.delete_local {
                     println!("  [delete]     {}", path);
                 }
@@ -256,7 +265,6 @@ async fn main() -> anyhow::Result<()> {
             .await?;
 
             if !no_watch {
-                println!("\nEntering real-time watch mode. Press Ctrl+C to stop...");
                 watch::run_watch(
                     &api,
                     &db,
@@ -319,19 +327,13 @@ async fn main() -> anyhow::Result<()> {
 
             let api = ApiClient::new(&url);
             println!("Querying workspaces from server at {}...", url);
-            match api.get_workspaces().await {
-                Ok(workspaces) => {
-                    if workspaces.is_empty() {
-                        println!("No active workspaces found on the server.");
-                    } else {
-                        println!("\nActive Workspaces:");
-                        for w in workspaces {
-                            println!("  * {}", w);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error: failed to fetch workspaces: {:?}", e);
+            let workspaces = api.get_workspaces().await?;
+            if workspaces.is_empty() {
+                println!("No active workspaces found on the server.");
+            } else {
+                println!("\nActive Workspaces:");
+                for w in workspaces {
+                    println!("  * {}", w);
                 }
             }
         }
