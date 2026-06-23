@@ -6,6 +6,43 @@ mod watch;
 use api::ApiClient;
 use clap::{Parser, Subcommand};
 use local::{load_config, save_config, ClientDb, Config};
+use tracing_subscriber::{fmt, prelude::*, Registry, EnvFilter};
+use std::fs::OpenOptions;
+
+fn setup_logging(current_dir: &std::path::Path) -> anyhow::Result<()> {
+    let log_dir = current_dir.join(".feanorfs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    
+    let log_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(log_dir.join("feanorfs.log"))?;
+
+    let log_file_clone = log_file.try_clone()?;
+
+    // Standard output layer: simple CLI output without targets or times
+    let stdout_layer = fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_target(false)
+        .without_time()
+        .with_filter(EnvFilter::new("info"));
+
+    // File logging layer: detailed debug traces
+    let file_layer = fmt::layer()
+        .with_writer(move || log_file_clone.try_clone().expect("Failed to clone log file"))
+        .with_target(true)
+        .with_ansi(false)
+        .with_filter(EnvFilter::new("debug"));
+
+    let _ = Registry::default()
+        .with(stdout_layer)
+        .with(file_layer)
+        .try_init();
+
+    Ok(())
+}
+
 
 #[derive(Parser)]
 #[command(name = "feanorfs")]
@@ -64,6 +101,11 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let current_dir = std::env::current_dir()?;
+
+    if let Err(e) = setup_logging(&current_dir) {
+        eprintln!("Warning: failed to initialize log file: {:?}", e);
+    }
+
 
     match cli.command {
         Commands::Init {
