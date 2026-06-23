@@ -1,7 +1,7 @@
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool, Row};
-use std::path::Path;
 use anyhow::{Context, Result};
-use fs_sync_common::FileState;
+use feanorfs_common::FileState;
+use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use std::path::Path;
 
 pub struct Db {
     pool: SqlitePool,
@@ -13,7 +13,7 @@ impl Db {
             "sqlite:{}",
             db_path.as_ref().to_str().context("Invalid database path")?
         );
-        
+
         // Ensure database file exists
         if !db_path.as_ref().exists() {
             if let Some(parent) = db_path.as_ref().parent() {
@@ -43,7 +43,7 @@ impl Db {
                 deleted BOOLEAN NOT NULL DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (workspace_id, path)
-            );"
+            );",
         )
         .execute(&self.pool)
         .await?;
@@ -52,7 +52,7 @@ impl Db {
 
     pub async fn get_workspace_files(&self, workspace_id: &str) -> Result<Vec<FileState>> {
         let rows = sqlx::query(
-            "SELECT path, hash, size, mtime, deleted FROM files WHERE workspace_id = ?"
+            "SELECT path, hash, size, mtime, deleted FROM files WHERE workspace_id = ?",
         )
         .bind(workspace_id)
         .fetch_all(&self.pool)
@@ -82,7 +82,7 @@ impl Db {
                 size = excluded.size,
                 mtime = excluded.mtime,
                 deleted = excluded.deleted,
-                updated_at = CURRENT_TIMESTAMP"
+                updated_at = CURRENT_TIMESTAMP",
         )
         .bind(workspace_id)
         .bind(&file.path)
