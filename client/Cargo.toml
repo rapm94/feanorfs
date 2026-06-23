@@ -31,4 +31,5 @@ chrono = { workspace = true }
 walkdir = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+mdns-sd = { workspace = true }
 
