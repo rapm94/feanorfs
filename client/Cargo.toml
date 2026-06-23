@@ -1,0 +1,18 @@
+[package]
+name = "fs-sync-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fs-sync-common = { path = "../common" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+notify = { workspace = true }
+ignore = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+walkdir = { workspace = true }
