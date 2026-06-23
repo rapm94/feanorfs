@@ -2,11 +2,13 @@ mod db;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use clap::Parser;
 use db::Db;
 use feanorfs_common::{FileState, SyncRequest, SyncResponse};
 use serde::Deserialize;
@@ -17,6 +19,20 @@ use tokio::fs;
 struct AppState {
     db: Arc<Db>,
     storage_dir: PathBuf,
+    server_password: Option<String>,
+}
+
+#[derive(Parser)]
+#[command(name = "feanorfs-server")]
+#[command(about = "Content-addressed blob storage and sync metadata server for FeanorFS")]
+struct Cli {
+    /// Require clients to authenticate with this password (Bearer token)
+    #[arg(long, env = "FEANORFS_SERVER_PASSWORD")]
+    password: Option<String>,
+
+    /// Disable mDNS service advertisement (use when behind a reverse proxy or on the internet)
+    #[arg(long)]
+    no_mdns: bool,
 }
 
 #[derive(Deserialize)]
@@ -28,9 +44,55 @@ struct UploadParams {
     mtime: i64,
 }
 
+fn local_ip() -> anyhow::Result<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?;
+    Ok(socket.local_addr()?.ip().to_string())
+}
+
+fn register_mdns(port: u16) -> anyhow::Result<mdns_sd::ServiceDaemon> {
+    use mdns_sd::{ServiceDaemon, ServiceInfo};
+
+    let daemon = ServiceDaemon::new()?;
+    let ip = local_ip()?;
+    let props: &[(&str, &str)] = &[("v", "1")];
+    let service_info = ServiceInfo::new(
+        "_feanorfs._tcp.local.",
+        "feanorfs-server",
+        "feanorfs-server",
+        &ip,
+        port,
+        props,
+    )?;
+    daemon.register(service_info)?;
+    Ok(daemon)
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    match &state.server_password {
+        None => Ok(next.run(request).await),
+        Some(expected) => {
+            let provided = request
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match provided {
+                Some(p) if p == expected => Ok(next.run(request).await),
+                _ => Err(StatusCode::UNAUTHORIZED),
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing subscriber
+    let cli = Cli::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -38,30 +100,59 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Setup directories
     let base_dir = PathBuf::from("server-data");
     let db_path = base_dir.join("db.sqlite");
     let blobs_dir = base_dir.join("blobs");
     fs::create_dir_all(&blobs_dir).await?;
 
-    // Initialize DB
     let db = Db::new(&db_path).await?;
     let state = AppState {
         db: Arc::new(db),
         storage_dir: base_dir,
+        server_password: cli.password.clone(),
     };
 
-    // Build router with TraceLayer
     let app = Router::new()
         .route("/api/sync/diff", post(handle_sync_diff))
         .route("/api/upload", post(handle_upload))
         .route("/api/download/:hash", get(handle_download))
         .route("/api/workspaces", get(handle_get_workspaces))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3030));
     tracing::info!("FeanorFS Sync Server starting on http://{}", addr);
+
+    let _mdns_daemon = if !cli.no_mdns {
+        match register_mdns(addr.port()) {
+            Ok(d) => {
+                tracing::info!("mDNS service registered (discoverable on local network)");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to register mDNS service: {}. Use --no-mdns to suppress.",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        tracing::info!("mDNS advertisement disabled (--no-mdns)");
+        None
+    };
+
+    if cli.password.is_some() {
+        tracing::info!("Server authentication enabled (password required)");
+    } else {
+        tracing::warn!(
+            "No server password set. Run with --password <PASS> for authenticated access."
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
