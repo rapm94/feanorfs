@@ -12,6 +12,18 @@ pub struct Config {
     pub server_url: String,
     pub workspace_id: String,
     pub encryption_password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_password: Option<String>,
+}
+
+/// Global client config stored at ~/.feanorfs/global.json.
+/// Cached by `feanorfs connect` so that `init` and other commands
+/// don't need an explicit server URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalConfig {
+    pub server_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_password: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +147,29 @@ pub fn save_config(base_path: &Path, config: &Config) -> Result<()> {
     let config_path = fs_dir.join("config.json");
     let content = serde_json::to_string_pretty(config)?;
     fs::write(config_path, content)?;
+    Ok(())
+}
+
+fn global_config_dir() -> Result<std::path::PathBuf> {
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    Ok(std::path::PathBuf::from(home).join(".feanorfs"))
+}
+
+pub fn load_global_config() -> Result<GlobalConfig> {
+    let path = global_config_dir()?.join("global.json");
+    let content = fs::read_to_string(&path).context(
+        "No server connection found. Run 'feanorfs connect <URL>' first, or pass the URL directly to 'init'.",
+    )?;
+    let config: GlobalConfig = serde_json::from_str(&content)?;
+    Ok(config)
+}
+
+pub fn save_global_config(config: &GlobalConfig) -> Result<()> {
+    let dir = global_config_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("global.json");
+    let content = serde_json::to_string_pretty(config)?;
+    fs::write(path, content)?;
     Ok(())
 }
 
