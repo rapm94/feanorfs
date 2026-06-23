@@ -24,25 +24,69 @@ server-data/
 └── blobs/          # content-addressed ciphertext blobs
 ```
 
-There are no server configuration flags yet. To change the port, modify `server/src/main.rs` or run behind a reverse proxy. Log verbosity can be tuned via the `RUST_LOG` environment variable (see [Environment](#environment) below).
+The server advertises itself via mDNS (Bonjour) on the local network, so clients can auto-discover it with `feanorfs connect` (no IP needed). Use `--no-mdns` to disable this when behind a reverse proxy or on the internet.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--password <PASS>` | Require clients to authenticate with a Bearer token | none (open access) |
+| `--no-mdns` | Disable mDNS service advertisement | disabled (mDNS on) |
+
+The server password can also be set via the `FEANORFS_SERVER_PASSWORD` environment variable.
+
+For internet deployments, put a TLS-terminating reverse proxy (e.g. Caddy) in front and use `--no-mdns`:
+
+```bash
+caddy reverse-proxy localhost:3030  # auto-HTTPS, port 443
+```
+
+Log verbosity can be tuned via `RUST_LOG` (see [Environment](#environment) below).
 
 ## Client
+
+### `connect` — connect to a server (cached globally)
+
+```bash
+feanorfs connect [URL] [--password <SERVER_PASS>]
+```
+
+| Argument / Flag | Description |
+|---|---|
+| `URL` (optional) | Server URL. If omitted, auto-discovers via mDNS on the local network. |
+| `--password <PASS>` | Server access password (for servers that require authentication). |
+
+Caches the server URL (and optional password) in `~/.feanorfs/global.json` so that subsequent commands (`init`, `sync`, etc.) don't need an explicit URL.
+
+**On a LAN:** `feanorfs connect` with no args discovers the server automatically via mDNS/Bonjour. No IP address needed.
+
+**On the internet or Tailscale:** `feanorfs connect https://my-server.com:3030 --password "server-pass"`. For Tailscale, mDNS works across the tailnet if multicast DNS relay is enabled.
 
 ### `init` — initialize a workspace
 
 ```bash
-feanorfs init <SERVER_URL> --workspace <WORKSPACE_ID> --password "<PASSWORD>"
+feanorfs init [SERVER_URL] --workspace <WORKSPACE_ID> [--password <E2EE_PASS>] [--server-password <SERVER_PASS>]
 ```
 
-| Flag | Description | Default |
+| Argument / Flag | Description | Default |
 |---|---|---|
+| `SERVER_URL` (optional) | Server URL. If omitted, uses the URL cached by `feanorfs connect`. | from cache |
 | `--workspace`, `-w` | Workspace ID to sync with | `default` |
-| `--password`, `-p` | Encryption password (enables E2EE) | none (uses `default-secret-key`) |
+| `--password`, `-p` | E2EE encryption password. If omitted, one is auto-generated and saved. | auto-generated |
+| `--server-password` | Server access password (overrides cached value from `connect`) | from cache |
 
 Creates `.feanorfs/config.json` and `.feanorfs/local_cache.db` in the current directory.
 
+**E2EE is always on.** If you don't pass `--password`, a 64-character hex key is generated using a CSPRNG and stored in the workspace config. You must use the same E2EE password on all machines that share a workspace — without it, files can't be decrypted.
+
+The server password and E2EE password are different things:
+- **Server password** — gates *access* to the server (who can talk to it at all).
+- **E2EE password** — gates *readability* of file contents (who can decrypt the blobs).
+
 **Example:**
 ```bash
+# After `feanorfs connect` (URL cached):
+feanorfs init --workspace my-project --password "correct-battery-horse-staple"
+
+# Or one-shot with explicit URL:
 feanorfs init http://localhost:3030 --workspace my-project --password "correct-battery-horse-staple"
 ```
 

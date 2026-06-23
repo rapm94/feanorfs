@@ -50,8 +50,8 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Blake3 XOF E2EE | [lib.rs](file:///Users/raulpuigbo/p/feanorfs/common/src/lib.rs#L56-L70) | Symmetric XOR cipher driven by Blake3 Extendable Output Function (XOF). |
 | Local Cache DB | [local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs#L31-L118) | Spins up the cache database using SQLx and exposes CRUD methods. |
 | Directory Scanning | [local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs#L138-L269) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
-| HTTP API Wrappers | [api.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/api.rs) | Wraps `/api/sync/diff`, `/api/upload`, `/api/download/:hash`, and `/api/workspaces`. |
-| CLI Actions | [main.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/main.rs) | Subcommand router (`init`, `status`, `push`, `pull`, `sync`, `hydrate`, `cat`, `watch`, `workspaces`). |
+| HTTP API Wrappers | [api.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/api.rs) | Wraps `/api/sync/diff`, `/api/upload`, `/api/download/:hash`, and `/api/workspaces`. Sends Bearer auth header when server password is configured. |
+| CLI Actions | [main.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/main.rs) | Subcommand router (`connect`, `init`, `status`, `push`, `pull`, `sync`, `hydrate`, `cat`, `watch`, `workspaces`). mDNS discovery for `connect`. |
 | Change Watching | [watch.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
 | Hydration & Cat | [commands.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/commands.rs) | Lazy download triggers and file decryption routines. |
 
@@ -68,9 +68,13 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 - `POST /api/upload?workspace_id=...`: Receives raw encrypted bytes, writes them to `server-data/blobs/<hash>`, and upserts DB metadata.
 - `GET /api/download/:hash`: Streams raw file contents.
 - `GET /api/workspaces`: Lists all workspace IDs that have at least one non-deleted file.
+- **Auth middleware**: If `--password` is set, all routes require `Authorization: Bearer <pass>` header.
+- **mDNS**: Server advertises `_feanorfs._tcp.local.` on port 3030 for LAN discovery (disabled with `--no-mdns`).
 
 ### Client Database Schema ([client/src/local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs))
 - `local_files` table: `path` (PK), `plaintext_hash`, `encrypted_hash`, `size`, `mtime` (disk), `server_mtime` (remote), `hydrated`.
+- Global config: `~/.feanorfs/global.json` stores server URL + optional server password, cached by `feanorfs connect`.
+- Workspace config: `.feanorfs/config.json` stores server URL, workspace ID, E2EE password, and optional server password.
 
 ---
 
@@ -107,10 +111,13 @@ cargo run --bin feanorfs-server
 
 ### Client CLI Usage
 ```bash
-# Initialize a workspace with Server URL, workspace name, and master password
-cargo run --bin feanorfs -- init http://localhost:3030 \
-  --workspace my-workspace \
-  --password "my-master-password"
+# Connect to a server (auto-discovers on LAN via mDNS, or explicit URL)
+cargo run --bin feanorfs -- connect
+cargo run --bin feanorfs -- connect http://localhost:3030 --password "server-pass"
+
+# Initialize a workspace (URL from connect cache, E2EE password auto-generated)
+cargo run --bin feanorfs -- init --workspace my-workspace
+cargo run --bin feanorfs -- init --workspace my-workspace --password "my-e2ee-password"
 
 # Check differences between local directory and server
 cargo run --bin feanorfs -- status
