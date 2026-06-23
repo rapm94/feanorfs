@@ -168,7 +168,9 @@ async fn handle_upload(
     if computed_hash != params.hash {
         tracing::warn!(
             "Hash mismatch for {}: expected {}, computed {}",
-            params.path, params.hash, computed_hash
+            params.path,
+            params.hash,
+            computed_hash
         );
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -227,4 +229,3 @@ async fn handle_get_workspaces(
     })?;
     Ok(Json(workspaces))
 }
-
