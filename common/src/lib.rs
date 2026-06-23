@@ -4,6 +4,16 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+/// Generates a cryptographically random 64-char hex password.
+/// Uses getrandom (CSPRNG) for entropy, then Blake3-hashes the bytes
+/// to produce a stable-length hex string suitable as an E2EE key.
+pub fn generate_password() -> Result<String> {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| anyhow::anyhow!("Failed to generate random bytes: {}", e))?;
+    Ok(blake3::hash(&seed).to_hex().to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileState {
     pub path: String,  // Relative path from workspace root, using forward slashes '/'
@@ -238,5 +248,22 @@ mod tests {
         assert!(json.contains("\"deleted\":true"), "json: {json}");
         let decoded: FileState = serde_json::from_str(&json).unwrap();
         assert!(decoded.deleted);
+    }
+
+    #[test]
+    fn generate_password_returns_64_char_hex() {
+        let pw = generate_password().unwrap();
+        assert_eq!(pw.len(), 64, "password must be 64 hex chars: {pw}");
+        assert!(
+            pw.chars().all(|c| c.is_ascii_hexdigit()),
+            "password must be hex: {pw}"
+        );
+    }
+
+    #[test]
+    fn generate_password_is_unique() {
+        let a = generate_password().unwrap();
+        let b = generate_password().unwrap();
+        assert_ne!(a, b, "two generated passwords must differ");
     }
 }
