@@ -51,9 +51,9 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Local Cache DB | [local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs#L31-L118) | Spins up the cache database using SQLx and exposes CRUD methods. |
 | Directory Scanning | [local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs#L138-L269) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
 | HTTP API Wrappers | [api.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/api.rs) | Wraps `/api/sync/diff`, `/api/upload`, `/api/download/:hash`, and `/api/workspaces`. Sends Bearer auth header when server password is configured. |
-| CLI Actions | [main.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/main.rs) | Subcommand router (`connect`, `init`, `status`, `push`, `pull`, `sync`, `hydrate`, `cat`, `watch`, `workspaces`). mDNS discovery for `connect`. |
+| CLI Actions | [main.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/main.rs) | Subcommand router (`connect`, `init`, `join`, `config`, `show-key`, `doctor`, `status`, `push`, `pull`, `sync`, `hydrate`, `cat`, `watch`, `workspaces`). `--lan` flag enables mDNS discovery. Clipboard copy of E2EE key. Interactive token prompt. All output formatting lives here. |
+| Sync Engine | [commands.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/commands.rs) | Pure sync logic returning structured result types (`SyncResult`, `PushResult`, `PullResult`, `HydrateResult`, `CatResult`, `StatusResult`). No `println!` — UI-agnostic. Future desktop/TUI app calls these directly. |
 | Change Watching | [watch.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
-| Hydration & Cat | [commands.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/commands.rs) | Lazy download triggers and file decryption routines. |
 
 ---
 
@@ -68,8 +68,9 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 - `POST /api/upload?workspace_id=...`: Receives raw encrypted bytes, writes them to `server-data/blobs/<hash>`, and upserts DB metadata.
 - `GET /api/download/:hash`: Streams raw file contents.
 - `GET /api/workspaces`: Lists all workspace IDs that have at least one non-deleted file.
-- **Auth middleware**: If `--password` is set, all routes require `Authorization: Bearer <pass>` header.
-- **mDNS**: Server advertises `_feanorfs._tcp.local.` on port 3030 for LAN discovery (disabled with `--no-mdns`).
+- **Auth middleware**: If `--token` is set, all routes require `Authorization: Bearer <token>` header. `--password` accepted as alias.
+- **mDNS**: Server advertises `_feanorfs._tcp.local.` on port 3030 for LAN discovery when started with `--mdns` (off by default for internet deployments).
+- **Multi-instance**: `--port` and `--data-dir` flags allow running multiple isolated instances behind a reverse proxy (SaaS deployment model).
 
 ### Client Database Schema ([client/src/local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs))
 - `local_files` table: `path` (PK), `plaintext_hash`, `encrypted_hash`, `size`, `mtime` (disk), `server_mtime` (remote), `hydrated`.
@@ -111,13 +112,21 @@ cargo run --bin feanorfs-server
 
 ### Client CLI Usage
 ```bash
-# Connect to a server (auto-discovers on LAN via mDNS, or explicit URL)
-cargo run --bin feanorfs -- connect
-cargo run --bin feanorfs -- connect http://localhost:3030 --password "server-pass"
+# Connect to a server (internet: explicit URL; LAN: --lan for mDNS discovery)
+# If server requires auth and no --password given, prompts interactively
+cargo run --bin feanorfs -- connect https://my-server.com:3030 --password "server-pass"
+cargo run --bin feanorfs -- connect --lan
 
-# Initialize a workspace (URL from connect cache, E2EE password auto-generated)
+# Initialize a workspace (uses cached server, auto-generates E2EE key)
+# Prints a ready-to-paste join command and copies key to clipboard
 cargo run --bin feanorfs -- init --workspace my-workspace
-cargo run --bin feanorfs -- init --workspace my-workspace --password "my-e2ee-password"
+cargo run --bin feanorfs -- init --workspace my-workspace --lan
+
+# Join an existing workspace from another machine (combines connect + init)
+cargo run --bin feanorfs -- join my-workspace --password "e2ee-key-from-machine-A"
+
+# Show current connection and workspace configuration
+cargo run --bin feanorfs -- config
 
 # Check differences between local directory and server
 cargo run --bin feanorfs -- status

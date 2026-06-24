@@ -28,5 +28,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-knowledge server: only encrypted hashes and ciphertext blobs are stored server-side.
 - See `SECURITY.md` for the full threat model and known limitations.
 
-[Unreleased]: https://github.com/raulpuigbo/fs-sync/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/raulpuigbo/fs-sync/releases/tag/v0.1.0
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0

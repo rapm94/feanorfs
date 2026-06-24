@@ -13,7 +13,7 @@ FeanorFS is a working-directory mirror for developers who use more than one mach
 ### Start the blob server
 
 ```bash
-cargo run --bin feanorfs-server
+cargo run --bin feanorfs-server -- --password "your-server-secret"
 ```
 
 The server listens on `0.0.0.0:3030` and creates its data directory at `server-data/` (relative to the working directory where it was launched):
@@ -24,20 +24,55 @@ server-data/
 └── blobs/          # content-addressed ciphertext blobs
 ```
 
-The server advertises itself via mDNS (Bonjour) on the local network, so clients can auto-discover it with `feanorfs connect` (no IP needed). Use `--no-mdns` to disable this when behind a reverse proxy or on the internet.
-
 | Flag | Description | Default |
 |---|---|---|
-| `--password <PASS>` | Require clients to authenticate with a Bearer token | none (open access) |
-| `--no-mdns` | Disable mDNS service advertisement | disabled (mDNS on) |
+| `--token <TOKEN>` | Authentication token (Bearer auth). `--password` is accepted as an alias. | none (open access) |
+| `--port <PORT>` | Port to listen on. Use different ports for multi-instance deployments. | `3030` |
+| `--data-dir <DIR>` | Data directory for SQLite DB and blob storage. Each instance should have its own. | `./server-data` |
+| `--mdns` | Enable mDNS service advertisement for LAN discovery | off |
 
-The server password can also be set via the `FEANORFS_SERVER_PASSWORD` environment variable.
+All flags can also be set via environment variables: `FEANORFS_TOKEN`, `FEANORFS_PORT`, `FEANORFS_DATA_DIR`.
 
-For internet deployments, put a TLS-terminating reverse proxy (e.g. Caddy) in front and use `--no-mdns`:
+### Internet deployment (recommended)
+
+For internet-facing deployments, put a TLS-terminating reverse proxy (Caddy) in front and run the server with `--token`:
 
 ```bash
-caddy reverse-proxy localhost:3030  # auto-HTTPS, port 443
+# Server (on your VPS/cloud):
+feanorfs-server --token "server-secret"
+
+# TLS via Caddy (auto-HTTPS, port 443):
+caddy reverse-proxy localhost:3030
 ```
+
+mDNS is off by default — it's only useful on LAN and can't cross routers.
+
+### Multi-instance deployment (SaaS-ready)
+
+Run multiple isolated instances behind a single Caddy, each with its own data directory and port:
+
+```bash
+feanorfs-server --port 3001 --data-dir /data/alice --token "alice-token"
+feanorfs-server --port 3002 --data-dir /data/bob   --token "bob-token"
+```
+
+Caddy routes subdomains to ports:
+```
+alice.feanorfs.app { reverse_proxy localhost:3001 }
+bob.feanorfs.app   { reverse_proxy localhost:3002 }
+```
+
+Each instance is fully isolated: separate SQLite DB, separate blob storage, separate auth token. This is the deployment model for the managed SaaS — same binary, no code changes needed.
+
+### LAN deployment
+
+For local-only setups, enable mDNS so clients can auto-discover without typing an IP:
+
+```bash
+feanorfs-server --mdns
+```
+
+Clients can then use `feanorfs connect --lan` to find the server automatically.
 
 Log verbosity can be tuned via `RUST_LOG` (see [Environment](#environment) below).
 
@@ -46,19 +81,21 @@ Log verbosity can be tuned via `RUST_LOG` (see [Environment](#environment) below
 ### `connect` — connect to a server (cached globally)
 
 ```bash
-feanorfs connect [URL] [--password <SERVER_PASS>]
+feanorfs connect <URL> [--password <SERVER_PASS>]
+feanorfs connect --lan [--password <SERVER_PASS>]
 ```
 
 | Argument / Flag | Description |
 |---|---|
-| `URL` (optional) | Server URL. If omitted, auto-discovers via mDNS on the local network. |
-| `--password <PASS>` | Server access password (for servers that require authentication). |
+| `URL` (required unless `--lan`) | Server URL (e.g. `https://my-server.com:3030`). |
+| `--token <TOKEN>` | Server access token (Bearer auth). `--password` is accepted as an alias. If omitted and server requires auth, prompts interactively. |
+| `--lan` | Discover server on local network via mDNS instead of providing a URL. |
 
-Caches the server URL (and optional password) in `~/.feanorfs/global.json` so that subsequent commands (`init`, `sync`, etc.) don't need an explicit URL.
+Caches the server URL (and optional token) in `~/.feanorfs/global.json` so that subsequent commands (`init`, `sync`, etc.) don't need an explicit URL.
 
-**On a LAN:** `feanorfs connect` with no args discovers the server automatically via mDNS/Bonjour. No IP address needed.
+**Internet (primary):** `feanorfs connect https://my-server.com:3030 --token "server-token"`
 
-**On the internet or Tailscale:** `feanorfs connect https://my-server.com:3030 --password "server-pass"`. For Tailscale, mDNS works across the tailnet if multicast DNS relay is enabled.
+**LAN (with mDNS):** `feanorfs connect --lan` (requires server started with `--mdns`)
 
 ### `init` — initialize a workspace
 
@@ -68,27 +105,130 @@ feanorfs init [SERVER_URL] --workspace <WORKSPACE_ID> [--password <E2EE_PASS>] [
 
 | Argument / Flag | Description | Default |
 |---|---|---|
-| `SERVER_URL` (optional) | Server URL. If omitted, uses the URL cached by `feanorfs connect`. | from cache |
+| `SERVER_URL` (optional) | Server URL. If omitted, uses the URL cached by `feanorfs connect`. Use `--lan` to discover via mDNS instead. | from cache |
 | `--workspace`, `-w` | Workspace ID to sync with | `default` |
-| `--password`, `-p` | E2EE encryption password. If omitted, one is auto-generated and saved. | auto-generated |
-| `--server-password` | Server access password (overrides cached value from `connect`) | from cache |
+| `--password`, `-p` | E2EE encryption password. If omitted, one is auto-generated, copied to clipboard, and a ready-to-paste `join` command is printed. | auto-generated |
+| `--server-token` | Server access token (overrides cached value from `connect`). `--server-password` accepted as alias. | from cache |
+| `--lan` | Discover server on local network via mDNS instead of using cached URL | off |
 
 Creates `.feanorfs/config.json` and `.feanorfs/local_cache.db` in the current directory.
 
-**E2EE is always on.** If you don't pass `--password`, a 64-character hex key is generated using a CSPRNG and stored in the workspace config. You must use the same E2EE password on all machines that share a workspace — without it, files can't be decrypted.
+If a server URL is provided, `init` implicitly caches it (same as running `connect` first). This means on machine A you can do everything in one command:
 
-The server password and E2EE password are different things:
-- **Server password** — gates *access* to the server (who can talk to it at all).
-- **E2EE password** — gates *readability* of file contents (who can decrypt the blobs).
-
-**Example:**
 ```bash
-# After `feanorfs connect` (URL cached):
-feanorfs init --workspace my-project --password "correct-battery-horse-staple"
-
-# Or one-shot with explicit URL:
-feanorfs init http://localhost:3030 --workspace my-project --password "correct-battery-horse-staple"
+feanorfs init https://my-server.com:3030 --workspace my-project
+# → caches server URL, generates E2EE key, copies to clipboard, prints join command
 ```
+
+**Internet (primary flow):**
+```bash
+feanorfs connect https://my-server.com:3030 --password "server-secret"
+feanorfs init --workspace my-project
+# → generates E2EE key, copies to clipboard, prints join command
+```
+
+**LAN (with mDNS):**
+```bash
+feanorfs init --workspace my-project --lan
+# → discovers server, generates E2EE key, prints join command
+```
+
+When the E2EE password is auto-generated, the output looks like:
+
+```
+Initialized FeanorFS workspace!
+  Blob Server:  http://192.168.1.50:3030
+  Workspace ID: my-project
+  Encryption:   Enabled (Blake3 XOF E2EE)
+
+E2EE password: a1b2c3d4e5f6...
+Copied to clipboard.
+
+Join from another machine:
+  feanorfs join my-project --password a1b2c3d4e5f6...
+
+Save this password! Without it, your files cannot be decrypted.
+```
+
+### `join` — join an existing workspace
+
+```bash
+feanorfs join <WORKSPACE> --password <E2EE_PASS> [--server-url <URL>] [--server-password <SERVER_PASS>]
+```
+
+| Argument / Flag | Description |
+|---|---|
+| `WORKSPACE` (required) | Workspace ID to join |
+| `--password`, `-p` (required) | E2EE encryption password (must match the one used by other machines in this workspace) |
+| `--server-url` | Server URL. If omitted, uses cached connection from `feanorfs connect`. |
+| `--server-token` | Server access token (for servers that require authentication). `--server-password` accepted as alias. |
+| `--lan` | Discover server on local network via mDNS instead of using cached URL |
+
+Combines `connect` + `init` into one command. Use this on machine B with the password printed by `init` on machine A.
+
+```bash
+# Internet:
+feanorfs join my-project --password a1b2c3d4... --server-url https://my-server.com:3030
+
+# LAN (with mDNS):
+feanorfs join my-project --password a1b2c3d4... --lan
+
+# Or if already connected via `feanorfs connect`:
+feanorfs join my-project --password a1b2c3d4...
+feanorfs sync --no-watch   # pull files
+```
+
+### `config` — show current configuration
+
+```bash
+feanorfs config
+```
+
+Prints both the global connection state (`~/.feanorfs/global.json`) and the workspace config (`.feanorfs/config.json`) in the current directory. Useful for checking which server you're connected to and whether E2EE is enabled.
+
+```
+Global connection (~/.feanorfs/global.json):
+  Server:        http://192.168.1.50:3030
+  Server auth:   enabled
+
+Workspace (.feanorfs/config.json):
+  Server:        http://192.168.1.50:3030
+  Workspace ID:  my-project
+  E2EE:          enabled
+  E2EE key:      a1b2c3...d4e5
+  Server auth:   enabled
+```
+
+### `show-key` — show E2EE password
+
+```bash
+feanorfs show-key
+```
+
+Prints the E2EE encryption password for this workspace and copies it to your clipboard. Also prints a ready-to-paste `join` command for other machines. Use this when you've lost the key that was auto-generated during `init`.
+
+### `doctor` — diagnose connection issues
+
+```bash
+feanorfs doctor
+```
+
+Runs a health check: verifies global config, workspace config, E2EE status, server reachability, workspace existence on server, and local cache DB. Reports `[OK]`, `[WARN]`, `[INFO]`, or `[FAIL]` for each check.
+
+```
+Running diagnostics...
+
+[OK]  Global config: server at https://my-server.com:3030
+[OK]  Workspace config: my-project on https://my-server.com:3030
+[OK]  E2EE: enabled
+[OK]  Server reachable: 3 workspace(s) found
+[OK]  Workspace 'my-project' exists on server
+[OK]  Local cache DB: accessible
+
+All checks passed.
+```
+
+Use `doctor` as the first troubleshooting step when something isn't working.
 
 ### `status` — show local vs. remote differences
 
