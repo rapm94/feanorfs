@@ -19,20 +19,28 @@ use tokio::fs;
 struct AppState {
     db: Arc<Db>,
     storage_dir: PathBuf,
-    server_password: Option<String>,
+    auth_token: Option<String>,
 }
 
 #[derive(Parser)]
 #[command(name = "feanorfs-server")]
 #[command(about = "Content-addressed blob storage and sync metadata server for FeanorFS")]
 struct Cli {
-    /// Require clients to authenticate with this password (Bearer token)
-    #[arg(long, env = "FEANORFS_SERVER_PASSWORD")]
-    password: Option<String>,
+    /// Authentication token. Clients must send this as a Bearer token. In SaaS mode, this becomes a per-user API key.
+    #[arg(long, env = "FEANORFS_TOKEN", visible_alias = "password")]
+    token: Option<String>,
 
-    /// Disable mDNS service advertisement (use when behind a reverse proxy or on the internet)
+    /// Enable mDNS service advertisement for LAN discovery (off by default for internet deployments)
     #[arg(long)]
-    no_mdns: bool,
+    mdns: bool,
+
+    /// Port to listen on (default: 3030). Use different ports when running multiple instances behind a reverse proxy.
+    #[arg(long, default_value = "3030", env = "FEANORFS_PORT")]
+    port: u16,
+
+    /// Data directory for SQLite DB and blob storage (default: ./server-data). Each instance should have its own.
+    #[arg(long, default_value = "server-data", env = "FEANORFS_DATA_DIR")]
+    data_dir: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -73,7 +81,7 @@ async fn auth_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    match &state.server_password {
+    match &state.auth_token {
         None => Ok(next.run(request).await),
         Some(expected) => {
             let provided = request
@@ -100,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let base_dir = PathBuf::from("server-data");
+    let base_dir = cli.data_dir.clone();
     let db_path = base_dir.join("db.sqlite");
     let blobs_dir = base_dir.join("blobs");
     fs::create_dir_all(&blobs_dir).await?;
@@ -109,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db: Arc::new(db),
         storage_dir: base_dir,
-        server_password: cli.password.clone(),
+        auth_token: cli.token.clone(),
     };
 
     let app = Router::new()
@@ -124,34 +132,33 @@ async fn main() -> anyhow::Result<()> {
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3030));
-    tracing::info!("FeanorFS Sync Server starting on http://{}", addr);
+    let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
+    tracing::info!(
+        "FeanorFS Sync Server starting on http://{} (data: {})",
+        addr,
+        cli.data_dir.display()
+    );
 
-    let _mdns_daemon = if !cli.no_mdns {
+    let _mdns_daemon = if cli.mdns {
         match register_mdns(addr.port()) {
             Ok(d) => {
                 tracing::info!("mDNS service registered (discoverable on local network)");
                 Some(d)
             }
             Err(e) => {
-                tracing::warn!(
-                    "Failed to register mDNS service: {}. Use --no-mdns to suppress.",
-                    e
-                );
+                tracing::warn!("Failed to register mDNS service: {}", e);
                 None
             }
         }
     } else {
-        tracing::info!("mDNS advertisement disabled (--no-mdns)");
+        tracing::info!("mDNS disabled (default). Use --mdns to enable LAN discovery.");
         None
     };
 
-    if cli.password.is_some() {
-        tracing::info!("Server authentication enabled (password required)");
+    if cli.token.is_some() {
+        tracing::info!("Authentication enabled (token required)");
     } else {
-        tracing::warn!(
-            "No server password set. Run with --password <PASS> for authenticated access."
-        );
+        tracing::warn!("No auth token set. Run with --token <TOKEN> for authenticated access.");
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
