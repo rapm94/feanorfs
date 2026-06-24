@@ -33,3 +33,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 mdns-sd = { workspace = true }
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ bin }-v{ version }-{ target }{ binary-ext }"
+pkg-fmt = "bin"
+

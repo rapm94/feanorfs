@@ -1,0 +1,7 @@
+[workspace]
+# FeanorFS is distributed as pre-built binaries, not via crates.io.
+publish = false
+
+# All crates inherit version via `version.workspace = true`, so a single
+# release-plz run bumps every member crate together and produces one tag +
+# one GitHub release for the whole workspace.
