@@ -3,6 +3,7 @@ mod commands;
 mod local;
 mod watch;
 
+use anyhow::Context as _;
 use api::ApiClient;
 use clap::{Parser, Subcommand};
 use local::{
@@ -92,6 +93,89 @@ fn discover_server_mdns(timeout: Duration) -> anyhow::Result<String> {
     )
 }
 
+fn resolve_server_url(explicit: Option<String>, allow_lan: bool) -> anyhow::Result<String> {
+    match explicit {
+        Some(u) => Ok(u),
+        None => match load_global_config() {
+            Ok(g) => Ok(g.server_url),
+            Err(_) => {
+                if allow_lan {
+                    println!("Searching for FeanorFS server on local network...");
+                    discover_server_mdns(Duration::from_secs(3))
+                } else {
+                    anyhow::bail!(
+                        "No server URL specified and no cached connection found.\n\
+                         \n\
+                         Connect to a server first:\n  \
+                         feanorfs connect https://your-server.com:3030\n\n\
+                         Or for LAN discovery:\n  \
+                         feanorfs connect --lan"
+                    )
+                }
+            }
+        },
+    }
+}
+
+fn resolve_server_password(explicit: Option<String>) -> Option<String> {
+    explicit.or_else(|| load_global_config().ok().and_then(|g| g.server_password))
+}
+
+fn copy_to_clipboard(text: &str) {
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin.write_all(text.as_bytes())?;
+                }
+                child.wait()
+            })
+    } else if cfg!(target_os = "linux") {
+        std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin.write_all(text.as_bytes())?;
+                }
+                child.wait()
+            })
+    } else {
+        Ok(std::process::ExitStatus::default())
+    };
+    let _ = result;
+}
+
+fn read_password_hidden(prompt: &str) -> anyhow::Result<String> {
+    use std::io::{self, BufRead, Write};
+    let mut stderr = io::stderr();
+    write!(stderr, "{}", prompt)?;
+    stderr.flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    eprintln!();
+    Ok(line.trim().to_string())
+}
+
+async fn probe_server_auth(url: &str) -> anyhow::Result<bool> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/api/workspaces", url.trim_end_matches('/')))
+        .send()
+        .await
+        .context("Failed to reach server")?;
+    Ok(resp.status() == reqwest::StatusCode::UNAUTHORIZED)
+}
+
 #[derive(Parser)]
 #[command(name = "feanorfs")]
 #[command(about = "FeanorFS: Developer-focused filesystem sync tool (client)", long_about = None)]
@@ -104,12 +188,16 @@ struct Cli {
 enum Commands {
     /// Connect to a FeanorFS server (cached for future commands)
     Connect {
-        /// Server URL (e.g. http://192.168.1.50:3030). If omitted, auto-discovers via mDNS on local network.
+        /// Server URL (e.g. https://my-server.com:3030). Required unless --lan is used.
         url: Option<String>,
 
-        /// Server access password (for servers that require authentication)
+        /// Server access token (Bearer auth). In SaaS mode, this is your per-user API key.
+        #[arg(long, visible_alias = "password")]
+        token: Option<String>,
+
+        /// Discover server on local network via mDNS instead of providing a URL
         #[arg(long)]
-        password: Option<String>,
+        lan: bool,
     },
     /// Initialize the current directory as a synced workspace
     Init {
@@ -124,9 +212,13 @@ enum Commands {
         #[arg(short, long)]
         password: Option<String>,
 
-        /// Server access password (overrides the one cached by `feanorfs connect`)
+        /// Server access token (overrides the one cached by `feanorfs connect`)
+        #[arg(long, visible_alias = "password")]
+        server_token: Option<String>,
+
+        /// Discover server on local network via mDNS instead of using cached URL
         #[arg(long)]
-        server_password: Option<String>,
+        lan: bool,
     },
     /// Show local and remote differences
     Status,
@@ -158,6 +250,33 @@ enum Commands {
         /// The relative path of the file to display
         path: String,
     },
+    /// Join an existing workspace (combines connect + init in one command)
+    Join {
+        /// Workspace ID to join
+        workspace: String,
+
+        /// E2EE encryption password (required to decrypt files from other machines)
+        #[arg(short, long)]
+        password: String,
+
+        /// Server URL. If omitted, uses the URL cached by `feanorfs connect`.
+        #[arg(long)]
+        server_url: Option<String>,
+
+        /// Server access token (for servers that require authentication)
+        #[arg(long, visible_alias = "password")]
+        server_token: Option<String>,
+
+        /// Discover server on local network via mDNS instead of using cached URL
+        #[arg(long)]
+        lan: bool,
+    },
+    /// Show current connection and workspace configuration
+    Config,
+    /// Show the E2EE password for this workspace (use to share with other machines)
+    ShowKey,
+    /// Diagnose connection and configuration issues
+    Doctor,
     /// Watch for local changes and sync them in real time
     Watch,
     /// List all active workspaces tracked on the server
@@ -178,24 +297,29 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Commands::Connect { url, password } => {
-            let server_url = match url {
-                Some(u) => u,
+        Commands::Connect { url, token, lan } => {
+            let server_url = resolve_server_url(url, lan)?;
+
+            let final_token = match token {
+                Some(t) => Some(t),
                 None => {
-                    println!("Searching for FeanorFS server on local network...");
-                    discover_server_mdns(Duration::from_secs(3))?
+                    if probe_server_auth(&server_url).await.unwrap_or(false) {
+                        Some(read_password_hidden("Server requires a token: ")?)
+                    } else {
+                        None
+                    }
                 }
             };
 
             let global = GlobalConfig {
                 server_url: server_url.clone(),
-                server_password: password.clone(),
+                server_password: final_token.clone(),
             };
             save_global_config(&global)?;
 
             println!("Connected to FeanorFS server at {}", server_url);
-            if password.is_some() {
-                println!("  Server password: saved");
+            if final_token.is_some() {
+                println!("  Server token: saved");
             }
             println!("\nNow run: feanorfs init --workspace <name>");
         }
@@ -203,35 +327,32 @@ async fn main() -> anyhow::Result<()> {
             server_url,
             workspace,
             password,
-            server_password,
+            server_token,
+            lan,
         } => {
-            let (url, srv_pass) = match server_url {
-                Some(u) => (u, server_password),
-                None => {
-                    let global = load_global_config()?;
-                    (
-                        global.server_url,
-                        server_password.or(global.server_password),
-                    )
-                }
-            };
+            let url = resolve_server_url(server_url.clone(), lan)?;
+            let srv_pass = resolve_server_password(server_token);
 
-            let e2ee_password = match password {
-                Some(p) => p,
+            if server_url.is_some() {
+                let global = GlobalConfig {
+                    server_url: url.clone(),
+                    server_password: srv_pass.clone(),
+                };
+                save_global_config(&global)?;
+            }
+
+            let (e2ee_password, was_generated) = match password {
+                Some(p) => (p, false),
                 None => {
                     let generated = feanorfs_common::generate_password()?;
-                    println!("Generated E2EE password: {}", generated);
-                    println!(
-                        "Save this password! Other machines must use the same one to decrypt your files."
-                    );
-                    generated
+                    (generated, true)
                 }
             };
 
             let config = Config {
                 server_url: url.clone(),
                 workspace_id: workspace.clone(),
-                encryption_password: Some(e2ee_password),
+                encryption_password: Some(e2ee_password.clone()),
                 server_password: srv_pass.clone(),
             };
             save_config(&current_dir, &config)?;
@@ -245,6 +366,95 @@ async fn main() -> anyhow::Result<()> {
             if srv_pass.is_some() {
                 println!("  Server auth:  Enabled");
             }
+
+            if was_generated {
+                println!("\nE2EE password: {}", e2ee_password);
+                copy_to_clipboard(&e2ee_password);
+                println!("Copied to clipboard.");
+                println!("\nJoin from another machine:");
+                println!("  feanorfs join {} --password {}", workspace, e2ee_password);
+                println!("\nSave this password! Without it, your files cannot be decrypted.");
+            }
+        }
+        Commands::Join {
+            workspace,
+            password,
+            server_url,
+            server_token,
+            lan,
+        } => {
+            let url = resolve_server_url(server_url, lan)?;
+            let srv_pass = resolve_server_password(server_token);
+
+            let config = Config {
+                server_url: url.clone(),
+                workspace_id: workspace.clone(),
+                encryption_password: Some(password.clone()),
+                server_password: srv_pass.clone(),
+            };
+            save_config(&current_dir, &config)?;
+
+            let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+
+            println!("Joined workspace '{}' on {}", workspace, url);
+            println!("  Encryption:   Enabled (Blake3 XOF E2EE)");
+            if srv_pass.is_some() {
+                println!("  Server auth:  Enabled");
+            }
+            println!("\nRun 'feanorfs sync' to pull files from the workspace.");
+        }
+        Commands::Config => {
+            match load_global_config() {
+                Ok(g) => {
+                    println!("Global connection (~/.feanorfs/global.json):");
+                    println!("  Server:        {}", g.server_url);
+                    println!(
+                        "  Server auth:   {}",
+                        if g.server_password.is_some() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                }
+                Err(_) => {
+                    println!("Global connection: not configured (run 'feanorfs connect')");
+                }
+            }
+
+            println!();
+            match load_config(&current_dir) {
+                Ok(c) => {
+                    println!("Workspace (.feanorfs/config.json):");
+                    println!("  Server:        {}", c.server_url);
+                    println!("  Workspace ID:  {}", c.workspace_id);
+                    let e2ee_status = if c.encryption_password.is_some() {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    println!("  E2EE:          {}", e2ee_status);
+                    if let Some(ref p) = c.encryption_password {
+                        let display = if p.len() > 12 {
+                            format!("{}...{}", &p[..6], &p[p.len() - 4..])
+                        } else {
+                            p.to_string()
+                        };
+                        println!("  E2EE key:      {}", display);
+                    }
+                    println!(
+                        "  Server auth:   {}",
+                        if c.server_password.is_some() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                }
+                Err(_) => {
+                    println!("Workspace: not initialized (run 'feanorfs init' in this directory)");
+                }
+            }
         }
         Commands::Status => {
             let config = load_config(&current_dir)?;
@@ -252,36 +462,22 @@ async fn main() -> anyhow::Result<()> {
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
             println!("Scanning workspace directory...");
-            let local_files = local::scan_local_directory(
-                &current_dir,
+            let result = commands::do_status(
+                &api,
                 &db,
+                &current_dir,
+                &config.workspace_id,
                 config.encryption_password.as_deref(),
             )
             .await?;
 
-            let files_vec: Vec<feanorfs_common::FileState> =
-                local_files.values().cloned().collect();
-            let request = feanorfs_common::SyncRequest {
-                workspace_id: config.workspace_id.clone(),
-                files: files_vec,
-            };
-
-            println!("Querying server for diff...");
-            let response = api.negotiate_sync(&request).await?;
-
-            for (path, file) in &local_files {
-                if file.deleted {
-                    let _ = db.delete_cache_entry(path).await;
-                }
-            }
-
             let mut has_changes = false;
 
-            if !response.upload_required.is_empty() {
+            if !result.upload_required.is_empty() {
                 has_changes = true;
                 println!("\nLocal changes to push (run 'feanorfs push'):");
-                for path in &response.upload_required {
-                    if let Some(f) = local_files.get(path) {
+                for path in &result.upload_required {
+                    if let Some(f) = result.local_files.get(path) {
                         if f.deleted {
                             println!("  [delete]     {}", path);
                         } else {
@@ -293,10 +489,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if !response.download_required.is_empty() {
+            if !result.download_required.is_empty() {
                 has_changes = true;
                 println!("\nRemote changes to pull (run 'feanorfs pull'):");
-                for f in &response.download_required {
+                for f in &result.download_required {
                     println!(
                         "  [download]   {} ({:.1} KB)",
                         f.path,
@@ -305,10 +501,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if !response.delete_local.is_empty() {
+            if !result.delete_local.is_empty() {
                 has_changes = true;
                 println!("\nRemote deletions to apply (run 'feanorfs pull'):");
-                for path in &response.delete_local {
+                for path in &result.delete_local {
                     println!("  [delete]     {}", path);
                 }
             }
@@ -322,7 +518,8 @@ async fn main() -> anyhow::Result<()> {
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            commands::do_push_only(
+            println!("Pushing...");
+            let result = commands::do_push_only(
                 &api,
                 &db,
                 &current_dir,
@@ -330,13 +527,22 @@ async fn main() -> anyhow::Result<()> {
                 config.encryption_password.as_deref(),
             )
             .await?;
+
+            println!(
+                "Push complete. Uploaded {} files, processed {} deletions.",
+                result.uploads, result.deletes
+            );
+            if result.remote_updates_available {
+                println!("Note: Remote updates available. Run 'feanorfs pull' to apply.");
+            }
         }
         Commands::Pull { lazy } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            commands::do_pull_only(
+            println!("Pulling...");
+            let result = commands::do_pull_only(
                 &api,
                 &db,
                 &current_dir,
@@ -345,13 +551,19 @@ async fn main() -> anyhow::Result<()> {
                 lazy,
             )
             .await?;
+
+            println!(
+                "Pull complete. Downloaded {}, {} lazy placeholders, {} deletions.",
+                result.downloads, result.placeholders, result.deletes
+            );
         }
         Commands::Sync { lazy, no_watch } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            commands::do_sync(
+            println!("Syncing...");
+            let result = commands::do_sync(
                 &api,
                 &db,
                 &current_dir,
@@ -360,6 +572,15 @@ async fn main() -> anyhow::Result<()> {
                 lazy,
             )
             .await?;
+
+            println!(
+                "Sync complete. Uploaded {}, Downloaded {} (lazy: {}), Local Deletes {}, Remote Deletes {}.",
+                result.uploads,
+                result.downloads,
+                result.placeholders,
+                result.deletes_local,
+                result.deletes_remote
+            );
 
             if !no_watch {
                 watch::run_watch(
@@ -377,7 +598,7 @@ async fn main() -> anyhow::Result<()> {
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            commands::do_hydrate(
+            let result = commands::do_hydrate(
                 &api,
                 &db,
                 &current_dir,
@@ -385,13 +606,15 @@ async fn main() -> anyhow::Result<()> {
                 config.encryption_password.as_deref(),
             )
             .await?;
+
+            println!("{}", result.message);
         }
         Commands::Cat { path } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            commands::do_cat(
+            let result = commands::do_cat(
                 &api,
                 &db,
                 &current_dir,
@@ -399,6 +622,18 @@ async fn main() -> anyhow::Result<()> {
                 config.encryption_password.as_deref(),
             )
             .await?;
+
+            if result.untracked {
+                println!("Warning: file '{}' is not tracked. Reading directly.", path);
+            }
+            if result.hydrated_first {
+                eprintln!("Hydrated {} from server.", path);
+            }
+            if result.not_found {
+                println!("Error: file '{}' does not exist.", path);
+            } else {
+                print!("{}", result.content);
+            }
         }
         Commands::Watch => {
             let config = load_config(&current_dir)?;
@@ -413,6 +648,92 @@ async fn main() -> anyhow::Result<()> {
                 config.encryption_password.as_deref(),
             )
             .await?;
+        }
+        Commands::ShowKey => {
+            let config = load_config(&current_dir)?;
+            match config.encryption_password {
+                Some(key) => {
+                    println!("{}", key);
+                    copy_to_clipboard(&key);
+                    eprintln!("\nCopied to clipboard.");
+                    eprintln!("Join from another machine:");
+                    eprintln!("  feanorfs join {} --password {}", config.workspace_id, key);
+                }
+                None => {
+                    println!("No E2EE password set for this workspace.");
+                }
+            }
+        }
+        Commands::Doctor => {
+            println!("Running diagnostics...\n");
+
+            let mut all_ok = true;
+
+            match load_global_config() {
+                Ok(g) => {
+                    println!("[OK]  Global config: server at {}", g.server_url);
+                }
+                Err(_) => {
+                    println!("[FAIL] Global config: not found (run 'feanorfs connect <URL>')");
+                    all_ok = false;
+                }
+            }
+
+            match load_config(&current_dir) {
+                Ok(c) => {
+                    println!(
+                        "[OK]  Workspace config: {} on {}",
+                        c.workspace_id, c.server_url
+                    );
+
+                    if c.encryption_password.is_some() {
+                        println!("[OK]  E2EE: enabled");
+                    } else {
+                        println!("[WARN] E2EE: no password set (using insecure default)");
+                    }
+
+                    let api = ApiClient::new(&c.server_url, c.server_password.as_deref());
+                    match api.get_workspaces().await {
+                        Ok(workspaces) => {
+                            println!(
+                                "[OK]  Server reachable: {} workspace(s) found",
+                                workspaces.len()
+                            );
+                            if workspaces.contains(&c.workspace_id) {
+                                println!("[OK]  Workspace '{}' exists on server", c.workspace_id);
+                            } else {
+                                println!(
+                                    "[INFO] Workspace '{}' not yet on server (run 'feanorfs push')",
+                                    c.workspace_id
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("[FAIL] Server unreachable: {}", e);
+                            all_ok = false;
+                        }
+                    }
+
+                    match ClientDb::new(current_dir.join(".feanorfs")).await {
+                        Ok(_) => println!("[OK]  Local cache DB: accessible"),
+                        Err(e) => {
+                            println!("[FAIL] Local cache DB: {}", e);
+                            all_ok = false;
+                        }
+                    }
+                }
+                Err(_) => {
+                    println!("[FAIL] Workspace config: not initialized (run 'feanorfs init')");
+                    all_ok = false;
+                }
+            }
+
+            println!();
+            if all_ok {
+                println!("All checks passed.");
+            } else {
+                println!("Some checks failed. See above.");
+            }
         }
         Commands::Workspaces { server_url } => {
             let (url, srv_pass) = if let Some(u) = server_url {

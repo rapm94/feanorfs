@@ -53,6 +53,28 @@ For a deeper breakdown, see [docs/architecture.md](docs/architecture.md) and [do
 
 ## Installation
 
+### Pre-built binaries (cargo-binstall)
+
+If you have Rust installed, this is the easiest method — cargo-binstall
+downloads the pre-built binary for your platform and installs it to
+`~/.cargo/bin` with the execute bit already set:
+
+```bash
+cargo install cargo-binstall
+cargo binstall feanorfs
+cargo binstall feanorfs-server
+```
+
+### Install script (no Rust required)
+
+```bash
+curl -fsSL https://github.com/rapm94/feanorfs/releases/latest/download/install.sh | sh
+```
+
+Installs both `feanorfs` and `feanorfs-server` to `/usr/local/bin` (or
+`~/.local/bin` if that's not writable). Supports Linux and macOS on x86_64
+and ARM64.
+
 ### From source
 
 ```bash
@@ -63,8 +85,8 @@ cargo install --path server --bin feanorfs-server
 ### Build from repository
 
 ```bash
-git clone https://github.com/raulpuigbo/fs-sync.git
-cd fs-sync
+git clone https://github.com/rapm94/feanorfs.git
+cd feanorfs
 cargo build --release
 # Binaries: target/release/feanorfs and target/release/feanorfs-server
 ```
@@ -73,34 +95,54 @@ cargo build --release
 
 ### 1. Start the blob server
 
+**Internet deployment (recommended):**
 ```bash
-cargo run --bin feanorfs-server
-# Listens on http://0.0.0.0:3030, advertises via mDNS on local network
+feanorfs-server --token "server-secret"
+caddy reverse-proxy localhost:3030   # TLS on :443
 ```
 
-For internet deployments, add `--password` and put Caddy in front for TLS:
+**Multi-instance (SaaS-ready):**
 ```bash
-feanorfs-server --password "server-secret" --no-mdns
-caddy reverse-proxy localhost:3030   # auto-HTTPS on port 443
+feanorfs-server --port 3001 --data-dir /data/alice --token "alice-token"
+feanorfs-server --port 3002 --data-dir /data/bob   --token "bob-token"
+# Caddy routes subdomains to ports
+```
+
+**LAN deployment (optional mDNS auto-discovery):**
+```bash
+feanorfs-server --mdns
 ```
 
 ### 2. Connect + initialize a workspace
 
-**On a LAN (mDNS auto-discovery):**
+**Internet (primary):**
 ```bash
 cd /path/to/your/project
-feanorfs connect                          # auto-discovers server
-feanorfs init --workspace my-workspace    # E2EE password auto-generated
+feanorfs connect https://my-server.com --token "server-secret"
+feanorfs init --workspace my-workspace
+# generates E2EE key, copies to clipboard, prints join command
 ```
 
-**On the internet:**
+**LAN (with mDNS):**
 ```bash
 cd /path/to/your/project
-feanorfs connect https://my-server.com --password "server-secret"
-feanorfs init --workspace my-workspace --password "your-e2ee-password"
+feanorfs connect --lan
+feanorfs init --workspace my-workspace
 ```
 
-The E2EE password is auto-generated if you don't provide one. Save it — other machines must use the same password to decrypt your files.
+**From another machine (joining the workspace):**
+```bash
+cd /path/to/your/project
+feanorfs join my-workspace --password a1b2...    # paste from machine A
+feanorfs sync --no-watch                          # pull files
+```
+
+The E2EE password is auto-generated if you don't provide one. It's copied to your clipboard and a ready-to-paste `join` command is printed. Save it — without it, your files cannot be decrypted.
+
+Check your configuration at any time:
+```bash
+feanorfs config
+```
 
 ### 3. Sync
 

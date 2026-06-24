@@ -13,7 +13,7 @@ pub async fn run_watch(
     workspace_id: &str,
     password: Option<&str>,
 ) -> Result<()> {
-    tracing::info!("Starting change watcher on {}...", current_dir.display());
+    tracing::info!("Starting watcher on {}", current_dir.display());
     println!("Starting change watcher on {}...", current_dir.display());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(100);
 
@@ -36,7 +36,7 @@ pub async fn run_watch(
                     }
                 }
                 if interest {
-                    tracing::debug!("Detected filesystem event of interest: {:?}", event);
+                    tracing::debug!("FS event: {:?}", event);
                     let _ = tx_clone.try_send(());
                 }
             }
@@ -45,11 +45,14 @@ pub async fn run_watch(
     watcher.watch(Path::new("."), notify::RecursiveMode::Recursive)?;
     println!("Watching for changes... (Press Ctrl+C to stop)");
 
-    tracing::info!("Performing initial sync...");
+    tracing::info!("Initial sync");
     println!("Performing initial sync...");
-    if let Err(e) = do_sync(api, db, current_dir, workspace_id, password, false).await {
-        tracing::error!("Initial sync failed: {:?}", e);
-        eprintln!("Initial sync failed: {:?}", e);
+    match do_sync(api, db, current_dir, workspace_id, password, false).await {
+        Ok(result) => print_sync_result(&result),
+        Err(e) => {
+            tracing::error!("Initial sync failed: {:?}", e);
+            eprintln!("Initial sync failed: {:?}", e);
+        }
     }
 
     loop {
@@ -58,19 +61,29 @@ pub async fn run_watch(
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
         while rx.try_recv().is_ok() {}
 
-        tracing::info!("Changes detected! Syncing with server...");
-        println!("Changes detected! Syncing with server...");
-        if let Err(e) = do_sync(api, db, current_dir, workspace_id, password, false).await {
-            tracing::error!("Auto-sync failed: {:?}", e);
-            eprintln!("Auto-sync failed: {:?}", e);
-        } else {
-            tracing::info!("Auto-sync complete.");
-            println!("Sync complete.");
+        tracing::info!("Change detected, syncing");
+        println!("Changes detected! Syncing...");
+        match do_sync(api, db, current_dir, workspace_id, password, false).await {
+            Ok(result) => print_sync_result(&result),
+            Err(e) => {
+                tracing::error!("Auto-sync failed: {:?}", e);
+                eprintln!("Auto-sync failed: {:?}", e);
+            }
         }
     }
 
     Ok(())
+}
+
+fn print_sync_result(result: &crate::commands::SyncResult) {
+    println!(
+        "Sync complete. Uploaded {}, Downloaded {} (lazy: {}), Local Deletes {}, Remote Deletes {}.",
+        result.uploads,
+        result.downloads,
+        result.placeholders,
+        result.deletes_local,
+        result.deletes_remote
+    );
 }

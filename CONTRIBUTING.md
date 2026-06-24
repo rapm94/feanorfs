@@ -13,7 +13,7 @@ Thank you for your interest in improving FeanorFS. This document describes the d
 ### Getting started
 
 ```bash
-git clone https://github.com/raulpuigbo/fs-sync.git
+git clone https://github.com/rapm94/feanorfs.git
 cd fs-sync
 cargo build
 cargo test
