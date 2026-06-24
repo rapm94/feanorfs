@@ -1,0 +1,88 @@
+name: Release
+
+# Triggered when release-plz pushes a version tag (vX.Y.Z).
+# Builds release binaries for Linux, macOS (Apple Silicon + Intel), and
+# Windows, renames them with target suffixes, generates SHA256 checksums,
+# and uploads the raw executables to the GitHub Release created by
+# release-plz.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin      # Apple Silicon (M1/M2)
+          - os: macos-13
+            target: x86_64-apple-darwin       # Intel
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Rename binaries (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          TARGET=${{ matrix.target }}
+          cp "target/${TARGET}/release/feanorfs"       "feanorfs-v${VERSION}-${TARGET}"
+          cp "target/${TARGET}/release/feanorfs-server" "feanorfs-server-v${VERSION}-${TARGET}"
+
+      - name: Rename binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $target = '${{ matrix.target }}'
+          Copy-Item "target/$target/release/feanorfs.exe"        "feanorfs-v$version-$target.exe"
+          Copy-Item "target/$target/release/feanorfs-server.exe"  "feanorfs-server-v$version-$target.exe"
+
+      - name: Stage install script
+        shell: bash
+        run: cp scripts/install.sh install.sh
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          for f in feanorfs-v* feanorfs-server-v*; do
+            [ -f "$f" ] && sha256sum "$f" > "${f}.sha256"
+          done
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            feanorfs-v*
+            feanorfs-server-v*
+            install.sh

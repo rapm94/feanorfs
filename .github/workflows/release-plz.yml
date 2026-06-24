@@ -1,0 +1,52 @@
+name: Release-plz
+
+# release-plz automates semantic versioning, changelog generation, and
+# GitHub release creation based on Conventional Commits.
+#
+# Flow:
+#   1. On every push to main, release-plz analyzes commits since the last tag.
+#   2. If there are releasable changes, it opens a "release PR" that bumps
+#      versions in Cargo.toml and updates CHANGELOG.md.
+#   3. When that PR is merged, release-plz creates the git tag (vX.Y.Z) and
+#      a GitHub Release with the generated changelog body.
+#   4. The tag push triggers .github/workflows/release.yml which builds
+#      cross-platform binaries and attaches them to the release.
+#
+# Prerequisite:
+#   Create a fine-grained Personal Access Token with `contents: write` and
+#   `pull-requests: write` permissions and add it as the repository secret
+#   `RELEASE_PLZ_TOKEN`. The default `GITHUB_TOKEN` cannot trigger subsequent
+#   workflow runs, so a PAT is required for the release PR → tag → build chain.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  release-plz:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history needed for changelog generation
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install release-plz
+        run: cargo install release-plz --locked
+
+      - name: Run release-plz
+        run: release-plz release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
