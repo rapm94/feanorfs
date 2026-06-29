@@ -1,10 +1,10 @@
 # FeanorFS
 
-> Zero-knowledge working-directory sync for developers with multiple machines.
+> Zero-knowledge working-directory sync for developers — **Dropbox for your uncommitted code.**
 
 FeanorFS synchronizes your working directory to a lightweight blob server using content-addressed storage (CAS) and end-to-end encryption (E2EE). The server only ever sees encrypted hashes and scrambled bytes — your plaintext never leaves your machine.
 
-It is designed for one specific situation: you write code on more than one machine and want your uncommitted work-in-progress to follow you without manually pushing to a remote every time you switch desks. FeanorFS runs in the background and keeps your working files mirrored across machines.
+It is designed for one specific situation: you write code on more than one machine and want your uncommitted work-in-progress to follow you without thinking about it. A background client (CLI `watch` today; system tray tomorrow) keeps your working files mirrored across machines. Self-host the server or use a managed instance — same open-source stack either way.
 
 ## Not a Git replacement
 
@@ -117,31 +117,29 @@ feanorfs-server --port 3002 --data-dir /data/bob   --token "bob-token"
 feanorfs-server --mdns
 ```
 
-### 2. Connect + initialize a workspace
+### 2. Mirror this folder
 
 **Internet (primary):**
 ```bash
 cd /path/to/your/project
-feanorfs connect https://my-server.com --token "server-secret"
-feanorfs init --workspace my-workspace
-# generates E2EE key, copies to clipboard, prints join command
+feanorfs setup https://my-server.com --workspace my-workspace --token "server-secret"
+# generates encryption key, copies to clipboard, prints attach command
 ```
 
 **LAN (with mDNS):**
 ```bash
 cd /path/to/your/project
-feanorfs connect --lan
-feanorfs init --workspace my-workspace
+feanorfs setup --workspace my-workspace --lan
 ```
 
-**From another machine (joining the workspace):**
+**From another machine (link the same mirror):**
 ```bash
 cd /path/to/your/project
-feanorfs join my-workspace --password a1b2...    # paste from machine A
-feanorfs sync --no-watch                          # pull files
+feanorfs attach my-workspace --encryption-key a1b2...    # paste from machine A
+feanorfs sync --no-watch                                 # download files
 ```
 
-The E2EE password is auto-generated if you don't provide one. It's copied to your clipboard and a ready-to-paste `join` command is printed. Save it — without it, your files cannot be decrypted.
+The encryption key is auto-generated if you don't provide one. It's copied to your clipboard and a ready-to-paste `attach` command is printed. Save it — without it, your files cannot be decrypted.
 
 Check your configuration at any time:
 ```bash

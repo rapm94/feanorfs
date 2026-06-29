@@ -78,7 +78,28 @@ Log verbosity can be tuned via `RUST_LOG` (see [Environment](#environment) below
 
 ## Client
 
-### `connect` — connect to a server (cached globally)
+### `setup` — mirror this folder (recommended)
+
+```bash
+feanorfs setup --workspace <NAME> [SERVER_URL] [--encryption-key <KEY>] [--token <SERVER_TOKEN>]
+feanorfs setup --workspace <NAME> --lan [--token <SERVER_TOKEN>]
+```
+
+One step: connect to the server (or discover via `--lan`), create a mirrored workspace, and save config. If `--encryption-key` is omitted, a key is generated, copied to the clipboard, and an `attach` command is printed for your other machines.
+
+**New mirror on machine A:**
+```bash
+feanorfs setup https://my-server.com:3030 --workspace my-project --token "server-token"
+```
+
+**Link the same mirror on machine B:**
+```bash
+feanorfs attach my-project --encryption-key <KEY_FROM_MACHINE_A> --server-url https://my-server.com:3030
+```
+
+(`join` remains an alias for `attach`.)
+
+### `connect` — connect to a server (cached for future commands)
 
 ```bash
 feanorfs connect <URL> [--password <SERVER_PASS>]
@@ -144,38 +165,31 @@ Initialized FeanorFS workspace!
 E2EE password: a1b2c3d4e5f6...
 Copied to clipboard.
 
-Join from another machine:
-  feanorfs join my-project --password a1b2c3d4e5f6...
+On your other machine, link the same workspace:
+  feanorfs attach my-project --encryption-key a1b2c3d4e5f6...
 
-Save this password! Without it, your files cannot be decrypted.
+Save this key! Without it, your files cannot be decrypted.
 ```
 
-### `join` — join an existing workspace
+### `attach` — link to an existing mirrored workspace
 
 ```bash
-feanorfs join <WORKSPACE> --password <E2EE_PASS> [--server-url <URL>] [--server-password <SERVER_PASS>]
+feanorfs attach <WORKSPACE> --encryption-key <KEY> [--server-url <URL>] [--token <SERVER_TOKEN>]
 ```
+
+Alias: `join` (legacy Git-adjacent name).
 
 | Argument / Flag | Description |
 |---|---|
-| `WORKSPACE` (required) | Workspace ID to join |
-| `--password`, `-p` (required) | E2EE encryption password (must match the one used by other machines in this workspace) |
-| `--server-url` | Server URL. If omitted, uses cached connection from `feanorfs connect`. |
-| `--server-token` | Server access token (for servers that require authentication). `--server-password` accepted as alias. |
-| `--lan` | Discover server on local network via mDNS instead of using cached URL |
-
-Combines `connect` + `init` into one command. Use this on machine B with the password printed by `init` on machine A.
+| `WORKSPACE` (required) | Workspace name to link to |
+| `--encryption-key` | Workspace encryption key from the machine that ran `setup` (`--password` accepted as alias) |
+| `--server-url` | Server URL if not cached |
+| `--token` | Server access token (`--password` accepted as alias) |
+| `--lan` | Discover server via mDNS |
 
 ```bash
-# Internet:
-feanorfs join my-project --password a1b2c3d4... --server-url https://my-server.com:3030
-
-# LAN (with mDNS):
-feanorfs join my-project --password a1b2c3d4... --lan
-
-# Or if already connected via `feanorfs connect`:
-feanorfs join my-project --password a1b2c3d4...
-feanorfs sync --no-watch   # pull files
+feanorfs attach my-project --encryption-key a1b2c3d4... --server-url https://my-server.com:3030
+feanorfs sync --no-watch
 ```
 
 ### `config` — show current configuration
@@ -205,7 +219,7 @@ Workspace (.feanorfs/config.json):
 feanorfs show-key
 ```
 
-Prints the E2EE encryption password for this workspace and copies it to your clipboard. Also prints a ready-to-paste `join` command for other machines. Use this when you've lost the key that was auto-generated during `init`.
+Prints the workspace encryption key and copies it to your clipboard. Also prints a ready-to-paste `attach` command for other machines.
 
 ### `doctor` — diagnose connection issues
 
@@ -326,7 +340,7 @@ Queries the server and prints all workspace IDs that have at least one non-delet
 
 | Flag | Description |
 |---|---|
-| `--json` | Emit structured JSON for status-returning commands (`status`, `push`, `pull`, `sync`, `hydrate`, `cat`, `summary`, `agent commit`). Useful for scripting and the `feanorfs_client` result types. |
+| `--json` | Emit structured JSON. `status` includes `mirror_state` (`idle`, `out_of_sync`, `offline`, `conflict`, `error`, `syncing`) for tray clients. |
 
 ### `agent` — isolated workspace sandboxes
 
@@ -351,16 +365,15 @@ Agent names must be simple identifiers (no `/`, `\`, `.`, or `..`).
 ### `summary` — session catch-up diff
 
 ```bash
-feanorfs summary [--summarize]
+feanorfs summary [--summarize] [--no-remember]
 ```
 
-Compares the current workspace against the previous session marker (`last_session.last_scan` in the local cache DB). Prints paths grouped as added, modified, or deleted.
+Compares the current workspace against the previous session baseline. By default, saves the current snapshot as the new baseline after showing the diff (`--no-remember` to skip).
 
 | Flag | Description |
 |---|---|
-| `--summarize` | Pipe the structured diff to `FEANORFS_SUMMARY_CMD` (default `feanorfs-llm`) for human-readable prose. Falls back to a plain path listing if the command is not on `PATH`. Only paths and metadata are sent — never file contents. |
-
-Run `feanorfs summary` at the start of a session; it updates the session marker after displaying the diff.
+| `--summarize` | Pipe paths/metadata to `FEANORFS_SUMMARY_CMD` for prose (default `feanorfs-llm`) |
+| `--no-remember` | Do not update the session baseline after this diff |
 
 ## Examples
 

@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Integration tests** — in-process Axum harness in `client/tests/sync_engine.rs`.
 
 ### Changed
-- Server routes extracted to `feanorfs_server` library (`server/src/app.rs`).
-- Client binary now links the library crate (no duplicate module compilation).
-- Upload path mirrors `server_mtime` into local cache to prevent re-download churn.
+- **`feanorfs setup`** — one-step mirror onboarding (connect + create workspace).
+- **`feanorfs attach`** — link folder to existing mirror (`join` remains alias).
+- **`summary`** — remembers session baseline by default (`--no-remember` to opt out).
+- **`--json` status** — adds `mirror_state` for tray UIs (`idle`, `out_of_sync`, `offline`, `conflict`, `error`, `syncing`).
+- User-facing copy uses mirror vocabulary; encryption **key** vs server **token** (not Git terms).
 
 ### Fixed
 - Filesystem watcher observes workspace `current_dir`, not `"."`.
