@@ -134,6 +134,7 @@ async fn process_downloads(
                 path: path.clone(),
                 plaintext_hash,
                 encrypted_hash: replica_file.hash.clone(),
+                // XOR keystream preserves byte length: equals plain_content.len() after decrypt.
                 size: replica_file.size,
                 mtime: actual_mtime,
                 server_mtime: replica_file.mtime,
@@ -415,6 +416,7 @@ pub async fn do_hydrate(
                 path: path.clone(),
                 plaintext_hash,
                 encrypted_hash: entry.encrypted_hash.clone(),
+                // XOR keystream preserves byte length: equals replica_file.size from download path.
                 size: plain_content.len() as u64,
                 mtime: actual_mtime,
                 server_mtime: entry.server_mtime,

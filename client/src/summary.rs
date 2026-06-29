@@ -3,7 +3,7 @@ use anyhow::Result;
 use feanorfs_common::FileState;
 use std::path::Path;
 
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
 pub struct SummaryResult {
     pub files_added: Vec<String>,
     pub files_modified: Vec<String>,
@@ -124,4 +124,71 @@ fn render_plain(s: &SummaryResult) -> String {
         }
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{commit_session_marker, diff_since_last_session, SummaryResult};
+    use crate::local::ClientDb;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    const PASSWORD: &str = "summary-test-password";
+
+    async fn workspace_with_db() -> (TempDir, ClientDb) {
+        let dir = TempDir::new().unwrap();
+        let db = ClientDb::new(dir.path().join(".feanorfs")).await.unwrap();
+        (dir, db)
+    }
+
+    async fn write_file(base: &Path, rel: &str, content: &str) {
+        let path = base.join(rel);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(path, content).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diff_detects_added_modified_and_deleted_files() {
+        let (dir, db) = workspace_with_db().await;
+        let base = dir.path();
+
+        write_file(base, "alpha.txt", "v1").await;
+        write_file(base, "beta.txt", "stable").await;
+        commit_session_marker(base, &db, Some(PASSWORD))
+            .await
+            .unwrap();
+
+        write_file(base, "alpha.txt", "v2").await;
+        write_file(base, "gamma.txt", "new").await;
+        tokio::fs::remove_file(base.join("beta.txt")).await.unwrap();
+
+        let diff = diff_since_last_session(base, &db, Some(PASSWORD))
+            .await
+            .unwrap();
+
+        assert_eq!(diff.files_added, vec!["gamma.txt".to_string()]);
+        assert_eq!(diff.files_modified, vec!["alpha.txt".to_string()]);
+        assert_eq!(diff.files_deleted, vec!["beta.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn diff_with_no_prior_session_treats_all_files_as_added() {
+        let (dir, db) = workspace_with_db().await;
+        write_file(dir.path(), "only.txt", "hello").await;
+
+        let diff = diff_since_last_session(dir.path(), &db, Some(PASSWORD))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            diff,
+            SummaryResult {
+                files_added: vec!["only.txt".to_string()],
+                files_modified: vec![],
+                files_deleted: vec![],
+            }
+        );
+    }
 }

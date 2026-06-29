@@ -12,6 +12,10 @@ keywords.workspace = true
 categories.workspace = true
 description = "Content-addressed blob storage and sync metadata server for FeanorFS"
 
+[lib]
+name = "feanorfs_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "feanorfs-server"
 path = "src/main.rs"

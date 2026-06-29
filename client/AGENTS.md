@@ -35,11 +35,11 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
 - `commands::password_or_default` warns when falling back to `LEGACY_DEFAULT_PASSWORD`. Treat any codepath that needs the default as a bug — surface a clear user-visible error instead, when feasible.
 - Summary JSON shape (`SummaryResult`) is consumed by `FEANORFS_SUMMARY_CMD` via stdin. Changing field names is a breaking change for that pipeline — coordinate with downstream LLM tooling before renaming.
 - After ANY code change in `commands.rs` or `local.rs`, run `cargo clippy -p feanorfs-client --all-targets -- -D warnings` and the existing test suite.
-- Tests so far cover: `agent::validate_name` (path traversal and identifier cases), `main::truncate_password_for_display` (length boundary, multibyte, 12/13 char edge cases), `common::*` (crypt roundtrips, domain separation, hash bytes, normalize, generate_password, is_valid_hash). Sync diff logic, three-way commit, predictive hydration, summary diff, watch loop currently have no unit tests — treat as priority gaps when adding behavior there.
+- Tests so far cover: `agent::validate_name` (path traversal and identifier cases), `main::truncate_password_for_display` (length boundary, multibyte, 12/13 char edge cases), `common::*` (crypt roundtrips, domain separation, hash bytes, normalize, generate_password, is_valid_hash), `summary::diff_since_last_session`, `watch::event_paths_warrant_sync`, and `client/tests/sync_engine.rs` (push/pull/sync roundtrip, lazy placeholders, agent concurrent-edit detection). Predictive prefetch currently has no dedicated tests — treat as a gap when adding behavior there.
 
 ## Verification
 
-- `cargo test --workspace` — runs all crate unit tests plus `common/tests/sync_models.rs` integration tests (currently 53 passing across 7 suites).
+- `cargo test --workspace` — runs all crate unit tests plus `common/tests/sync_models.rs` integration tests and `client/tests/sync_engine.rs` in-process server harness (currently 68+ passing across 8 suites).
 - `cargo clippy -p feanorfs-client --all-targets -- -D warnings`.
 - `cargo fmt -p feanorfs-client -- --check`.
 - For E2E smoke: spin up `feanorfs-server`, then two `test-client-a/`/`test-client-b/` fixtures and run `feanorfs sync`/`feanorfs agent spawn`/`feanorfs agent commit`. Fixtures live in workspace root but are NOT tracked in git.

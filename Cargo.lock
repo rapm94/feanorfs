@@ -582,9 +582,11 @@ name = "feanorfs-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "feanorfs-common",
+ "feanorfs-server",
  "ignore",
  "mdns-sd",
  "notify",
@@ -593,6 +595,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

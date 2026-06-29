@@ -39,6 +39,11 @@ mdns-sd = { workspace = true }
 which = { workspace = true }
 rpassword = { workspace = true }
 
+[dev-dependencies]
+feanorfs-server = { path = "../server" }
+tempfile = { workspace = true }
+axum = { workspace = true }
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ bin }-v{ version }-{ target }{ binary-ext }"
 pkg-fmt = "bin"

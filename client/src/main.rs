@@ -682,15 +682,20 @@ async fn main() -> anyhow::Result<()> {
             .await?;
 
             if let Some(ref p) = path {
-                let _ = predictive::record_access_with_recent(&db, p).await;
-                let _ = predictive::prefetch_related(
+                if let Err(e) = predictive::record_access_with_recent(&db, p).await {
+                    tracing::warn!("Failed to record predictive access for {p}: {e:#}");
+                }
+                if let Err(e) = predictive::prefetch_related(
                     &current_dir,
                     &db,
                     &api,
                     config.encryption_password.as_deref(),
                     std::slice::from_ref(p),
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!("Predictive prefetch failed for {p}: {e:#}");
+                }
             }
 
             if cli.json {
@@ -713,7 +718,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            let _ = predictive::record_access_with_recent(&db, &path).await;
+            if let Err(e) = predictive::record_access_with_recent(&db, &path).await {
+                tracing::warn!("Failed to record predictive access for {path}: {e:#}");
+            }
 
             if cli.json {
                 output_json(&result)?;

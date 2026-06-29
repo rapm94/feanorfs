@@ -93,7 +93,13 @@ pub async fn spawn_agent(
             fs::create_dir_all(parent).await?;
         }
 
-        if std::fs::hard_link(abs, &dest).is_err() {
+        if let Err(e) = std::fs::hard_link(abs, &dest) {
+            tracing::debug!(
+                error = %e,
+                src = %abs.display(),
+                dest = %dest.display(),
+                "hard_link failed, falling back to copy"
+            );
             fs::copy(abs, &dest).await?;
         }
         linked += 1;

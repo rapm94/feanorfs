@@ -3,6 +3,26 @@ use feanorfs_common::FileState;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::path::Path;
 
+fn file_size_from_db(size: i64) -> u64 {
+    u64::try_from(size).unwrap_or_else(|_| {
+        tracing::warn!(
+            "stored file size {} exceeds u64::MAX, saturating to u64::MAX",
+            size
+        );
+        u64::MAX
+    })
+}
+
+fn file_size_to_db(size: u64) -> i64 {
+    i64::try_from(size).unwrap_or_else(|_| {
+        tracing::warn!(
+            "file size {} exceeds i64::MAX, saturating to i64::MAX",
+            size
+        );
+        i64::MAX
+    })
+}
+
 pub struct Db {
     pool: SqlitePool,
 }
@@ -63,7 +83,7 @@ impl Db {
             .map(|r| FileState {
                 path: r.get::<String, _>("path"),
                 hash: r.get::<String, _>("hash"),
-                size: u64::try_from(r.get::<i64, _>("size")).unwrap_or(0),
+                size: file_size_from_db(r.get::<i64, _>("size")),
                 mtime: r.get::<i64, _>("mtime"),
                 deleted: r.get::<bool, _>("deleted"),
             })
@@ -73,7 +93,7 @@ impl Db {
     }
 
     pub async fn upsert_file(&self, workspace_id: &str, file: &FileState) -> Result<()> {
-        let size = i64::try_from(file.size).unwrap_or(i64::MAX);
+        let size = file_size_to_db(file.size);
         sqlx::query(
             "INSERT INTO files (workspace_id, path, hash, size, mtime, deleted, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
