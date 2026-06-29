@@ -10,7 +10,7 @@ pub use agent::{clean_agent, commit_agent, list_agents, spawn_agent};
 pub use api::ApiClient;
 pub use commands::{
     do_cat, do_hydrate, do_pull_only, do_push_only, do_status, do_sync, CatResult, HydrateResult,
-    PullResult, PushResult, StatusResult, SyncResult,
+    MirrorState, PullResult, PushResult, StatusResult, SyncResult,
 };
 pub use feanorfs_common::AgentCommitResult as CommitResult;
 pub use feanorfs_common::{ConcurrentEdit, FileState};

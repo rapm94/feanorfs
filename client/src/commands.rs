@@ -1,11 +1,80 @@
 use crate::api::ApiClient;
 use crate::local::{CacheEntry, ClientDb};
 use anyhow::Result;
-use feanorfs_common::FileState;
+use feanorfs_common::{FileState, SyncResponse};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::fs;
+
+/// Tray-friendly mirror state. Vocabulary intentionally avoids Git terms
+/// (`commit`, `branch`, etc.). `syncing` is set on operation results while
+/// bytes are in flight; `status --json` reports point-in-time state only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MirrorState {
+    #[default]
+    Idle,
+    OutOfSync,
+    Offline,
+    Conflict,
+    Error,
+    Syncing,
+}
+
+impl std::fmt::Display for MirrorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Idle => "idle",
+            Self::OutOfSync => "out_of_sync",
+            Self::Offline => "offline",
+            Self::Conflict => "conflict",
+            Self::Error => "error",
+            Self::Syncing => "syncing",
+        };
+        write!(f, "{}", label)
+    }
+}
+
+pub fn conflicts_pending(base_path: &Path) -> bool {
+    let conflicts_dir = base_path.join(".feanorfs/conflicts");
+    if !conflicts_dir.is_dir() {
+        return false;
+    }
+    std::fs::read_dir(&conflicts_dir)
+        .map(|entries| entries.filter_map(Result::ok).any(|e| e.path().is_dir()))
+        .unwrap_or(false)
+}
+
+pub fn derive_mirror_state(base_path: &Path, response: Option<&SyncResponse>) -> MirrorState {
+    if conflicts_pending(base_path) {
+        return MirrorState::Conflict;
+    }
+    let Some(resp) = response else {
+        return MirrorState::Offline;
+    };
+    if !resp.upload_required.is_empty()
+        || !resp.download_required.is_empty()
+        || !resp.delete_local.is_empty()
+    {
+        MirrorState::OutOfSync
+    } else {
+        MirrorState::Idle
+    }
+}
+
+async fn mirror_state_after_sync(
+    api: &ApiClient,
+    db: &ClientDb,
+    base_path: &Path,
+    workspace_id: &str,
+    password: Option<&str>,
+) -> MirrorState {
+    match do_status(api, db, base_path, workspace_id, password).await {
+        Ok(s) => s.mirror_state,
+        Err(_) => MirrorState::Error,
+    }
+}
 
 pub(crate) fn password_or_default(password: Option<&str>) -> &str {
     match password {
@@ -13,7 +82,7 @@ pub(crate) fn password_or_default(password: Option<&str>) -> &str {
         None => {
             tracing::warn!(
                 "No E2EE password set in config. Using insecure legacy default. \
-                 Run 'feanorfs init' to set a proper password."
+                 Run 'feanorfs setup' to set a proper encryption key."
             );
             feanorfs_common::LEGACY_DEFAULT_PASSWORD
         }
@@ -22,6 +91,7 @@ pub(crate) fn password_or_default(password: Option<&str>) -> &str {
 
 #[derive(Debug, Default, Serialize)]
 pub struct PushResult {
+    pub mirror_state: MirrorState,
     pub uploads: u32,
     pub deletes: u32,
     pub remote_updates_available: bool,
@@ -29,6 +99,7 @@ pub struct PushResult {
 
 #[derive(Debug, Default, Serialize)]
 pub struct PullResult {
+    pub mirror_state: MirrorState,
     pub downloads: u32,
     pub placeholders: u32,
     pub deletes: u32,
@@ -36,6 +107,7 @@ pub struct PullResult {
 
 #[derive(Debug, Default, Serialize)]
 pub struct SyncResult {
+    pub mirror_state: MirrorState,
     pub uploads: u32,
     pub downloads: u32,
     pub placeholders: u32,
@@ -60,6 +132,7 @@ pub struct CatResult {
 
 #[derive(Debug, Serialize)]
 pub struct StatusResult {
+    pub mirror_state: MirrorState,
     pub upload_required: Vec<String>,
     pub download_required: Vec<FileState>,
     pub delete_local: Vec<String>,
@@ -268,6 +341,7 @@ pub async fn do_push_only(
         result.uploads,
         result.deletes
     );
+    result.mirror_state = mirror_state_after_sync(api, db, base_path, workspace_id, password).await;
     Ok(result)
 }
 
@@ -306,6 +380,7 @@ pub async fn do_pull_only(
         result.placeholders,
         result.deletes
     );
+    result.mirror_state = mirror_state_after_sync(api, db, base_path, workspace_id, password).await;
     Ok(result)
 }
 
@@ -356,6 +431,7 @@ pub async fn do_sync(
         result.deletes_local,
         result.deletes_remote
     );
+    result.mirror_state = mirror_state_after_sync(api, db, base_path, workspace_id, password).await;
     Ok(result)
 }
 
@@ -504,12 +580,64 @@ pub async fn do_status(
         files: files_vec,
     };
 
-    let response = api.negotiate_sync(&request).await?;
+    match api.negotiate_sync(&request).await {
+        Err(_) => Ok(StatusResult {
+            mirror_state: MirrorState::Offline,
+            upload_required: Vec::new(),
+            download_required: Vec::new(),
+            delete_local: Vec::new(),
+            local_files,
+        }),
+        Ok(response) => Ok(StatusResult {
+            mirror_state: derive_mirror_state(base_path, Some(&response)),
+            upload_required: response.upload_required,
+            download_required: response.download_required,
+            delete_local: response.delete_local,
+            local_files,
+        }),
+    }
+}
 
-    Ok(StatusResult {
-        upload_required: response.upload_required,
-        download_required: response.download_required,
-        delete_local: response.delete_local,
-        local_files,
-    })
+#[cfg(test)]
+mod mirror_state_tests {
+    use super::{conflicts_pending, derive_mirror_state, MirrorState};
+    use feanorfs_common::SyncResponse;
+    use std::path::Path;
+
+    #[test]
+    fn idle_when_no_pending_changes() {
+        let base = Path::new("/tmp/unused");
+        let resp = SyncResponse {
+            upload_required: vec![],
+            download_required: vec![],
+            delete_local: vec![],
+        };
+        assert_eq!(derive_mirror_state(base, Some(&resp)), MirrorState::Idle);
+    }
+
+    #[test]
+    fn out_of_sync_when_uploads_pending() {
+        let base = Path::new("/tmp/unused");
+        let resp = SyncResponse {
+            upload_required: vec!["a.txt".into()],
+            download_required: vec![],
+            delete_local: vec![],
+        };
+        assert_eq!(
+            derive_mirror_state(base, Some(&resp)),
+            MirrorState::OutOfSync
+        );
+    }
+
+    #[test]
+    fn offline_when_server_unreachable() {
+        let base = Path::new("/tmp/unused");
+        assert_eq!(derive_mirror_state(base, None), MirrorState::Offline);
+    }
+
+    #[test]
+    fn conflicts_dir_absent_is_not_pending() {
+        let base = Path::new("/tmp/feanorfs-nonexistent-conflicts-test");
+        assert!(!conflicts_pending(base));
+    }
 }
