@@ -170,6 +170,98 @@ async fn probe_server_auth(url: &str) -> anyhow::Result<bool> {
     Ok(resp.status() == reqwest::StatusCode::UNAUTHORIZED)
 }
 
+async fn initialize_new_mirror(
+    current_dir: &std::path::Path,
+    url: String,
+    workspace: String,
+    encryption_key: Option<String>,
+    server_token: Option<String>,
+    save_global: bool,
+) -> anyhow::Result<()> {
+    let srv_pass = resolve_server_password(server_token);
+
+    if save_global {
+        let global = GlobalConfig {
+            server_url: url.clone(),
+            server_password: srv_pass.clone(),
+        };
+        save_global_config(&global)?;
+    }
+
+    let (e2ee_key, was_generated) = match encryption_key {
+        Some(k) => (k, false),
+        None => (feanorfs_common::generate_password()?, true),
+    };
+
+    let config = Config {
+        server_url: url.clone(),
+        workspace_id: workspace.clone(),
+        encryption_password: Some(e2ee_key.clone()),
+        server_password: srv_pass.clone(),
+    };
+    save_config(current_dir, &config)?;
+
+    let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+
+    println!("This folder is now mirrored to FeanorFS.");
+    println!("  Server:       {}", url);
+    println!("  Workspace:    {}", workspace);
+    println!("  Encryption:   enabled (zero-knowledge)");
+    if srv_pass.is_some() {
+        println!("  Server auth:  enabled");
+    }
+
+    if was_generated {
+        println!("\nWorkspace encryption key: {}", e2ee_key);
+        copy_to_clipboard(&e2ee_key);
+        println!("Copied to clipboard.");
+        println!("\nOn your other machine, link the same workspace:");
+        println!(
+            "  feanorfs attach {} --encryption-key {}",
+            workspace, e2ee_key
+        );
+        println!("\nSave this key — without it your files cannot be decrypted.");
+    }
+
+    Ok(())
+}
+
+async fn link_existing_mirror(
+    current_dir: &std::path::Path,
+    url: String,
+    workspace: String,
+    encryption_key: String,
+    server_token: Option<String>,
+) -> anyhow::Result<()> {
+    let srv_pass = resolve_server_password(server_token);
+
+    let global = GlobalConfig {
+        server_url: url.clone(),
+        server_password: srv_pass.clone(),
+    };
+    save_global_config(&global)?;
+
+    let config = Config {
+        server_url: url.clone(),
+        workspace_id: workspace.clone(),
+        encryption_password: Some(encryption_key),
+        server_password: srv_pass.clone(),
+    };
+    save_config(current_dir, &config)?;
+
+    let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+
+    println!("Linked this folder to mirrored workspace '{}'.", workspace);
+    println!("  Server:     {}", url);
+    println!("  Encryption: enabled");
+    if srv_pass.is_some() {
+        println!("  Server auth: enabled");
+    }
+    println!("\nRun 'feanorfs sync --no-watch' to download files from the mirror.");
+
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "feanorfs")]
 #[command(about = "FeanorFS: Developer-focused filesystem sync tool (client)", long_about = None)]
@@ -190,6 +282,27 @@ fn output_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Mirror this folder in one step (connect to server + create workspace)
+    Setup {
+        /// Workspace name for this mirrored folder
+        #[arg(short, long, default_value = "default")]
+        workspace: String,
+
+        /// Server URL. If omitted, uses cached connection or `--lan` discovery.
+        server_url: Option<String>,
+
+        /// Workspace encryption key. If omitted, one is generated and saved.
+        #[arg(long, visible_alias = "password")]
+        encryption_key: Option<String>,
+
+        /// Server access token
+        #[arg(long, visible_alias = "password")]
+        server_token: Option<String>,
+
+        /// Discover server on local network via mDNS instead of providing a URL
+        #[arg(long)]
+        lan: bool,
+    },
     /// Connect to a FeanorFS server (cached for future commands)
     Connect {
         /// Server URL (e.g. <https://my-server.com:3030>). Required unless --lan is used.
@@ -213,7 +326,7 @@ enum Commands {
         workspace: String,
 
         /// E2EE encryption password. If omitted, one is auto-generated and saved.
-        #[arg(short, long)]
+        #[arg(short, long, visible_alias = "encryption-key")]
         password: Option<String>,
 
         /// Server access token (overrides the one cached by `feanorfs connect`)
@@ -254,24 +367,25 @@ enum Commands {
         /// The relative path of the file to display
         path: String,
     },
-    /// Join an existing workspace (combines connect + init in one command)
-    Join {
-        /// Workspace ID to join
+    /// Link this folder to a workspace already mirrored on another machine
+    #[command(visible_alias = "join")]
+    Attach {
+        /// Workspace name to link to
         workspace: String,
 
-        /// E2EE encryption password (required to decrypt files from other machines)
-        #[arg(short, long)]
-        password: String,
+        /// Workspace encryption key (from the machine that created the mirror)
+        #[arg(long, visible_alias = "password")]
+        encryption_key: String,
 
-        /// Server URL. If omitted, uses the URL cached by `feanorfs connect`.
+        /// Server URL. If omitted, uses cached connection or `--lan` discovery.
         #[arg(long)]
         server_url: Option<String>,
 
-        /// Server access token (for servers that require authentication)
+        /// Server access token
         #[arg(long, visible_alias = "password")]
         server_token: Option<String>,
 
-        /// Discover server on local network via mDNS instead of using cached URL
+        /// Discover server on local network via mDNS
         #[arg(long)]
         lan: bool,
     },
@@ -289,16 +403,15 @@ enum Commands {
         /// Optional Server URL (overrides config URL)
         server_url: Option<String>,
     },
-    /// Summarize files that changed since the previous session marker.
+    /// Summarize files that changed since you last opened this workspace.
     Summary {
-        /// Shell out to FEANORFS_SUMMARY_CMD to produce prose instead of just listing paths.
+        /// Shell out to FEANORFS_SUMMARY_CMD to produce prose instead of listing paths.
         #[arg(long)]
         summarize: bool,
 
-        /// Persist the current state as the next session's "previous" snapshot.
-        /// Combine with `feanorfs sync` so the marker advances right after a successful sync.
+        /// Do not save the current snapshot as the baseline for the next catch-up diff.
         #[arg(long)]
-        commit: bool,
+        no_remember: bool,
     },
     /// Manage isolated agent workspaces (copy-on-write snapshots of the current workspace).
     Agent {
@@ -367,7 +480,40 @@ async fn main() -> anyhow::Result<()> {
             if final_token.is_some() {
                 println!("  Server token: saved");
             }
-            println!("\nNow run: feanorfs init --workspace <name>");
+            println!("\nNow run: feanorfs setup --workspace <name>");
+        }
+        Commands::Setup {
+            workspace,
+            server_url,
+            encryption_key,
+            server_token,
+            lan,
+        } => {
+            let url = resolve_server_url(server_url, lan)?;
+            let final_token = match server_token {
+                Some(t) => Some(t),
+                None => match probe_server_auth(&url).await {
+                    Ok(true) => Some(read_password_hidden("Server requires a token: ")?),
+                    Ok(false) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Server auth probe failed for {}: {:?}. Continuing without token.",
+                            url,
+                            e
+                        );
+                        None
+                    }
+                },
+            };
+            initialize_new_mirror(
+                &current_dir,
+                url,
+                workspace,
+                encryption_key,
+                final_token,
+                true,
+            )
+            .await?;
         }
         Commands::Init {
             server_url,
@@ -377,77 +523,26 @@ async fn main() -> anyhow::Result<()> {
             lan,
         } => {
             let url = resolve_server_url(server_url.clone(), lan)?;
-            let srv_pass = resolve_server_password(server_token);
-
-            if server_url.is_some() {
-                let global = GlobalConfig {
-                    server_url: url.clone(),
-                    server_password: srv_pass.clone(),
-                };
-                save_global_config(&global)?;
-            }
-
-            let (e2ee_password, was_generated) = match password {
-                Some(p) => (p, false),
-                None => {
-                    let generated = feanorfs_common::generate_password()?;
-                    (generated, true)
-                }
-            };
-
-            let config = Config {
-                server_url: url.clone(),
-                workspace_id: workspace.clone(),
-                encryption_password: Some(e2ee_password.clone()),
-                server_password: srv_pass.clone(),
-            };
-            save_config(&current_dir, &config)?;
-
-            let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-
-            println!("Initialized FeanorFS workspace!");
-            println!("  Blob Server:  {}", url);
-            println!("  Workspace ID: {}", workspace);
-            println!("  Encryption:   Enabled (Blake3 XOF E2EE)");
-            if srv_pass.is_some() {
-                println!("  Server auth:  Enabled");
-            }
-
-            if was_generated {
-                println!("\nE2EE password: {}", e2ee_password);
-                copy_to_clipboard(&e2ee_password);
-                println!("Copied to clipboard.");
-                println!("\nJoin from another machine:");
-                println!("  feanorfs join {} --password {}", workspace, e2ee_password);
-                println!("\nSave this password! Without it, your files cannot be decrypted.");
-            }
+            initialize_new_mirror(
+                &current_dir,
+                url,
+                workspace,
+                password,
+                server_token,
+                server_url.is_some(),
+            )
+            .await?;
         }
-        Commands::Join {
+        Commands::Attach {
             workspace,
-            password,
+            encryption_key,
             server_url,
             server_token,
             lan,
         } => {
             let url = resolve_server_url(server_url, lan)?;
-            let srv_pass = resolve_server_password(server_token);
-
-            let config = Config {
-                server_url: url.clone(),
-                workspace_id: workspace.clone(),
-                encryption_password: Some(password.clone()),
-                server_password: srv_pass.clone(),
-            };
-            save_config(&current_dir, &config)?;
-
-            let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-
-            println!("Joined workspace '{}' on {}", workspace, url);
-            println!("  Encryption:   Enabled (Blake3 XOF E2EE)");
-            if srv_pass.is_some() {
-                println!("  Server auth:  Enabled");
-            }
-            println!("\nRun 'feanorfs sync' to pull files from the workspace.");
+            link_existing_mirror(&current_dir, url, workspace, encryption_key, server_token)
+                .await?;
         }
         Commands::Config => {
             match load_global_config() {
@@ -493,7 +588,9 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 Err(_) => {
-                    println!("Workspace: not initialized (run 'feanorfs init' in this directory)");
+                    println!(
+                        "Workspace: not mirrored yet (run 'feanorfs setup' in this directory)"
+                    );
                 }
             }
         }
@@ -521,7 +618,7 @@ async fn main() -> anyhow::Result<()> {
 
                 if !result.upload_required.is_empty() {
                     has_changes = true;
-                    println!("\nLocal changes to push (run 'feanorfs push'):");
+                    println!("\nLocal changes not yet on the mirror (run 'feanorfs push'):");
                     for path in &result.upload_required {
                         if let Some(f) = result.local_files.get(path) {
                             if f.deleted {
@@ -537,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
 
                 if !result.download_required.is_empty() {
                     has_changes = true;
-                    println!("\nRemote changes to pull (run 'feanorfs pull'):");
+                    println!("\nChanges on other machines to download (run 'feanorfs pull'):");
                     for f in &result.download_required {
                         println!(
                             "  [download]   {} ({:.1} KB)",
@@ -549,14 +646,16 @@ async fn main() -> anyhow::Result<()> {
 
                 if !result.delete_local.is_empty() {
                     has_changes = true;
-                    println!("\nRemote deletions to apply (run 'feanorfs pull'):");
+                    println!("\nFiles removed on other machines (run 'feanorfs pull'):");
                     for path in &result.delete_local {
                         println!("  [delete]     {}", path);
                     }
                 }
 
                 if !has_changes {
-                    println!("\nEverything is up to date!");
+                    println!("\nMirror is up to date.");
+                } else {
+                    println!("\nMirror state: {}", result.mirror_state);
                 }
             }
         }
@@ -750,8 +849,11 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", key);
                     copy_to_clipboard(&key);
                     eprintln!("\nCopied to clipboard.");
-                    eprintln!("Join from another machine:");
-                    eprintln!("  feanorfs join {} --password {}", config.workspace_id, key);
+                    eprintln!("\nOn another machine, link this workspace:");
+                    eprintln!(
+                        "  feanorfs attach {} --encryption-key {}",
+                        config.workspace_id, key
+                    );
                 }
                 None => {
                     println!("No E2EE password set for this workspace.");
@@ -817,7 +919,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Err(_) => {
-                    println!("[FAIL] Workspace config: not initialized (run 'feanorfs init')");
+                    println!("[FAIL] Workspace: not mirrored (run 'feanorfs setup')");
                     all_ok = false;
                 }
             }
@@ -853,7 +955,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Summary { summarize, commit } => {
+        Commands::Summary {
+            summarize,
+            no_remember,
+        } => {
             let password = load_config(&current_dir)
                 .ok()
                 .and_then(|c| c.encryption_password);
@@ -861,7 +966,7 @@ async fn main() -> anyhow::Result<()> {
             let result =
                 summary::diff_since_last_session(&current_dir, &db, password.as_deref()).await?;
 
-            if commit {
+            if !no_remember {
                 summary::commit_session_marker(&current_dir, &db, password.as_deref()).await?;
             }
 
