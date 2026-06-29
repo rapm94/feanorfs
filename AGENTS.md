@@ -8,6 +8,23 @@
 
 **FeanorFS is dumb storage, smart transport.** FeanorFS never makes decisions about file content (no auto-merge, no summarization, no chat). Its job is to decide _what_ to transport, _when_ to transport it, and _how_ to isolate and preserve files safely. Anything requiring file-semantic understanding belongs in the consumer/agent layer.
 
+## Product direction
+
+**Dropbox for dev — zero mental burden.** The user should install, point at a folder, and forget. Sync runs in the background; they only hear from FeanorFS when something needs attention (auth failure, conflict, offline backlog).
+
+| Layer | Role |
+|---|---|
+| **Server** (`feanorfs-server`) | OSS blob + metadata backend. Same binary for self-host and managed SaaS (`--port`, `--data-dir`, `--token` per tenant). |
+| **Engine** (`feanorfs_client` + CLI) | Headless sync library + power-user CLI. All behavior lives here; `--json` is the contract for any UI shell. |
+| **Tray client** (future) | Minimal system-tray UI: connected / syncing / up-to-date / error, workspace switcher, pause, “open folder”. No duplicate sync logic — calls the library or CLI with `--json`. |
+
+**Ergonomics rules for all clients:**
+- Prefer smart defaults over flags (`summary` should remember session state; tray should auto-watch without asking).
+- Setup is one flow, not `connect` + `init` + `join` trivia — collapse for first-run; keep granular commands for power users.
+- Server auth = **token**; workspace secrecy = **encryption key** — never overload “password” in user-facing copy.
+- Surface conflicts, never auto-merge. Tray shows “needs attention”, not a merge UI.
+- SaaS and self-host must share the same API and client; hosted is “someone else runs `feanorfs-server` with TLS + per-user token.”
+
 ## OVERVIEW
 `FeanorFS` is a developer-focused uncommitted-code synchronization tool written in Rust. It utilizes a **self-contained local-first architecture**:
 1. **Metadata Synchronization**: SQLite on both sides. Server in `server-data/db.sqlite`, client cache in `.feanorfs/local_cache.db`. Client queries `/api/sync/diff` with its metadata and receives a delta.
