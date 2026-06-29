@@ -1,5 +1,6 @@
 mod db;
 
+use axum::extract::DefaultBodyLimit;
 use axum::{
     extract::{Path, Query, State},
     http::{Request, StatusCode},
@@ -9,8 +10,9 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use constant_time_eq::constant_time_eq;
 use db::Db;
-use feanorfs_common::{FileState, SyncRequest, SyncResponse};
+use feanorfs_common::{is_valid_hash, FileState, SyncRequest, SyncResponse};
 use serde::Deserialize;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::fs;
@@ -90,7 +92,9 @@ async fn auth_middleware(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "));
             match provided {
-                Some(p) if p == expected => Ok(next.run(request).await),
+                Some(p) if constant_time_eq(p.as_bytes(), expected.as_bytes()) => {
+                    Ok(next.run(request).await)
+                }
                 _ => Err(StatusCode::UNAUTHORIZED),
             }
         }
@@ -125,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/upload", post(handle_upload))
         .route("/api/download/:hash", get(handle_download))
         .route("/api/workspaces", get(handle_get_workspaces))
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -229,15 +234,15 @@ async fn handle_sync_diff(
             }
         } else {
             // Client has it, server doesn't
-            if !client_file.deleted {
-                upload_required.push(path.clone());
-            } else {
+            if client_file.deleted {
                 // Client deleted it before server saw it, mark as deleted on server anyway
                 state
                     .db
                     .upsert_file(&workspace_id, client_file)
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            } else {
+                upload_required.push(path.clone());
             }
         }
     }
@@ -261,7 +266,11 @@ async fn handle_upload(
     Query(params): Query<UploadParams>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Verify hash matches uploaded body
+    if !is_valid_hash(&params.hash) {
+        tracing::warn!("Rejected upload with invalid hash: {}", params.hash);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let computed_hash = feanorfs_common::hash_bytes(&body);
     if computed_hash != params.hash {
         tracing::warn!(
@@ -295,6 +304,7 @@ async fn handle_upload(
         .await
     {
         tracing::error!("Failed to upsert file in db: {:?}", e);
+        let _ = fs::remove_file(&blob_path).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -305,15 +315,23 @@ async fn handle_download(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let blob_path = state.storage_dir.join("blobs").join(&hash);
-    if !blob_path.exists() {
-        return Err(StatusCode::NOT_FOUND);
+    if !is_valid_hash(&hash) {
+        return Err(StatusCode::BAD_REQUEST);
     }
+    let blob_path = state.storage_dir.join("blobs").join(&hash);
 
-    let file_content = fs::read(&blob_path).await.map_err(|e| {
-        tracing::error!("Failed to read blob file: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Single read attempt — eliminates the exists()/read() TOCTOU window
+    // and still returns 404 cleanly if the blob was removed between calls.
+    let file_content = match fs::read(&blob_path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        Err(e) => {
+            tracing::error!("Failed to read blob file: {:?}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     Ok(file_content)
 }

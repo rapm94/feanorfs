@@ -2,10 +2,10 @@ use crate::api::ApiClient;
 use crate::local::{CacheEntry, ClientDb};
 use anyhow::Result;
 use feanorfs_common::FileState;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::fs;
-
-const LEGACY_DEFAULT_PASSWORD: &str = "default-secret-key";
 
 pub(crate) fn password_or_default(password: Option<&str>) -> &str {
     match password {
@@ -15,26 +15,26 @@ pub(crate) fn password_or_default(password: Option<&str>) -> &str {
                 "No E2EE password set in config. Using insecure legacy default. \
                  Run 'feanorfs init' to set a proper password."
             );
-            LEGACY_DEFAULT_PASSWORD
+            feanorfs_common::LEGACY_DEFAULT_PASSWORD
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct PushResult {
     pub uploads: u32,
     pub deletes: u32,
     pub remote_updates_available: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct PullResult {
     pub downloads: u32,
     pub placeholders: u32,
     pub deletes: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct SyncResult {
     pub uploads: u32,
     pub downloads: u32,
@@ -43,7 +43,7 @@ pub struct SyncResult {
     pub deletes_remote: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 #[allow(dead_code)]
 pub struct HydrateResult {
     pub hydrated: Vec<String>,
@@ -51,7 +51,7 @@ pub struct HydrateResult {
     pub message: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct CatResult {
     pub content: String,
     pub hydrated_first: bool,
@@ -59,12 +59,165 @@ pub struct CatResult {
     pub not_found: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct StatusResult {
     pub upload_required: Vec<String>,
     pub download_required: Vec<FileState>,
     pub delete_local: Vec<String>,
-    pub local_files: std::collections::HashMap<String, FileState>,
+    pub local_files: HashMap<String, FileState>,
+}
+
+async fn process_downloads(
+    api: &ApiClient,
+    response: &feanorfs_common::SyncResponse,
+    base_path: &Path,
+    db: &ClientDb,
+    password_str: &str,
+    lazy: bool,
+) -> Result<(u32, u32)> {
+    let mut downloads = 0u32;
+    let mut placeholders = 0u32;
+
+    for replica_file in &response.download_required {
+        let path = &replica_file.path;
+        if lazy {
+            tracing::info!("Placeholder: {} ({} bytes)", path, replica_file.size);
+            let full_path = base_path.join(path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(&full_path, b"").await?;
+
+            let cache_entry = CacheEntry {
+                path: path.clone(),
+                plaintext_hash: String::new(),
+                encrypted_hash: replica_file.hash.clone(),
+                size: replica_file.size,
+                mtime: replica_file.mtime,
+                server_mtime: replica_file.mtime,
+                hydrated: false,
+            };
+            db.upsert_cache_entry(&cache_entry).await?;
+            placeholders += 1;
+        } else {
+            tracing::info!("Downloading {} ({} bytes)", path, replica_file.size);
+            let encrypted_content = api.download_file(&replica_file.hash).await?;
+            let computed_hash = feanorfs_common::hash_bytes(&encrypted_content);
+            if computed_hash != replica_file.hash {
+                anyhow::bail!(
+                    "Integrity check failed for {}: expected hash {}, computed {} (server may be tampered or corrupt)",
+                    path,
+                    replica_file.hash,
+                    computed_hash
+                );
+            }
+            let plain_content =
+                feanorfs_common::crypt_bytes(&encrypted_content, password_str, path);
+
+            let full_path = base_path.join(path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(&full_path, &plain_content).await?;
+
+            let actual_mtime = fs::metadata(&full_path)
+                .await?
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(replica_file.mtime);
+
+            let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
+
+            let cache_entry = CacheEntry {
+                path: path.clone(),
+                plaintext_hash,
+                encrypted_hash: replica_file.hash.clone(),
+                size: replica_file.size,
+                mtime: actual_mtime,
+                server_mtime: replica_file.mtime,
+                hydrated: true,
+            };
+            db.upsert_cache_entry(&cache_entry).await?;
+            downloads += 1;
+        }
+    }
+
+    Ok((downloads, placeholders))
+}
+
+async fn process_delete_local(
+    response: &feanorfs_common::SyncResponse,
+    base_path: &Path,
+    db: &ClientDb,
+) -> Result<u32> {
+    let mut deletes = 0u32;
+    for path in &response.delete_local {
+        let full_path = base_path.join(path);
+        if full_path.exists() {
+            tracing::info!("Remote deletion: {}", path);
+            let _ = fs::remove_file(full_path).await;
+        }
+        db.delete_cache_entry(path).await?;
+        deletes += 1;
+    }
+    Ok(deletes)
+}
+
+async fn process_uploads(
+    api: &ApiClient,
+    db: &ClientDb,
+    response: &feanorfs_common::SyncResponse,
+    local_files: &HashMap<String, FileState>,
+    base_path: &Path,
+    workspace_id: &str,
+    password_str: &str,
+) -> Result<u32> {
+    let mut uploads = 0u32;
+    for path in &response.upload_required {
+        if let Some(local_file) = local_files.get(path) {
+            if !local_file.deleted {
+                tracing::info!("Uploading {} ({} bytes)", path, local_file.size);
+                let plain_content = fs::read(base_path.join(path)).await?;
+                let encrypted_content =
+                    feanorfs_common::crypt_bytes(&plain_content, password_str, path);
+
+                api.upload_file(
+                    workspace_id,
+                    path,
+                    &local_file.hash,
+                    local_file.size,
+                    local_file.mtime,
+                    encrypted_content,
+                )
+                .await?;
+                // The server now records local_file.mtime as the file's mtime.
+                // Mirror that into our cache so the next sync diff treats the
+                // client view and server view as equal — otherwise the stale
+                // server_mtime would force a needless re-download of the blob
+                // we just uploaded.
+                db.set_cache_server_mtime(path, local_file.mtime).await?;
+                uploads += 1;
+            }
+        }
+    }
+    Ok(uploads)
+}
+
+async fn cleanup_deleted_cache(
+    local_files: &HashMap<String, FileState>,
+    db: &ClientDb,
+) -> Result<u32> {
+    let mut count = 0u32;
+    for (path, local_file) in local_files {
+        if local_file.deleted {
+            tracing::info!("Cleanup cache: {}", path);
+            db.delete_cache_entry(path).await?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 pub async fn do_push_only(
@@ -92,38 +245,20 @@ pub async fn do_push_only(
         response.delete_local.len()
     );
 
-    let mut result = PushResult::default();
     let password_str = password_or_default(password);
 
-    for path in &response.upload_required {
-        if let Some(local_file) = local_files.get(path) {
-            if !local_file.deleted {
-                tracing::info!("Uploading {} ({} bytes)", path, local_file.size);
-                let plain_content = fs::read(base_path.join(path)).await?;
-                let encrypted_content =
-                    feanorfs_common::crypt_bytes(&plain_content, password_str, path);
-
-                api.upload_file(
-                    workspace_id,
-                    path,
-                    &local_file.hash,
-                    local_file.size,
-                    local_file.mtime,
-                    encrypted_content,
-                )
-                .await?;
-                result.uploads += 1;
-            }
-        }
-    }
-
-    for (path, local_file) in &local_files {
-        if local_file.deleted {
-            tracing::info!("Deleting cache entry: {}", path);
-            db.delete_cache_entry(path).await?;
-            result.deletes += 1;
-        }
-    }
+    let mut result = PushResult::default();
+    result.uploads = process_uploads(
+        api,
+        db,
+        &response,
+        &local_files,
+        base_path,
+        workspace_id,
+        password_str,
+    )
+    .await?;
+    result.deletes = cleanup_deleted_cache(&local_files, db).await?;
 
     result.remote_updates_available =
         !response.download_required.is_empty() || !response.delete_local.is_empty();
@@ -155,82 +290,15 @@ pub async fn do_pull_only(
 
     let response = api.negotiate_sync(&request).await?;
 
-    let mut result = PullResult::default();
     let password_str = password_or_default(password);
 
-    for replica_file in &response.download_required {
-        let path = &replica_file.path;
-        if lazy {
-            tracing::info!("Placeholder: {} ({} bytes)", path, replica_file.size);
-            let full_path = base_path.join(path);
-            if let Some(parent) = full_path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            fs::write(&full_path, b"").await?;
-
-            let cache_entry = CacheEntry {
-                path: path.clone(),
-                plaintext_hash: String::new(),
-                encrypted_hash: replica_file.hash.clone(),
-                size: replica_file.size,
-                mtime: replica_file.mtime,
-                server_mtime: replica_file.mtime,
-                hydrated: false,
-            };
-            db.upsert_cache_entry(&cache_entry).await?;
-            result.placeholders += 1;
-        } else {
-            tracing::info!("Downloading {} ({} bytes)", path, replica_file.size);
-            let encrypted_content = api.download_file(&replica_file.hash).await?;
-            let plain_content =
-                feanorfs_common::crypt_bytes(&encrypted_content, password_str, path);
-
-            let full_path = base_path.join(path);
-            if let Some(parent) = full_path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            fs::write(&full_path, &plain_content).await?;
-
-            let actual_mtime = fs::metadata(&full_path)
-                .await?
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(replica_file.mtime);
-
-            let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
-
-            let cache_entry = CacheEntry {
-                path: path.clone(),
-                plaintext_hash,
-                encrypted_hash: replica_file.hash.clone(),
-                size: replica_file.size,
-                mtime: actual_mtime,
-                server_mtime: replica_file.mtime,
-                hydrated: true,
-            };
-            db.upsert_cache_entry(&cache_entry).await?;
-            result.downloads += 1;
-        }
-    }
-
-    for path in &response.delete_local {
-        let full_path = base_path.join(path);
-        if full_path.exists() {
-            tracing::info!("Remote deletion: {}", path);
-            let _ = fs::remove_file(full_path).await;
-        }
-        db.delete_cache_entry(path).await?;
-        result.deletes += 1;
-    }
-
-    for (path, local_file) in &local_files {
-        if local_file.deleted {
-            tracing::info!("Cleanup cache: {}", path);
-            db.delete_cache_entry(path).await?;
-        }
-    }
+    let mut result = PullResult::default();
+    let (downloads, placeholders) =
+        process_downloads(api, &response, base_path, db, password_str, lazy).await?;
+    result.downloads = downloads;
+    result.placeholders = placeholders;
+    result.deletes = process_delete_local(&response, base_path, db).await?;
+    cleanup_deleted_cache(&local_files, db).await?;
 
     tracing::info!(
         "Pull done: {} downloaded, {} placeholders, {} deleted",
@@ -260,104 +328,25 @@ pub async fn do_sync(
 
     let response = api.negotiate_sync(&request).await?;
 
-    let mut result = SyncResult::default();
     let password_str = password_or_default(password);
 
-    for replica_file in &response.download_required {
-        let path = &replica_file.path;
-        if lazy {
-            let full_path = base_path.join(path);
-            if let Some(parent) = full_path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            fs::write(&full_path, b"").await?;
-
-            let cache_entry = CacheEntry {
-                path: path.clone(),
-                plaintext_hash: String::new(),
-                encrypted_hash: replica_file.hash.clone(),
-                size: replica_file.size,
-                mtime: replica_file.mtime,
-                server_mtime: replica_file.mtime,
-                hydrated: false,
-            };
-            db.upsert_cache_entry(&cache_entry).await?;
-            result.placeholders += 1;
-        } else {
-            tracing::info!("Downloading {} ({} bytes)", path, replica_file.size);
-            let encrypted_content = api.download_file(&replica_file.hash).await?;
-            let plain_content =
-                feanorfs_common::crypt_bytes(&encrypted_content, password_str, path);
-
-            let full_path = base_path.join(path);
-            if let Some(parent) = full_path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            fs::write(&full_path, &plain_content).await?;
-
-            let actual_mtime = fs::metadata(&full_path)
-                .await?
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(replica_file.mtime);
-
-            let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
-
-            let cache_entry = CacheEntry {
-                path: path.clone(),
-                plaintext_hash,
-                encrypted_hash: replica_file.hash.clone(),
-                size: replica_file.size,
-                mtime: actual_mtime,
-                server_mtime: replica_file.mtime,
-                hydrated: true,
-            };
-            db.upsert_cache_entry(&cache_entry).await?;
-            result.downloads += 1;
-        }
-    }
-
-    for path in &response.delete_local {
-        let full_path = base_path.join(path);
-        if full_path.exists() {
-            tracing::info!("Remote deletion: {}", path);
-            let _ = fs::remove_file(full_path).await;
-        }
-        db.delete_cache_entry(path).await?;
-        result.deletes_local += 1;
-    }
-
-    for path in &response.upload_required {
-        if let Some(local_file) = local_files.get(path) {
-            if !local_file.deleted {
-                tracing::info!("Uploading {} ({} bytes)", path, local_file.size);
-                let plain_content = fs::read(base_path.join(path)).await?;
-                let encrypted_content =
-                    feanorfs_common::crypt_bytes(&plain_content, password_str, path);
-
-                api.upload_file(
-                    workspace_id,
-                    path,
-                    &local_file.hash,
-                    local_file.size,
-                    local_file.mtime,
-                    encrypted_content,
-                )
-                .await?;
-                result.uploads += 1;
-            }
-        }
-    }
-
-    for (path, local_file) in &local_files {
-        if local_file.deleted {
-            tracing::info!("Cleanup cache: {}", path);
-            db.delete_cache_entry(path).await?;
-            result.deletes_remote += 1;
-        }
-    }
+    let mut result = SyncResult::default();
+    let (downloads, placeholders) =
+        process_downloads(api, &response, base_path, db, password_str, lazy).await?;
+    result.downloads = downloads;
+    result.placeholders = placeholders;
+    result.deletes_local = process_delete_local(&response, base_path, db).await?;
+    result.uploads = process_uploads(
+        api,
+        db,
+        &response,
+        &local_files,
+        base_path,
+        workspace_id,
+        password_str,
+    )
+    .await?;
+    result.deletes_remote = cleanup_deleted_cache(&local_files, db).await?;
 
     tracing::info!(
         "Sync done: {} up, {} down ({} lazy), {} local del, {} remote del",
@@ -393,6 +382,16 @@ pub async fn do_hydrate(
         if !entry.hydrated {
             tracing::info!("Hydrating {} (hash: {})", path, entry.encrypted_hash);
             let encrypted_content = api.download_file(&entry.encrypted_hash).await?;
+            let computed_hash = feanorfs_common::hash_bytes(&encrypted_content);
+            if computed_hash != entry.encrypted_hash {
+                tracing::warn!(
+                    "Integrity check failed for {}: expected {}, computed {} (skipping)",
+                    path,
+                    entry.encrypted_hash,
+                    computed_hash
+                );
+                continue;
+            }
             let plain_content =
                 feanorfs_common::crypt_bytes(&encrypted_content, password_str, &path);
 
@@ -407,7 +406,7 @@ pub async fn do_hydrate(
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
+                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
                 .unwrap_or(entry.mtime);
 
             let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
@@ -505,12 +504,6 @@ pub async fn do_status(
     };
 
     let response = api.negotiate_sync(&request).await?;
-
-    for (path, file) in &local_files {
-        if file.deleted {
-            let _ = db.delete_cache_entry(path).await;
-        }
-    }
 
     Ok(StatusResult {
         upload_required: response.upload_required,

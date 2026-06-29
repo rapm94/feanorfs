@@ -4,6 +4,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+/// Insecure legacy default password used when no E2EE password is configured.
+/// Kept as a single constant so all call sites share the same fallback.
+pub const LEGACY_DEFAULT_PASSWORD: &str = "default-secret-key";
+
 /// Generates a cryptographically random 64-char hex password.
 /// Uses getrandom (CSPRNG) for entropy, then Blake3-hashes the bytes
 /// to produce a stable-length hex string suitable as an E2EE key.
@@ -36,7 +40,41 @@ pub struct SyncResponse {
     pub delete_local: Vec<String>,    // Paths the client must delete locally
 }
 
+/// Snapshot row recorded when an agent workspace is spawned.
+/// Represents the server's view of a file at spawn time, which becomes the
+/// "base" version used by `agent commit` to detect concurrent edits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSnapshotEntry {
+    pub agent_name: String,
+    pub path: String,
+    pub base_hash: String,
+    pub base_size: u64,
+    pub base_mtime: i64,
+}
+
+/// Triple emitted when both the agent and the server modified the same path
+/// since the snapshot was taken. FeanorFS does not merge — the consumer
+/// (human or AI agent) reconciles the three versions and syncs back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConcurrentEdit {
+    pub path: String,
+    pub base: Option<FileState>,
+    pub ours: Option<FileState>,
+    pub theirs: Option<FileState>,
+}
+
+/// Structured result of `agent commit`. Caller inspects the buckets to
+/// decide what to apply, what to pull, and which conflicts need resolution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentCommitResult {
+    pub agent_name: String,
+    pub our_changes: Vec<FileState>,
+    pub their_changes: Vec<FileState>,
+    pub conflicts: Vec<ConcurrentEdit>,
+}
+
 /// Computes the Blake3 hash of a byte slice and returns it as a hex string.
+#[must_use]
 pub fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
@@ -45,7 +83,8 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0; 65536]; // 64KB buffer
+    // 65_536-byte (64 KiB) buffer — heap-allocated to avoid a large stack frame.
+    let mut buffer = vec![0u8; 65_536];
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
@@ -57,26 +96,47 @@ pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<String> {
 }
 
 /// Normalizes a path to use forward slashes for cross-platform consistency.
+#[must_use]
 pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
 /// Encrypts or decrypts bytes using a symmetric keystream derived from a password and path via Blake3 XOF.
 /// Because XOR is symmetric, calling this twice with the same password and path returns the original data.
+///
+/// Length prefixes before each field provide domain separation so that
+/// `(password="ab", path="cdef")` and `(password="abc", path="def")` produce
+/// different keystreams — without them, Blake3's absorbed bytes would be
+/// identical.
+#[must_use]
 pub fn crypt_bytes(data: &[u8], password: &str, path: &str) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(&(password.len() as u64).to_le_bytes());
     hasher.update(password.as_bytes());
+    hasher.update(&(path.len() as u64).to_le_bytes());
     hasher.update(path.as_bytes());
     let mut reader = hasher.finalize_xof();
 
-    let mut keystream = vec![0u8; data.len()];
-    reader.fill(&mut keystream);
-
     let mut result = data.to_vec();
-    for (r, k) in result.iter_mut().zip(keystream.iter()) {
-        *r ^= k;
+    // 65_536-byte (64 KiB) keystream chunk — heap-allocated to avoid a large stack frame.
+    let mut chunk = vec![0u8; 65_536];
+    let mut offset = 0;
+    while offset < result.len() {
+        let n = (result.len() - offset).min(chunk.len());
+        reader.fill(&mut chunk[..n]);
+        for i in 0..n {
+            result[offset + i] ^= chunk[i];
+        }
+        offset += n;
     }
     result
+}
+
+/// Returns true if `hash` is a valid Blake3 hex digest (64 lowercase hex chars).
+/// Used to reject path-traversal attempts in blob download/upload endpoints.
+#[must_use]
+pub fn is_valid_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -226,8 +286,8 @@ mod tests {
         let state = FileState {
             path: "src/main.rs".to_string(),
             hash: "abc123".to_string(),
-            size: 4096,
-            mtime: 1719500000000,
+            size: 4_096,
+            mtime: 1_719_500_000_000,
             deleted: false,
         };
         let json = serde_json::to_string(&state).unwrap();
@@ -265,5 +325,50 @@ mod tests {
         let a = generate_password().unwrap();
         let b = generate_password().unwrap();
         assert_ne!(a, b, "two generated passwords must differ");
+    }
+
+    #[test]
+    fn is_valid_hash_accepts_64_hex_chars() {
+        let h = hash_bytes(b"some payload");
+        assert!(is_valid_hash(&h), "{}", h);
+    }
+
+    #[test]
+    fn is_valid_hash_rejects_too_short() {
+        assert!(!is_valid_hash("abc123"));
+    }
+
+    #[test]
+    fn is_valid_hash_rejects_too_long() {
+        assert!(!is_valid_hash(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn is_valid_hash_rejects_non_hex() {
+        assert!(!is_valid_hash(&"z".repeat(64)));
+        assert!(!is_valid_hash(&"G".repeat(64)));
+    }
+
+    #[test]
+    fn is_valid_hash_rejects_path_traversal_patterns() {
+        assert!(!is_valid_hash(".."));
+        assert!(!is_valid_hash("../../db.sqlite"));
+        assert!(!is_valid_hash(""));
+    }
+
+    #[test]
+    fn crypt_bytes_domain_separation_prevents_collision() {
+        let pw_ab = "ab";
+        let path_cdef = "cdef";
+        let pw_abc = "abc";
+        let path_def = "def";
+
+        let ks1 = crypt_bytes(b"payload", pw_ab, path_cdef);
+        let ks2 = crypt_bytes(b"payload", pw_abc, path_def);
+
+        assert_ne!(
+            ks1, ks2,
+            "different password/path splits with same concatenation must differ"
+        );
     }
 }

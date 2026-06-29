@@ -1,6 +1,9 @@
+mod agent;
 mod api;
 mod commands;
 mod local;
+mod predictive;
+mod summary;
 mod watch;
 
 use anyhow::Context as _;
@@ -121,49 +124,49 @@ fn resolve_server_password(explicit: Option<String>) -> Option<String> {
     explicit.or_else(|| load_global_config().ok().and_then(|g| g.server_password))
 }
 
+fn try_clipboard_cmd(cmd: &str, args: &[&str], text: &str) -> Option<std::process::ExitStatus> {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(text.as_bytes())?;
+            }
+            child.wait()
+        })
+        .ok()
+}
+
 fn copy_to_clipboard(text: &str) {
     let result = if cfg!(target_os = "macos") {
-        std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(text.as_bytes())?;
-                }
-                child.wait()
-            })
+        try_clipboard_cmd("pbcopy", &[], text)
     } else if cfg!(target_os = "linux") {
-        std::process::Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(text.as_bytes())?;
-                }
-                child.wait()
-            })
+        try_clipboard_cmd("xclip", &["-selection", "clipboard"], text)
+            .or_else(|| try_clipboard_cmd("wl-copy", &[], text))
+            .or_else(|| try_clipboard_cmd("xsel", &["--clipboard", "--input"], text))
     } else {
-        Ok(std::process::ExitStatus::default())
+        None
     };
     let _ = result;
 }
 
 fn read_password_hidden(prompt: &str) -> anyhow::Result<String> {
-    use std::io::{self, BufRead, Write};
-    let mut stderr = io::stderr();
-    write!(stderr, "{}", prompt)?;
-    stderr.flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    eprintln!();
-    Ok(line.trim().to_string())
+    Ok(rpassword::prompt_password(prompt)?)
+}
+
+fn truncate_password_for_display(p: &str) -> String {
+    let chars: Vec<char> = p.chars().collect();
+    if chars.len() > 12 {
+        let head: String = chars.iter().take(6).collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{}...{}", head, tail)
+    } else {
+        p.to_string()
+    }
 }
 
 async fn probe_server_auth(url: &str) -> anyhow::Result<bool> {
@@ -180,8 +183,18 @@ async fn probe_server_auth(url: &str) -> anyhow::Result<bool> {
 #[command(name = "feanorfs")]
 #[command(about = "FeanorFS: Developer-focused filesystem sync tool (client)", long_about = None)]
 struct Cli {
+    /// Emit machine-readable JSON results instead of human prose. Honored by sync/push/pull/hydrate/cat/status/agent/summary.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+fn output_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    let s = serde_json::to_string_pretty(value)?;
+    println!("{}", s);
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -285,6 +298,42 @@ enum Commands {
         /// Optional Server URL (overrides config URL)
         server_url: Option<String>,
     },
+    /// Summarize files that changed since the previous session marker.
+    Summary {
+        /// Shell out to FEANORFS_SUMMARY_CMD to produce prose instead of just listing paths.
+        #[arg(long)]
+        summarize: bool,
+
+        /// Persist the current state as the next session's "previous" snapshot.
+        /// Combine with `feanorfs sync` so the marker advances right after a successful sync.
+        #[arg(long)]
+        commit: bool,
+    },
+    /// Manage isolated agent workspaces (copy-on-write snapshots of the current workspace).
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Spawn a new isolated agent workspace `.feanorfs/agents/<name>/`.
+    Spawn { name: String },
+    /// Diff agent workspace against base snapshot and split into clean-our / clean-their / conflicts.
+    Commit { name: String },
+    /// List all spawned agent workspaces.
+    List,
+    /// Remove an agent workspace and its snapshot rows.
+    Clean { name: String },
+    /// Run a command inside an agent workspace (Level 1 process isolation).
+    Run {
+        name: String,
+        /// Command and arguments to execute inside the agent workspace.
+        /// Example: `feanorfs agent run ci1 -- cargo test`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -302,13 +351,19 @@ async fn main() -> anyhow::Result<()> {
 
             let final_token = match token {
                 Some(t) => Some(t),
-                None => {
-                    if probe_server_auth(&server_url).await.unwrap_or(false) {
-                        Some(read_password_hidden("Server requires a token: ")?)
-                    } else {
+                None => match probe_server_auth(&server_url).await {
+                    Ok(true) => Some(read_password_hidden("Server requires a token: ")?),
+                    Ok(false) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Server auth probe failed for {}: {:?}. Saving without token. \
+                             If server requires auth, re-run 'feanorfs connect <URL> --token <T>'.",
+                            server_url,
+                            e
+                        );
                         None
                     }
-                }
+                },
             };
 
             let global = GlobalConfig {
@@ -435,12 +490,7 @@ async fn main() -> anyhow::Result<()> {
                     };
                     println!("  E2EE:          {}", e2ee_status);
                     if let Some(ref p) = c.encryption_password {
-                        let display = if p.len() > 12 {
-                            format!("{}...{}", &p[..6], &p[p.len() - 4..])
-                        } else {
-                            p.to_string()
-                        };
-                        println!("  E2EE key:      {}", display);
+                        println!("  E2EE key:      {}", truncate_password_for_display(p));
                     }
                     println!(
                         "  Server auth:   {}",
@@ -461,7 +511,9 @@ async fn main() -> anyhow::Result<()> {
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            println!("Scanning workspace directory...");
+            if !cli.json {
+                println!("Scanning workspace directory...");
+            }
             let result = commands::do_status(
                 &api,
                 &db,
@@ -471,46 +523,50 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            let mut has_changes = false;
+            if cli.json {
+                output_json(&result)?;
+            } else {
+                let mut has_changes = false;
 
-            if !result.upload_required.is_empty() {
-                has_changes = true;
-                println!("\nLocal changes to push (run 'feanorfs push'):");
-                for path in &result.upload_required {
-                    if let Some(f) = result.local_files.get(path) {
-                        if f.deleted {
-                            println!("  [delete]     {}", path);
+                if !result.upload_required.is_empty() {
+                    has_changes = true;
+                    println!("\nLocal changes to push (run 'feanorfs push'):");
+                    for path in &result.upload_required {
+                        if let Some(f) = result.local_files.get(path) {
+                            if f.deleted {
+                                println!("  [delete]     {}", path);
+                            } else {
+                                println!("  [modify/add] {}", path);
+                            }
                         } else {
                             println!("  [modify/add] {}", path);
                         }
-                    } else {
-                        println!("  [modify/add] {}", path);
                     }
                 }
-            }
 
-            if !result.download_required.is_empty() {
-                has_changes = true;
-                println!("\nRemote changes to pull (run 'feanorfs pull'):");
-                for f in &result.download_required {
-                    println!(
-                        "  [download]   {} ({:.1} KB)",
-                        f.path,
-                        f.size as f64 / 1024.0
-                    );
+                if !result.download_required.is_empty() {
+                    has_changes = true;
+                    println!("\nRemote changes to pull (run 'feanorfs pull'):");
+                    for f in &result.download_required {
+                        println!(
+                            "  [download]   {} ({:.1} KB)",
+                            f.path,
+                            f.size as f64 / 1024.0
+                        );
+                    }
                 }
-            }
 
-            if !result.delete_local.is_empty() {
-                has_changes = true;
-                println!("\nRemote deletions to apply (run 'feanorfs pull'):");
-                for path in &result.delete_local {
-                    println!("  [delete]     {}", path);
+                if !result.delete_local.is_empty() {
+                    has_changes = true;
+                    println!("\nRemote deletions to apply (run 'feanorfs pull'):");
+                    for path in &result.delete_local {
+                        println!("  [delete]     {}", path);
+                    }
                 }
-            }
 
-            if !has_changes {
-                println!("\nEverything is up to date!");
+                if !has_changes {
+                    println!("\nEverything is up to date!");
+                }
             }
         }
         Commands::Push => {
@@ -518,7 +574,9 @@ async fn main() -> anyhow::Result<()> {
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            println!("Pushing...");
+            if !cli.json {
+                println!("Pushing...");
+            }
             let result = commands::do_push_only(
                 &api,
                 &db,
@@ -528,12 +586,16 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            println!(
-                "Push complete. Uploaded {} files, processed {} deletions.",
-                result.uploads, result.deletes
-            );
-            if result.remote_updates_available {
-                println!("Note: Remote updates available. Run 'feanorfs pull' to apply.");
+            if cli.json {
+                output_json(&result)?;
+            } else {
+                println!(
+                    "Push complete. Uploaded {} files, processed {} deletions.",
+                    result.uploads, result.deletes
+                );
+                if result.remote_updates_available {
+                    println!("Note: Remote updates available. Run 'feanorfs pull' to apply.");
+                }
             }
         }
         Commands::Pull { lazy } => {
@@ -541,7 +603,9 @@ async fn main() -> anyhow::Result<()> {
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            println!("Pulling...");
+            if !cli.json {
+                println!("Pulling...");
+            }
             let result = commands::do_pull_only(
                 &api,
                 &db,
@@ -552,17 +616,23 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            println!(
-                "Pull complete. Downloaded {}, {} lazy placeholders, {} deletions.",
-                result.downloads, result.placeholders, result.deletes
-            );
+            if cli.json {
+                output_json(&result)?;
+            } else {
+                println!(
+                    "Pull complete. Downloaded {}, {} lazy placeholders, {} deletions.",
+                    result.downloads, result.placeholders, result.deletes
+                );
+            }
         }
         Commands::Sync { lazy, no_watch } => {
             let config = load_config(&current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
 
-            println!("Syncing...");
+            if !cli.json {
+                println!("Syncing...");
+            }
             let result = commands::do_sync(
                 &api,
                 &db,
@@ -573,14 +643,18 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            println!(
-                "Sync complete. Uploaded {}, Downloaded {} (lazy: {}), Local Deletes {}, Remote Deletes {}.",
-                result.uploads,
-                result.downloads,
-                result.placeholders,
-                result.deletes_local,
-                result.deletes_remote
-            );
+            if cli.json {
+                output_json(&result)?;
+            } else {
+                println!(
+                    "Sync complete. Uploaded {}, Downloaded {} (lazy: {}), Local Deletes {}, Remote Deletes {}.",
+                    result.uploads,
+                    result.downloads,
+                    result.placeholders,
+                    result.deletes_local,
+                    result.deletes_remote
+                );
+            }
 
             if !no_watch {
                 watch::run_watch(
@@ -602,12 +676,28 @@ async fn main() -> anyhow::Result<()> {
                 &api,
                 &db,
                 &current_dir,
-                path,
+                path.clone(),
                 config.encryption_password.as_deref(),
             )
             .await?;
 
-            println!("{}", result.message);
+            if let Some(ref p) = path {
+                let _ = predictive::record_access_with_recent(&db, p).await;
+                let _ = predictive::prefetch_related(
+                    &current_dir,
+                    &db,
+                    &api,
+                    config.encryption_password.as_deref(),
+                    std::slice::from_ref(p),
+                )
+                .await;
+            }
+
+            if cli.json {
+                output_json(&result)?;
+            } else {
+                println!("{}", result.message);
+            }
         }
         Commands::Cat { path } => {
             let config = load_config(&current_dir)?;
@@ -623,16 +713,22 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            if result.untracked {
-                println!("Warning: file '{}' is not tracked. Reading directly.", path);
-            }
-            if result.hydrated_first {
-                eprintln!("Hydrated {} from server.", path);
-            }
-            if result.not_found {
-                println!("Error: file '{}' does not exist.", path);
+            let _ = predictive::record_access_with_recent(&db, &path).await;
+
+            if cli.json {
+                output_json(&result)?;
             } else {
-                print!("{}", result.content);
+                if result.untracked {
+                    println!("Warning: file '{}' is not tracked. Reading directly.", path);
+                }
+                if result.hydrated_first {
+                    eprintln!("Hydrated {} from server.", path);
+                }
+                if result.not_found {
+                    println!("Error: file '{}' does not exist.", path);
+                } else {
+                    print!("{}", result.content);
+                }
             }
         }
         Commands::Watch => {
@@ -744,9 +840,13 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let api = ApiClient::new(&url, srv_pass.as_deref());
-            println!("Querying workspaces from server at {}...", url);
+            if !cli.json {
+                println!("Querying workspaces from server at {}...", url);
+            }
             let workspaces = api.get_workspaces().await?;
-            if workspaces.is_empty() {
+            if cli.json {
+                output_json(&workspaces)?;
+            } else if workspaces.is_empty() {
                 println!("No active workspaces found on the server.");
             } else {
                 println!("\nActive Workspaces:");
@@ -755,7 +855,194 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Summary { summarize, commit } => {
+            let password = load_config(&current_dir)
+                .ok()
+                .and_then(|c| c.encryption_password);
+            let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+            let result =
+                summary::diff_since_last_session(&current_dir, &db, password.as_deref()).await?;
+
+            if commit {
+                summary::commit_session_marker(&current_dir, &db, password.as_deref()).await?;
+            }
+
+            if cli.json {
+                output_json(&result)?;
+            } else if summarize {
+                let rendered = summary::render_via_summary_tool(&result)?;
+                println!("{}", rendered);
+            } else {
+                let rendered = summary::render_via_summary_tool(&result);
+                match rendered {
+                    Ok(s) => println!("{}", s),
+                    Err(e) => {
+                        eprintln!("Summary tool error: {}", e);
+                        output_json(&result)?;
+                    }
+                }
+            }
+        }
+        Commands::Agent { action } => match action {
+            AgentAction::Spawn { name } => {
+                let config = load_config(&current_dir)?;
+                let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+                let count = agent::spawn_agent(
+                    &current_dir,
+                    &db,
+                    &name,
+                    config.encryption_password.as_deref(),
+                )
+                .await?;
+                if cli.json {
+                    output_json(&serde_json::json!({
+                        "agent": name,
+                        "files_linked": count,
+                    }))?;
+                } else {
+                    println!(
+                        "Agent '{}' spawned with {} files at .feanorfs/agents/{}/",
+                        name, count, name
+                    );
+                }
+            }
+            AgentAction::Commit { name } => {
+                let config = load_config(&current_dir)?;
+                let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+                let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
+                let result = agent::commit_agent(
+                    &current_dir,
+                    &db,
+                    &api,
+                    &config.workspace_id,
+                    &name,
+                    config.encryption_password.as_deref(),
+                )
+                .await?;
+
+                if cli.json {
+                    output_json(&result)?;
+                } else {
+                    println!("Agent '{}' commit:", name);
+                    println!("  Our changes:    {}", result.our_changes.len());
+                    println!("  Their changes: {}", result.their_changes.len());
+                    println!("  Conflicts:     {}", result.conflicts.len());
+                    if !result.conflicts.is_empty() {
+                        println!("\nConflicting paths (look in .feanorfs/conflicts/ for base/ours/theirs):");
+                        for c in &result.conflicts {
+                            println!("  ! {}", c.path);
+                        }
+                    }
+                }
+            }
+            AgentAction::List => {
+                let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+                let names = agent::list_agents(&current_dir, &db).await?;
+                if cli.json {
+                    output_json(&serde_json::json!({ "agents": names }))?;
+                } else if names.is_empty() {
+                    println!("No agent workspaces.");
+                } else {
+                    println!("Agent workspaces:");
+                    for n in &names {
+                        println!("  * {}", n);
+                    }
+                }
+            }
+            AgentAction::Clean { name } => {
+                let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+                agent::clean_agent(&current_dir, &db, &name).await?;
+                if cli.json {
+                    output_json(&serde_json::json!({ "cleaned": name }))?;
+                } else {
+                    println!("Agent '{}' removed.", name);
+                }
+            }
+            AgentAction::Run { name, command } => {
+                if command.is_empty() {
+                    anyhow::bail!("`agent run` requires a command after `--`. Example: feanorfs agent run ci -- cargo test");
+                }
+                agent::validate_name(&name)?;
+                let agent_path = agent::agent_dir(&current_dir, &name);
+                if !agent_path.exists() {
+                    anyhow::bail!(
+                        "Agent workspace '{}' not found. Run `feanorfs agent spawn {}` first.",
+                        name,
+                        name
+                    );
+                }
+                let mut cmd = std::process::Command::new(&command[0]);
+                cmd.args(&command[1..]).current_dir(&agent_path);
+                let status = cmd.status()?;
+                if !status.success() {
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            }
+        },
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_password_for_display;
+
+    #[test]
+    fn display_short_password_returns_unchanged() {
+        assert_eq!(truncate_password_for_display("short"), "short");
+    }
+
+    #[test]
+    fn display_long_ascii_password_is_truncated_with_ellipsis() {
+        let pw = "0123456789abcdef0123456789abcdef";
+        let display = truncate_password_for_display(pw);
+        assert!(
+            display.contains("..."),
+            "display must contain ellipsis: {}",
+            display
+        );
+        assert!(
+            display.starts_with("012345"),
+            "head must be first 6 chars: {}",
+            display
+        );
+        assert!(
+            display.ends_with("cdef"),
+            "tail must be last 4 chars: {}",
+            display
+        );
+    }
+
+    #[test]
+    fn display_multibyte_password_does_not_panic() {
+        let pw = "日本語のパスワード1234567890";
+        let display = truncate_password_for_display(pw);
+        assert!(
+            !display.is_empty(),
+            "display must be non-empty for multibyte password"
+        );
+        assert!(
+            display.contains("..."),
+            "long multibyte password must be truncated: {}",
+            display
+        );
+    }
+
+    #[test]
+    fn display_exactly_twelve_chars_returns_unchanged() {
+        let pw = "012345678901";
+        assert_eq!(truncate_password_for_display(pw), pw);
+    }
+
+    #[test]
+    fn display_thirteen_chars_is_truncated() {
+        let pw = "0123456789012";
+        let display = truncate_password_for_display(pw);
+        assert!(
+            display.contains("..."),
+            "13-char password must be truncated: {}",
+            display
+        );
+    }
 }

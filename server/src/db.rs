@@ -63,7 +63,7 @@ impl Db {
             .map(|r| FileState {
                 path: r.get::<String, _>("path"),
                 hash: r.get::<String, _>("hash"),
-                size: r.get::<i64, _>("size") as u64,
+                size: u64::try_from(r.get::<i64, _>("size")).unwrap_or(0),
                 mtime: r.get::<i64, _>("mtime"),
                 deleted: r.get::<bool, _>("deleted"),
             })
@@ -73,7 +73,7 @@ impl Db {
     }
 
     pub async fn upsert_file(&self, workspace_id: &str, file: &FileState) -> Result<()> {
-        let size = file.size as i64;
+        let size = i64::try_from(file.size).unwrap_or(i64::MAX);
         sqlx::query(
             "INSERT INTO files (workspace_id, path, hash, size, mtime, deleted, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)

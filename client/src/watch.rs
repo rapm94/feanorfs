@@ -42,7 +42,7 @@ pub async fn run_watch(
             }
         })?;
 
-    watcher.watch(Path::new("."), notify::RecursiveMode::Recursive)?;
+    watcher.watch(current_dir, notify::RecursiveMode::Recursive)?;
     println!("Watching for changes... (Press Ctrl+C to stop)");
 
     tracing::info!("Initial sync");
