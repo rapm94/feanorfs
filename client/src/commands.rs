@@ -44,7 +44,6 @@ pub struct SyncResult {
 }
 
 #[derive(Debug, Serialize)]
-#[allow(dead_code)]
 pub struct HydrateResult {
     pub hydrated: Vec<String>,
     pub skipped: bool,

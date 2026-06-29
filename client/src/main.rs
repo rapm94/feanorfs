@@ -1,17 +1,8 @@
-mod agent;
-mod api;
-mod commands;
-mod local;
-mod predictive;
-mod summary;
-mod watch;
-
 use anyhow::Context as _;
-use api::ApiClient;
 use clap::{Parser, Subcommand};
-use local::{
-    load_config, load_global_config, save_config, save_global_config, ClientDb, Config,
-    GlobalConfig,
+use feanorfs_client::{
+    agent, commands, load_config, load_global_config, predictive, save_config, save_global_config,
+    summary, watch, ApiClient, ClientDb, Config, GlobalConfig,
 };
 use std::fs::OpenOptions;
 use std::time::Duration;
@@ -201,7 +192,7 @@ fn output_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 enum Commands {
     /// Connect to a FeanorFS server (cached for future commands)
     Connect {
-        /// Server URL (e.g. https://my-server.com:3030). Required unless --lan is used.
+        /// Server URL (e.g. <https://my-server.com:3030>). Required unless --lan is used.
         url: Option<String>,
 
         /// Server access token (Bearer auth). In SaaS mode, this is your per-user API key.

@@ -7,6 +7,26 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+fn file_size_from_db(size: i64) -> u64 {
+    u64::try_from(size).unwrap_or_else(|_| {
+        tracing::warn!(
+            "stored file size {} exceeds u64::MAX, saturating to u64::MAX",
+            size
+        );
+        u64::MAX
+    })
+}
+
+fn file_size_to_db(size: u64) -> i64 {
+    i64::try_from(size).unwrap_or_else(|_| {
+        tracing::warn!(
+            "file size {} exceeds i64::MAX, saturating to i64::MAX",
+            size
+        );
+        i64::MAX
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
@@ -130,7 +150,7 @@ impl ClientDb {
                 path: path.clone(),
                 plaintext_hash: r.get::<String, _>("plaintext_hash"),
                 encrypted_hash: r.get::<String, _>("encrypted_hash"),
-                size: u64::try_from(r.get::<i64, _>("size")).unwrap_or(0),
+                size: file_size_from_db(r.get::<i64, _>("size")),
                 mtime: r.get::<i64, _>("mtime"),
                 server_mtime: r.get::<i64, _>("server_mtime"),
                 hydrated: r.get::<i32, _>("hydrated") != 0,
@@ -141,7 +161,7 @@ impl ClientDb {
     }
 
     pub async fn upsert_cache_entry(&self, entry: &CacheEntry) -> Result<()> {
-        let size = i64::try_from(entry.size).unwrap_or(i64::MAX);
+        let size = file_size_to_db(entry.size);
         let hydrated = if entry.hydrated { 1 } else { 0 };
         sqlx::query(
             "INSERT OR REPLACE INTO local_files (path, plaintext_hash, encrypted_hash, size, mtime, server_mtime, hydrated)
@@ -181,7 +201,7 @@ impl ClientDb {
             .bind(entry.agent_name.clone())
             .bind(&entry.path)
             .bind(&entry.base_hash)
-            .bind(i64::try_from(entry.base_size).unwrap_or(i64::MAX))
+            .bind(file_size_to_db(entry.base_size))
             .bind(entry.base_mtime)
             .execute(&mut *tx)
             .await?;
@@ -208,7 +228,7 @@ impl ClientDb {
                 agent_name: r.get::<String, _>("agent_name"),
                 path: r.get::<String, _>("path"),
                 base_hash: r.get::<String, _>("base_hash"),
-                base_size: u64::try_from(r.get::<i64, _>("base_size")).unwrap_or(0),
+                base_size: file_size_from_db(r.get::<i64, _>("base_size")),
                 base_mtime: r.get::<i64, _>("base_mtime"),
             })
             .collect();

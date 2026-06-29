@@ -34,6 +34,10 @@ FeanorFS complements Git — it syncs the working directory that Git ignores. It
 - **Real-time watch** — `feanorfs watch` monitors filesystem changes (debounced 500ms) and auto-syncs with the server.
 - **Local cache** — The client caches plaintext/encrypted hash pairs keyed by `(mtime, size)` to avoid re-hashing unchanged files on every scan.
 - **Cross-platform paths** — All paths are normalized to forward slashes before DB operations.
+- **Agent workspaces** — `feanorfs agent spawn|commit|list|clean|run` for isolated copy-on-write sandboxes and three-way conflict detection (FeanorFS does not merge — consumers reconcile).
+- **Catch-up summary** — `feanorfs summary [--summarize]` lists files added/modified/deleted since your last session.
+- **Predictive hydration** — After `cat`/`hydrate`, co-occurring siblings are prefetched in the background (local-only).
+- **Library + JSON API** — Use `feanorfs_client` from Rust, or add `--json` to CLI commands for machine-readable output.
 
 ## Architecture
 
@@ -183,11 +187,11 @@ FeanorFS provides end-to-end encryption using a symmetric XOR cipher driven by B
 
 **E2EE is always on.** Every workspace has an encryption password — if you don't provide one, a 64-character CSPRNG-generated key is created automatically. The same E2EE password must be used on all machines sharing a workspace.
 
-**Server authentication** is optional. Run `feanorfs-server --password <PASS>` to require a Bearer token on all API requests. On LAN, the server advertises itself via mDNS so clients can discover without typing an IP. On the internet, use `--no-mdns` and put a TLS-terminating reverse proxy (Caddy, nginx) in front.
+**Server authentication** is optional. Run `feanorfs-server --token <TOKEN>` to require a Bearer token on all API requests (`--password` is accepted as an alias). On LAN, the server advertises itself via mDNS so clients can discover without typing an IP. On the internet, use `--no-mdns` and put a TLS-terminating reverse proxy (Caddy, nginx) in front.
 
 **Important limitations** (see [docs/threat-model.md](docs/threat-model.md) for the full analysis):
 
-- The encryption is **stream cipher based on Blake3 XOF**, not an authenticated encryption scheme (AES-GCM, ChaCha20-Poly1305). It does not provide integrity verification of ciphertext.
+- The encryption is **stream cipher based on Blake3 XOF**, not an authenticated encryption scheme (AES-GCM, ChaCha20-Poly1305). The client mitigates active-server tampering by re-hashing downloaded ciphertext and comparing to the expected `encrypted_hash` before decrypting — but this is not a substitute for AEAD.
 - The server can observe metadata: file paths, sizes, modification times, and encrypted hashes. Path confidentiality is NOT protected.
 - The server password travels in cleartext over HTTP. For internet deployments, always use TLS (Caddy/nginx reverse proxy).
 - Passwords are stored in plaintext in `.feanorfs/config.json` and `~/.feanorfs/global.json`. Protect your workspace directory accordingly.
@@ -243,10 +247,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
 ## Project structure
 
 ```
-fs-sync/
+feanorfs/
 ├── common/     # Shared data models + Blake3 XOF encryption primitives
 ├── server/     # Axum blob server + SQLite metadata coordinator
-├── client/     # CLI client with local cache, scanner, and sync engine
+├── client/     # CLI + feanorfs_client library (cache, scanner, sync engine)
 └── docs/       # Architecture, threat model, and usage documentation
 ```
 

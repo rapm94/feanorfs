@@ -322,6 +322,46 @@ Queries the server and prints all workspace IDs that have at least one non-delet
 
 **Note:** workspaces are listed based on file metadata on the server. A freshly `init`-ed workspace that has never pushed any files will not appear in the list.
 
+### Global flags
+
+| Flag | Description |
+|---|---|
+| `--json` | Emit structured JSON for status-returning commands (`status`, `push`, `pull`, `sync`, `hydrate`, `cat`, `summary`, `agent commit`). Useful for scripting and the `feanorfs_client` result types. |
+
+### `agent` — isolated workspace sandboxes
+
+```bash
+feanorfs agent spawn <NAME>
+feanorfs agent commit <NAME> [--json]
+feanorfs agent list
+feanorfs agent clean <NAME>
+feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
+```
+
+| Subcommand | Description |
+|---|---|
+| `spawn` | Create a copy-on-write snapshot under `.feanorfs/agents/<NAME>/` and record the server's per-file view as the base snapshot. Requires the workspace E2EE password. |
+| `commit` | Diff the agent workspace against its base snapshot. Detects concurrent edits (base/ours/theirs) and writes conflict files under `.feanorfs/conflicts/`. FeanorFS does **not** merge — reconcile conflicts yourself, then sync. |
+| `list` | List agent workspaces with active snapshots. |
+| `clean` | Remove an agent workspace and its snapshot rows. |
+| `run` | Execute a command with the agent directory as the working directory (Level 1 sandbox). |
+
+Agent names must be simple identifiers (no `/`, `\`, `.`, or `..`).
+
+### `summary` — session catch-up diff
+
+```bash
+feanorfs summary [--summarize]
+```
+
+Compares the current workspace against the previous session marker (`last_session.last_scan` in the local cache DB). Prints paths grouped as added, modified, or deleted.
+
+| Flag | Description |
+|---|---|
+| `--summarize` | Pipe the structured diff to `FEANORFS_SUMMARY_CMD` (default `feanorfs-llm`) for human-readable prose. Falls back to a plain path listing if the command is not on `PATH`. Only paths and metadata are sent — never file contents. |
+
+Run `feanorfs summary` at the start of a session; it updates the session marker after displaying the diff.
+
 ## Examples
 
 ### First-time setup across two machines

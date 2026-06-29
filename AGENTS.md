@@ -28,7 +28,9 @@ feanorfs/
 │   └── src/lib.rs       # FileState, SyncRequest/Response, AgentSnapshotEntry, ConcurrentEdit, AgentCommitResult, Blake3 XOF crypt_bytes and hashing
 ├── server/              # Pure blob storage server
 │   ├── src/db.rs        # SQLite metadata DB coordinator using SQLx
-│   └── src/main.rs      # Axum routes for sync negotiation, blob uploads & downloads
+│   ├── src/app.rs       # Axum routes for sync negotiation, blob uploads & downloads
+│   ├── src/lib.rs       # feanorfs_server library (build_router, init_app_state)
+│   └── src/main.rs      # CLI entrypoint
 ├── client/              # CLI terminal client + library crate
 │   ├── src/lib.rs       # feanorfs_client lib export surface (sync/push/pull/hydrate/cat, types, Db, ApiClient)
 │   ├── src/api.rs       # HTTP client request wrappers for blob transport
@@ -62,42 +64,41 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 
 | Task / Feature | Location | Notes |
 | :--- | :--- | :--- |
-| FileState definition | [lib.rs](file:///Users/raulpuigbo/p/feanorfs/common/src/lib.rs) | Tracks relative path, Blake3 hash (encrypted), size, mtime, and deleted status. |
-| Agent snapshot + conflict types | [lib.rs](file:///Users/raulpuigbo/p/feanorfs/common/src/lib.rs) | `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentCommitResult` — the wire types `agent commit` returns. |
-| Blake3 XOF E2EE | [lib.rs](file:///Users/raulpuigbo/p/feanorfs/common/src/lib.rs) | Symmetric XOR cipher driven by Blake3 Extendable Output Function (XOF) with length-prefixed domain separation. Also exports `is_valid_hash` for path-traversal defense. |
-| Library API surface | [lib.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/lib.rs) | `feanorfs_client::sync/push/pull/hydrate/cat` callable from any Rust program. Re-exports `ApiClient`, `ClientDb`, `Config`, types. |
-| Local Cache DB + tables | [local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs) | Schema for `local_files`, `agent_snapshots`, `file_access_log`, `last_session`. CRUD on each. |
-| Directory Scanning | [local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
-| HTTP API Wrappers | [api.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/api.rs) | Wraps `/api/sync/diff`, `/api/upload`, `/api/download/:hash`, `/api/delete`, `/api/workspaces`. Sends Bearer auth header when configured. |
-| CLI Actions | [main.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/main.rs) | Subcommand router. Global `--json` flag. Agent subcommand with Spawn/Commit/List/Clean/Run actions. |
-| Sync Engine | [commands.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/commands.rs) | Pure sync logic returning `Serialize`-derived result types (`SyncResult`, `PushResult`, etc.). No `println!` — UI-agnostic. |
-| Workspace Isolation | [agent.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/agent.rs) | `spawn_agent` (hardlink CoW + fallback copy + per-file base snapshot, requires E2EE password), `commit_agent` (three-way concurrent edit via `/api/sync/diff`), `list_agents`, `clean_agent`, `write_conflict_files`. |
-| Catch-up Summary | [summary.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
-| Predictive Hydration | [predictive.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
-| Change Watching | [watch.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
+| FileState definition | [lib.rs](common/src/lib.rs) | Tracks relative path, Blake3 hash (encrypted), size, mtime, and deleted status. |
+| Agent snapshot + conflict types | [lib.rs](common/src/lib.rs) | `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentCommitResult` — the wire types `agent commit` returns. |
+| Blake3 XOF E2EE | [lib.rs](common/src/lib.rs) | Symmetric XOR cipher driven by Blake3 Extendable Output Function (XOF) with length-prefixed domain separation. Also exports `is_valid_hash` for path-traversal defense. |
+| Library API surface | [lib.rs](client/src/lib.rs) | `feanorfs_client::sync/push/pull/hydrate/cat` callable from any Rust program. Re-exports `ApiClient`, `ClientDb`, `Config`, types. |
+| Local Cache DB + tables | [local.rs](client/src/local.rs) | Schema for `local_files`, `agent_snapshots`, `file_access_log`, `last_session`. CRUD on each. |
+| Directory Scanning | [local.rs](client/src/local.rs) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
+| HTTP API Wrappers | [api.rs](client/src/api.rs) | Wraps `/api/sync/diff`, `/api/upload`, `/api/download/:hash`, `/api/workspaces`. Sends Bearer auth header when configured. |
+| CLI Actions | [main.rs](client/src/main.rs) | Subcommand router. Global `--json` flag. Agent subcommand with Spawn/Commit/List/Clean/Run actions. |
+| Sync Engine | [commands.rs](client/src/commands.rs) | Pure sync logic returning `Serialize`-derived result types (`SyncResult`, `PushResult`, etc.). No `println!` — UI-agnostic. |
+| Workspace Isolation | [agent.rs](client/src/agent.rs) | `spawn_agent` (hardlink CoW + fallback copy + per-file base snapshot, requires E2EE password), `commit_agent` (three-way concurrent edit via `/api/sync/diff`), `list_agents`, `clean_agent`, `write_conflict_files`. |
+| Catch-up Summary | [summary.rs](client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
+| Predictive Hydration | [predictive.rs](client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
+| Change Watching | [watch.rs](client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
 
 ---
 
 ## CODE MAP
 
-### Core Data Models ([common/src/lib.rs](file:///Users/raulpuigbo/p/feanorfs/common/src/lib.rs))
+### Core Data Models ([common/src/lib.rs](common/src/lib.rs))
 - `FileState`: Schema for paths, hashes, sizes, mtimes, and deleted states.
 - `SyncRequest` & `SyncResponse`: Serialization structs for endpoint negotiation.
 - `AgentSnapshotEntry`: One row of the per-agent base snapshot — `(agent_name, path, base_hash, base_size, base_mtime)`.
 - `ConcurrentEdit`: Three-way triple (base/ours/theirs) emitted by `agent commit` for conflicting paths. FeanorFS does not merge — consumers reconcile.
 - `AgentCommitResult`: Aggregate result of `agent commit` — `our_changes`, `their_changes`, `conflicts`.
 
-### Server API Endpoints ([server/src/main.rs](file:///Users/raulpuigbo/p/feanorfs/server/src/main.rs))
-- `POST /api/sync/diff`: Compares incoming client list with `files` table and returns a delta response. **Reused by `agent commit`**: the client sends the base snapshot as the "client" view, so every server-side change since spawn surfaces as `download_required`. No new endpoint needed.
+### Server API Endpoints ([server/src/app.rs](server/src/app.rs))
+- `POST /api/sync/diff`: Compares incoming client list with `files` table and returns a delta response. **Reused by `agent commit`**: the client sends the base snapshot as the "client" view, so every server-side change since spawn surfaces as `download_required`. No new endpoint needed. Deletions are propagated via `upload_required` with `deleted=true` in the `FileState` payload (handled inside the diff handler).
 - `POST /api/upload?workspace_id=...`: Receives raw encrypted bytes, writes them to `server-data/blobs/<hash>`, and upserts DB metadata. If the DB upsert fails, the orphaned blob is removed from disk before returning an error (no partial state). Request body size capped at 100 MB via `DefaultBodyLimit` to prevent memory-exhaustion DoS.
-- `POST /api/delete`: Marks a file as deleted on the server (upserts with `deleted=true`).
 - `GET /api/download/:hash`: Streams raw file contents. Rejects non-hex hashes via `is_valid_hash` to prevent path traversal.
 - `GET /api/workspaces`: Lists all workspace IDs that have at least one non-deleted file.
 - **Auth middleware**: If `--token` is set, all routes require `Authorization: Bearer <token>` header. `--password` accepted as alias. Token comparison uses constant-time equality to prevent timing side-channels.
 - **mDNS**: Server advertises `_feanorfs._tcp.local.` on port 3030 for LAN discovery when started with `--mdns` (off by default for internet deployments).
 - **Multi-instance**: `--port` and `--data-dir` flags allow running multiple isolated instances behind a reverse proxy (SaaS deployment model).
 
-### Client Database Schema ([client/src/local.rs](file:///Users/raulpuigbo/p/feanorfs/client/src/local.rs))
+### Client Database Schema ([client/src/local.rs](client/src/local.rs))
 - `local_files` table: `path` (PK), `plaintext_hash`, `encrypted_hash`, `size`, `mtime` (disk), `server_mtime` (remote), `hydrated`.
 - `agent_snapshots` table: `agent_name`, `path`, `base_hash`, `base_size`, `base_mtime`. Primary key `(agent_name, path)`.
 - `file_access_log` table: `path`, `sibling_path`, `weight`, `updated_at`. Primary key `(path, sibling_path)`.

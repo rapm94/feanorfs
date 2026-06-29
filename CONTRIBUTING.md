@@ -14,7 +14,7 @@ Thank you for your interest in improving FeanorFS. This document describes the d
 
 ```bash
 git clone https://github.com/rapm94/feanorfs.git
-cd fs-sync
+cd feanorfs
 cargo build
 cargo test
 ```

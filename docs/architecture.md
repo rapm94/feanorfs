@@ -5,10 +5,10 @@ FeanorFS is a three-crate Rust workspace implementing zero-knowledge filesystem 
 ## Workspace layout
 
 ```
-fs-sync/
+feanorfs/
 ├── common/     # Shared data models + Blake3 XOF encryption primitives
 ├── server/     # Axum blob server + SQLite metadata coordinator
-├── client/     # CLI client with local cache, scanner, and sync engine
+├── client/     # CLI + feanorfs_client library (cache, scanner, sync engine, agents)
 └── docs/       # This documentation
 ```
 
@@ -24,6 +24,7 @@ Defines the data exchanged between client and server, and the cryptographic prim
 - `FileState` — the canonical metadata record: `{ path, hash, size, mtime, deleted }`. The `hash` field always stores the **encrypted** Blake3 hash (the CAS blob key), never the plaintext hash.
 - `SyncRequest` — `{ workspace_id, files: Vec<FileState> }`. Sent by the client to `/api/sync/diff`.
 - `SyncResponse` — `{ upload_required, download_required, delete_local }`. The server's delta computation.
+- `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentCommitResult` — agent workspace isolation and three-way conflict detection types.
 
 **Primitives:**
 - `hash_bytes(bytes)` — Blake3 hash → hex string. Used for both plaintext (client cache) and ciphertext (CAS key) identification.
@@ -33,15 +34,16 @@ Defines the data exchanged between client and server, and the cryptographic prim
 
 ### `server` — blob storage + metadata coordinator
 
-Location: [`server/src/main.rs`](../server/src/main.rs), [`server/src/db.rs`](../server/src/db.rs)
+Location: [`server/src/app.rs`](../server/src/app.rs), [`server/src/db.rs`](../server/src/db.rs), [`server/src/lib.rs`](../server/src/lib.rs)
 
-An Axum HTTP server on port 3030 with three endpoints:
+An Axum HTTP server (default port 3030) with four endpoints:
 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/api/sync/diff` | POST | Receive client metadata, compute delta, return `SyncResponse` |
 | `/api/upload?workspace_id=&path=&hash=&size=&mtime=` | POST | Receive encrypted bytes, verify hash, write blob, upsert DB |
 | `/api/download/:hash` | GET | Stream encrypted blob bytes |
+| `/api/workspaces` | GET | List workspace IDs with at least one non-deleted file |
 
 **Storage:**
 - `server-data/blobs/<hash>` — content-addressed ciphertext blobs.
@@ -56,15 +58,17 @@ An Axum HTTP server on port 3030 with three endpoints:
    - If server doesn't have it: push to `upload_required` (or mark deleted on server).
 3. For server files the client doesn't know about: push to `download_required`.
 
-### `client` — CLI + sync engine
+### `client` — CLI + library + sync engine
 
-Location: [`client/src/main.rs`](../client/src/main.rs), [`client/src/local.rs`](../client/src/local.rs), [`client/src/api.rs`](../client/src/api.rs)
+Location: [`client/src/lib.rs`](../client/src/lib.rs) (library), [`client/src/main.rs`](../client/src/main.rs) (CLI entry), [`client/src/local.rs`](../client/src/local.rs), [`client/src/api.rs`](../client/src/api.rs), [`client/src/commands.rs`](../client/src/commands.rs)
 
-**CLI** (`clap`): `init`, `status`, `push`, `pull [--lazy]`, `sync [--lazy]`, `hydrate [path]`, `cat <path>`, `watch`.
+**CLI** (`clap`): `connect`, `init`, `join`, `status`, `push`, `pull [--lazy]`, `sync [--lazy] [--no-watch]`, `hydrate [path]`, `cat <path>`, `watch`, `summary [--summarize]`, `agent spawn|commit|list|clean|run`, plus global `--json`.
+
+**Library** (`feanorfs_client`): exposes `sync`, `push`, `pull`, `hydrate`, `cat`, agent helpers, and `Serialize`-derived result types for programmatic use.
 
 **Local cache** (`local.rs`):
 - `.feanorfs/config.json` — server URL, workspace ID, encryption password.
-- `.feanorfs/local_cache.db` — SQLite `local_files` table: `(path PK, plaintext_hash, encrypted_hash, size, mtime, server_mtime, hydrated)`.
+- `.feanorfs/local_cache.db` — SQLite tables: `local_files`, `agent_snapshots`, `file_access_log`, `last_session`.
 
 **Directory scanning** (`scan_local_directory`):
 1. Load all cached entries from `local_cache.db`.
@@ -90,10 +94,16 @@ Location: [`client/src/main.rs`](../client/src/main.rs), [`client/src/local.rs`]
 - `cat <path>`: if the file is a placeholder, hydrate it first, then print contents.
 
 **Watch mode:**
-- Uses `notify::recommended_watcher` with recursive monitoring.
+- Uses `notify::recommended_watcher` with recursive monitoring on the workspace `current_dir` (never `"."`).
 - Filters out events in `.feanorfs/` and `.git/` directories.
 - Sends a unit signal through a tokio mpsc channel on relevant events.
 - Main loop: receive signal → sleep 500ms (debounce) → drain pending signals → call `do_sync` → repeat.
+
+**Agent workspaces** (`agent.rs`): `spawn` creates a copy-on-write snapshot under `.feanorfs/agents/<name>/` and records server hashes in `agent_snapshots`. `commit` reuses `/api/sync/diff` with the base snapshot as the client view to detect concurrent edits; conflicts are written under `.feanorfs/conflicts/` — FeanorFS does not merge.
+
+**Catch-up summary** (`summary.rs`): diffs the workspace against the previous `last_session.last_scan` marker. Optional `--summarize` shells out to `FEANORFS_SUMMARY_CMD` with path metadata only.
+
+**Predictive hydration** (`predictive.rs`): records co-accessed paths locally in `file_access_log` and prefetches top siblings after `cat`/`hydrate`. Data never leaves the client.
 
 ## Data flow diagram
 

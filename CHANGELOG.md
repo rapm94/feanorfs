@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Agent workspaces** — `feanorfs agent spawn|commit|list|clean|run` for copy-on-write isolation and three-way concurrent-edit detection.
+- **Library API** — `feanorfs_client` crate exposes `sync`, `push`, `pull`, `hydrate`, `cat`, and agent helpers for programmatic use.
+- **JSON output** — global `--json` flag on status-returning commands.
+- **Catch-up summary** — `feanorfs summary [--summarize]` diffs against the previous session marker.
+- **Predictive hydration** — co-occurrence prefetch after `hydrate`/`cat` (local-only access log).
+- **Integration tests** — in-process Axum harness in `client/tests/sync_engine.rs`.
+
+### Changed
+- Server routes extracted to `feanorfs_server` library (`server/src/app.rs`).
+- Client binary now links the library crate (no duplicate module compilation).
+- Upload path mirrors `server_mtime` into local cache to prevent re-download churn.
+
+### Fixed
+- Filesystem watcher observes workspace `current_dir`, not `"."`.
+- Blob download uses single-read TOCTOU-safe path.
+
 ## [0.1.0] - 2026-06-23
 
 ### Added

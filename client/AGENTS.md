@@ -39,7 +39,7 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
 
 ## Verification
 
-- `cargo test --workspace` — runs all crate unit tests plus `common/tests/sync_models.rs` integration tests and `client/tests/sync_engine.rs` in-process server harness (currently 68+ passing across 8 suites).
+- `cargo test --workspace` — runs all crate unit tests plus `common/tests/sync_models.rs` integration tests and `client/tests/sync_engine.rs` in-process server harness (56 tests across 7 suites; bin tests cover CLI-only helpers).
 - `cargo clippy -p feanorfs-client --all-targets -- -D warnings`.
 - `cargo fmt -p feanorfs-client -- --check`.
 - For E2E smoke: spin up `feanorfs-server`, then two `test-client-a/`/`test-client-b/` fixtures and run `feanorfs sync`/`feanorfs agent spawn`/`feanorfs agent commit`. Fixtures live in workspace root but are NOT tracked in git.

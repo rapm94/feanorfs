@@ -48,6 +48,18 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  deny:
+    name: License & advisory audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check
+
   build:
     name: Build (release)
     runs-on: ubuntu-latest
