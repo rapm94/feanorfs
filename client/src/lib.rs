@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod api;
 pub mod commands;
+pub mod fs_util;
 pub mod local;
 pub mod predictive;
 pub mod summary;

@@ -218,7 +218,7 @@ The global server connection is cached in `~/.feanorfs/global.json`:
 }
 ```
 
-Files matching `.gitignore` patterns are automatically excluded from sync. The `.feanorfs/` and `.git/` directories are always skipped.
+All files in the workspace directory are synced, including hidden files and files that would be ignored by `.gitignore`. The `.feanorfs/` and `.git/` directories are always skipped.
 
 ## Development
 

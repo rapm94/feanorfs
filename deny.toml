@@ -32,11 +32,11 @@ wildcards = "warn"
 highlight = "all"
 
 [advisories]
-# Fail on security advisories with severity >= medium
-vulnerability = "deny"
-unmaintained = "warn"
+# cargo-deny 0.19+: vulnerability advisories always fail unless ignored.
+# unmaintained scope: all | workspace | transitive | none
+# (0.19 removed severity levels like "warn"; workspace flags direct deps only)
+unmaintained = "workspace"
 yanked = "deny"
-notice = "warn"
 
 [sources]
 # Only allow crates from crates.io by default

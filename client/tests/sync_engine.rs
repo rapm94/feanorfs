@@ -190,3 +190,226 @@ async fn agent_commit_detects_concurrent_edit() {
     assert!(commit.conflicts[0].theirs.is_some());
     assert!(commit.our_changes.is_empty());
 }
+
+#[tokio::test]
+async fn sync_detects_concurrent_workspace_edit_without_silent_overwrite() {
+    use feanorfs_client::commands::conflicts_pending;
+
+    let server = spawn_test_server().await;
+    let client_a = spawn_test_client().await;
+    let client_b = spawn_test_client().await;
+    let base_a = client_a.workspace.path();
+
+    write_workspace_file(base_a, "notes.txt", b"base").await;
+    do_push_only(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+
+    do_sync(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &client_b.db,
+        client_b.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    write_workspace_file(base_a, "notes.txt", b"offline edit A").await;
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    write_workspace_file(client_b.workspace.path(), "notes.txt", b"offline edit B").await;
+    do_sync(
+        &server.api,
+        &client_b.db,
+        client_b.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    do_sync(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        read_workspace_file(base_a, "notes.txt").await,
+        b"offline edit A"
+    );
+    assert!(conflicts_pending(base_a));
+}
+
+#[tokio::test]
+async fn concurrent_delete_is_not_a_workspace_conflict() {
+    use feanorfs_client::commands::conflicts_pending;
+
+    let server = spawn_test_server().await;
+    let client_a = spawn_test_client().await;
+    let client_b = spawn_test_client().await;
+    let base_a = client_a.workspace.path();
+    let base_b = client_b.workspace.path();
+
+    write_workspace_file(base_a, "gone.txt", b"bye").await;
+    do_push_only(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &client_b.db,
+        base_b,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    tokio::fs::remove_file(base_a.join("gone.txt"))
+        .await
+        .unwrap();
+    tokio::fs::remove_file(base_b.join("gone.txt"))
+        .await
+        .unwrap();
+
+    do_sync(
+        &server.api,
+        &client_b.db,
+        base_b,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(!conflicts_pending(base_a));
+    assert!(!base_a.join("gone.txt").exists());
+}
+
+#[tokio::test]
+async fn sync_removes_stale_conflict_dirs_from_prior_sessions() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client().await;
+    let base = client.workspace.path();
+
+    write_workspace_file(base, "ok.txt", b"ok").await;
+    do_push_only(
+        &server.api,
+        &client.db,
+        base,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+
+    let stale = base.join(".feanorfs/conflicts/1_sync");
+    tokio::fs::create_dir_all(&stale).await.unwrap();
+
+    do_sync(
+        &server.api,
+        &client.db,
+        base,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(!stale.exists());
+}
+
+#[tokio::test]
+async fn gitignored_file_is_synced() {
+    let server = spawn_test_server().await;
+    let uploader = spawn_test_client().await;
+    let base = uploader.workspace.path();
+
+    write_workspace_file(base, ".gitignore", b"secret.env\n").await;
+    write_workspace_file(base, "secret.env", b"SUPER_SECRET=1").await;
+
+    let result = do_push_only(
+        &server.api,
+        &uploader.db,
+        base,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.uploads, 2,
+        "both .gitignore and secret.env must upload"
+    );
+
+    let downloader = spawn_test_client().await;
+    do_pull_only(
+        &server.api,
+        &downloader.db,
+        downloader.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        read_workspace_file(downloader.workspace.path(), "secret.env").await,
+        b"SUPER_SECRET=1",
+        "git-ignored file must arrive on the other side"
+    );
+}

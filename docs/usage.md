@@ -358,7 +358,7 @@ feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
 | `commit` | Diff the agent workspace against its base snapshot. Detects concurrent edits (base/ours/theirs) and writes conflict files under `.feanorfs/conflicts/`. FeanorFS does **not** merge — reconcile conflicts yourself, then sync. |
 | `list` | List agent workspaces with active snapshots. |
 | `clean` | Remove an agent workspace and its snapshot rows. |
-| `run` | Execute a command with the agent directory as the working directory (Level 1 sandbox). |
+| `run` | Execute a command with the agent directory as the working directory (cwd-scoped, not a kernel-level sandbox). |
 
 Agent names must be simple identifiers (no `/`, `\`, `.`, or `..`).
 
@@ -415,11 +415,11 @@ feanorfs status
 #     [download]   README.md (2.3 KB)
 ```
 
-## Ignored files
+## Synced files
 
-FeanorFS respects `.gitignore` patterns via the `ignore` crate. Files matching ignore patterns are excluded from sync.
+FeanorFS syncs all files in the workspace directory. `.gitignore` is **not** honored — FeanorFS is not Git, and ignoring files based on Git's notion of what's untracked would silently drop files you may want on your other machine (`.env.local`, build configs, etc.).
 
-The following directories are **always skipped** regardless of `.gitignore`:
+The following directories are **always skipped**:
 - `.feanorfs/` — client state (config, cache DB)
 - `.git/` — Git repository metadata
 

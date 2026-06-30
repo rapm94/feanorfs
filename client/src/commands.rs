@@ -1,9 +1,11 @@
+use crate::agent::conflicts_dir;
 use crate::api::ApiClient;
+use crate::fs_util::atomic_write;
 use crate::local::{CacheEntry, ClientDb};
 use anyhow::Result;
-use feanorfs_common::{FileState, SyncResponse};
+use feanorfs_common::{ConcurrentEdit, FileState, SyncRequest, SyncResponse};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tokio::fs;
 
@@ -63,19 +65,6 @@ pub fn derive_mirror_state(base_path: &Path, response: Option<&SyncResponse>) ->
     }
 }
 
-async fn mirror_state_after_sync(
-    api: &ApiClient,
-    db: &ClientDb,
-    base_path: &Path,
-    workspace_id: &str,
-    password: Option<&str>,
-) -> MirrorState {
-    match do_status(api, db, base_path, workspace_id, password).await {
-        Ok(s) => s.mirror_state,
-        Err(_) => MirrorState::Error,
-    }
-}
-
 pub(crate) fn password_or_default(password: Option<&str>) -> &str {
     match password {
         Some(p) => p,
@@ -87,6 +76,298 @@ pub(crate) fn password_or_default(password: Option<&str>) -> &str {
             feanorfs_common::LEGACY_DEFAULT_PASSWORD
         }
     }
+}
+
+const LAST_SYNCED_KEY: &str = "last_synced_state";
+
+async fn load_last_synced(db: &ClientDb) -> Result<HashMap<String, FileState>> {
+    match db.get_session_key(LAST_SYNCED_KEY).await? {
+        Some(s) => match serde_json::from_str(&s) {
+            Ok(map) => Ok(map),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse {LAST_SYNCED_KEY} session state: {e}. Treating as empty."
+                );
+                Ok(HashMap::new())
+            }
+        },
+        None => Ok(HashMap::new()),
+    }
+}
+
+async fn commit_last_synced(db: &ClientDb, states: &HashMap<String, FileState>) -> Result<()> {
+    let serialized = serde_json::to_string(states)?;
+    db.set_session_key(LAST_SYNCED_KEY, &serialized).await?;
+    Ok(())
+}
+
+async fn finalize_last_synced(
+    db: &ClientDb,
+    current_files: &HashMap<String, FileState>,
+    conflict_paths: &HashSet<String>,
+) -> Result<()> {
+    let mut last = load_last_synced(db).await?;
+    for (path, file) in current_files {
+        if !conflict_paths.contains(path) {
+            last.insert(path.clone(), file.clone());
+        }
+    }
+    commit_last_synced(db, &last).await
+}
+
+/// Conflict dirs are named `{millis}_sync`. After a successful sync pass, remove
+/// dirs from earlier sessions so resolved conflicts do not pin `mirror_state`
+/// to `conflict` forever.
+fn cleanup_stale_conflict_dirs(base_path: &Path, sync_started_at_ms: i64) -> Result<()> {
+    let root = conflicts_dir(base_path);
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Some(ts_str) = name_str.strip_suffix("_sync") else {
+            continue;
+        };
+        let Ok(ts) = ts_str.parse::<i64>() else {
+            continue;
+        };
+        if ts < sync_started_at_ms {
+            tracing::info!("Removing resolved conflict dir {}", name_str);
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn mirror_state_after_apply(
+    base_path: &Path,
+    conflict_paths: &HashSet<String>,
+    remote_still_pending: bool,
+) -> MirrorState {
+    if !conflict_paths.is_empty() || conflicts_pending(base_path) {
+        MirrorState::Conflict
+    } else if remote_still_pending {
+        MirrorState::OutOfSync
+    } else {
+        MirrorState::Idle
+    }
+}
+
+async fn finish_sync_pass(
+    db: &ClientDb,
+    base_path: &Path,
+    password: Option<&str>,
+    local_files: &HashMap<String, FileState>,
+    conflict_paths: &HashSet<String>,
+    sync_started_at_ms: i64,
+    disk_mutated: bool,
+) -> Result<()> {
+    let current_files = if disk_mutated {
+        crate::local::scan_local_directory(base_path, db, password).await?
+    } else {
+        local_files.clone()
+    };
+    finalize_last_synced(db, &current_files, conflict_paths).await?;
+    cleanup_stale_conflict_dirs(base_path, sync_started_at_ms)?;
+    Ok(())
+}
+
+/// Three-way concurrent-edit detection for workspace sync, mirroring `agent commit`.
+/// Uses `last_synced_state` as the base and a second `/api/sync/diff` round-trip
+/// with that snapshot to learn what changed on the server since we last agreed.
+///
+/// Known limitation: paths absent from `last_synced_state` (concurrent offline
+/// creates of the same new file) are not detected here — the dumb diff protocol
+/// cannot surface both upload and download for one path in a single round-trip.
+async fn detect_workspace_conflicts(
+    api: &ApiClient,
+    workspace_id: &str,
+    last_synced: &HashMap<String, FileState>,
+    local_files: &HashMap<String, FileState>,
+    response: &SyncResponse,
+) -> Result<Vec<ConcurrentEdit>> {
+    if last_synced.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let base_request = SyncRequest {
+        workspace_id: workspace_id.to_string(),
+        files: last_synced.values().cloned().collect(),
+    };
+    let base_response = api.negotiate_sync(&base_request).await?;
+    let their_changed: HashMap<String, FileState> = base_response
+        .download_required
+        .into_iter()
+        .map(|f| (f.path.clone(), f))
+        .collect();
+    let their_deleted: HashSet<String> = base_response.delete_local.into_iter().collect();
+
+    let mut conflicts = Vec::new();
+    let mut seen = HashSet::new();
+
+    let candidate_paths: Vec<String> = response
+        .download_required
+        .iter()
+        .map(|f| f.path.clone())
+        .chain(response.upload_required.iter().cloned())
+        .collect();
+
+    for path in candidate_paths {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Some(base) = last_synced.get(&path) else {
+            continue;
+        };
+        let ours = local_files.get(&path);
+        let we_changed = ours
+            .map(|o| o.hash != base.hash || o.deleted != base.deleted)
+            .unwrap_or(false);
+        if !we_changed {
+            continue;
+        }
+        let server_changed = their_changed.contains_key(&path) || their_deleted.contains(&path);
+        if !server_changed {
+            continue;
+        }
+
+        // Both sides deleted the same path since last agree — not a conflict.
+        if their_deleted.contains(&path) && ours.is_some_and(|o| o.deleted) {
+            continue;
+        }
+
+        let theirs = their_changed.get(&path).cloned().or_else(|| {
+            if their_deleted.contains(&path) {
+                Some(FileState {
+                    path: path.clone(),
+                    hash: String::new(),
+                    size: 0,
+                    mtime: 0,
+                    deleted: true,
+                })
+            } else {
+                None
+            }
+        });
+
+        conflicts.push(ConcurrentEdit {
+            path,
+            base: Some(base.clone()),
+            ours: ours.cloned(),
+            theirs,
+        });
+    }
+
+    Ok(conflicts)
+}
+
+async fn write_workspace_conflict_files(
+    base: &Path,
+    api: &ApiClient,
+    conflicts: &[ConcurrentEdit],
+    password: Option<&str>,
+) -> Result<()> {
+    let ts = chrono::Utc::now().timestamp_millis();
+    let dir = conflicts_dir(base).join(format!("{ts}_sync"));
+    fs::create_dir_all(&dir).await?;
+
+    let password_str = password_or_default(password);
+    for c in conflicts {
+        let base_dest = dir.join(format!("{}.base", c.path));
+        let ours_dest = dir.join(format!("{}.ours", c.path));
+        let theirs_dest = dir.join(format!("{}.theirs", c.path));
+        if let Some(parent) = base_dest.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        write_conflict_version(&base_dest, c.base.as_ref(), api, password_str, &c.path).await?;
+
+        if let Some(ref ours) = c.ours {
+            let workspace_file = base.join(&ours.path);
+            if workspace_file.exists() && !ours.deleted {
+                fs::copy(&workspace_file, &ours_dest).await?;
+            } else {
+                fs::write(&ours_dest, b"<deleted locally>\n").await?;
+            }
+        } else {
+            fs::write(&ours_dest, b"<no local changes>\n").await?;
+        }
+
+        write_conflict_version(&theirs_dest, c.theirs.as_ref(), api, password_str, &c.path).await?;
+    }
+    Ok(())
+}
+
+async fn write_conflict_version(
+    dest: &Path,
+    state: Option<&FileState>,
+    api: &ApiClient,
+    password: &str,
+    path: &str,
+) -> Result<()> {
+    match state {
+        Some(f) if f.deleted => {
+            fs::write(dest, b"<deleted>\n").await?;
+        }
+        Some(f) => {
+            let encrypted = api.download_file(&f.hash).await?;
+            let computed_hash = feanorfs_common::hash_bytes(&encrypted);
+            if computed_hash != f.hash {
+                let msg = format!(
+                    "<integrity check failed for blob {}: expected {}, computed {}>\n",
+                    f.hash, f.hash, computed_hash
+                );
+                fs::write(dest, msg).await?;
+                return Ok(());
+            }
+            let plain = feanorfs_common::crypt_bytes(&encrypted, password, path);
+            fs::write(dest, &plain).await?;
+        }
+        None => {
+            fs::write(dest, b"<missing>\n").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_workspace_conflicts(
+    api: &ApiClient,
+    workspace_id: &str,
+    db: &ClientDb,
+    base_path: &Path,
+    local_files: &HashMap<String, FileState>,
+    response: &mut SyncResponse,
+    password: Option<&str>,
+) -> Result<HashSet<String>> {
+    let last_synced = load_last_synced(db).await?;
+    let conflicts =
+        detect_workspace_conflicts(api, workspace_id, &last_synced, local_files, response).await?;
+    if conflicts.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    tracing::warn!(
+        "{} concurrent workspace edit conflict(s); wrote base/ours/theirs under .feanorfs/conflicts/",
+        conflicts.len()
+    );
+    for c in &conflicts {
+        tracing::warn!("  conflict: {}", c.path);
+    }
+    write_workspace_conflict_files(base_path, api, &conflicts, password).await?;
+
+    let conflict_paths: HashSet<String> = conflicts.iter().map(|c| c.path.clone()).collect();
+    response
+        .upload_required
+        .retain(|p| !conflict_paths.contains(p));
+    response
+        .download_required
+        .retain(|f| !conflict_paths.contains(&f.path));
+    Ok(conflict_paths)
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -124,7 +405,7 @@ pub struct HydrateResult {
 
 #[derive(Debug, Serialize)]
 pub struct CatResult {
-    pub content: String,
+    pub content: Vec<u8>,
     pub hydrated_first: bool,
     pub untracked: bool,
     pub not_found: bool,
@@ -158,7 +439,7 @@ async fn process_downloads(
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            fs::write(&full_path, b"").await?;
+            atomic_write(base_path, path, b"").await?;
 
             let cache_entry = CacheEntry {
                 path: path.clone(),
@@ -190,7 +471,7 @@ async fn process_downloads(
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            fs::write(&full_path, &plain_content).await?;
+            atomic_write(base_path, path, &plain_content).await?;
 
             let actual_mtime = fs::metadata(&full_path)
                 .await?
@@ -301,6 +582,7 @@ pub async fn do_push_only(
     password: Option<&str>,
 ) -> Result<PushResult> {
     tracing::info!("Push started");
+    let sync_started_at_ms = chrono::Utc::now().timestamp_millis();
     let local_files = crate::local::scan_local_directory(base_path, db, password).await?;
     tracing::debug!("Scanned {} entries", local_files.len());
 
@@ -310,7 +592,7 @@ pub async fn do_push_only(
         files: files_vec,
     };
 
-    let response = api.negotiate_sync(&request).await?;
+    let mut response = api.negotiate_sync(&request).await?;
     tracing::debug!(
         "Diff: upload={}, download={}, delete_local={}",
         response.upload_required.len(),
@@ -319,6 +601,17 @@ pub async fn do_push_only(
     );
 
     let password_str = password_or_default(password);
+
+    let conflict_paths = resolve_workspace_conflicts(
+        api,
+        workspace_id,
+        db,
+        base_path,
+        &local_files,
+        &mut response,
+        password,
+    )
+    .await?;
 
     let mut result = PushResult::default();
     result.uploads = process_uploads(
@@ -341,7 +634,19 @@ pub async fn do_push_only(
         result.uploads,
         result.deletes
     );
-    result.mirror_state = mirror_state_after_sync(api, db, base_path, workspace_id, password).await;
+    let disk_mutated = result.uploads > 0 || result.deletes > 0;
+    finish_sync_pass(
+        db,
+        base_path,
+        password,
+        &local_files,
+        &conflict_paths,
+        sync_started_at_ms,
+        disk_mutated,
+    )
+    .await?;
+    result.mirror_state =
+        mirror_state_after_apply(base_path, &conflict_paths, result.remote_updates_available);
     Ok(result)
 }
 
@@ -354,6 +659,7 @@ pub async fn do_pull_only(
     lazy: bool,
 ) -> Result<PullResult> {
     tracing::info!("Pull started (lazy={})", lazy);
+    let sync_started_at_ms = chrono::Utc::now().timestamp_millis();
     let local_files = crate::local::scan_local_directory(base_path, db, password).await?;
 
     let files_vec: Vec<FileState> = local_files.values().cloned().collect();
@@ -362,9 +668,20 @@ pub async fn do_pull_only(
         files: files_vec,
     };
 
-    let response = api.negotiate_sync(&request).await?;
+    let mut response = api.negotiate_sync(&request).await?;
 
     let password_str = password_or_default(password);
+
+    let conflict_paths = resolve_workspace_conflicts(
+        api,
+        workspace_id,
+        db,
+        base_path,
+        &local_files,
+        &mut response,
+        password,
+    )
+    .await?;
 
     let mut result = PullResult::default();
     let (downloads, placeholders) =
@@ -380,7 +697,18 @@ pub async fn do_pull_only(
         result.placeholders,
         result.deletes
     );
-    result.mirror_state = mirror_state_after_sync(api, db, base_path, workspace_id, password).await;
+    let disk_mutated = result.downloads > 0 || result.placeholders > 0 || result.deletes > 0;
+    finish_sync_pass(
+        db,
+        base_path,
+        password,
+        &local_files,
+        &conflict_paths,
+        sync_started_at_ms,
+        disk_mutated,
+    )
+    .await?;
+    result.mirror_state = mirror_state_after_apply(base_path, &conflict_paths, false);
     Ok(result)
 }
 
@@ -393,6 +721,7 @@ pub async fn do_sync(
     lazy: bool,
 ) -> Result<SyncResult> {
     tracing::info!("Sync started (lazy={})", lazy);
+    let sync_started_at_ms = chrono::Utc::now().timestamp_millis();
     let local_files = crate::local::scan_local_directory(base_path, db, password).await?;
 
     let files_vec: Vec<FileState> = local_files.values().cloned().collect();
@@ -401,9 +730,20 @@ pub async fn do_sync(
         files: files_vec,
     };
 
-    let response = api.negotiate_sync(&request).await?;
+    let mut response = api.negotiate_sync(&request).await?;
 
     let password_str = password_or_default(password);
+
+    let conflict_paths = resolve_workspace_conflicts(
+        api,
+        workspace_id,
+        db,
+        base_path,
+        &local_files,
+        &mut response,
+        password,
+    )
+    .await?;
 
     let mut result = SyncResult::default();
     let (downloads, placeholders) =
@@ -431,7 +771,22 @@ pub async fn do_sync(
         result.deletes_local,
         result.deletes_remote
     );
-    result.mirror_state = mirror_state_after_sync(api, db, base_path, workspace_id, password).await;
+    let disk_mutated = result.uploads > 0
+        || result.downloads > 0
+        || result.placeholders > 0
+        || result.deletes_local > 0
+        || result.deletes_remote > 0;
+    finish_sync_pass(
+        db,
+        base_path,
+        password,
+        &local_files,
+        &conflict_paths,
+        sync_started_at_ms,
+        disk_mutated,
+    )
+    .await?;
+    result.mirror_state = mirror_state_after_apply(base_path, &conflict_paths, false);
     Ok(result)
 }
 
@@ -475,7 +830,7 @@ pub async fn do_hydrate(
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            fs::write(&full_path, &plain_content).await?;
+            atomic_write(base_path, &path, &plain_content).await?;
 
             let actual_mtime = fs::metadata(&full_path)
                 .await?
@@ -549,14 +904,14 @@ pub async fn do_cat(
     let full_path = base_path.join(target_path);
     if !full_path.exists() {
         return Ok(CatResult {
-            content: String::new(),
+            content: Vec::new(),
             hydrated_first,
             untracked,
             not_found: true,
         });
     }
 
-    let content = fs::read_to_string(full_path).await?;
+    let content = fs::read(full_path).await?;
     Ok(CatResult {
         content,
         hydrated_first,
@@ -639,5 +994,25 @@ mod mirror_state_tests {
     fn conflicts_dir_absent_is_not_pending() {
         let base = Path::new("/tmp/feanorfs-nonexistent-conflicts-test");
         assert!(!conflicts_pending(base));
+    }
+
+    #[test]
+    fn apply_mirror_idle_when_clean() {
+        let base = Path::new("/tmp/unused");
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(
+            super::mirror_state_after_apply(base, &empty, false),
+            MirrorState::Idle
+        );
+    }
+
+    #[test]
+    fn apply_mirror_out_of_sync_when_remote_pending() {
+        let base = Path::new("/tmp/unused");
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(
+            super::mirror_state_after_apply(base, &empty, true),
+            MirrorState::OutOfSync
+        );
     }
 }
