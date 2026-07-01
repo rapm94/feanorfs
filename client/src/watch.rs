@@ -5,9 +5,8 @@ use anyhow::Result;
 use feanorfs_common::normalize_path;
 use notify::Watcher;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Returns true when a filesystem notification should trigger a sync round.
-/// Skips `.feanorfs` and `.git` control directories.
 pub(crate) fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
     for path in paths {
         let Some(path_str) = path.to_str() else {
@@ -23,6 +22,17 @@ pub(crate) fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
         }
     }
     false
+}
+
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(45);
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+fn backoff_duration(consecutive_errors: u32) -> Duration {
+    if consecutive_errors == 0 {
+        return Duration::ZERO;
+    }
+    let secs = 5u64.saturating_mul(1u64 << consecutive_errors.min(6));
+    Duration::from_secs(secs).min(MAX_BACKOFF)
 }
 
 pub async fn run_watch(
@@ -50,31 +60,78 @@ pub async fn run_watch(
     watcher.watch(current_dir, notify::RecursiveMode::Recursive)?;
     println!("Watching for changes... (Press Ctrl+C to stop)");
 
-    tracing::info!("Initial sync");
+    let mut consecutive_errors = 0u32;
+    let mut poll = tokio::time::interval(IDLE_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     println!("Performing initial sync...");
-    match do_sync(api, db, current_dir, workspace_id, password, false).await {
-        Ok(result) => print_sync_result(&result),
-        Err(e) => {
-            tracing::error!("Initial sync failed: {:?}", e);
-            eprintln!("Initial sync failed: {:?}", e);
-        }
+    if let Err(e) = sync_once(
+        api,
+        db,
+        current_dir,
+        workspace_id,
+        password,
+        "initial sync",
+        false,
+    )
+    .await
+    {
+        consecutive_errors = consecutive_errors.saturating_add(1);
+        tracing::error!("Initial sync failed: {:?}", e);
+        eprintln!("Initial sync failed: {:?}", e);
     }
 
     loop {
-        if rx.recv().await.is_none() {
-            break;
-        }
+        let backoff = backoff_duration(consecutive_errors);
+        tokio::select! {
+            maybe = rx.recv() => {
+                if maybe.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                while rx.try_recv().is_ok() {}
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        while rx.try_recv().is_ok() {}
+                if backoff > Duration::ZERO {
+                    continue;
+                }
 
-        tracing::info!("Change detected, syncing");
-        println!("Changes detected! Syncing...");
-        match do_sync(api, db, current_dir, workspace_id, password, false).await {
-            Ok(result) => print_sync_result(&result),
-            Err(e) => {
-                tracing::error!("Auto-sync failed: {:?}", e);
-                eprintln!("Auto-sync failed: {:?}", e);
+                match sync_once(
+                    api,
+                    db,
+                    current_dir,
+                    workspace_id,
+                    password,
+                    "Changes detected! Syncing",
+                    true,
+                )
+                .await
+                {
+                    Ok(()) => consecutive_errors = 0,
+                    Err(e) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        tracing::error!("Auto-sync failed: {:?}", e);
+                        eprintln!("Auto-sync failed: {:?}", e);
+                    }
+                }
+            }
+            _ = poll.tick() => {
+                if backoff > Duration::ZERO {
+                    continue;
+                }
+                if let Err(e) = sync_once(
+                    api,
+                    db,
+                    current_dir,
+                    workspace_id,
+                    password,
+                    "Periodic sync",
+                    true,
+                )
+                .await
+                {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    tracing::error!("Periodic sync failed: {:?}", e);
+                }
             }
         }
     }
@@ -82,7 +139,20 @@ pub async fn run_watch(
     Ok(())
 }
 
-fn print_sync_result(result: &crate::commands::SyncResult) {
+async fn sync_once(
+    api: &ApiClient,
+    db: &ClientDb,
+    current_dir: &Path,
+    workspace_id: &str,
+    password: Option<&str>,
+    label: &str,
+    announce: bool,
+) -> Result<()> {
+    tracing::info!("{label}");
+    if announce {
+        println!("{label}...");
+    }
+    let result = do_sync(api, db, current_dir, workspace_id, password, false).await?;
     println!(
         "Sync complete. Uploaded {}, Downloaded {} (lazy: {}), Local Deletes {}, Remote Deletes {}.",
         result.uploads,
@@ -91,12 +161,14 @@ fn print_sync_result(result: &crate::commands::SyncResult) {
         result.deletes_local,
         result.deletes_remote
     );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::event_paths_warrant_sync;
+    use super::{backoff_duration, event_paths_warrant_sync};
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn sync_worthy_for_workspace_file() {
@@ -123,5 +195,12 @@ mod tests {
         assert!(!event_paths_warrant_sync(&[PathBuf::from(
             "/workspace/src/.git/config"
         )]));
+    }
+
+    #[test]
+    fn backoff_grows_with_errors() {
+        assert_eq!(backoff_duration(0), Duration::ZERO);
+        assert_eq!(backoff_duration(1), Duration::from_secs(10));
+        assert!(backoff_duration(10) <= Duration::from_secs(300));
     }
 }

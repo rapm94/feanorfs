@@ -1,3 +1,9 @@
+pub mod sync_delta;
+pub mod three_way;
+
+pub use sync_delta::compute_sync_delta;
+pub use three_way::{classify_conflict_kind, conflict_candidate_paths, detect_concurrent_edits};
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -31,6 +37,44 @@ pub struct FileState {
 pub struct SyncRequest {
     pub workspace_id: String,
     pub files: Vec<FileState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictKind {
+    EditEdit,
+    EditDelete,
+    DeleteEdit,
+}
+
+impl ConflictKind {
+    #[must_use]
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "edit_edit" => Self::EditEdit,
+            "edit_delete" => Self::EditDelete,
+            "delete_edit" => Self::DeleteEdit,
+            _ => Self::EditEdit,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::EditEdit => "edit_edit",
+            Self::EditDelete => "edit_delete",
+            Self::DeleteEdit => "delete_edit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictRecord {
+    pub path: String,
+    pub kind: ConflictKind,
+    pub conflict_dir: String,
+    pub opened_at: i64,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +145,40 @@ pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+/// Returns true when `path` is a safe workspace-relative path.
+#[must_use]
+pub fn is_safe_rel_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let normalized = normalize_path(path);
+    if normalized.starts_with('/') || normalized.contains("..") {
+        return false;
+    }
+    if normalized == ".feanorfs"
+        || normalized == ".git"
+        || normalized.starts_with(".feanorfs/")
+        || normalized.starts_with(".git/")
+        || normalized.contains("/.git/")
+        || normalized.contains("/.feanorfs/")
+    {
+        return false;
+    }
+    true
+}
+
+pub const AEAD_PREFIX_BYTE: u8 = 1;
+
+fn derive_crypto_key(password: &str, path: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"feanorfs-aead-v1");
+    hasher.update(&(password.len() as u64).to_le_bytes());
+    hasher.update(password.as_bytes());
+    hasher.update(&(path.len() as u64).to_le_bytes());
+    hasher.update(path.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 /// Encrypts or decrypts bytes using a symmetric keystream derived from a password and path via Blake3 XOF.
 /// Because XOR is symmetric, calling this twice with the same password and path returns the original data.
 ///
@@ -130,6 +208,48 @@ pub fn crypt_bytes(data: &[u8], password: &str, path: &str) -> Vec<u8> {
         offset += n;
     }
     result
+}
+
+/// Encrypts plaintext for upload (ChaCha20-Poly1305).
+pub fn pack_bytes(data: &[u8], password: &str, path: &str) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+
+    let key = derive_crypto_key(password, path);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
+    let mut nonce_hasher = blake3::Hasher::new();
+    nonce_hasher.update(b"feanorfs-aead-nonce-v1");
+    nonce_hasher.update(&key);
+    nonce_hasher.update(&(data.len() as u64).to_le_bytes());
+    nonce_hasher.update(data);
+    let digest = nonce_hasher.finalize();
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&digest.as_bytes()[..12]);
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), data)
+        .map_err(|e| anyhow::anyhow!("AEAD encrypt failed: {e}"))?;
+    let mut out = Vec::with_capacity(1 + 12 + ciphertext.len());
+    out.push(AEAD_PREFIX_BYTE);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Decrypts packed blob (ChaCha20-Poly1305 or legacy XOR).
+pub fn unpack_bytes(data: &[u8], password: &str, path: &str) -> Result<Vec<u8>> {
+    if data.first() == Some(&AEAD_PREFIX_BYTE) && data.len() > 13 {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+
+        let key = derive_crypto_key(password, path);
+        let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
+        let nonce = Nonce::from_slice(&data[1..13]);
+        let plain = cipher.decrypt(nonce, &data[13..]).map_err(|_| {
+            anyhow::anyhow!("decryption failed (wrong encryption key or corrupt blob)")
+        })?;
+        return Ok(plain);
+    }
+    Ok(crypt_bytes(data, password, path))
 }
 
 /// Returns true if `hash` is a valid Blake3 hex digest (64 lowercase hex chars).
@@ -354,6 +474,30 @@ mod tests {
         assert!(!is_valid_hash(".."));
         assert!(!is_valid_hash("../../db.sqlite"));
         assert!(!is_valid_hash(""));
+    }
+
+    #[test]
+    fn pack_unpack_roundtrip() {
+        let plain = b"hello aead world";
+        let packed = pack_bytes(plain, "pw", "path/file.txt").unwrap();
+        assert_eq!(packed.first(), Some(&AEAD_PREFIX_BYTE));
+        let recovered = unpack_bytes(&packed, "pw", "path/file.txt").unwrap();
+        assert_eq!(recovered, plain);
+    }
+
+    #[test]
+    fn unpack_legacy_xor_still_works() {
+        let plain = b"legacy blob";
+        let xored = crypt_bytes(plain, "pw", "legacy.txt");
+        let recovered = unpack_bytes(&xored, "pw", "legacy.txt").unwrap();
+        assert_eq!(recovered, plain);
+    }
+
+    #[test]
+    fn pack_bytes_different_paths_differ() {
+        let a = pack_bytes(b"x", "pw", "a.txt").unwrap();
+        let b = pack_bytes(b"x", "pw", "b.txt").unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]

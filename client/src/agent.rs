@@ -1,10 +1,12 @@
 use crate::api::ApiClient;
+use crate::conflict_artifacts::write_conflict_triple;
 use crate::local::ClientDb;
 use anyhow::{bail, Result};
 use feanorfs_common::{
-    normalize_path, AgentCommitResult, AgentSnapshotEntry, ConcurrentEdit, FileState, SyncRequest,
+    conflict_candidate_paths, detect_concurrent_edits, normalize_path, pack_bytes,
+    AgentCommitResult, AgentSnapshotEntry, ConcurrentEdit, FileState, SyncRequest,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -33,8 +35,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Snapshot `base` into `.feanorfs/agents/<name>/` using hardlinks (CoW via
-/// atomic rename on edit); falls back to copy when hardlinks are unavailable.
+/// Snapshot `base` into `.feanorfs/agents/<name>/` by copying files.
 /// Each tracked path records the server's current hash+mtime+size into
 /// `agent_snapshots`, which is the base `commit` diffs against later.
 pub async fn spawn_agent(
@@ -58,7 +59,7 @@ pub async fn spawn_agent(
     let cached = db.get_cache_entries().await?;
     let password_str = password.unwrap_or(feanorfs_common::LEGACY_DEFAULT_PASSWORD);
 
-    let mut linked = 0usize;
+    let mut copied = 0usize;
     let mut snapshot_entries = Vec::new();
 
     for result in ignore::WalkBuilder::new(base)
@@ -81,13 +82,7 @@ pub async fn spawn_agent(
             continue;
         };
         let normalized = normalize_path(rel_str);
-        if normalized == ".feanorfs"
-            || normalized == ".git"
-            || normalized.starts_with(".feanorfs/")
-            || normalized.starts_with(".git/")
-            || normalized.contains("/.git/")
-            || normalized.contains("/.feanorfs/")
-        {
+        if !feanorfs_common::is_safe_rel_path(&normalized) {
             continue;
         }
 
@@ -96,23 +91,15 @@ pub async fn spawn_agent(
             fs::create_dir_all(parent).await?;
         }
 
-        if let Err(e) = std::fs::hard_link(abs, &dest) {
-            tracing::debug!(
-                error = %e,
-                src = %abs.display(),
-                dest = %dest.display(),
-                "hard_link failed, falling back to copy"
-            );
-            fs::copy(abs, &dest).await?;
-        }
-        linked += 1;
+        fs::copy(abs, &dest).await?;
+        copied += 1;
 
         let cache_row = cached.get(&normalized);
         let (base_hash, base_size, base_mtime) = match cache_row {
             Some(c) => (c.encrypted_hash.clone(), c.size, c.server_mtime),
             None => {
                 let bytes = std::fs::read(abs)?;
-                let enc = feanorfs_common::crypt_bytes(&bytes, password_str, &normalized);
+                let enc = pack_bytes(&bytes, password_str, &normalized)?;
                 let eh = feanorfs_common::hash_bytes(&enc);
                 (eh, bytes.len() as u64, 0)
             }
@@ -131,18 +118,13 @@ pub async fn spawn_agent(
         return Err(e);
     }
 
-    Ok(linked)
+    Ok(copied)
 }
 
 /// Diff agent workspace against base snapshot, split into clean-our /
 /// clean-their / concurrent-edit buckets. Conflicts are written under
 /// `.feanorfs/conflicts/<ts>_<name>/` as `path.base`, `path.ours`,
 /// `path.theirs`.
-///
-/// To learn "what changed on the server since spawn", we send the base
-/// snapshot as the client view to `/api/sync/diff`. The server then sees
-/// every current-vs-base difference as a download (their change) — reusing
-/// the existing read-only diff endpoint without adding a new one.
 pub async fn commit_agent(
     base: &Path,
     db: &ClientDb,
@@ -169,98 +151,131 @@ pub async fn commit_agent(
         );
     }
 
-    let base_map: HashMap<String, &AgentSnapshotEntry> =
-        snapshot.iter().map(|e| (e.path.clone(), e)).collect();
-
-    let base_request_files: Vec<FileState> = snapshot
+    let base_map: HashMap<String, FileState> = snapshot
         .iter()
-        .map(|e| FileState {
-            path: e.path.clone(),
-            hash: e.base_hash.clone(),
-            size: e.base_size,
-            mtime: e.base_mtime,
-            deleted: false,
+        .map(|e| {
+            (
+                e.path.clone(),
+                FileState {
+                    path: e.path.clone(),
+                    hash: e.base_hash.clone(),
+                    size: e.base_size,
+                    mtime: e.base_mtime,
+                    deleted: false,
+                },
+            )
         })
         .collect();
+
     let request = SyncRequest {
         workspace_id: workspace_id.to_string(),
-        files: base_request_files,
+        files: base_map.values().cloned().collect(),
     };
-    let response = api.negotiate_sync(&request).await?;
+    let response = api.peek_sync(&request).await?;
 
     let their_changed: HashMap<String, FileState> = response
         .download_required
         .into_iter()
         .map(|f| (f.path.clone(), f))
         .collect();
-    let their_deleted: std::collections::HashSet<String> =
-        response.delete_local.into_iter().collect();
+    let their_deleted: HashSet<String> = response.delete_local.into_iter().collect();
 
-    let mut our_changed: Vec<FileState> = Vec::new();
     let agent_cache = ClientDb::new(agent_path.join(".feanorfs")).await?;
     let agent_scan =
         crate::local::scan_local_directory(&agent_path, &agent_cache, password).await?;
 
-    for (path, agent_file) in &agent_scan {
-        if let Some(base_entry) = base_map.get(path) {
-            if agent_file.hash != base_entry.base_hash {
-                our_changed.push(agent_file.clone());
-            }
+    let mut local_view = agent_scan.clone();
+    for (path, base) in &base_map {
+        if !agent_scan.contains_key(path) {
+            local_view.insert(
+                path.clone(),
+                FileState {
+                    path: path.clone(),
+                    hash: base.hash.clone(),
+                    size: base.size,
+                    mtime: base.mtime,
+                    deleted: true,
+                },
+            );
         }
     }
 
-    let mut conflicts = Vec::new();
-    let mut clean_our = Vec::new();
-    for ours in &our_changed {
-        if let Some(theirs) = their_changed.get(&ours.path) {
-            let Some(base_entry) = base_map.get(&ours.path) else {
-                anyhow::bail!(
-                    "internal: our_changed path '{}' is missing from base_map; \
-                     agent snapshot may be corrupt or partially committed",
-                    ours.path
-                );
-            };
-            let base_state = FileState {
-                path: ours.path.clone(),
-                hash: base_entry.base_hash.clone(),
-                size: base_entry.base_size,
-                mtime: base_entry.base_mtime,
-                deleted: false,
-            };
-            conflicts.push(ConcurrentEdit {
-                path: ours.path.clone(),
-                base: Some(base_state),
-                ours: Some(ours.clone()),
-                theirs: Some(theirs.clone()),
-            });
+    let mut our_changed_paths = HashSet::new();
+    for (path, agent_file) in &agent_scan {
+        if let Some(base_entry) = base_map.get(path) {
+            if agent_file.hash != base_entry.hash {
+                our_changed_paths.insert(path.clone());
+            }
         } else {
-            clean_our.push(ours.clone());
+            our_changed_paths.insert(path.clone());
+        }
+    }
+    for path in base_map.keys() {
+        if !agent_scan.contains_key(path) {
+            our_changed_paths.insert(path.clone());
+        }
+    }
+
+    let empty_pending = HashSet::new();
+    let empty_response = feanorfs_common::SyncResponse {
+        upload_required: our_changed_paths.iter().cloned().collect(),
+        download_required: Vec::new(),
+        delete_local: Vec::new(),
+    };
+    let candidates = conflict_candidate_paths(&empty_response, &empty_pending);
+    let conflict_edits: Vec<ConcurrentEdit> = detect_concurrent_edits(
+        &base_map,
+        &local_view,
+        &their_changed,
+        &their_deleted,
+        candidates,
+        &empty_pending,
+    )
+    .into_iter()
+    .map(|(edit, _)| edit)
+    .collect();
+
+    let conflict_paths: HashSet<String> = conflict_edits.iter().map(|c| c.path.clone()).collect();
+
+    let mut clean_our = Vec::new();
+    for path in &our_changed_paths {
+        if conflict_paths.contains(path) {
+            continue;
+        }
+        if let Some(f) = agent_scan.get(path) {
+            clean_our.push(f.clone());
+        } else if let Some(base) = base_map.get(path) {
+            clean_our.push(FileState {
+                path: path.clone(),
+                hash: base.hash.clone(),
+                size: base.size,
+                mtime: base.mtime,
+                deleted: true,
+            });
         }
     }
 
     let mut clean_their = Vec::new();
     for (path, theirs) in &their_changed {
-        if their_deleted.contains(path) {
+        if their_deleted.contains(path) || our_changed_paths.contains(path) {
             continue;
         }
-        if !our_changed.iter().any(|f| f.path == *path) {
-            clean_their.push(theirs.clone());
-        }
+        clean_their.push(theirs.clone());
     }
 
-    if !conflicts.is_empty() {
-        write_conflict_files(base, api, name, &conflicts, password).await?;
+    if !conflict_edits.is_empty() {
+        write_agent_conflict_files(base, api, name, &conflict_edits, password).await?;
     }
 
     Ok(AgentCommitResult {
         agent_name: name.to_string(),
         our_changes: clean_our,
         their_changes: clean_their,
-        conflicts,
+        conflicts: conflict_edits,
     })
 }
 
-async fn write_conflict_files(
+async fn write_agent_conflict_files(
     base: &Path,
     api: &ApiClient,
     agent_name: &str,
@@ -268,70 +283,26 @@ async fn write_conflict_files(
     password: Option<&str>,
 ) -> Result<()> {
     let ts = chrono::Utc::now().timestamp_millis();
-    let dir = conflicts_dir(base).join(format!("{}_{}", ts, agent_name));
+    let dir = conflicts_dir(base).join(format!("{ts}_{agent_name}"));
     fs::create_dir_all(&dir).await?;
 
     let password_str = password.unwrap_or(feanorfs_common::LEGACY_DEFAULT_PASSWORD);
+    let agent_root = agent_dir(base, agent_name);
     for c in conflicts {
-        let base_dest = dir.join(format!("{}.base", c.path));
-        if let Some(parent) = base_dest.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let ours_dest = dir.join(format!("{}.ours", c.path));
-        let theirs_dest = dir.join(format!("{}.theirs", c.path));
-
-        write_version_file(&base_dest, c.base.as_ref(), api, password_str, &c.path).await?;
-
-        if let Some(ref o) = c.ours {
-            let agent_file = agent_dir(base, agent_name).join(&o.path);
-            if agent_file.exists() {
-                fs::copy(&agent_file, &ours_dest).await?;
-            } else {
-                fs::write(&ours_dest, b"<agent file missing>\n").await?;
-            }
-        } else {
-            fs::write(&ours_dest, b"<no agent changes>\n").await?;
-        }
-
-        write_version_file(&theirs_dest, c.theirs.as_ref(), api, password_str, &c.path).await?;
+        let ours_src = c.ours.as_ref().map(|o| agent_root.join(&o.path));
+        write_conflict_triple(
+            &dir,
+            c,
+            api,
+            password_str,
+            ours_src.as_deref(),
+            "no-agent-changes",
+        )
+        .await?;
     }
-    Ok(())
-}
 
-async fn write_version_file(
-    dest: &Path,
-    state: Option<&FileState>,
-    api: &ApiClient,
-    password: &str,
-    path: &str,
-) -> Result<()> {
-    match state {
-        Some(f) => {
-            let encrypted = api.download_file(&f.hash).await;
-            match encrypted {
-                Ok(bytes) => {
-                    let computed_hash = feanorfs_common::hash_bytes(&bytes);
-                    if computed_hash == f.hash {
-                        let plain = feanorfs_common::crypt_bytes(&bytes, password, path);
-                        fs::write(dest, &plain).await?;
-                    } else {
-                        let msg = format!(
-                            "<integrity check failed for blob {}: expected {}, computed {}>\n",
-                            f.hash, f.hash, computed_hash
-                        );
-                        fs::write(dest, msg).await?;
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("<could not fetch blob {}: {:?}>\n", f.hash, e);
-                    fs::write(dest, msg).await?;
-                }
-            }
-        }
-        None => {
-            fs::write(dest, b"<missing>\n").await?;
-        }
-    }
+    let paths: Vec<String> = conflicts.iter().map(|c| c.path.clone()).collect();
+    fs::write(dir.join("manifest.json"), serde_json::to_string(&paths)?).await?;
     Ok(())
 }
 

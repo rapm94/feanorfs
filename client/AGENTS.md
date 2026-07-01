@@ -9,10 +9,13 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
 - Crates: `feanorfs-client` produces binary `feanorfs` and library `feanorfs_client` (both defined in `client/Cargo.toml`).
 - Modules under `client/src/`:
   - `lib.rs` — public API re-export surface. Add new public functions here; downstream Rust consumers depend on this list.
-  - `api.rs` — HTTP request wrappers. Wraps `/api/sync/diff`, `/api/upload`, `/api/download/:hash`, `/api/workspaces`. Adds Bearer auth when configured. Surfaces 401 with a friendly "run `feanorfs connect ... --password PASS`" hint.
-  - `commands.rs` — sync/push/pull/hydrate/cat/status. Returns `Serialize`-derived structs. No `println!` — all UI lives in `main.rs`. `process_uploads` MUST mirror the uploaded mtime into `local_cache.server_mtime` via `ClientDb::set_cache_server_mtime` to avoid re-download churn on the next diff.
-  - `local.rs` — `Config`, `GlobalConfig`, `CacheEntry`, `ClientDb` (SQLite schema + CRUD), `scan_local_directory` (the directory walker). Walks ALL files; does NOT honor `.gitignore`. Skips `.feanorfs`, `.git`, and any path containing `/.git/` or `/.feanorfs/`.
-  - `agent.rs` — workspace isolation: `spawn_agent` (CoW hardlink + fallback copy + per-file base snapshot), `commit_agent` (three-way concurrent-edit detection via `/api/sync/diff`), `write_conflict_files`, `list_agents`, `clean_agent`, `validate_name`. Conflicts are written under `.feanorfs/conflicts/<ts>_<name>/` as `<path>.base`, `<path>.ours`, `<path>.theirs`. FeanorFS does NOT merge — the consumer reconciles.
+  - `api.rs` — HTTP request wrappers. Wraps `/api/sync/peek` (alias `/api/sync/diff`), `/api/upload`, `/api/download/:hash`, `/api/workspaces`. Adds Bearer auth when configured.
+  - `commands.rs` — sync/push/pull/hydrate/cat/status via unified `run_sync_pass`. Returns `Serialize`-derived structs. No `println!` — UI in `main.rs` / `cli/`.
+  - `conflicts.rs` — workspace conflict detection, registry, and `resolve_conflict`. Uses `negotiate_sync_with_conflict_gate` before apply.
+  - `conflict_artifacts.rs` — shared base/ours/theirs file writer for agent and workspace conflicts (`<feanorfs-sentinel:` placeholders).
+  - `cli/` — CLI helpers (`util`, `agent`, `conflicts` command handlers). Keeps `main.rs` under 1k lines.
+  - `local.rs` — `Config`, `ClientDb` (includes `last_synced_files`, `conflict_registry`), `scan_local_directory`.
+  - `agent.rs` — workspace isolation via `feanorfs_common::detect_concurrent_edits`. Agent conflicts under `.feanorfs/conflicts/<ts>_<name>/`.
   - `predictive.rs` — `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 time-decay factor). Local-only; `file_access_log` never leaves the client.
   - `summary.rs` — `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD` default `feanorfs-llm`; falls back to plain listing). Zero-knowledge — never ships file contents to a remote LLM.
   - `watch.rs` — debounced (500 ms) filesystem watcher that drives `do_sync` on changes. The watcher path MUST be the workspace `current_dir`, never `"."`, so origin-agnostic invocations observe the correct directory.
@@ -23,10 +26,10 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
 - All paths stored in `local_cache.db` use forward slashes via `feanorfs_common::normalize_path`. Always normalize BEFORE any DB operation.
 - Avoid redundant hashing: check `local_cache.db` first and re-hash only if `mtime`/`size` differs from the cached entry. For unchanged placeholders (`hydrated=false`, `size==0`), reuse the cached hashes so the sync diff remains correct without downloading bytes.
 - Scanner does NOT honor `.gitignore`, `.ignore`, or global gitignore. All files are synced. If exclusion is needed in the future, add a `.feanorfsignore` or explicit denylist — do NOT re-enable gitignore inheritance silently.
-- Zero-knowledge: always `crypt_bytes` plaintext BEFORE calling `api.upload_file` and store the resulting `encrypted_hash` in the cache. On download, re-hash the ciphertext and compare to the expected `encrypted_hash` BEFORE decrypting — this is the active-server-tampering check that substitutes for AEAD until ChaCha20-Poly1305 lands.
+- Zero-knowledge: always `pack_bytes` plaintext BEFORE calling `api.upload_file` and store the resulting `encrypted_hash` in the cache. `unpack_bytes` handles ChaCha20-Poly1305 blobs and legacy XOR. On download, re-hash ciphertext before decrypting.
 - Result types are `Serialize`-derived. The `--json` CLI flag and `feanorfs_client::` library callers MUST see the same shape; do not add `println!` in `commands.rs` or `agent.rs` — keep UI in `main.rs` only.
-- `agent commit` reuses `/api/sync/diff` by sending the base snapshot as the "client view": every server-side change since spawn shows up as `download_required`. Do NOT add a new server endpoint for this.
-- `agent commit` writes three-way conflict files under `.feanorfs/conflicts/` and stops. A consumer (human or AI agent) reconciles. Never attempt to merge.
+- Workspace conflicts: `conflicts list|resolve`. Registry in `conflict_registry`; artifacts under `.feanorfs/conflicts/<ts>/` with `manifest.json`. Resolving one path removes only that path's artifacts; batch dir removed when last pending row clears.
+- `agent commit` uses `/api/sync/peek` with base snapshot as client view. FeanorFS does NOT merge — consumer reconciles.
 - Predictive hydration is local-only: `file_access_log` weights and access patterns stay in `.feanorfs/local_cache.db` and MUST NEVER be uploaded or shipped off-device.
 - When `--summarize` shells out, only paths and metadata cross the pipe. The E2EE password and file bytes stay local.
 

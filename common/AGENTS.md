@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Shared data models and Blake3 XOF encryption primitives used by both the server and client crates. Provides zero-I/O, zero-side-effect helpers: hashing, path normalization, domain-separated symmetric keystream, CSPRNG password generator, and the wire types (`FileState`, `SyncRequest`/`SyncResponse`, `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentCommitResult`) exchanged across the wire.
+Shared data models, sync delta (`compute_sync_delta`), three-way conflict classification (`detect_concurrent_edits`), and crypto (`pack_bytes`/`unpack_bytes` AEAD + legacy `crypt_bytes`) used by both server and client.
 
 ## Ownership
 
@@ -12,7 +12,9 @@ Shared data models and Blake3 XOF encryption primitives used by both the server 
 
 ## Local Contracts
 
-- `crypt_bytes(data, password, path)` is symmetric: encrypting twice with the same `(password, path)` returns the original. Callers MUST re-hash the ciphertext before decrypting to detect active-server-tampering; do not assume integrity from the keystream itself (XOF is not an AEAD).
+- `pack_bytes` / `unpack_bytes` — ChaCha20-Poly1305 for new blobs; `unpack_bytes` falls back to legacy `crypt_bytes` XOR.
+- `compute_sync_delta` — pure LWW read-only delta (used by server peek/diff handlers).
+- `detect_concurrent_edits` / `classify_conflict_kind` — shared three-way logic for agent and workspace conflicts.
 - Length-prefix domain separation before each XOF input field is mandatory — never concatenate without it. `(password="ab", path="cdef")` and `(password="abc", path="def")` MUST produce different keystreams.
 - `is_valid_hash(hash)` returns true iff `hash` is exactly 64 lowercase hex chars. All blob download/upload endpoints MUST reject anything else to prevent path traversal via `..` or absolute paths.
 - `LEGACY_DEFAULT_PASSWORD` is an unsafe fallback preserved only for legacy compatibility. New code paths MUST surface a warning when this default is used; treat any caller relying on it as a bug.

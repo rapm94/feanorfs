@@ -1,6 +1,8 @@
 pub mod agent;
 pub mod api;
 pub mod commands;
+pub mod conflict_artifacts;
+pub mod conflicts;
 pub mod fs_util;
 pub mod local;
 pub mod predictive;
@@ -13,8 +15,9 @@ pub use commands::{
     do_cat, do_hydrate, do_pull_only, do_push_only, do_status, do_sync, CatResult, HydrateResult,
     MirrorState, PullResult, PushResult, StatusResult, SyncResult,
 };
+pub use conflicts::{resolve_conflict, ResolveKeep};
 pub use feanorfs_common::AgentCommitResult as CommitResult;
-pub use feanorfs_common::{ConcurrentEdit, FileState};
+pub use feanorfs_common::{ConcurrentEdit, ConflictKind, ConflictRecord, FileState};
 pub use local::{
     load_config, load_global_config, save_config, save_global_config, ClientDb, Config,
     GlobalConfig,

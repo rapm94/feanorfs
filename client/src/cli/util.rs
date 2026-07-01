@@ -1,0 +1,308 @@
+use anyhow::Context as _;
+use feanorfs_client::{
+    conflicts, load_global_config, save_config, save_global_config, ApiClient, ClientDb, Config,
+    GlobalConfig,
+};
+use std::fs::OpenOptions;
+use std::path::Path;
+use std::time::Duration;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
+
+pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
+    let log_dir = current_dir.join(".feanorfs");
+    let _ = std::fs::create_dir_all(&log_dir)
+        .map_err(|e| eprintln!("Warning: could not create log directory: {e:?}"));
+
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("feanorfs.log"))?;
+
+    let log_file_clone = log_file.try_clone()?;
+
+    let stdout_layer = fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_target(false)
+        .without_time()
+        .with_filter(EnvFilter::new("warn"));
+
+    let file_layer = fmt::layer()
+        .with_writer(move || -> Box<dyn std::io::Write + Send> {
+            match log_file_clone.try_clone() {
+                Ok(f) => Box::new(f),
+                Err(_) => Box::new(std::io::sink()),
+            }
+        })
+        .with_target(true)
+        .with_ansi(false)
+        .with_filter(EnvFilter::new("debug"));
+
+    let _ = Registry::default()
+        .with(stdout_layer)
+        .with(file_layer)
+        .try_init();
+
+    Ok(())
+}
+
+fn discover_server_mdns(timeout: Duration) -> anyhow::Result<String> {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+
+    let daemon =
+        ServiceDaemon::new().map_err(|e| anyhow::anyhow!("Failed to start mDNS daemon: {}", e))?;
+    let receiver = daemon
+        .browse("_feanorfs._tcp.local.")
+        .map_err(|e| anyhow::anyhow!("Failed to browse mDNS: {}", e))?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_default();
+        match receiver.recv_timeout(remaining) {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                if let Some(ip) = info.addresses.iter().next() {
+                    let url = format!("http://{}:{}", ip, info.port);
+                    let _ = daemon.shutdown();
+                    return Ok(url);
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+
+    let _ = daemon.shutdown();
+    anyhow::bail!(
+        "No FeanorFS server found on local network within {} seconds. \
+         Specify URL explicitly: feanorfs connect <URL>",
+        timeout.as_secs()
+    )
+}
+
+pub fn resolve_server_url(explicit: Option<String>, allow_lan: bool) -> anyhow::Result<String> {
+    match explicit {
+        Some(u) => Ok(u),
+        None => match load_global_config() {
+            Ok(g) => Ok(g.server_url),
+            Err(_) => {
+                if allow_lan {
+                    println!("Searching for FeanorFS server on local network...");
+                    discover_server_mdns(Duration::from_secs(3))
+                } else {
+                    anyhow::bail!(
+                        "No server URL specified and no cached connection found.\n\
+                         \n\
+                         Connect to a server first:\n  \
+                         feanorfs connect https://your-server.com:3030\n\n\
+                         Or for LAN discovery:\n  \
+                         feanorfs connect --lan"
+                    )
+                }
+            }
+        },
+    }
+}
+
+pub fn resolve_server_password(explicit: Option<String>) -> Option<String> {
+    explicit.or_else(|| load_global_config().ok().and_then(|g| g.server_password))
+}
+
+fn try_clipboard_cmd(cmd: &str, args: &[&str], text: &str) -> Option<std::process::ExitStatus> {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(text.as_bytes())?;
+            }
+            child.wait()
+        })
+        .ok()
+}
+
+pub fn copy_to_clipboard(text: &str) {
+    let result = if cfg!(target_os = "macos") {
+        try_clipboard_cmd("pbcopy", &[], text)
+    } else if cfg!(target_os = "linux") {
+        try_clipboard_cmd("xclip", &["-selection", "clipboard"], text)
+            .or_else(|| try_clipboard_cmd("wl-copy", &[], text))
+            .or_else(|| try_clipboard_cmd("xsel", &["--clipboard", "--input"], text))
+    } else {
+        None
+    };
+    let _ = result;
+}
+
+pub fn read_password_hidden(prompt: &str) -> anyhow::Result<String> {
+    Ok(rpassword::prompt_password(prompt)?)
+}
+
+pub fn truncate_password_for_display(p: &str) -> String {
+    let chars: Vec<char> = p.chars().collect();
+    if chars.len() > 12 {
+        let head: String = chars.iter().take(6).collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{}...{}", head, tail)
+    } else {
+        p.to_string()
+    }
+}
+
+pub async fn probe_server_auth(url: &str) -> anyhow::Result<bool> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/api/workspaces", url.trim_end_matches('/')))
+        .send()
+        .await
+        .context("Failed to reach server")?;
+    Ok(resp.status() == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+pub fn output_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    let s = serde_json::to_string_pretty(value)?;
+    println!("{}", s);
+    Ok(())
+}
+
+pub async fn initialize_new_mirror(
+    current_dir: &Path,
+    url: String,
+    workspace: String,
+    encryption_key: Option<String>,
+    server_token: Option<String>,
+    save_global: bool,
+) -> anyhow::Result<()> {
+    let srv_pass = resolve_server_password(server_token);
+
+    if save_global {
+        let global = GlobalConfig {
+            server_url: url.clone(),
+            server_password: srv_pass.clone(),
+        };
+        save_global_config(&global)?;
+    }
+
+    let (e2ee_key, was_generated) = match encryption_key {
+        Some(k) => (k, false),
+        None => (feanorfs_common::generate_password()?, true),
+    };
+
+    let config = Config {
+        server_url: url.clone(),
+        workspace_id: workspace.clone(),
+        encryption_password: Some(e2ee_key.clone()),
+        server_password: srv_pass.clone(),
+    };
+    save_config(current_dir, &config)?;
+
+    let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+
+    println!("This folder is now mirrored to FeanorFS.");
+    println!("  Server:       {}", url);
+    println!("  Workspace:    {}", workspace);
+    println!("  Encryption:   enabled (zero-knowledge)");
+    if srv_pass.is_some() {
+        println!("  Server auth:  enabled");
+    }
+
+    if was_generated {
+        println!("\nWorkspace encryption key: {}", e2ee_key);
+        copy_to_clipboard(&e2ee_key);
+        println!("Copied to clipboard.");
+        println!("\nOn your other machine, link the same workspace:");
+        println!(
+            "  feanorfs attach {} --encryption-key {}",
+            workspace, e2ee_key
+        );
+        println!("\nSave this key — without it your files cannot be decrypted.");
+    }
+
+    Ok(())
+}
+
+pub async fn link_existing_mirror(
+    current_dir: &Path,
+    url: String,
+    workspace: String,
+    encryption_key: String,
+    server_token: Option<String>,
+) -> anyhow::Result<()> {
+    let srv_pass = resolve_server_password(server_token);
+
+    let global = GlobalConfig {
+        server_url: url.clone(),
+        server_password: srv_pass.clone(),
+    };
+    save_global_config(&global)?;
+
+    let config = Config {
+        server_url: url.clone(),
+        workspace_id: workspace.clone(),
+        encryption_password: Some(encryption_key.clone()),
+        server_password: srv_pass.clone(),
+    };
+    save_config(current_dir, &config)?;
+
+    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+
+    println!("Linked this folder to mirrored workspace '{}'.", workspace);
+    println!("  Server:     {}", url);
+    println!("  Encryption: enabled");
+    if srv_pass.is_some() {
+        println!("  Server auth: enabled");
+    }
+    println!("\nRun 'feanorfs sync --no-watch' to download files from the mirror.");
+
+    let api = ApiClient::new(&url, srv_pass.as_deref());
+    let local_files =
+        feanorfs_client::local::scan_local_directory(current_dir, &db, Some(&encryption_key))
+            .await?;
+    conflicts::seed_last_synced_from_server(&api, &db, &workspace, &local_files).await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_password_for_display;
+
+    #[test]
+    fn display_short_password_returns_unchanged() {
+        assert_eq!(truncate_password_for_display("short"), "short");
+    }
+
+    #[test]
+    fn display_long_ascii_password_is_truncated_with_ellipsis() {
+        let pw = "0123456789abcdef0123456789abcdef";
+        let display = truncate_password_for_display(pw);
+        assert!(display.contains("..."));
+        assert!(display.starts_with("012345"));
+        assert!(display.ends_with("cdef"));
+    }
+
+    #[test]
+    fn display_multibyte_password_does_not_panic() {
+        let pw = "日本語のパスワード1234567890";
+        let display = truncate_password_for_display(pw);
+        assert!(!display.is_empty());
+        assert!(display.contains("..."));
+    }
+
+    #[test]
+    fn display_exactly_twelve_chars_returns_unchanged() {
+        let pw = "012345678901";
+        assert_eq!(truncate_password_for_display(pw), pw);
+    }
+
+    #[test]
+    fn display_thirteen_chars_is_truncated() {
+        let pw = "0123456789012";
+        let display = truncate_password_for_display(pw);
+        assert!(display.contains("..."));
+    }
+}

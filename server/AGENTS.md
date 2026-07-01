@@ -7,13 +7,13 @@ Content-addressed blob storage and sync metadata server. Axum HTTP server backed
 ## Ownership
 
 - Crate: `feanorfs-server`, binary `feanorfs-server`.
-- Source layout: `src/main.rs` (Axum routes, CLI args, auth middleware, mDNS, server bootstrap) and `src/db.rs` (SQLite schema and the four public methods: `get_workspace_files`, `upsert_file`, `get_workspaces`, plus `new`/`init_schema`).
+- Source layout: `src/main.rs`, `src/app.rs` (routes), `src/db.rs` (SQLite). Sync delta logic lives in `feanorfs_common::compute_sync_delta`.
 - Runtime data lives in `server-data/` which is git-ignored and MUST stay server-local — never include it in distributions.
 
 ## Local Contracts
 
 - Wire types come from `feanorfs-common`. Never redefine `FileState`/`SyncRequest`/`SyncResponse` here.
-- All HTTP routes reuse `/api/sync/diff` for any "compare client view vs server view" operation — including `agent commit`, which sends the agent base snapshot as the client view. Do NOT add a new endpoint to learn server-side changes since a snapshot.
+- `/api/sync/peek` and `/api/sync/diff` (alias) are read-only; both call `feanorfs_common::compute_sync_delta`.
 - Bearer token comparison uses `constant_time_eq` to prevent timing side-channels. Any future auth changes MUST keep the timing equality property.
 - Request body is capped at 100 MiB via `DefaultBodyLimit` to mitigate memory-exhaustion DoS. Do not raise this without a matching blob-size policy.
 - Upload flow: compute `hash_bytes(body)` server-side and reject mismatches with 400 BEFORE writing the blob. If the DB upsert fails after the blob is on disk, the orphan blob MUST be removed before returning an error so no partial state survives.

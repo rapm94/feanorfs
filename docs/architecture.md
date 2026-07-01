@@ -30,18 +30,21 @@ Defines the data exchanged between client and server, and the cryptographic prim
 - `hash_bytes(bytes)` — Blake3 hash → hex string. Used for both plaintext (client cache) and ciphertext (CAS key) identification.
 - `hash_file(path)` — Streaming Blake3 hash of a file (64KB buffer). Used to identify plaintext file contents on disk.
 - `normalize_path(path)` — Replaces `\` with `/` for cross-platform consistency. All DB operations expect forward-slash paths.
-- `crypt_bytes(data, password, path)` — Symmetric XOR encryption using a Blake3 XOF keystream derived from `blake3(password ‖ path)`. Calling it twice with the same `(password, path)` returns the original bytes. See [threat-model.md](threat-model.md) for security properties.
+- `pack_bytes(data, password, path)` / `unpack_bytes(data, password, path)` — ChaCha20-Poly1305 AEAD for new blobs (`AEAD_PREFIX_BYTE` marker). `unpack_bytes` falls back to legacy `crypt_bytes` XOR for older blobs.
+- `crypt_bytes(data, password, path)` — Legacy symmetric XOR (still used for backward-compatible reads). See [threat-model.md](threat-model.md).
+- `is_safe_rel_path(path)` — Rejects `..`, absolute paths, and `.feanorfs`/`.git` control paths.
 
 ### `server` — blob storage + metadata coordinator
 
 Location: [`server/src/app.rs`](../server/src/app.rs), [`server/src/db.rs`](../server/src/db.rs), [`server/src/lib.rs`](../server/src/lib.rs)
 
-An Axum HTTP server (default port 3030) with four endpoints:
+An Axum HTTP server (default port 3030) with five endpoints:
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/sync/diff` | POST | Receive client metadata, compute delta, return `SyncResponse` |
-| `/api/upload?workspace_id=&path=&hash=&size=&mtime=` | POST | Receive encrypted bytes, verify hash, write blob, upsert DB |
+| `/api/sync/peek` | POST | Read-only delta: receive client metadata, return `SyncResponse` (no DB mutations) |
+| `/api/sync/diff` | POST | Alias for `/api/sync/peek` (backward compatible) |
+| `/api/upload?workspace_id=&path=&hash=&size=&mtime=&deleted=` | POST | Receive encrypted bytes (or tombstone when `deleted=true`), verify hash, write blob, upsert DB |
 | `/api/download/:hash` | GET | Stream encrypted blob bytes |
 | `/api/workspaces` | GET | List workspace IDs with at least one non-deleted file |
 
@@ -49,20 +52,14 @@ An Axum HTTP server (default port 3030) with four endpoints:
 - `server-data/blobs/<hash>` — content-addressed ciphertext blobs.
 - `server-data/db.sqlite` — `files` table: `(workspace_id, path, hash, size, mtime, deleted, updated_at)`, PK = `(workspace_id, path)`.
 
-**Sync negotiation logic** (`handle_sync_diff`):
-1. Fetch all server files for the workspace into a `HashMap<path, FileState>`.
-2. For each client file:
-   - If server has it and client mtime > server mtime: push to `upload_required` (or mark deleted on server if `deleted=true`).
-   - If server has it and server mtime > client mtime: push to `download_required` (or `delete_local` if server file is deleted).
-   - If mtimes equal but hashes differ: push to `upload_required` (client-side change detection).
-   - If server doesn't have it: push to `upload_required` (or mark deleted on server).
-3. For server files the client doesn't know about: push to `download_required`.
+**Sync negotiation logic** (`compute_sync_delta` in `sync_delta.rs`):
+Read-only LWW comparison — server never applies deletes or uploads during peek. Client applies `upload_required`, `download_required`, and `delete_local` in a separate apply phase via `/api/upload` (including `deleted=true` tombstones).
 
 ### `client` — CLI + library + sync engine
 
 Location: [`client/src/lib.rs`](../client/src/lib.rs) (library), [`client/src/main.rs`](../client/src/main.rs) (CLI entry), [`client/src/local.rs`](../client/src/local.rs), [`client/src/api.rs`](../client/src/api.rs), [`client/src/commands.rs`](../client/src/commands.rs)
 
-**CLI** (`clap`): `connect`, `init`, `join`, `status`, `push`, `pull [--lazy]`, `sync [--lazy] [--no-watch]`, `hydrate [path]`, `cat <path>`, `watch`, `summary [--summarize]`, `agent spawn|commit|list|clean|run`, plus global `--json`.
+**CLI** (`clap`): `connect`, `init`, `join`/`attach`, `status`, `push`, `pull [--lazy]`, `sync [--lazy] [--no-watch]`, `hydrate [path]`, `cat <path>`, `watch`, `summary [--summarize]`, `conflicts list|resolve`, `agent spawn|commit|check|list|clean|run`, plus global `--json`.
 
 **Library** (`feanorfs_client`): exposes `sync`, `push`, `pull`, `hydrate`, `cat`, agent helpers, and `Serialize`-derived result types for programmatic use.
 
@@ -76,17 +73,17 @@ Location: [`client/src/lib.rs`](../client/src/lib.rs) (library), [`client/src/ma
 3. For each file on disk:
    - If cache hit (same `mtime` + `size` + `hydrated=true`): reuse cached hashes. No re-hashing.
    - If unhydrated placeholder (size=0, `hydrated=false`): reuse cached encrypted hash + server_mtime. Reports server_mtime to avoid false "local changed" detection.
-   - If cache miss (modified or new): read bytes, compute `plaintext_hash = hash_bytes(bytes)`, `encrypted_hash = hash_bytes(crypt_bytes(bytes, password, path))`.
-4. For cached files no longer on disk: mark as `deleted=true` with `mtime = now()`.
+   - If cache miss (modified or new): read bytes, compute `plaintext_hash = hash_bytes(bytes)`, `encrypted_hash = hash_bytes(pack_bytes(bytes, password, path))`.
+4. For cached files no longer on disk: mark as `deleted=true` with stable tombstone mtime (`max(server_mtime, mtime) + 1`).
 5. Upsert all disk entries into the cache DB.
 
 **Sync flow** (`do_sync`):
 1. Scan local directory → `HashMap<path, FileState>`.
-2. Build `SyncRequest` and call `/api/sync/diff`.
-3. Process `download_required` first (download, decrypt, write, update cache).
-4. Apply `delete_local` (remove file from disk, delete cache entry).
-5. Process `upload_required` (read, encrypt, upload, server upserts metadata).
-6. Clean up cache entries for locally-deleted files.
+2. `peek_sync` (read-only) → detect workspace conflicts via three-way compare against `last_synced_files`; block LWW for pending paths.
+3. Process `download_required` (download, `unpack_bytes`, atomic write; TOCTOU mtime check).
+4. Apply `delete_local` (remove file from disk; fail sync if removal errors).
+5. Process `upload_required` (tombstones via `upload_tombstone`, else `pack_bytes` + upload).
+6. Update `last_synced_files` for non-conflicted paths.
 
 **Lazy hydration:**
 - `pull --lazy` / `sync --lazy`: for each `download_required` file, write a 0-byte placeholder to disk and insert a cache entry with `hydrated=false` and `server_mtime = remote_mtime`.
@@ -94,10 +91,11 @@ Location: [`client/src/lib.rs`](../client/src/lib.rs) (library), [`client/src/ma
 - `cat <path>`: if the file is a placeholder, hydrate it first, then print contents.
 
 **Watch mode:**
-- Uses `notify::recommended_watcher` with recursive monitoring on the workspace `current_dir` (never `"."`).
+- Uses `notify::recommended_watcher` with recursive monitoring on the workspace `current_dir`.
 - Filters out events in `.feanorfs/` and `.git/` directories.
-- Sends a unit signal through a tokio mpsc channel on relevant events.
-- Main loop: receive signal → sleep 500ms (debounce) → drain pending signals → call `do_sync` → repeat.
+- Debounces FS events (500ms), then calls `do_sync`.
+- Also runs idle periodic sync every ~45s to catch remote changes.
+- Exponential backoff after consecutive sync failures (skips FS and idle polls while backing off).
 
 **Agent workspaces** (`agent.rs`): `spawn` creates a copy-on-write snapshot under `.feanorfs/agents/<name>/` and records server hashes in `agent_snapshots`. `commit` reuses `/api/sync/diff` with the base snapshot as the client view to detect concurrent edits; conflicts are written under `.feanorfs/conflicts/` — FeanorFS does not merge.
 

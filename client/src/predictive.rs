@@ -2,7 +2,7 @@ use crate::api::ApiClient;
 use crate::fs_util::atomic_write;
 use crate::local::{CacheEntry, ClientDb};
 use anyhow::Result;
-use feanorfs_common::crypt_bytes;
+use feanorfs_common::unpack_bytes;
 use std::path::Path;
 use tokio::fs;
 
@@ -115,7 +115,7 @@ async fn hydrate_one(
         );
         return Ok(false);
     }
-    let plain = crypt_bytes(&encrypted, password, &entry.path);
+    let plain = unpack_bytes(&encrypted, password, &entry.path)?;
     atomic_write(base, &entry.path, &plain).await?;
 
     let full = base.join(&entry.path);
@@ -137,6 +137,7 @@ async fn hydrate_one(
         mtime: actual_mtime,
         server_mtime: entry.server_mtime,
         hydrated: true,
+        deleted_at: None,
     })
     .await?;
 
