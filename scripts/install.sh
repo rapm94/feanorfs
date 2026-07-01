@@ -1,68 +1,38 @@
 #!/bin/sh
-# FeanorFS install script — downloads pre-built binaries from GitHub Releases.
-# Usage: curl -fsSL https://github.com/rapm94/feanorfs/releases/latest/download/install.sh | sh
+# FeanorFS install script — installs both CLI and server from GitHub Releases.
+#
+# Uses cargo-dist-generated per-app installers (feanorfs-client-installer.sh and
+# feanorfs-server-installer.sh). Pass BINDIR to either script via env vars:
+#   FEANORFS_CLIENT_INSTALL_DIR / FEANORFS_SERVER_INSTALL_DIR
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/rapm94/feanorfs/main/scripts/install.sh | sh
 
 set -eu
 
 REPO="rapm94/feanorfs"
-BINDIR="${BINDIR:-}"
 
 err() { echo "error: $*" >&2; exit 1; }
 
-# --- detect platform ---------------------------------------------------------
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-
-case "$OS" in
-    Linux)  TARGET_OS="unknown-linux-gnu" ;;
-    Darwin) TARGET_OS="apple-darwin" ;;
-    *)      err "unsupported OS: $OS" ;;
-esac
-
-case "$ARCH" in
-    x86_64|amd64)   TARGET_ARCH="x86_64" ;;
-    aarch64|arm64)  TARGET_ARCH="aarch64" ;;
-    *)              err "unsupported architecture: $ARCH" ;;
-esac
-
-TARGET="${TARGET_ARCH}-${TARGET_OS}"
-
-# --- pick install directory --------------------------------------------------
-if [ -z "$BINDIR" ]; then
-    if [ -w /usr/local/bin ]; then
-        BINDIR="/usr/local/bin"
-    else
-        BINDIR="${HOME}/.local/bin"
-        mkdir -p "$BINDIR"
-    fi
-fi
-
-# --- download ----------------------------------------------------------------
 echo "Fetching latest release version..."
-VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')"
+VERSION="$(
+    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
+)"
 [ -n "$VERSION" ] || err "could not determine latest version"
 
-BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION}"
+BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
 
-install_bin() {
-    name="$1"
-    file="${name}-v${VERSION}-${TARGET}"
-    url="${BASE_URL}/${file}"
+if [ -n "${BINDIR:-}" ]; then
+    export FEANORFS_CLIENT_INSTALL_DIR="$BINDIR"
+    export FEANORFS_SERVER_INSTALL_DIR="$BINDIR"
+fi
 
-    echo "Downloading ${name} v${VERSION} (${TARGET})..."
-    tmp="$(mktemp)"
-    curl -fsSL "$url" -o "$tmp" || err "download failed: ${url}"
-    chmod +x "$tmp"
-    mv "$tmp" "${BINDIR}/${name}"
-    echo "Installed ${name} -> ${BINDIR}/${name}"
-}
+echo "Installing feanorfs (client) ${VERSION}..."
+curl -fsSL "${BASE_URL}/feanorfs-client-installer.sh" | sh
 
-install_bin feanorfs
-install_bin feanorfs-server
+echo "Installing feanorfs-server ${VERSION}..."
+curl -fsSL "${BASE_URL}/feanorfs-server-installer.sh" | sh
 
 echo ""
-echo "Done. feanorfs v${VERSION} installed to ${BINDIR}."
-case ":${PATH}:" in
-    *":${BINDIR}:"*) ;;
-    *) echo "warning: ${BINDIR} is not in your PATH. Add it with: export PATH=\"${BINDIR}:\$PATH\"" ;;
-esac
+echo "Done. feanorfs ${VERSION} and feanorfs-server ${VERSION} installed."
