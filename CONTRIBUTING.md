@@ -88,8 +88,24 @@ chore: bump sqlx to 0.8.1
 
 ## Release process
 
-1. Update `CHANGELOG.md` under a new `## [Unreleased]` → `## [x.y.z] - YYYY-MM-DD` heading.
-2. Bump `version` in `[workspace.package]` of the root `Cargo.toml`.
-3. Tag: `git tag -s vx.y.z -m "Release vx.y.z"`.
-4. Push tag: `git push --tags`.
+Releases are fully automated via [release-plz](https://github.com/release-plz/release-plz) and [cargo-dist](https://github.com/axodotdev/cargo-dist):
+
+1. Merge conventional commits to `main`.
+2. **release-plz** opens a Release PR (version bump + `CHANGELOG.md`). Merge it.
+3. **release-plz** pushes a `vX.Y.Z` git tag (`git_release_enable = false` in `release-plz.toml`).
+4. **cargo-dist** (`.github/workflows/release.yml`) builds cross-platform archives, shell/PowerShell installers, checksums, and creates the GitHub Release.
+
+### Maintainer setup
+
+- Add repository secret **`RELEASE_PLZ_TOKEN`** (PAT with `contents:write` + `pull-requests:write`). The default `GITHUB_TOKEN` cannot trigger the cargo-dist workflow on tag push.
+
+### Local dist checks
+
+```bash
+cargo install cargo-dist --locked
+dist plan          # preview artifacts for the current workspace version
+dist build --artifacts=all   # build locally (requires cross targets installed)
+```
+
+Config lives in `dist-workspace.toml` and `release-plz.toml`. Regenerate CI after dist config changes: `dist init -y` or `dist generate`.
 
