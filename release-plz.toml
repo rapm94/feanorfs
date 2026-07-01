@@ -2,6 +2,18 @@
 # FeanorFS is distributed as pre-built binaries, not via crates.io.
 publish = false
 
+# Unpublished workspace: derive versions from git tags, not crates.io.
+git_only = true
+
+# Tag only when the release PR is merged, not on every push to main.
+release_always = false
+
 # All crates inherit version via `version.workspace = true`, so a single
-# release-plz run bumps every member crate together and produces one tag +
-# one GitHub release for the whole workspace.
+# release-plz run bumps every member crate together and produces one tag.
+#
+# release-plz: version bump, changelog, git tag (via RELEASE_PLZ_TOKEN PAT).
+# cargo-dist: tag push triggers .github/workflows/release.yml → binaries,
+# installers, checksums, and the GitHub Release (git_release_enable = false).
+git_tag_enable = true
+git_release_enable = false
+git_tag_name = "v{{ version }}"
