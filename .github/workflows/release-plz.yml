@@ -3,20 +3,11 @@ name: Release-plz
 # release-plz automates semantic versioning, changelog generation, and
 # GitHub release creation based on Conventional Commits.
 #
-# Flow:
-#   1. On every push to main, release-plz analyzes commits since the last tag.
-#   2. If there are releasable changes, it opens a "release PR" that bumps
-#      versions in Cargo.toml and updates CHANGELOG.md.
-#   3. When that PR is merged, release-plz creates the git tag (vX.Y.Z) and
-#      a GitHub Release with the generated changelog body.
-#   4. The tag push triggers .github/workflows/release.yml which builds
-#      cross-platform binaries and attaches them to the release.
-#
-# Prerequisite:
-#   Create a fine-grained Personal Access Token with `contents: write` and
-#   `pull-requests: write` permissions and add it as the repository secret
-#   `RELEASE_PLZ_TOKEN`. The default `GITHUB_TOKEN` cannot trigger subsequent
-#   workflow runs, so a PAT is required for the release PR → tag → build chain.
+# Prerequisite (repository secret, exact name):
+#   RELEASE_PLZ_TOKEN — fine-grained or classic PAT with contents:write and
+#   pull-requests:write. Must be a repo Actions secret (Settings → Secrets →
+#   Actions), not only an environment secret unless this job sets `environment:`.
+#   The default GITHUB_TOKEN cannot trigger the release.yml tag build workflow.
 
 on:
   push:
@@ -25,28 +16,68 @@ on:
   workflow_dispatch:
 
 jobs:
-  release-plz:
-    name: Release
+  release-plz-pr:
+    name: Release PR
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # full history needed for changelog generation
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Verify release token
+        run: |
+          if [ -z "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
+            echo "::error::Missing repository secret RELEASE_PLZ_TOKEN (exact name, case-sensitive)."
+            echo "Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
 
-      - name: Install release-plz
-        run: cargo install release-plz --locked
+      - name: Run release-plz (release-pr)
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+          forge: github
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-      - name: Run release-plz
-        run: release-plz release
+  release-plz-release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release token
+        run: |
+          if [ -z "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
+            echo "::error::Missing repository secret RELEASE_PLZ_TOKEN (exact name, case-sensitive)."
+            exit 1
+          fi
+
+      - name: Run release-plz (release)
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+          forge: github
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
