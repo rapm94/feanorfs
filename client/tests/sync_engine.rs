@@ -193,7 +193,7 @@ async fn agent_commit_detects_concurrent_edit() {
 
 #[tokio::test]
 async fn sync_detects_concurrent_workspace_edit_without_silent_overwrite() {
-    use feanorfs_client::commands::conflicts_pending;
+    use feanorfs_client::conflicts;
 
     let server = spawn_test_server().await;
     let client_a = spawn_test_client().await;
@@ -261,12 +261,16 @@ async fn sync_detects_concurrent_workspace_edit_without_silent_overwrite() {
         read_workspace_file(base_a, "notes.txt").await,
         b"offline edit A"
     );
-    assert!(conflicts_pending(base_a));
+    let pending = conflicts::pending_conflict_paths(&client_a.db)
+        .await
+        .unwrap();
+    assert!(conflicts::conflicts_pending(Some(&pending)));
+    assert!(pending.contains("notes.txt"));
 }
 
 #[tokio::test]
 async fn concurrent_delete_is_not_a_workspace_conflict() {
-    use feanorfs_client::commands::conflicts_pending;
+    use feanorfs_client::conflicts;
 
     let server = spawn_test_server().await;
     let client_a = spawn_test_client().await;
@@ -333,42 +337,12 @@ async fn concurrent_delete_is_not_a_workspace_conflict() {
     .await
     .unwrap();
 
-    assert!(!conflicts_pending(base_a));
+    assert!(!conflicts::conflicts_pending(Some(
+        &conflicts::pending_conflict_paths(&client_a.db)
+            .await
+            .unwrap()
+    )));
     assert!(!base_a.join("gone.txt").exists());
-}
-
-#[tokio::test]
-async fn sync_removes_stale_conflict_dirs_from_prior_sessions() {
-    let server = spawn_test_server().await;
-    let client = spawn_test_client().await;
-    let base = client.workspace.path();
-
-    write_workspace_file(base, "ok.txt", b"ok").await;
-    do_push_only(
-        &server.api,
-        &client.db,
-        base,
-        WORKSPACE_ID,
-        Some(TEST_PASSWORD),
-    )
-    .await
-    .unwrap();
-
-    let stale = base.join(".feanorfs/conflicts/1_sync");
-    tokio::fs::create_dir_all(&stale).await.unwrap();
-
-    do_sync(
-        &server.api,
-        &client.db,
-        base,
-        WORKSPACE_ID,
-        Some(TEST_PASSWORD),
-        false,
-    )
-    .await
-    .unwrap();
-
-    assert!(!stale.exists());
 }
 
 #[tokio::test]

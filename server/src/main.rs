@@ -10,6 +10,10 @@ struct Cli {
     #[arg(long, env = "FEANORFS_TOKEN", visible_alias = "password")]
     token: Option<String>,
 
+    /// Allow starting without an auth token (development only).
+    #[arg(long)]
+    allow_open: bool,
+
     /// Enable mDNS service advertisement for LAN discovery (off by default for internet deployments)
     #[arg(long)]
     mdns: bool,
@@ -58,7 +62,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let state = init_app_state(cli.data_dir.clone(), cli.token.clone()).await?;
+    let token = if cli.token.is_some() {
+        cli.token
+    } else if cli.allow_open {
+        tracing::warn!("--allow-open: server accepts unauthenticated requests (development only)");
+        None
+    } else {
+        anyhow::bail!(
+            "Authentication token required. Set FEANORFS_TOKEN / --token, or pass --allow-open for local dev."
+        );
+    };
+
+    let state = init_app_state(cli.data_dir.clone(), token.clone()).await?;
     let app = build_router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
@@ -84,10 +99,8 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    if cli.token.is_some() {
+    if token.is_some() {
         tracing::info!("Authentication enabled (token required)");
-    } else {
-        tracing::warn!("No auth token set. Run with --token <TOKEN> for authenticated access.");
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

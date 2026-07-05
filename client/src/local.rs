@@ -3,7 +3,7 @@ use feanorfs_common::{normalize_path, FileState};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -55,6 +55,7 @@ pub struct CacheEntry {
     pub mtime: i64,
     pub server_mtime: i64,
     pub hydrated: bool,
+    pub deleted_at: Option<i64>,
 }
 
 pub struct ClientDb {
@@ -133,12 +134,222 @@ impl ClientDb {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS last_synced_files (
+                path TEXT PRIMARY KEY,
+                hash TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime INTEGER NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS conflict_registry (
+                path TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                conflict_dir TEXT NOT NULL,
+                opened_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            );",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        self.migrate_local_files_deleted_at().await?;
+
+        Ok(())
+    }
+
+    async fn migrate_local_files_deleted_at(&self) -> Result<()> {
+        let rows = sqlx::query("PRAGMA table_info(local_files)")
+            .fetch_all(&self.pool)
+            .await?;
+        let has_col = rows
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "deleted_at");
+        if !has_col {
+            sqlx::query("ALTER TABLE local_files ADD COLUMN deleted_at INTEGER")
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_last_synced_files(&self) -> Result<HashMap<String, FileState>> {
+        let rows = sqlx::query("SELECT path, hash, size, mtime, deleted FROM last_synced_files")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let path = r.get::<String, _>("path");
+            out.insert(
+                path.clone(),
+                FileState {
+                    path,
+                    hash: r.get::<String, _>("hash"),
+                    size: file_size_from_db(r.get::<i64, _>("size")),
+                    mtime: r.get::<i64, _>("mtime"),
+                    deleted: r.get::<i32, _>("deleted") != 0,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    pub async fn replace_last_synced_files(
+        &self,
+        states: &HashMap<String, FileState>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM last_synced_files")
+            .execute(&mut *tx)
+            .await?;
+        for f in states.values() {
+            sqlx::query(
+                "INSERT INTO last_synced_files (path, hash, size, mtime, deleted)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&f.path)
+            .bind(&f.hash)
+            .bind(file_size_to_db(f.size))
+            .bind(f.mtime)
+            .bind(if f.deleted { 1 } else { 0 })
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_pending_conflict_paths(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT path FROM conflict_registry WHERE status = 'pending'")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("path"))
+            .collect())
+    }
+
+    pub async fn list_conflict_records(&self) -> Result<Vec<feanorfs_common::ConflictRecord>> {
+        let rows = sqlx::query(
+            "SELECT path, kind, conflict_dir, opened_at, status FROM conflict_registry WHERE status = 'pending'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| feanorfs_common::ConflictRecord {
+                path: r.get("path"),
+                kind: feanorfs_common::ConflictKind::from_db_str(&r.get::<String, _>("kind")),
+                conflict_dir: r.get("conflict_dir"),
+                opened_at: r.get("opened_at"),
+                status: r.get("status"),
+            })
+            .collect())
+    }
+
+    pub async fn get_conflict_record(
+        &self,
+        path: &str,
+    ) -> Result<Option<feanorfs_common::ConflictRecord>> {
+        let row = sqlx::query(
+            "SELECT path, kind, conflict_dir, opened_at, status FROM conflict_registry WHERE path = ? AND status = 'pending'",
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| feanorfs_common::ConflictRecord {
+            path: r.get("path"),
+            kind: feanorfs_common::ConflictKind::from_db_str(&r.get::<String, _>("kind")),
+            conflict_dir: r.get("conflict_dir"),
+            opened_at: r.get("opened_at"),
+            status: r.get("status"),
+        }))
+    }
+
+    pub async fn upsert_conflict(
+        &self,
+        path: &str,
+        kind: &feanorfs_common::ConflictKind,
+        conflict_dir: &str,
+        opened_at: i64,
+        status: &str,
+    ) -> Result<()> {
+        let kind_str = kind.as_db_str();
+        sqlx::query(
+            "INSERT OR REPLACE INTO conflict_registry (path, kind, conflict_dir, opened_at, status)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(path)
+        .bind(kind_str)
+        .bind(conflict_dir)
+        .bind(opened_at)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn resolve_conflict_path(&self, path: &str) -> Result<()> {
+        sqlx::query("DELETE FROM conflict_registry WHERE path = ?")
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn count_pending_in_dir(&self, conflict_dir: &str) -> Result<u32> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM conflict_registry WHERE conflict_dir = ? AND status = 'pending'",
+        )
+        .bind(conflict_dir)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt") as u32)
+    }
+
+    pub async fn merge_last_synced_files(
+        &self,
+        updates: &HashMap<String, FileState>,
+        exclude_paths: &HashSet<String>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (path, file) in updates {
+            if exclude_paths.contains(path) {
+                continue;
+            }
+            sqlx::query(
+                "INSERT OR REPLACE INTO last_synced_files (path, hash, size, mtime, deleted)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&file.path)
+            .bind(&file.hash)
+            .bind(file_size_to_db(file.size))
+            .bind(file.mtime)
+            .bind(if file.deleted { 1 } else { 0 })
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn set_deleted_at(&self, path: &str, deleted_at: i64) -> Result<()> {
+        sqlx::query("UPDATE local_files SET deleted_at = ? WHERE path = ?")
+            .bind(deleted_at)
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     pub async fn get_cache_entries(&self) -> Result<HashMap<String, CacheEntry>> {
         let rows = sqlx::query(
-            "SELECT path, plaintext_hash, encrypted_hash, size, mtime, server_mtime, hydrated FROM local_files"
+            "SELECT path, plaintext_hash, encrypted_hash, size, mtime, server_mtime, hydrated, deleted_at FROM local_files"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -154,6 +365,7 @@ impl ClientDb {
                 mtime: r.get::<i64, _>("mtime"),
                 server_mtime: r.get::<i64, _>("server_mtime"),
                 hydrated: r.get::<i32, _>("hydrated") != 0,
+                deleted_at: r.get::<Option<i64>, _>("deleted_at"),
             };
             files.insert(path, entry);
         }
@@ -164,8 +376,8 @@ impl ClientDb {
         let size = file_size_to_db(entry.size);
         let hydrated = if entry.hydrated { 1 } else { 0 };
         sqlx::query(
-            "INSERT OR REPLACE INTO local_files (path, plaintext_hash, encrypted_hash, size, mtime, server_mtime, hydrated)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT OR REPLACE INTO local_files (path, plaintext_hash, encrypted_hash, size, mtime, server_mtime, hydrated, deleted_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&entry.path)
         .bind(&entry.plaintext_hash)
@@ -174,6 +386,7 @@ impl ClientDb {
         .bind(entry.mtime)
         .bind(entry.server_mtime)
         .bind(hydrated)
+        .bind(entry.deleted_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -422,14 +635,7 @@ pub async fn scan_local_directory(
 
         let normalized = normalize_path(rel_path_str);
 
-        // Skip our control directories
-        if normalized == ".feanorfs"
-            || normalized == ".git"
-            || normalized.starts_with(".feanorfs/")
-            || normalized.starts_with(".git/")
-            || normalized.contains("/.git/")
-            || normalized.contains("/.feanorfs/")
-        {
+        if !feanorfs_common::is_safe_rel_path(&normalized) {
             continue;
         }
 
@@ -473,7 +679,7 @@ pub async fn scan_local_directory(
                     let bytes = fs::read(abs_path)?;
                     let ph = feanorfs_common::hash_bytes(&bytes);
                     let encrypted_bytes =
-                        feanorfs_common::crypt_bytes(&bytes, password_str, &normalized);
+                        feanorfs_common::pack_bytes(&bytes, password_str, &normalized)?;
                     let eh = feanorfs_common::hash_bytes(&encrypted_bytes);
                     (ph, eh, size, mtime, mtime, true)
                 }
@@ -482,7 +688,7 @@ pub async fn scan_local_directory(
                 let bytes = fs::read(abs_path)?;
                 let ph = feanorfs_common::hash_bytes(&bytes);
                 let encrypted_bytes =
-                    feanorfs_common::crypt_bytes(&bytes, password_str, &normalized);
+                    feanorfs_common::pack_bytes(&bytes, password_str, &normalized)?;
                 let eh = feanorfs_common::hash_bytes(&encrypted_bytes);
                 (ph, eh, size, mtime, mtime, true)
             };
@@ -495,6 +701,7 @@ pub async fn scan_local_directory(
             mtime: final_mtime,
             server_mtime: final_server_mtime,
             hydrated,
+            deleted_at: None,
         };
 
         let file_state = FileState {
@@ -513,12 +720,17 @@ pub async fn scan_local_directory(
     let mut final_files = HashMap::new();
     for (path, cached) in cached_entries.drain() {
         if !disk_files.contains_key(&path) {
-            // Mark as deleted!
+            let tombstone_mtime = cached
+                .deleted_at
+                .unwrap_or_else(|| cached.server_mtime.max(cached.mtime).saturating_add(1));
+            if cached.deleted_at.is_none() {
+                db.set_deleted_at(&path, tombstone_mtime).await?;
+            }
             let file_state = FileState {
                 path: path.clone(),
                 hash: cached.encrypted_hash.clone(),
                 size: cached.size,
-                mtime: chrono::Utc::now().timestamp_millis(), // Update time to current time so registers deletion
+                mtime: tombstone_mtime,
                 deleted: true,
             };
             final_files.insert(path, file_state);
