@@ -12,7 +12,8 @@ Shared data models, sync delta (`compute_sync_delta`), three-way conflict classi
 
 ## Local Contracts
 
-- `pack_bytes` / `unpack_bytes` — ChaCha20-Poly1305 for new blobs; `unpack_bytes` falls back to legacy `crypt_bytes` XOR.
+- `pack_bytes` / `unpack_bytes` — ChaCha20-Poly1305 for new blobs; format v2 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to legacy `crypt_bytes` XOR on decrypt — removal tracked as [SEC-6](../docs/roadmap.md).
+- Deterministic SIV-style nonce (`blake3(key ‖ len ‖ plaintext)[..12]`) is LOAD-BEARING: CAS keys and change detection require identical `(key, path, plaintext)` → identical ciphertext. Do NOT switch to random nonces. Known accepted leak: the server can observe a file reverting to a previous state.
 - `compute_sync_delta` — pure LWW read-only delta (used by server peek/diff handlers).
 - `detect_concurrent_edits` / `classify_conflict_kind` — shared three-way logic for agent and workspace conflicts.
 - Length-prefix domain separation before each XOF input field is mandatory — never concatenate without it. `(password="ab", path="cdef")` and `(password="abc", path="def")` MUST produce different keystreams.

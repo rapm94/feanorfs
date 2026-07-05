@@ -78,12 +78,12 @@ pub fn detect_concurrent_edits(
                     their_deleted.contains(&path),
                 );
                 out.push((
-                    ConcurrentEdit {
-                        path: path.clone(),
-                        base: Some(base_entry.clone()),
-                        ours: ours.cloned(),
-                        theirs: theirs_state(&path, their_changed, their_deleted.contains(&path)),
-                    },
+                    ConcurrentEdit::new(
+                        path.clone(),
+                        Some(base_entry.clone()),
+                        ours.cloned(),
+                        theirs_state(&path, their_changed, their_deleted.contains(&path)),
+                    ),
                     kind,
                 ));
             }
@@ -91,12 +91,7 @@ pub fn detect_concurrent_edits(
             if let (Some(o), Some(t)) = (ours, their_changed.get(&path)) {
                 if o.hash != t.hash {
                     out.push((
-                        ConcurrentEdit {
-                            path: path.clone(),
-                            base: None,
-                            ours: Some(o.clone()),
-                            theirs: Some(t.clone()),
-                        },
+                        ConcurrentEdit::new(path.clone(), None, Some(o.clone()), Some(t.clone())),
                         ConflictKind::EditEdit,
                     ));
                 }

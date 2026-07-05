@@ -1,5 +1,8 @@
+pub mod invite;
 pub mod sync_delta;
 pub mod three_way;
+
+pub use invite::{decode_invite, encode_invite, looks_like_invite, WorkspaceInvite, INVITE_PREFIX};
 
 pub use sync_delta::compute_sync_delta;
 pub use three_way::{classify_conflict_kind, conflict_candidate_paths, detect_concurrent_edits};
@@ -78,6 +81,15 @@ pub struct ConflictRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictResolution {
+    pub path: String,
+    pub method: String,
+    pub source_file_hash: Option<String>,
+    pub resolved_at: i64,
+    pub resolver: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResponse {
     pub upload_required: Vec<String>, // Paths of files the client needs to upload
     pub download_required: Vec<FileState>, // Metadata of files the client needs to download
@@ -105,9 +117,92 @@ pub struct ConcurrentEdit {
     pub base: Option<FileState>,
     pub ours: Option<FileState>,
     pub theirs: Option<FileState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ConflictKind>,
+    #[serde(default)]
+    pub local_available: bool,
+    #[serde(default)]
+    pub cloud_available: bool,
+    #[serde(default)]
+    pub is_binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_clean: Option<bool>,
 }
 
-/// Structured result of `agent commit`. Caller inspects the buckets to
+/// One path applied (or failed) during `agent land`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LandedPath {
+    pub path: String,
+    pub action: String,
+}
+
+/// Structured result of `agent check` (read-only preview).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentCheckResult {
+    pub agent_name: String,
+    pub our_changes: Vec<FileState>,
+    pub their_changes: Vec<FileState>,
+    pub conflicts: Vec<ConcurrentEdit>,
+    pub conflict_risk: Vec<String>,
+}
+
+/// Structured result of `agent land` (check + apply).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentLandResult {
+    pub agent_name: String,
+    pub our_changes: Vec<FileState>,
+    pub their_changes: Vec<FileState>,
+    pub conflicts: Vec<ConcurrentEdit>,
+    pub landed: Vec<LandedPath>,
+    pub message: String,
+}
+
+/// Result of `agent refresh`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRefreshResult {
+    pub agent_name: String,
+    pub refreshed: Vec<String>,
+    pub deferred: Vec<String>,
+}
+
+impl ConcurrentEdit {
+    #[must_use]
+    pub fn new(
+        path: String,
+        base: Option<FileState>,
+        ours: Option<FileState>,
+        theirs: Option<FileState>,
+    ) -> Self {
+        let local_available = ours.as_ref().is_some_and(|o| !o.deleted);
+        let cloud_available = theirs.as_ref().is_some_and(|t| !t.deleted);
+        Self {
+            local_available,
+            cloud_available,
+            path,
+            base,
+            ours,
+            theirs,
+            original_file: None,
+            local_file: None,
+            cloud_file: None,
+            kind: None,
+            is_binary: false,
+            hint: None,
+            proposed_file: None,
+            proposal_clean: None,
+        }
+    }
+}
 /// decide what to apply, what to pull, and which conflicts need resolution.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentCommitResult {
@@ -168,6 +263,27 @@ pub fn is_safe_rel_path(path: &str) -> bool {
 }
 
 pub const AEAD_PREFIX_BYTE: u8 = 1;
+
+/// Policy for handling blobs without the AEAD prefix byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LegacyPolicy {
+    /// Hard-fail on non-AEAD blobs (format v2 workspaces).
+    Reject,
+    /// Fall back to legacy Blake3-XOF XOR decrypt (format v1 / migration).
+    #[default]
+    AllowXorFallback,
+}
+
+impl LegacyPolicy {
+    #[must_use]
+    pub fn from_format_version(version: u32) -> Self {
+        if version >= 2 {
+            Self::Reject
+        } else {
+            Self::AllowXorFallback
+        }
+    }
+}
 
 fn derive_crypto_key(password: &str, path: &str) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
@@ -235,8 +351,18 @@ pub fn pack_bytes(data: &[u8], password: &str, path: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decrypts packed blob (ChaCha20-Poly1305 or legacy XOR).
+/// Decrypts packed blob (ChaCha20-Poly1305 or legacy XOR per policy).
 pub fn unpack_bytes(data: &[u8], password: &str, path: &str) -> Result<Vec<u8>> {
+    unpack_bytes_with_policy(data, password, path, LegacyPolicy::AllowXorFallback)
+}
+
+/// Decrypt with an explicit legacy-blob policy (format v2 uses `Reject`).
+pub fn unpack_bytes_with_policy(
+    data: &[u8],
+    password: &str,
+    path: &str,
+    policy: LegacyPolicy,
+) -> Result<Vec<u8>> {
     if data.first() == Some(&AEAD_PREFIX_BYTE) && data.len() > 13 {
         use chacha20poly1305::aead::{Aead, KeyInit};
         use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -245,11 +371,16 @@ pub fn unpack_bytes(data: &[u8], password: &str, path: &str) -> Result<Vec<u8>> 
         let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
         let nonce = Nonce::from_slice(&data[1..13]);
         let plain = cipher.decrypt(nonce, &data[13..]).map_err(|_| {
-            anyhow::anyhow!("decryption failed (wrong encryption key or corrupt blob)")
+            anyhow::anyhow!("wrong encryption key for this workspace (decryption failed)")
         })?;
         return Ok(plain);
     }
-    Ok(crypt_bytes(data, password, path))
+    match policy {
+        LegacyPolicy::Reject => anyhow::bail!(
+            "blob uses legacy unauthenticated encryption; run `feanorfs migrate` to re-seal"
+        ),
+        LegacyPolicy::AllowXorFallback => Ok(crypt_bytes(data, password, path)),
+    }
 }
 
 /// Returns true if `hash` is a valid Blake3 hex digest (64 lowercase hex chars).
@@ -486,11 +617,20 @@ mod tests {
     }
 
     #[test]
-    fn unpack_legacy_xor_still_works() {
+    fn unpack_legacy_xor_still_works_with_allow_policy() {
         let plain = b"legacy blob";
         let xored = crypt_bytes(plain, "pw", "legacy.txt");
         let recovered = unpack_bytes(&xored, "pw", "legacy.txt").unwrap();
         assert_eq!(recovered, plain);
+    }
+
+    #[test]
+    fn unpack_rejects_legacy_when_policy_reject() {
+        let plain = b"legacy blob";
+        let xored = crypt_bytes(plain, "pw", "legacy.txt");
+        let err =
+            unpack_bytes_with_policy(&xored, "pw", "legacy.txt", LegacyPolicy::Reject).unwrap_err();
+        assert!(err.to_string().contains("legacy"));
     }
 
     #[test]
