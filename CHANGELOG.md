@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Lazy hydration** — `pull --lazy` fetches metadata only and creates 0-byte placeholders; `hydrate` and `cat` download and decrypt on demand.
 - **Real-time watch** — `watch` subcommand monitors filesystem changes with 500ms debounce and auto-syncs.
 - **Cross-platform path normalization** — all tracked paths use forward slashes.
-- **`.gitignore` integration** — files matching ignore patterns are excluded from sync; `.feanorfs/` and `.git/` are always skipped.
+- **All files synced** — `.gitignore` is not honored; FeanorFS syncs all files except `.feanorfs/` and `.git/`.
 
 ### Security
 - Zero-knowledge server: only encrypted hashes and ciphertext blobs are stored server-side.

@@ -63,6 +63,7 @@ pub async fn spawn_agent(
 
     for result in ignore::WalkBuilder::new(base)
         .hidden(false)
+        .ignore(false)
         .git_ignore(false)
         .git_exclude(false)
         .git_global(false)
@@ -80,8 +81,10 @@ pub async fn spawn_agent(
             continue;
         };
         let normalized = normalize_path(rel_str);
-        if normalized.starts_with(".feanorfs")
-            || normalized.starts_with(".git")
+        if normalized == ".feanorfs"
+            || normalized == ".git"
+            || normalized.starts_with(".feanorfs/")
+            || normalized.starts_with(".git/")
             || normalized.contains("/.git/")
             || normalized.contains("/.feanorfs/")
         {

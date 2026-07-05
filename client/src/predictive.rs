@@ -1,4 +1,5 @@
 use crate::api::ApiClient;
+use crate::fs_util::atomic_write;
 use crate::local::{CacheEntry, ClientDb};
 use anyhow::Result;
 use feanorfs_common::crypt_bytes;
@@ -115,12 +116,9 @@ async fn hydrate_one(
         return Ok(false);
     }
     let plain = crypt_bytes(&encrypted, password, &entry.path);
-    let full = base.join(&entry.path);
-    if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    fs::write(&full, &plain).await?;
+    atomic_write(base, &entry.path, &plain).await?;
 
+    let full = base.join(&entry.path);
     let actual_mtime = fs::metadata(&full)
         .await?
         .modified()

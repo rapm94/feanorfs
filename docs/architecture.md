@@ -72,7 +72,7 @@ Location: [`client/src/lib.rs`](../client/src/lib.rs) (library), [`client/src/ma
 
 **Directory scanning** (`scan_local_directory`):
 1. Load all cached entries from `local_cache.db`.
-2. Walk the directory tree using `ignore::WalkBuilder` (respects `.gitignore`).
+2. Walk the directory tree using `ignore::WalkBuilder` (gitignore disabled — all files synced).
 3. For each file on disk:
    - If cache hit (same `mtime` + `size` + `hydrated=true`): reuse cached hashes. No re-hashing.
    - If unhydrated placeholder (size=0, `hydrated=false`): reuse cached encrypted hash + server_mtime. Reports server_mtime to avoid false "local changed" detection.
@@ -155,3 +155,14 @@ When a file is pulled as a lazy placeholder (0 bytes, `hydrated=false`), the cli
 ### Why debounce watcher events for 500ms?
 
 Filesystem writes are noisy — a single `save` in an editor can emit 3-10 events (temp file → rename, or partial writes). Without debouncing, the watch loop would trigger multiple rapid syncs for a single logical change. 500ms is long enough to coalesce burst events but short enough to feel responsive.
+
+### Workspace sync conflict detection (`last_synced_state`)
+
+The client stores the last agreed file metadata snapshot in `last_session.last_synced_state` (JSON blob today). Before applying upload/download actions, it sends that snapshot to `/api/sync/diff` to learn what changed on the server since the last successful agree — the same pattern as `agent commit`, without adding server logic.
+
+**Handled:** concurrent offline edits to files that existed at last sync; concurrent delete agreement (both sides delete the same path).
+
+**Known limitations (dumb diff protocol):**
+
+- **Concurrent offline creates** of the same new path on two clients cannot be detected in one round-trip. Once a client reports the path, the server treats it as known and the diff will not mark both upload and download. Last-writer-wins can still occur for brand-new paths. Fixing this would require the server to distinguish “new to this client” from “new to the workspace.”
+- **`last_synced_state` storage** is a single JSON blob per workspace. This is fine for typical dev folders; very large trees (10k+ files) would benefit from a dedicated per-path table and incremental updates (future work).

@@ -381,7 +381,8 @@ pub fn save_global_config(config: &GlobalConfig) -> Result<()> {
     Ok(())
 }
 
-/// Scans the local filesystem directory, matching against .gitignore, caching file hashes.
+/// Scans the local filesystem directory, caching file hashes. Does NOT honor
+/// `.gitignore` — all files are synced except `.feanorfs/` and `.git/`.
 pub async fn scan_local_directory(
     base_path: &Path,
     db: &ClientDb,
@@ -394,7 +395,11 @@ pub async fn scan_local_directory(
     // 2. Scan physical files on disk
     let mut disk_files = HashMap::new();
     let walker = WalkBuilder::new(base_path)
-        .hidden(false) // don't skip hidden files entirely, but we skip .git and .feanorfs manually
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
         .build();
 
     let password_str = password.unwrap_or(feanorfs_common::LEGACY_DEFAULT_PASSWORD);
@@ -418,8 +423,10 @@ pub async fn scan_local_directory(
         let normalized = normalize_path(rel_path_str);
 
         // Skip our control directories
-        if normalized.starts_with(".feanorfs")
-            || normalized.starts_with(".git")
+        if normalized == ".feanorfs"
+            || normalized == ".git"
+            || normalized.starts_with(".feanorfs/")
+            || normalized.starts_with(".git/")
             || normalized.contains("/.git/")
             || normalized.contains("/.feanorfs/")
         {

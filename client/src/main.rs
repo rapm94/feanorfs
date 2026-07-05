@@ -5,6 +5,7 @@ use feanorfs_client::{
     summary, watch, ApiClient, ClientDb, Config, GlobalConfig,
 };
 use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 
@@ -430,7 +431,9 @@ enum AgentAction {
     List,
     /// Remove an agent workspace and its snapshot rows.
     Clean { name: String },
-    /// Run a command inside an agent workspace (Level 1 process isolation).
+    /// Run a command with the agent workspace as its working directory.
+    /// No kernel-level sandbox: the child process inherits the parent's
+    /// environment, filesystem access, and network. Use only with trusted commands.
     Run {
         name: String,
         /// Command and arguments to execute inside the agent workspace.
@@ -824,7 +827,7 @@ async fn main() -> anyhow::Result<()> {
                 if result.not_found {
                     println!("Error: file '{}' does not exist.", path);
                 } else {
-                    print!("{}", result.content);
+                    std::io::stdout().write_all(&result.content)?;
                 }
             }
         }

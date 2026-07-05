@@ -48,7 +48,7 @@ cargo run --bin feanorfs -- hydrate
 - **No redundant hashing**: Check disk files against `local_cache.db` first. Rehash only if `mtime` or `size` differs.
 - **Zero-knowledge encryption**: Always encrypt file contents with `crypt_bytes` before calling `api.upload_file`. Store the resulting `encrypted_hash` in the database.
 - **Error handling**: Use `anyhow::Result` for application code. Provide context with `.context()` or `.with_context()`. Avoid bare `.unwrap()` on fallible operations — use `.unwrap_or()` / `.unwrap_or_default()` only when the default is genuinely safe.
-- **Skip control directories**: `.feanorfs` and `.git` must be hardcoded as skipped in directory scanning. Do not rely on `.gitignore` alone for these.
+- **Skip control directories**: `.feanorfs` and `.git` must be hardcoded as skipped in directory scanning. Do not rely on `.gitignore` for these.
 - **Debounce filesystem events**: Filesystem saves are noisy. Debounce watcher events for 500ms using a channel.
 - **Lazy placeholders**: Do not download remote file bytes during sync if `--lazy` is enabled. Write 0-byte placeholders instead.
 
