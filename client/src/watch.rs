@@ -7,7 +7,7 @@ use notify::Watcher;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
+pub fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
     for path in paths {
         let Some(path_str) = path.to_str() else {
             continue;
@@ -64,7 +64,11 @@ pub async fn run_watch(
     let mut poll = tokio::time::interval(IDLE_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    println!("Performing initial sync...");
+    if consecutive_errors > 0 {
+        eprintln!("Offline — changes will sync when the server is reachable.");
+    } else {
+        println!("Performing initial sync...");
+    }
     if let Err(e) = sync_once(
         api,
         db,
@@ -79,6 +83,7 @@ pub async fn run_watch(
         consecutive_errors = consecutive_errors.saturating_add(1);
         tracing::error!("Initial sync failed: {:?}", e);
         eprintln!("Initial sync failed: {:?}", e);
+        eprintln!("Offline — changes will sync when the server is reachable.");
     }
 
     loop {

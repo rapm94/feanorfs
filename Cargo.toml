@@ -39,6 +39,12 @@ which = "7"
 rpassword = "7"
 constant_time_eq = "0.4"
 chacha20poly1305 = "0.10"
+reflink = "0.1"
+unicode-normalization = "0.1"
+diffy = "0.4"
+urlencoding = "2"
+tower = "0.5"
+http = "1"
 
 [profile.release]
 strip = true

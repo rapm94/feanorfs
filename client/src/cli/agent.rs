@@ -1,19 +1,82 @@
-use feanorfs_client::{commit_agent, load_config, spawn_agent, ApiClient, ClientDb};
+use clap::Subcommand;
+use feanorfs_client::{
+    check_agent, clean_agent, land_agent, list_agents, load_config, refresh_agent, spawn_agent,
+    ApiClient, ClientDb,
+};
 use std::path::Path;
 
 use super::util::output_json;
-use super::AgentAction;
+
+#[derive(Subcommand)]
+pub enum AgentAction {
+    /// List agents or preview one agent's changes (read-only)
+    Status {
+        /// Agent name. If omitted, lists all agents with a one-line summary.
+        name: Option<String>,
+    },
+    /// Spawn a new isolated agent workspace `.feanorfs/agents/<name>/`.
+    Spawn {
+        name: String,
+        /// Skip pre-spawn sync (requires folder to match last synced state).
+        #[arg(long)]
+        no_sync: bool,
+        /// Replace an existing agent with the same name.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Integrate agent work into your folder (applies clean changes, registers conflicts).
+    #[command(alias = "commit", hide = true)]
+    Land {
+        name: String,
+        /// Remove agent workspace after a successful land.
+        #[arg(long)]
+        clean: bool,
+        /// Write diff3 `.proposed` artifacts for conflicts (never auto-applied).
+        #[arg(long)]
+        propose: bool,
+    },
+    /// Pull cloud changes into the agent for paths the agent hasn't edited.
+    Refresh { name: String },
+    /// Remove an agent workspace and its snapshot rows.
+    Clean { name: String },
+    /// Run a command with the agent workspace as its working directory.
+    Run {
+        name: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Preview agent changes (legacy — prefer `agent status <name>`)
+    #[command(hide = true)]
+    Check { name: String },
+    /// List agent workspaces (legacy — prefer `agent status`)
+    #[command(hide = true)]
+    List,
+}
 
 pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow::Result<()> {
     match action {
-        AgentAction::Spawn { name } => {
+        AgentAction::Status { name: Some(name) } | AgentAction::Check { name } => {
+            run_agent_check(current_dir, &name, json).await?
+        }
+        AgentAction::Status { name: None } => run_agent_status_list(current_dir, json).await?,
+        AgentAction::List => run_agent_list_legacy(current_dir, json).await?,
+        AgentAction::Spawn {
+            name,
+            no_sync,
+            replace,
+        } => {
             let config = load_config(current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+            let api = ApiClient::from_config(current_dir, &config).await?;
             let count = spawn_agent(
                 current_dir,
                 &db,
+                &api,
+                &config.workspace_id,
                 &name,
                 config.encryption_password.as_deref(),
+                no_sync,
+                replace,
             )
             .await?;
             if json {
@@ -23,16 +86,41 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 }))?;
             } else {
                 println!(
-                    "Agent '{}' spawned with {} files (copied) at .feanorfs/agents/{}/",
+                    "Agent '{}' spawned with {} files at .feanorfs/agents/{}/",
                     name, count, name
                 );
             }
         }
-        AgentAction::Commit { name } | AgentAction::Check { name } => {
+        AgentAction::Land {
+            name,
+            clean,
+            propose,
+        } => {
             let config = load_config(current_dir)?;
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
-            let result = commit_agent(
+            let api = ApiClient::from_config(current_dir, &config).await?;
+            let result = land_agent(
+                current_dir,
+                &db,
+                &api,
+                &config.workspace_id,
+                &name,
+                config.encryption_password.as_deref(),
+                clean,
+                propose,
+            )
+            .await?;
+            if json {
+                output_json(&result)?;
+            } else {
+                println!("{}", result.message);
+            }
+        }
+        AgentAction::Refresh { name } => {
+            let config = load_config(current_dir)?;
+            let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+            let api = ApiClient::from_config(current_dir, &config).await?;
+            let result = refresh_agent(
                 current_dir,
                 &db,
                 &api,
@@ -41,41 +129,15 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 config.encryption_password.as_deref(),
             )
             .await?;
-
             if json {
                 output_json(&result)?;
             } else {
-                println!("Agent '{}' commit:", name);
-                println!("  Our changes:    {}", result.our_changes.len());
-                println!("  Their changes: {}", result.their_changes.len());
-                println!("  Conflicts:     {}", result.conflicts.len());
-                if !result.conflicts.is_empty() {
-                    println!(
-                        "\nConflicting paths (look in .feanorfs/conflicts/ for base/ours/theirs):"
-                    );
-                    for c in &result.conflicts {
-                        println!("  ! {}", c.path);
-                    }
-                }
-            }
-        }
-        AgentAction::List => {
-            let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let names = feanorfs_client::list_agents(current_dir, &db).await?;
-            if json {
-                output_json(&serde_json::json!({ "agents": names }))?;
-            } else if names.is_empty() {
-                println!("No agent workspaces.");
-            } else {
-                println!("Agent workspaces:");
-                for n in &names {
-                    println!("  * {}", n);
-                }
+                println!("Refreshed: {:?}", result.refreshed);
             }
         }
         AgentAction::Clean { name } => {
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            feanorfs_client::clean_agent(current_dir, &db, &name).await?;
+            clean_agent(current_dir, &db, &name).await?;
             if json {
                 output_json(&serde_json::json!({ "cleaned": name }))?;
             } else {
@@ -84,9 +146,7 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
         }
         AgentAction::Run { name, command } => {
             if command.is_empty() {
-                anyhow::bail!(
-                    "`agent run` requires a command after `--`. Example: feanorfs agent run ci -- cargo test"
-                );
+                anyhow::bail!("`agent run` requires a command after `--`");
             }
             feanorfs_client::agent::validate_name(&name)?;
             let agent_path = feanorfs_client::agent::agent_dir(current_dir, &name);
@@ -97,12 +157,140 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                     name
                 );
             }
+            let agent_dir_abs = agent_path.canonicalize().unwrap_or(agent_path.clone());
             let mut cmd = std::process::Command::new(&command[0]);
-            cmd.args(&command[1..]).current_dir(&agent_path);
+            cmd.args(&command[1..])
+                .current_dir(&agent_path)
+                .env("FEANORFS_AGENT", &name)
+                .env("FEANORFS_AGENT_DIR", agent_dir_abs);
             let status = cmd.status()?;
             if !status.success() {
                 std::process::exit(status.code().unwrap_or(1));
             }
+        }
+    }
+    Ok(())
+}
+
+async fn run_agent_check(current_dir: &Path, name: &str, json: bool) -> anyhow::Result<()> {
+    let config = load_config(current_dir)?;
+    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+    let api = ApiClient::from_config(current_dir, &config).await?;
+    let result = check_agent(
+        current_dir,
+        &db,
+        &api,
+        &config.workspace_id,
+        name,
+        config.encryption_password.as_deref(),
+    )
+    .await?;
+    if json {
+        output_json(&result)?;
+    } else {
+        println!("Agent '{name}':");
+        println!("  Changes to land: {}", result.our_changes.len());
+        println!("  Cloud changes:   {}", result.their_changes.len());
+        println!("  Needs attention: {}", result.conflicts.len());
+        if !result.conflict_risk.is_empty() {
+            println!("  Consider refresh: {}", result.conflict_risk.join(", "));
+        }
+        if !result.conflicts.is_empty() {
+            println!("  Conflicting paths:");
+            for c in &result.conflicts {
+                println!("    ! {}", c.path);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_agent_list_legacy(current_dir: &Path, json: bool) -> anyhow::Result<()> {
+    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+    let names = list_agents(current_dir, &db).await?;
+    if json {
+        output_json(&serde_json::json!({ "agents": names }))?;
+    } else if names.is_empty() {
+        println!("No agent workspaces.");
+    } else {
+        for n in &names {
+            println!("  * {n}");
+        }
+    }
+    Ok(())
+}
+
+async fn agent_one_line_state(
+    current_dir: &Path,
+    db: &ClientDb,
+    api: &ApiClient,
+    workspace_id: &str,
+    password: Option<&str>,
+    name: &str,
+) -> String {
+    match check_agent(current_dir, db, api, workspace_id, name, password).await {
+        Ok(check) => {
+            if !check.conflicts.is_empty() {
+                format!("{} conflict(s)", check.conflicts.len())
+            } else if !check.our_changes.is_empty() {
+                format!("{} change(s)", check.our_changes.len())
+            } else {
+                "clean".into()
+            }
+        }
+        Err(_) => "(offline)".into(),
+    }
+}
+
+async fn run_agent_status_list(current_dir: &Path, json: bool) -> anyhow::Result<()> {
+    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+    let names = list_agents(current_dir, &db).await?;
+
+    let enriched = match load_config(current_dir) {
+        Ok(config) => match ApiClient::from_config(current_dir, &config).await {
+            Ok(api) => Some((config, api)),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
+    if json {
+        if let Some((config, api)) = enriched {
+            let mut agents = Vec::new();
+            for name in &names {
+                let state = agent_one_line_state(
+                    current_dir,
+                    &db,
+                    &api,
+                    &config.workspace_id,
+                    config.encryption_password.as_deref(),
+                    name,
+                )
+                .await;
+                agents.push(serde_json::json!({ "name": name, "state": state }));
+            }
+            output_json(&serde_json::json!({ "agents": agents }))?;
+        } else {
+            output_json(&serde_json::json!({ "agents": names }))?;
+        }
+    } else if names.is_empty() {
+        println!("No agent workspaces.");
+    } else if let Some((config, api)) = enriched {
+        for name in &names {
+            let state = agent_one_line_state(
+                current_dir,
+                &db,
+                &api,
+                &config.workspace_id,
+                config.encryption_password.as_deref(),
+                name,
+            )
+            .await;
+            println!("  {name}: {state}");
+        }
+    } else {
+        for name in &names {
+            println!("  {name}");
         }
     }
     Ok(())

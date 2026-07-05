@@ -1,4 +1,4 @@
-use feanorfs_client::{ApiClient, ClientDb};
+use feanorfs_client::{ApiClient, ClientDb, Config};
 use feanorfs_server::{build_router, init_app_state};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -6,8 +6,24 @@ use tempfile::TempDir;
 pub const TEST_PASSWORD: &str = "integration-test-password";
 pub const WORKSPACE_ID: &str = "test-workspace";
 
+pub fn write_test_config(workspace: &Path, server_url: &str) {
+    let feanorfs = workspace.join(".feanorfs");
+    std::fs::create_dir_all(&feanorfs).unwrap();
+    let cfg = Config {
+        server_url: server_url.to_string(),
+        workspace_id: WORKSPACE_ID.to_string(),
+        encryption_password: Some(TEST_PASSWORD.to_string()),
+        server_password: None,
+        format_version: 2,
+        hub_local: false,
+    };
+    let json = serde_json::to_string_pretty(&cfg).unwrap();
+    std::fs::write(feanorfs.join("config.json"), json).unwrap();
+}
+
 pub struct TestServer {
     pub api: ApiClient,
+    pub url: String,
     _data_dir: TempDir,
     _handle: tokio::task::JoinHandle<()>,
 }
@@ -26,6 +42,7 @@ pub async fn spawn_test_server() -> TestServer {
     let url = format!("http://{addr}");
     TestServer {
         api: ApiClient::new(&url, None),
+        url,
         _data_dir: data_dir,
         _handle: handle,
     }
@@ -42,6 +59,12 @@ pub async fn spawn_test_client() -> TestClient {
         .await
         .unwrap();
     TestClient { workspace, db }
+}
+
+pub async fn spawn_test_client_with_server(server: &TestServer) -> TestClient {
+    let client = spawn_test_client().await;
+    write_test_config(client.workspace.path(), &server.url);
+    client
 }
 
 pub async fn write_workspace_file(workspace: &Path, rel: &str, content: &[u8]) -> PathBuf {

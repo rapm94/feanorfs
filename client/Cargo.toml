@@ -22,6 +22,7 @@ path = "src/lib.rs"
 
 [dependencies]
 feanorfs-common = { path = "../common" }
+feanorfs-server = { path = "../server" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }
@@ -32,12 +33,19 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+http = { workspace = true }
+urlencoding = { workspace = true }
 
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 mdns-sd = { workspace = true }
 which = { workspace = true }
 rpassword = { workspace = true }
+reflink = { workspace = true }
+unicode-normalization = { workspace = true }
+diffy = { workspace = true }
 
 [dev-dependencies]
 feanorfs-server = { path = "../server" }

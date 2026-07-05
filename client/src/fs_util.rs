@@ -39,3 +39,15 @@ pub async fn atomic_write(base_path: &Path, rel: &str, content: &[u8]) -> Result
         }
     }
 }
+
+/// Set or clear read-only bit on a file (placeholder safety DX-9).
+pub async fn set_readonly(path: &Path, readonly: bool) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let meta = fs::metadata(path).await?;
+    let mut perms = meta.permissions();
+    perms.set_readonly(readonly);
+    fs::set_permissions(path, perms).await?;
+    Ok(())
+}

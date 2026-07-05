@@ -1,7 +1,8 @@
 use anyhow::Context as _;
 use feanorfs_client::{
-    conflicts, load_global_config, save_config, save_global_config, ApiClient, ClientDb, Config,
-    GlobalConfig,
+    conflicts, do_sync, encode_invite, hub::LocalHub, load_global_config, save_config,
+    save_global_config, validate_e2ee_key, ApiClient, ClientDb, Config, GlobalConfig,
+    WorkspaceInvite, LOCAL_HUB_URL,
 };
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -75,7 +76,7 @@ fn discover_server_mdns(timeout: Duration) -> anyhow::Result<String> {
     let _ = daemon.shutdown();
     anyhow::bail!(
         "No FeanorFS server found on local network within {} seconds. \
-         Specify URL explicitly: feanorfs connect <URL>",
+         Specify URL explicitly: feanorfs start https://your-server:3030",
         timeout.as_secs()
     )
 }
@@ -93,10 +94,10 @@ pub fn resolve_server_url(explicit: Option<String>, allow_lan: bool) -> anyhow::
                     anyhow::bail!(
                         "No server URL specified and no cached connection found.\n\
                          \n\
-                         Connect to a server first:\n  \
-                         feanorfs connect https://your-server.com:3030\n\n\
-                         Or for LAN discovery:\n  \
-                         feanorfs connect --lan"
+                         Examples:\n  \
+                         feanorfs start https://your-server.com:3030\n  \
+                         feanorfs start --lan\n  \
+                         feanorfs start --local"
                     )
                 }
             }
@@ -154,6 +155,9 @@ pub fn truncate_password_for_display(p: &str) -> String {
 }
 
 pub async fn probe_server_auth(url: &str) -> anyhow::Result<bool> {
+    if url == LOCAL_HUB_URL {
+        return Ok(false);
+    }
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{}/api/workspaces", url.trim_end_matches('/')))
@@ -169,6 +173,42 @@ pub fn output_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn invite_from_config(config: &Config) -> Option<WorkspaceInvite> {
+    Some(WorkspaceInvite {
+        server_url: config.server_url.clone(),
+        workspace_id: config.workspace_id.clone(),
+        server_token: config.server_password.clone(),
+        encryption_key: config.encryption_password.clone()?,
+        hub_local: config.is_local_hub(),
+    })
+}
+
+pub fn print_invite(invite: &WorkspaceInvite) -> anyhow::Result<()> {
+    let encoded = encode_invite(invite)?;
+    println!("\nInvite (one-line join on another machine):");
+    println!("  feanorfs start {encoded}");
+    copy_to_clipboard(&encoded);
+    println!("Copied invite to clipboard.");
+    Ok(())
+}
+
+pub async fn initialize_local_mirror(
+    current_dir: &Path,
+    workspace: String,
+    encryption_key: Option<String>,
+) -> anyhow::Result<()> {
+    initialize_new_mirror(
+        current_dir,
+        LOCAL_HUB_URL.to_string(),
+        workspace,
+        encryption_key,
+        None,
+        false,
+        true,
+    )
+    .await
+}
+
 pub async fn initialize_new_mirror(
     current_dir: &Path,
     url: String,
@@ -176,12 +216,19 @@ pub async fn initialize_new_mirror(
     encryption_key: Option<String>,
     server_token: Option<String>,
     save_global: bool,
+    local_hub: bool,
 ) -> anyhow::Result<()> {
     let srv_pass = resolve_server_password(server_token);
+    let hub_local = local_hub || url == LOCAL_HUB_URL;
+    let server_url = if hub_local {
+        LOCAL_HUB_URL.to_string()
+    } else {
+        url.clone()
+    };
 
-    if save_global {
+    if save_global && !hub_local {
         let global = GlobalConfig {
-            server_url: url.clone(),
+            server_url: server_url.clone(),
             server_password: srv_pass.clone(),
         };
         save_global_config(&global)?;
@@ -193,33 +240,70 @@ pub async fn initialize_new_mirror(
     };
 
     let config = Config {
-        server_url: url.clone(),
+        server_url: server_url.clone(),
         workspace_id: workspace.clone(),
         encryption_password: Some(e2ee_key.clone()),
         server_password: srv_pass.clone(),
+        format_version: 2,
+        hub_local,
     };
+    if let Err(e) = validate_e2ee_key(&e2ee_key, 2) {
+        if !was_generated {
+            return Err(e);
+        }
+    }
     save_config(current_dir, &config)?;
+
+    if hub_local {
+        let hub_dir = config.hub_data_dir(current_dir);
+        LocalHub::open(hub_dir, srv_pass.clone()).await?;
+    }
 
     let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
 
     println!("This folder is now mirrored to FeanorFS.");
-    println!("  Server:       {}", url);
+    if hub_local {
+        println!("  Hub:          embedded (local, in-process)");
+    } else {
+        println!("  Server:       {}", server_url);
+    }
     println!("  Workspace:    {}", workspace);
     println!("  Encryption:   enabled (zero-knowledge)");
     if srv_pass.is_some() {
         println!("  Server auth:  enabled");
     }
 
+    let invite = WorkspaceInvite {
+        server_url: server_url.clone(),
+        workspace_id: workspace.clone(),
+        server_token: srv_pass.clone(),
+        encryption_key: e2ee_key.clone(),
+        hub_local,
+    };
+
     if was_generated {
         println!("\nWorkspace encryption key: {}", e2ee_key);
         copy_to_clipboard(&e2ee_key);
-        println!("Copied to clipboard.");
-        println!("\nOn your other machine, link the same workspace:");
+        println!("Copied encryption key to clipboard.");
+        if hub_local {
+            println!(
+                "\nThis workspace uses an embedded local hub. Invites are not portable — \
+                 run `feanorfs serve --data-dir .feanorfs/hub-data` to share it on the network."
+            );
+        } else {
+            print_invite(&invite)?;
+        }
         println!(
-            "  feanorfs attach {} --encryption-key {}",
-            workspace, e2ee_key
+            "This key encrypts your files. The server can never read them. \
+             Store it — without it your files are unrecoverable."
         );
-        println!("\nSave this key — without it your files cannot be decrypted.");
+    } else if hub_local {
+        println!(
+            "\nThis workspace uses an embedded local hub. Invites are not portable — \
+             run `feanorfs serve --data-dir .feanorfs/hub-data` to share it on the network."
+        );
+    } else {
+        print_invite(&invite)?;
     }
 
     Ok(())
@@ -231,40 +315,126 @@ pub async fn link_existing_mirror(
     workspace: String,
     encryption_key: String,
     server_token: Option<String>,
+    hub_local: bool,
+    run_initial_sync: bool,
 ) -> anyhow::Result<()> {
     let srv_pass = resolve_server_password(server_token);
-
-    let global = GlobalConfig {
-        server_url: url.clone(),
-        server_password: srv_pass.clone(),
+    let hub_local = hub_local || url == LOCAL_HUB_URL;
+    let server_url = if hub_local {
+        LOCAL_HUB_URL.to_string()
+    } else {
+        url.clone()
     };
-    save_global_config(&global)?;
+
+    if !hub_local {
+        let global = GlobalConfig {
+            server_url: server_url.clone(),
+            server_password: srv_pass.clone(),
+        };
+        save_global_config(&global)?;
+    }
 
     let config = Config {
-        server_url: url.clone(),
+        server_url: server_url.clone(),
         workspace_id: workspace.clone(),
         encryption_password: Some(encryption_key.clone()),
         server_password: srv_pass.clone(),
+        format_version: 2,
+        hub_local,
     };
+    validate_e2ee_key(&encryption_key, 2)?;
     save_config(current_dir, &config)?;
+
+    if hub_local {
+        LocalHub::open(config.hub_data_dir(current_dir), srv_pass.clone()).await?;
+    }
 
     let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
 
     println!("Linked this folder to mirrored workspace '{}'.", workspace);
-    println!("  Server:     {}", url);
+    if hub_local {
+        println!("  Hub:        embedded (local, in-process)");
+    } else {
+        println!("  Server:     {}", server_url);
+    }
     println!("  Encryption: enabled");
     if srv_pass.is_some() {
         println!("  Server auth: enabled");
     }
-    println!("\nRun 'feanorfs sync --no-watch' to download files from the mirror.");
 
-    let api = ApiClient::new(&url, srv_pass.as_deref());
+    let api = ApiClient::from_config(current_dir, &config).await?;
     let local_files =
         feanorfs_client::local::scan_local_directory(current_dir, &db, Some(&encryption_key))
             .await?;
-    conflicts::seed_last_synced_from_server(&api, &db, &workspace, &local_files).await?;
+    let ctx = feanorfs_client::SyncCtx::new(
+        &api,
+        &db,
+        current_dir,
+        &workspace,
+        Some(&encryption_key),
+        feanorfs_common::LegacyPolicy::Reject,
+    );
+    conflicts::seed_last_synced_from_server(&ctx, &local_files).await?;
+
+    if run_initial_sync {
+        println!("Syncing union of local files and workspace mirror...");
+        do_sync(
+            &api,
+            &db,
+            current_dir,
+            &workspace,
+            Some(&encryption_key),
+            false,
+        )
+        .await?;
+    } else {
+        println!("\nRun 'feanorfs sync --no-watch' to download files from the mirror.");
+    }
 
     Ok(())
+}
+
+pub async fn acquire_token(
+    server_url: &str,
+    arg: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(t) = arg {
+        return Ok(Some(t));
+    }
+    match probe_server_auth(server_url).await {
+        Ok(true) => Ok(Some(read_password_hidden("Server requires a token: ")?)),
+        Ok(false) => Ok(None),
+        Err(e) => {
+            tracing::warn!(
+                "Server auth probe failed for {server_url}: {e:?}. Continuing without token."
+            );
+            Ok(None)
+        }
+    }
+}
+
+pub async fn join_from_invite(
+    current_dir: &Path,
+    token: &str,
+    run_initial_sync: bool,
+) -> anyhow::Result<()> {
+    let invite = feanorfs_client::decode_invite(token)?;
+    if invite.hub_local {
+        anyhow::bail!(
+            "This invite is for an embedded local hub and cannot be used on another machine. \
+             Run `feanorfs serve` on the host and join with a remote invite, or copy the folder."
+        );
+    }
+    link_existing_mirror(
+        current_dir,
+        invite.server_url,
+        invite.workspace_id,
+        invite.encryption_key,
+        invite.server_token,
+        invite.hub_local,
+        run_initial_sync,
+    )
+    .await
 }
 
 #[cfg(test)]

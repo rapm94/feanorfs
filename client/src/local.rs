@@ -1,11 +1,115 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use feanorfs_common::{normalize_path, FileState};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
+
+fn default_format_version() -> u32 {
+    1
+}
+
+/// Built-in denylist for derivative build/cache dirs (DX-3).
+pub const DEFAULT_IGNORES: &[&str] = &[
+    "target/",
+    "node_modules/",
+    ".DS_Store",
+    "*.swp",
+    "*~",
+    ".venv/",
+    "__pycache__/",
+    "dist/",
+    "build/",
+    ".next/",
+    ".cache/",
+];
+
+/// Normalize path to NFC for cross-platform consistency (DX-16).
+#[must_use]
+pub fn normalize_path_nfc(path: &str) -> String {
+    normalize_path(&path.nfc().collect::<String>())
+}
+
+/// Validate E2EE key for format v2 workspaces (SEC-7).
+pub fn validate_e2ee_key(key: &str, format_version: u32) -> Result<()> {
+    if format_version < 2 {
+        return Ok(());
+    }
+    if key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!(
+            "Encryption key must be exactly 64 hex characters (generated keys only). \
+             Human passphrases are not accepted on format v2 workspaces."
+        );
+    }
+    Ok(())
+}
+
+pub fn build_workspace_walker(base_path: &Path, no_default_ignores: bool) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(base_path);
+    builder
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false);
+
+    if !no_default_ignores {
+        let mut igb = ignore::gitignore::GitignoreBuilder::new(base_path);
+        for pattern in DEFAULT_IGNORES {
+            let _ = igb.add_line(None, pattern);
+        }
+        if let Ok(content) = fs::read_to_string(base_path.join(".feanorfsignore")) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let _ = igb.add_line(None, line);
+            }
+        }
+        if let Ok(ig) = igb.build() {
+            let base = base_path.to_path_buf();
+            builder.filter_entry(move |e| {
+                if !e.file_type().is_some_and(|ft| ft.is_file()) {
+                    return true;
+                }
+                let Ok(rel) = e.path().strip_prefix(&base) else {
+                    return true;
+                };
+                let Some(s) = rel.to_str() else {
+                    return true;
+                };
+                !ig.matched(s, false).is_ignore()
+            });
+        }
+    }
+    builder
+}
+
+/// Symlink paths under the workspace (DX-19).
+pub fn collect_symlink_warnings(base_path: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for result in build_workspace_walker(base_path, false).build() {
+        let Ok(entry) = result else { continue };
+        if !entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(base_path) else {
+            continue;
+        };
+        let Some(s) = rel.to_str() else {
+            continue;
+        };
+        let normalized = normalize_path_nfc(s);
+        if feanorfs_common::is_safe_rel_path(&normalized) {
+            out.push(normalized);
+        }
+    }
+    out
+}
 
 fn file_size_from_db(size: i64) -> u64 {
     u64::try_from(size).unwrap_or_else(|_| {
@@ -34,6 +138,26 @@ pub struct Config {
     pub encryption_password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_password: Option<String>,
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
+    /// When true, sync uses an embedded hub at `.feanorfs/hub-data` (CONN-2).
+    #[serde(default)]
+    pub hub_local: bool,
+}
+
+/// Sentinel URL written for embedded local hubs (CONN-2).
+pub const LOCAL_HUB_URL: &str = "feanorfs+local://hub";
+
+impl Config {
+    #[must_use]
+    pub fn is_local_hub(&self) -> bool {
+        self.hub_local || self.server_url == LOCAL_HUB_URL
+    }
+
+    #[must_use]
+    pub fn hub_data_dir(&self, workspace: &Path) -> PathBuf {
+        workspace.join(".feanorfs").join("hub-data")
+    }
 }
 
 /// Global client config stored at ~/.feanorfs/global.json.
@@ -159,7 +283,24 @@ impl ClientDb {
         .await?;
 
         self.migrate_local_files_deleted_at().await?;
+        self.migrate_conflict_resolutions().await?;
 
+        Ok(())
+    }
+
+    async fn migrate_conflict_resolutions(&self) -> Result<()> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS conflict_resolutions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                method TEXT NOT NULL,
+                source_file_hash TEXT,
+                resolved_at INTEGER NOT NULL,
+                resolver TEXT NOT NULL
+            );",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -300,6 +441,48 @@ impl ClientDb {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn record_conflict_resolution(
+        &self,
+        path: &str,
+        method: &str,
+        source_file_hash: Option<&str>,
+        resolver: &str,
+    ) -> Result<()> {
+        let resolved_at = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO conflict_resolutions (path, method, source_file_hash, resolved_at, resolver)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(path)
+        .bind(method)
+        .bind(source_file_hash)
+        .bind(resolved_at)
+        .bind(resolver)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_conflict_resolutions(
+        &self,
+    ) -> Result<Vec<feanorfs_common::ConflictResolution>> {
+        let rows = sqlx::query(
+            "SELECT path, method, source_file_hash, resolved_at, resolver FROM conflict_resolutions ORDER BY resolved_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| feanorfs_common::ConflictResolution {
+                path: r.get("path"),
+                method: r.get("method"),
+                source_file_hash: r.get("source_file_hash"),
+                resolved_at: r.get("resolved_at"),
+                resolver: r.get("resolver"),
+            })
+            .collect())
     }
 
     pub async fn count_pending_in_dir(&self, conflict_dir: &str) -> Result<u32> {
@@ -456,6 +639,26 @@ impl ClientDb {
         Ok(())
     }
 
+    pub async fn update_agent_snapshot_base(
+        &self,
+        agent_name: &str,
+        path: &str,
+        state: &feanorfs_common::FileState,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE agent_snapshots SET base_hash = ?, base_size = ?, base_mtime = ?
+             WHERE agent_name = ? AND path = ?",
+        )
+        .bind(&state.hash)
+        .bind(file_size_to_db(state.size))
+        .bind(state.mtime)
+        .bind(agent_name)
+        .bind(path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn list_agent_snapshots(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT DISTINCT agent_name FROM agent_snapshots")
             .fetch_all(&self.pool)
@@ -594,26 +797,27 @@ pub fn save_global_config(config: &GlobalConfig) -> Result<()> {
     Ok(())
 }
 
-/// Scans the local filesystem directory, caching file hashes. Does NOT honor
-/// `.gitignore` — all files are synced except `.feanorfs/` and `.git/`.
+/// Scans the local filesystem directory, caching file hashes.
+/// Honors built-in default ignores and `.feanorfsignore` (DX-3/DX-4).
 pub async fn scan_local_directory(
     base_path: &Path,
     db: &ClientDb,
     password: Option<&str>,
 ) -> Result<HashMap<String, FileState>> {
-    // 1. Load cached files from SQLite DB
+    scan_local_directory_with_opts(base_path, db, password, false).await
+}
+
+pub async fn scan_local_directory_with_opts(
+    base_path: &Path,
+    db: &ClientDb,
+    password: Option<&str>,
+    no_default_ignores: bool,
+) -> Result<HashMap<String, FileState>> {
     let mut cached_entries = db.get_cache_entries().await?;
     let mut cache_hits = std::collections::HashSet::new();
 
-    // 2. Scan physical files on disk
     let mut disk_files = HashMap::new();
-    let walker = WalkBuilder::new(base_path)
-        .hidden(false)
-        .ignore(false)
-        .git_ignore(false)
-        .git_exclude(false)
-        .git_global(false)
-        .build();
+    let walker = build_workspace_walker(base_path, no_default_ignores).build();
 
     let password_str = password.unwrap_or(feanorfs_common::LEGACY_DEFAULT_PASSWORD);
 
@@ -633,7 +837,7 @@ pub async fn scan_local_directory(
             continue;
         };
 
-        let normalized = normalize_path(rel_path_str);
+        let normalized = normalize_path_nfc(rel_path_str);
 
         if !feanorfs_common::is_safe_rel_path(&normalized) {
             continue;
@@ -651,7 +855,6 @@ pub async fn scan_local_directory(
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
-        // Determine if we need to rehash/re-encrypt
         let (plaintext_hash, encrypted_hash, final_size, final_mtime, final_server_mtime, hydrated) =
             if let Some(cached) = cached_entries.get(&normalized) {
                 if cached.hydrated && cached.size == size && cached.mtime == mtime {
@@ -664,7 +867,7 @@ pub async fn scan_local_directory(
                         cached.server_mtime,
                         true,
                     )
-                } else if !cached.hydrated && size == 0 {
+                } else if !cached.hydrated {
                     cache_hits.insert(normalized.clone());
                     (
                         cached.plaintext_hash.clone(),
@@ -675,17 +878,48 @@ pub async fn scan_local_directory(
                         false,
                     )
                 } else {
-                    // Cache miss (modified file or placeholder that has local modifications)
                     let bytes = fs::read(abs_path)?;
-                    let ph = feanorfs_common::hash_bytes(&bytes);
-                    let encrypted_bytes =
-                        feanorfs_common::pack_bytes(&bytes, password_str, &normalized)?;
-                    let eh = feanorfs_common::hash_bytes(&encrypted_bytes);
-                    (ph, eh, size, mtime, mtime, true)
+                    let meta_after = fs::metadata(abs_path)?;
+                    let size_after = meta_after.len();
+                    let mtime_after = meta_after
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                        .unwrap_or(0);
+                    if size_after != size || mtime_after != mtime {
+                        // Partial write during scan (DX-13a) — reuse cache for
+                        // this pass so we do not tombstone a live file.
+                        cache_hits.insert(normalized.clone());
+                        (
+                            cached.plaintext_hash.clone(),
+                            cached.encrypted_hash.clone(),
+                            cached.size,
+                            cached.mtime,
+                            cached.server_mtime,
+                            cached.hydrated,
+                        )
+                    } else {
+                        let ph = feanorfs_common::hash_bytes(&bytes);
+                        let encrypted_bytes =
+                            feanorfs_common::pack_bytes(&bytes, password_str, &normalized)?;
+                        let eh = feanorfs_common::hash_bytes(&encrypted_bytes);
+                        (ph, eh, size, mtime, mtime, true)
+                    }
                 }
             } else {
-                // New file
                 let bytes = fs::read(abs_path)?;
+                let meta_after = fs::metadata(abs_path)?;
+                let size_after = meta_after.len();
+                let mtime_after = meta_after
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                    .unwrap_or(0);
+                if size_after != size || mtime_after != mtime {
+                    continue;
+                }
                 let ph = feanorfs_common::hash_bytes(&bytes);
                 let encrypted_bytes =
                     feanorfs_common::pack_bytes(&bytes, password_str, &normalized)?;
@@ -715,8 +949,6 @@ pub async fn scan_local_directory(
         disk_files.insert(normalized, (disk_entry, file_state));
     }
 
-    // 3. Find deleted files
-    // Files that are in the cached local DB but no longer present on disk
     let mut final_files = HashMap::new();
     for (path, cached) in cached_entries.drain() {
         if !disk_files.contains_key(&path) {

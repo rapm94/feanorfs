@@ -1,17 +1,20 @@
 use crate::api::ApiClient;
 use crate::conflicts;
-use crate::fs_util::{atomic_write, file_mtime_ms};
-use crate::local::{CacheEntry, ClientDb};
+use crate::ctx::SyncCtx;
+use crate::fs_util::{atomic_write, file_mtime_ms, set_readonly};
+use crate::local::{load_config, CacheEntry, ClientDb};
+use crate::lock::SyncLock;
+use crate::migrate::legacy_policy_for_config;
 use anyhow::{Context, Result};
-use feanorfs_common::{is_safe_rel_path, pack_bytes, unpack_bytes, FileState, SyncResponse};
+use feanorfs_common::{
+    is_safe_rel_path, pack_bytes, unpack_bytes_with_policy, FileState, SyncResponse,
+};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tokio::fs;
 
-/// Tray-friendly mirror state. Vocabulary intentionally avoids Git terms
-/// (`commit`, `branch`, etc.). `syncing` is set on operation results while
-/// bytes are in flight; `status --json` reports point-in-time state only.
+/// Mirror state for status output and `--json` consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MirrorState {
@@ -24,17 +27,24 @@ pub enum MirrorState {
     Syncing,
 }
 
-impl std::fmt::Display for MirrorState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
-            Self::Idle => "idle",
-            Self::OutOfSync => "out_of_sync",
+impl MirrorState {
+    /// Human-readable label for status output.
+    #[must_use]
+    pub const fn human_label(self) -> &'static str {
+        match self {
+            Self::Idle => "up to date",
+            Self::OutOfSync => "has changes",
             Self::Offline => "offline",
-            Self::Conflict => "conflict",
+            Self::Conflict => "needs attention",
             Self::Error => "error",
             Self::Syncing => "syncing",
-        };
-        write!(f, "{}", label)
+        }
+    }
+}
+
+impl std::fmt::Display for MirrorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.human_label())
     }
 }
 
@@ -58,19 +68,6 @@ pub fn derive_mirror_state(
     }
 }
 
-pub(crate) fn password_or_default(password: Option<&str>) -> &str {
-    match password {
-        Some(p) => p,
-        None => {
-            tracing::warn!(
-                "No E2EE password set in config. Using insecure legacy default. \
-                 Run 'feanorfs setup' to set a proper encryption key."
-            );
-            feanorfs_common::LEGACY_DEFAULT_PASSWORD
-        }
-    }
-}
-
 fn mirror_state_after_apply(blocked: &HashSet<String>, remote_still_pending: bool) -> MirrorState {
     if conflicts::conflicts_pending(Some(blocked)) {
         MirrorState::Conflict
@@ -81,20 +78,42 @@ fn mirror_state_after_apply(blocked: &HashSet<String>, remote_still_pending: boo
     }
 }
 
-async fn finish_sync_pass(
-    db: &ClientDb,
+/// Build `SyncCtx` from on-disk config, or synthesize one when config.json is absent.
+fn build_ctx_or_fallback<'a>(
+    api: &'a ApiClient,
+    db: &'a ClientDb,
+    base_path: &'a Path,
+    workspace_id: &str,
     password: Option<&str>,
+) -> Result<SyncCtx<'a>> {
+    let config_path = base_path.join(".feanorfs").join("config.json");
+    if config_path.exists() {
+        let config = load_config(base_path)?;
+        SyncCtx::from_config(api, db, base_path, &config)
+    } else {
+        Ok(SyncCtx::new(
+            api,
+            db,
+            base_path,
+            workspace_id,
+            password,
+            feanorfs_common::LegacyPolicy::AllowXorFallback,
+        ))
+    }
+}
+
+async fn finish_sync_pass(
+    ctx: &SyncCtx<'_>,
     local_files: &HashMap<String, FileState>,
     conflict_paths: &HashSet<String>,
     disk_mutated: bool,
-    base_path: &Path,
 ) -> Result<()> {
     let current_files = if disk_mutated {
-        crate::local::scan_local_directory(base_path, db, password).await?
+        crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?
     } else {
         local_files.clone()
     };
-    conflicts::commit_last_synced(db, &current_files, conflict_paths).await
+    conflicts::commit_last_synced(ctx.db, &current_files, conflict_paths).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,34 +134,22 @@ struct SyncPassOutcome {
 }
 
 async fn run_sync_pass(
-    api: &ApiClient,
-    db: &ClientDb,
-    base_path: &Path,
-    workspace_id: &str,
-    password: Option<&str>,
+    ctx: &SyncCtx<'_>,
     mode: SyncMode,
     lazy: bool,
 ) -> Result<(SyncPassOutcome, HashSet<String>)> {
+    let _lock = SyncLock::acquire(ctx.base)?;
     let label = match mode {
         SyncMode::Push => "Push",
         SyncMode::Pull => "Pull",
         SyncMode::Full => "Sync",
     };
     tracing::info!("{label} started (lazy={lazy})");
-    let local_files = crate::local::scan_local_directory(base_path, db, password).await?;
+    let local_files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     tracing::debug!("Scanned {} entries", local_files.len());
 
-    let password_str = password_or_default(password);
-    let (response, blocked) = conflicts::negotiate_sync_with_conflict_gate(
-        api,
-        workspace_id,
-        db,
-        base_path,
-        &local_files,
-        password,
-        true,
-    )
-    .await?;
+    let (response, mut blocked) =
+        conflicts::negotiate_sync_with_conflict_gate(ctx, &local_files, true).await?;
 
     tracing::debug!(
         "Diff: upload={}, download={}, delete_local={}",
@@ -154,33 +161,30 @@ async fn run_sync_pass(
     let mut outcome = SyncPassOutcome::default();
 
     if mode != SyncMode::Push {
-        let (downloads, placeholders) = process_downloads(
-            api,
-            &response,
-            base_path,
-            db,
-            &local_files,
-            password_str,
-            lazy,
-        )
-        .await?;
+        let (downloads, placeholders) =
+            process_downloads(ctx, &response, &local_files, lazy).await?;
         outcome.downloads = downloads;
         outcome.placeholders = placeholders;
-        outcome.deletes_local = process_delete_local(&response, base_path, db).await?;
+        outcome.deletes_local = process_delete_local(&response, ctx.base, ctx.db).await?;
     }
 
     if mode != SyncMode::Pull {
-        outcome.uploads = process_uploads(
-            api,
-            db,
-            &response,
-            &local_files,
-            base_path,
-            workspace_id,
-            password_str,
-        )
-        .await?;
-        outcome.deletes_remote = cleanup_deleted_cache(&local_files, db).await?;
+        outcome.uploads = process_uploads(ctx, &response, &local_files).await?;
+        outcome.deletes_remote = cleanup_deleted_cache(&local_files, ctx.db).await?;
+
+        if !response.upload_required.is_empty() {
+            let post = conflicts::detect_post_upload_collisions(
+                ctx,
+                &local_files,
+                &response.upload_required,
+            )
+            .await?;
+            if !post.is_empty() {
+                let (_post_dir, post_paths) =
+                    conflicts::register_and_write_conflicts(ctx, &post, None).await?;
+                blocked.extend(post_paths);
+            }
+        }
     }
 
     if mode == SyncMode::Push {
@@ -202,15 +206,7 @@ async fn run_sync_pass(
         || outcome.placeholders > 0
         || outcome.deletes_local > 0
         || outcome.deletes_remote > 0;
-    finish_sync_pass(
-        db,
-        password,
-        &local_files,
-        &blocked,
-        disk_mutated,
-        base_path,
-    )
-    .await?;
+    finish_sync_pass(ctx, &local_files, &blocked, disk_mutated).await?;
 
     Ok((outcome, blocked))
 }
@@ -264,19 +260,31 @@ pub struct StatusResult {
     pub delete_local: Vec<String>,
     pub local_files: HashMap<String, FileState>,
     pub pending_conflicts: Vec<String>,
+    /// Local changes waiting to sync when the server was unreachable (DX-8).
+    pub offline_backlog: u32,
+    /// Set when the server metadata looks older than this machine (DX-23).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_rollback_warning: Option<String>,
+    /// Symlink paths skipped during scan (DX-19).
+    pub skipped_symlinks: Vec<String>,
 }
 
-async fn process_downloads(
-    api: &ApiClient,
+/// AEAD-seal plaintext into `(encrypt_hash, packed_bytes)`.
+pub(crate) fn seal(content: &[u8], password: &str, path: &str) -> Result<(String, Vec<u8>)> {
+    let packed = pack_bytes(content, password, path)?;
+    let hash = feanorfs_common::hash_bytes(&packed);
+    Ok((hash, packed))
+}
+
+pub(crate) async fn process_downloads(
+    ctx: &SyncCtx<'_>,
     response: &SyncResponse,
-    base_path: &Path,
-    db: &ClientDb,
     local_files: &HashMap<String, FileState>,
-    password_str: &str,
     lazy: bool,
 ) -> Result<(u32, u32)> {
     let mut downloads = 0u32;
     let mut placeholders = 0u32;
+    let password_str = ctx.password_str();
 
     for replica_file in &response.download_required {
         let path = &replica_file.path;
@@ -285,11 +293,12 @@ async fn process_downloads(
         }
         if lazy {
             tracing::info!("Placeholder: {} ({} bytes)", path, replica_file.size);
-            let full_path = base_path.join(path);
+            let full_path = ctx.base.join(path);
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            atomic_write(base_path, path, b"").await?;
+            atomic_write(ctx.base, path, b"").await?;
+            set_readonly(&ctx.base.join(path), true).await?;
 
             let cache_entry = CacheEntry {
                 path: path.clone(),
@@ -301,10 +310,10 @@ async fn process_downloads(
                 hydrated: false,
                 deleted_at: None,
             };
-            db.upsert_cache_entry(&cache_entry).await?;
+            ctx.db.upsert_cache_entry(&cache_entry).await?;
             placeholders += 1;
         } else {
-            let full_path = base_path.join(path);
+            let full_path = ctx.base.join(path);
             let stale_local = match local_files.get(path) {
                 None => false,
                 Some(local) if local.deleted || !full_path.exists() => false,
@@ -320,7 +329,7 @@ async fn process_downloads(
             }
 
             tracing::info!("Downloading {} ({} bytes)", path, replica_file.size);
-            let encrypted_content = api.download_file(&replica_file.hash).await?;
+            let encrypted_content = ctx.api.download_file(&replica_file.hash).await?;
             let computed_hash = feanorfs_common::hash_bytes(&encrypted_content);
             if computed_hash != replica_file.hash {
                 anyhow::bail!(
@@ -330,12 +339,14 @@ async fn process_downloads(
                     computed_hash
                 );
             }
-            let plain_content = unpack_bytes(&encrypted_content, password_str, path)?;
+            let plain_content =
+                unpack_bytes_with_policy(&encrypted_content, password_str, path, ctx.policy)?;
 
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            atomic_write(base_path, path, &plain_content).await?;
+            set_readonly(&full_path, false).await?;
+            atomic_write(ctx.base, path, &plain_content).await?;
 
             let actual_mtime = file_mtime_ms(&full_path)
                 .await
@@ -352,7 +363,7 @@ async fn process_downloads(
                 hydrated: true,
                 deleted_at: None,
             };
-            db.upsert_cache_entry(&cache_entry).await?;
+            ctx.db.upsert_cache_entry(&cache_entry).await?;
             downloads += 1;
         }
     }
@@ -360,7 +371,7 @@ async fn process_downloads(
     Ok((downloads, placeholders))
 }
 
-async fn process_delete_local(
+pub(crate) async fn process_delete_local(
     response: &SyncResponse,
     base_path: &Path,
     db: &ClientDb,
@@ -373,6 +384,7 @@ async fn process_delete_local(
         let full_path = base_path.join(path);
         if full_path.exists() {
             tracing::info!("Remote deletion: {}", path);
+            crate::fs_util::set_readonly(&full_path, false).await.ok();
             fs::remove_file(&full_path)
                 .await
                 .with_context(|| format!("failed to remove local file {path}"))?;
@@ -383,16 +395,13 @@ async fn process_delete_local(
     Ok(deletes)
 }
 
-async fn process_uploads(
-    api: &ApiClient,
-    db: &ClientDb,
+pub(crate) async fn process_uploads(
+    ctx: &SyncCtx<'_>,
     response: &SyncResponse,
     local_files: &HashMap<String, FileState>,
-    base_path: &Path,
-    workspace_id: &str,
-    password_str: &str,
 ) -> Result<u32> {
     let mut uploads = 0u32;
+    let password_str = ctx.password_str();
     for path in &response.upload_required {
         if !is_safe_rel_path(path) {
             continue;
@@ -402,26 +411,28 @@ async fn process_uploads(
         };
         if local_file.deleted {
             tracing::info!("Uploading tombstone for {}", path);
-            api.upload_tombstone(workspace_id, path, &local_file.hash, local_file.mtime)
+            ctx.api
+                .upload_tombstone(ctx.workspace_id(), path, &local_file.hash, local_file.mtime)
                 .await?;
-            db.delete_cache_entry(path).await?;
+            ctx.db.delete_cache_entry(path).await?;
             uploads += 1;
         } else {
             tracing::info!("Uploading {} ({} bytes)", path, local_file.size);
-            let plain_content = fs::read(base_path.join(path)).await?;
-            let encrypted_content = pack_bytes(&plain_content, password_str, path)?;
-            let hash = feanorfs_common::hash_bytes(&encrypted_content);
-
-            api.upload_file(
-                workspace_id,
-                path,
-                &hash,
-                local_file.size,
-                local_file.mtime,
-                encrypted_content,
-            )
-            .await?;
-            db.set_cache_server_mtime(path, local_file.mtime).await?;
+            let plain_content = fs::read(ctx.base.join(path)).await?;
+            let (hash, encrypted_content) = seal(&plain_content, password_str, path)?;
+            ctx.api
+                .upload_file(
+                    ctx.workspace_id(),
+                    path,
+                    &hash,
+                    local_file.size,
+                    local_file.mtime,
+                    encrypted_content,
+                )
+                .await?;
+            ctx.db
+                .set_cache_server_mtime(path, local_file.mtime)
+                .await?;
             uploads += 1;
         }
     }
@@ -450,16 +461,8 @@ pub async fn do_push_only(
     workspace_id: &str,
     password: Option<&str>,
 ) -> Result<PushResult> {
-    let (outcome, blocked) = run_sync_pass(
-        api,
-        db,
-        base_path,
-        workspace_id,
-        password,
-        SyncMode::Push,
-        false,
-    )
-    .await?;
+    let ctx = build_ctx_or_fallback(api, db, base_path, workspace_id, password)?;
+    let (outcome, blocked) = run_sync_pass(&ctx, SyncMode::Push, false).await?;
     Ok(PushResult {
         mirror_state: mirror_state_after_apply(&blocked, outcome.remote_still_pending),
         uploads: outcome.uploads,
@@ -476,16 +479,8 @@ pub async fn do_pull_only(
     password: Option<&str>,
     lazy: bool,
 ) -> Result<PullResult> {
-    let (outcome, blocked) = run_sync_pass(
-        api,
-        db,
-        base_path,
-        workspace_id,
-        password,
-        SyncMode::Pull,
-        lazy,
-    )
-    .await?;
+    let ctx = build_ctx_or_fallback(api, db, base_path, workspace_id, password)?;
+    let (outcome, blocked) = run_sync_pass(&ctx, SyncMode::Pull, lazy).await?;
     Ok(PullResult {
         mirror_state: mirror_state_after_apply(&blocked, false),
         downloads: outcome.downloads,
@@ -502,16 +497,8 @@ pub async fn do_sync(
     password: Option<&str>,
     lazy: bool,
 ) -> Result<SyncResult> {
-    let (outcome, blocked) = run_sync_pass(
-        api,
-        db,
-        base_path,
-        workspace_id,
-        password,
-        SyncMode::Full,
-        lazy,
-    )
-    .await?;
+    let ctx = build_ctx_or_fallback(api, db, base_path, workspace_id, password)?;
+    let (outcome, blocked) = run_sync_pass(&ctx, SyncMode::Full, lazy).await?;
     Ok(SyncResult {
         mirror_state: mirror_state_after_apply(&blocked, false),
         uploads: outcome.uploads,
@@ -529,9 +516,27 @@ pub async fn do_hydrate(
     target_path: Option<String>,
     password: Option<&str>,
 ) -> Result<HydrateResult> {
+    let ctx = match load_config(base_path) {
+        Ok(config) => SyncCtx::from_config(api, db, base_path, &config)?,
+        Err(_) => SyncCtx::new(
+            api,
+            db,
+            base_path,
+            "",
+            password,
+            feanorfs_common::LegacyPolicy::AllowXorFallback,
+        ),
+    };
+    do_hydrate_with_ctx(&ctx, target_path).await
+}
+
+async fn do_hydrate_with_ctx(
+    ctx: &SyncCtx<'_>,
+    target_path: Option<String>,
+) -> Result<HydrateResult> {
     tracing::info!("Hydrate (target={:?})", target_path);
-    let password_str = password_or_default(password);
-    let cache_entries = db.get_cache_entries().await?;
+    let password_str = ctx.password_str();
+    let cache_entries = ctx.db.get_cache_entries().await?;
 
     let mut hydrated = Vec::new();
 
@@ -544,7 +549,7 @@ pub async fn do_hydrate(
 
         if !entry.hydrated {
             tracing::info!("Hydrating {} (hash: {})", path, entry.encrypted_hash);
-            let encrypted_content = api.download_file(&entry.encrypted_hash).await?;
+            let encrypted_content = ctx.api.download_file(&entry.encrypted_hash).await?;
             let computed_hash = feanorfs_common::hash_bytes(&encrypted_content);
             if computed_hash != entry.encrypted_hash {
                 tracing::warn!(
@@ -555,13 +560,15 @@ pub async fn do_hydrate(
                 );
                 continue;
             }
-            let plain_content = unpack_bytes(&encrypted_content, password_str, &path)?;
+            let plain_content =
+                unpack_bytes_with_policy(&encrypted_content, password_str, &path, ctx.policy)?;
 
-            let full_path = base_path.join(&path);
+            let full_path = ctx.base.join(&path);
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            atomic_write(base_path, &path, &plain_content).await?;
+            set_readonly(&full_path, false).await?;
+            atomic_write(ctx.base, &path, &plain_content).await?;
 
             let actual_mtime = file_mtime_ms(&full_path).await.unwrap_or(entry.mtime);
             let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
@@ -576,7 +583,7 @@ pub async fn do_hydrate(
                 hydrated: true,
                 deleted_at: None,
             };
-            db.upsert_cache_entry(&updated_entry).await?;
+            ctx.db.upsert_cache_entry(&updated_entry).await?;
             hydrated.push(path);
         }
     }
@@ -608,8 +615,13 @@ pub async fn do_cat(
     target_path: &str,
     password: Option<&str>,
 ) -> Result<CatResult> {
+    let ctx = build_ctx_or_fallback(api, db, base_path, "", password)?;
+    do_cat_with_ctx(&ctx, target_path).await
+}
+
+async fn do_cat_with_ctx(ctx: &SyncCtx<'_>, target_path: &str) -> Result<CatResult> {
     tracing::info!("Cat (path={})", target_path);
-    let cache_entries = db.get_cache_entries().await?;
+    let cache_entries = ctx.db.get_cache_entries().await?;
 
     let mut hydrated_first = false;
     let mut untracked = false;
@@ -617,7 +629,7 @@ pub async fn do_cat(
     if let Some(entry) = cache_entries.get(target_path) {
         if !entry.hydrated {
             tracing::info!("Auto-hydrating {}", target_path);
-            do_hydrate(api, db, base_path, Some(target_path.to_string()), password).await?;
+            do_hydrate_with_ctx(ctx, Some(target_path.to_string())).await?;
             hydrated_first = true;
         }
     } else {
@@ -625,7 +637,7 @@ pub async fn do_cat(
         untracked = true;
     }
 
-    let full_path = base_path.join(target_path);
+    let full_path = ctx.base.join(target_path);
     if !full_path.exists() {
         return Ok(CatResult {
             content: Vec::new(),
@@ -651,38 +663,132 @@ pub async fn do_status(
     workspace_id: &str,
     password: Option<&str>,
 ) -> Result<StatusResult> {
-    let local_files = crate::local::scan_local_directory(base_path, db, password).await?;
+    let ctx = build_ctx_or_fallback(api, db, base_path, workspace_id, password)?;
+    do_status_with_ctx(&ctx).await
+}
 
-    let pending = conflicts::pending_conflict_paths(db).await?;
+async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
+    let local_files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    let skipped_symlinks = crate::local::collect_symlink_warnings(ctx.base);
+    let pending = conflicts::pending_conflict_paths(ctx.db).await?;
+    let last = conflicts::load_last_synced(ctx.db).await?;
 
-    match conflicts::negotiate_sync_with_conflict_gate(
+    match conflicts::negotiate_sync_with_conflict_gate(ctx, &local_files, false).await {
+        Err(_) => {
+            let offline_backlog = local_files
+                .iter()
+                .filter(|(path, state)| {
+                    !last
+                        .get(*path)
+                        .is_some_and(|ls| ls.hash == state.hash && ls.deleted == state.deleted)
+                })
+                .count() as u32;
+            Ok(StatusResult {
+                mirror_state: MirrorState::Offline,
+                upload_required: Vec::new(),
+                download_required: Vec::new(),
+                delete_local: Vec::new(),
+                local_files,
+                pending_conflicts: pending.into_iter().collect(),
+                offline_backlog,
+                server_rollback_warning: None,
+                skipped_symlinks,
+            })
+        }
+        Ok((response, blocked)) => {
+            let server_files: Vec<FileState> = response.download_required.clone();
+            Ok(StatusResult {
+                mirror_state: derive_mirror_state(Some(&response), Some(&blocked)),
+                upload_required: response.upload_required,
+                download_required: response.download_required,
+                delete_local: response.delete_local,
+                local_files,
+                pending_conflicts: blocked.into_iter().collect(),
+                offline_backlog: 0,
+                server_rollback_warning: conflicts::detect_server_rollback(&last, &server_files),
+                skipped_symlinks,
+            })
+        }
+    }
+}
+
+/// Remove tracked files that match built-in or `.feanorfsignore` patterns (DX-5).
+pub async fn prune_ignored(
+    api: &ApiClient,
+    db: &ClientDb,
+    base_path: &Path,
+    workspace_id: &str,
+    dry_run: bool,
+) -> Result<PruneIgnoredResult> {
+    let config = load_config(base_path)?;
+    let ctx = SyncCtx::new(
         api,
-        workspace_id,
         db,
         base_path,
-        &local_files,
-        password,
-        false,
-    )
-    .await
-    {
-        Err(_) => Ok(StatusResult {
-            mirror_state: MirrorState::Offline,
-            upload_required: Vec::new(),
-            download_required: Vec::new(),
-            delete_local: Vec::new(),
-            local_files,
-            pending_conflicts: pending.into_iter().collect(),
-        }),
-        Ok((response, blocked)) => Ok(StatusResult {
-            mirror_state: derive_mirror_state(Some(&response), Some(&blocked)),
-            upload_required: response.upload_required,
-            download_required: response.download_required,
-            delete_local: response.delete_local,
-            local_files,
-            pending_conflicts: blocked.into_iter().collect(),
-        }),
+        workspace_id,
+        config.encryption_password.as_deref(),
+        legacy_policy_for_config(&config),
+    );
+    prune_ignored_with_ctx(&ctx, dry_run).await
+}
+
+async fn prune_ignored_with_ctx(ctx: &SyncCtx<'_>, dry_run: bool) -> Result<PruneIgnoredResult> {
+    let tracked = ctx.db.get_cache_entries().await?;
+    let mut igb = ignore::gitignore::GitignoreBuilder::new(ctx.base);
+    for pattern in crate::local::DEFAULT_IGNORES {
+        let _ = igb.add_line(None, pattern);
     }
+    if let Ok(content) = tokio::fs::read_to_string(ctx.base.join(".feanorfsignore")).await {
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                let _ = igb.add_line(None, line);
+            }
+        }
+    }
+    let ig = igb.build()?;
+    let mut to_prune = Vec::new();
+    for (path, entry) in &tracked {
+        if entry.deleted_at.is_some() {
+            continue;
+        }
+        if ig.matched(path, false).is_ignore() {
+            to_prune.push(path.clone());
+        }
+    }
+    if dry_run {
+        return Ok(PruneIgnoredResult {
+            pruned: Vec::new(),
+            dry_run: true,
+            candidates: to_prune,
+        });
+    }
+    let mut pruned = Vec::new();
+    for path in &to_prune {
+        let full = ctx.base.join(path);
+        if full.exists() {
+            tokio::fs::remove_file(&full).await.ok();
+        }
+        ctx.db.delete_cache_entry(path).await?;
+        let mtime = chrono::Utc::now().timestamp_millis();
+        let hash = feanorfs_common::hash_bytes(b"");
+        ctx.api
+            .upload_tombstone(ctx.workspace_id(), path, &hash, mtime)
+            .await?;
+        pruned.push(path.clone());
+    }
+    Ok(PruneIgnoredResult {
+        pruned,
+        dry_run: false,
+        candidates: to_prune,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct PruneIgnoredResult {
+    pub pruned: Vec<String>,
+    pub dry_run: bool,
+    pub candidates: Vec<String>,
 }
 
 #[cfg(test)]
@@ -690,6 +796,12 @@ mod mirror_state_tests {
     use super::{derive_mirror_state, MirrorState};
     use feanorfs_common::SyncResponse;
     use std::collections::HashSet;
+
+    #[test]
+    fn human_label_idle() {
+        assert_eq!(MirrorState::Idle.human_label(), "up to date");
+        assert_eq!(MirrorState::Conflict.human_label(), "needs attention");
+    }
 
     #[test]
     fn idle_when_no_pending_changes() {
