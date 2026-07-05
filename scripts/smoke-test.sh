@@ -7,7 +7,6 @@ cd "$ROOT"
 
 TARGET="$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; print(json.load(sys.stdin)['target_directory'])")"
 FEANORFS="$TARGET/release/feanorfs"
-FEANORFS_SERVER="$TARGET/release/feanorfs-server"
 
 SMOKE_ROOT="$(mktemp -d /tmp/feanorfs-smoke-XXXXXX)"
 SMOKE_HOME="$SMOKE_ROOT/home"
@@ -35,7 +34,6 @@ step() { echo ""; echo "== $* =="; }
 step "Build release binaries"
 cargo build --release -q
 [[ -x "$FEANORFS" ]] || fail "missing feanorfs binary"
-[[ -x "$FEANORFS_SERVER" ]] || fail "missing feanorfs-server binary"
 pass "binaries built"
 
 step "cargo fmt --check"
@@ -54,11 +52,11 @@ step "cargo doc (strict)"
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace -q
 pass "docs"
 
-step "Start feanorfs-server"
+step "Start feanorfs serve"
 mkdir -p "$SMOKE_HOME" "$SERVER_DATA" "$CLIENT_A" "$CLIENT_B"
 export HOME="$SMOKE_HOME"
 FEANORFS_PORT=$PORT FEANORFS_TOKEN=$TOKEN FEANORFS_DATA_DIR="$SERVER_DATA" \
-  "$FEANORFS_SERVER" --port "$PORT" --data-dir "$SERVER_DATA" --token "$TOKEN" \
+  "$FEANORFS" serve --port "$PORT" --data-dir "$SERVER_DATA" --token "$TOKEN" \
   >"$SMOKE_ROOT/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 1

@@ -1,9 +1,8 @@
 #!/bin/sh
-# FeanorFS install script — installs both CLI and server from GitHub Releases.
+# FeanorFS install script — installs the `feanorfs` binary from GitHub Releases.
 #
-# Uses cargo-dist-generated per-app installers (feanorfs-client-installer.sh and
-# feanorfs-server-installer.sh). Pass BINDIR to either script via env vars:
-#   FEANORFS_CLIENT_INSTALL_DIR / FEANORFS_SERVER_INSTALL_DIR
+# One install covers sync client + blob hub (`feanorfs serve`).
+# Set FEANORFS_INSTALL_SERVER=1 to also install legacy server-only `feanorfs-server`.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/rapm94/feanorfs/main/scripts/install.sh | sh
@@ -28,11 +27,14 @@ if [ -n "${BINDIR:-}" ]; then
     export FEANORFS_SERVER_INSTALL_DIR="$BINDIR"
 fi
 
-echo "Installing feanorfs (client) ${VERSION}..."
+echo "Installing feanorfs ${VERSION}..."
 curl -fsSL "${BASE_URL}/feanorfs-client-installer.sh" | sh
 
-echo "Installing feanorfs-server ${VERSION}..."
-curl -fsSL "${BASE_URL}/feanorfs-server-installer.sh" | sh
+if [ "${FEANORFS_INSTALL_SERVER:-0}" = "1" ]; then
+    echo "Installing feanorfs-server ${VERSION} (legacy server-only binary)..."
+    curl -fsSL "${BASE_URL}/feanorfs-server-installer.sh" | sh
+fi
 
 echo ""
-echo "Done. feanorfs ${VERSION} and feanorfs-server ${VERSION} installed."
+echo "Done. feanorfs ${VERSION} installed."
+echo "Run a hub with: feanorfs serve --token <TOKEN>"
