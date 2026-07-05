@@ -11,9 +11,15 @@ ci = "github"
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-# Default install dir when FEANORFS_*_INSTALL_DIR is unset (~/.local/bin)
+# Path that installers should place binaries in
 install-path = "~/.local/bin"
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# Whether to enable GitHub Attestations
+github-attestations = true
+# When to generate GitHub Attestations
+github-attestations-phase = "host"
+# Patterns to attest when creating attestations for release artifacts
+github-attestations-filters = ["*.tar.xz", "*.zip", "*.sh", "*.ps1"]

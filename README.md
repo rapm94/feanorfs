@@ -68,6 +68,8 @@ curl -fsSL https://raw.githubusercontent.com/rapm94/feanorfs/main/scripts/instal
 
 Installs `feanorfs` via [cargo-dist](https://github.com/axodotdev/cargo-dist). Set `FEANORFS_INSTALL_SERVER=1` to also install the optional legacy `feanorfs-server` binary. Linux and macOS on x86_64 and ARM64.
 
+Release binaries are signed with [GitHub Artifact Attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds). To verify before running: `gh attestation verify <artifact> --repo rapm94/feanorfs`. See [SECURITY.md](SECURITY.md#verifying-release-artifacts) for checksum and build-from-source alternatives.
+
 Per-app installer (client — recommended):
 
 ```bash

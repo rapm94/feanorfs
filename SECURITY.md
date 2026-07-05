@@ -19,6 +19,56 @@ You will receive an acknowledgement within 72 hours. If the vulnerability is con
 
 Please do not disclose the vulnerability publicly until a fix has been released.
 
+## Verifying release artifacts
+
+FeanorFS release binaries are built by [cargo-dist](https://github.com/axodotdev/cargo-dist) in GitHub Actions (`.github/workflows/release.yml`). Each release archive and installer script is signed with a **GitHub Artifact Attestation** (SLSA build provenance via Sigstore). The attestation proves the file was produced by the official Release workflow from a specific commit in this repository — a tampered artifact on the release page fails verification even if the download URL looks correct.
+
+Attestations apply from the **next tagged release** after this workflow ships (not retroactive on v0.2.0).
+
+### Verify with GitHub CLI (recommended)
+
+Install [GitHub CLI](https://cli.github.com/) (`gh`), download the artifact you intend to run, then:
+
+```bash
+gh attestation verify feanorfs-client-x86_64-apple-darwin.tar.xz \
+  --repo rapm94/feanorfs
+```
+
+Use the filename you downloaded (`*.tar.xz`, `*.zip`, `feanorfs-client-installer.sh`, or `feanorfs-client-installer.ps1`). Success prints the linked workflow run and commit; failure means do not run the binary.
+
+List attestations for a release tag:
+
+```bash
+gh attestation download --repo rapm94/feanorfs <tag>
+```
+
+### Verify without piping the install script
+
+If you prefer not to `curl | sh`, download the archive for your platform from [GitHub Releases](https://github.com/rapm94/feanorfs/releases), verify the attestation (above), unpack, and place the `feanorfs` binary on your `PATH`. The install scripts are convenience wrappers around the same attested archives.
+
+### Verify with checksums
+
+Each release also ships `*.sha256` checksum files. After download:
+
+```bash
+shasum -a 256 -c feanorfs-client-x86_64-apple-darwin.tar.xz.sha256
+```
+
+Checksums detect accidental corruption; attestations additionally bind the file to the CI build that produced it.
+
+### Build from source
+
+For maximum assurance, clone the tag and build locally:
+
+```bash
+git clone https://github.com/rapm94/feanorfs.git
+cd feanorfs
+git checkout <tag>
+cargo build --release --bin feanorfs
+```
+
+No binary from GitHub Releases is involved.
+
 ## Threat model
 
 Full analysis: [docs/threat-model.md](docs/threat-model.md). Open backlog: [docs/roadmap.md](docs/roadmap.md) (SEC-6, etc.).
