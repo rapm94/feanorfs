@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-05
+
 ### Added
 
 - **Single binary:** install `feanorfs` only — sync client and blob hub (`feanorfs serve`) in one executable. `feanorfs-server` remains an optional legacy server-only release artifact.
@@ -27,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Placeholders:** lazy placeholders written read-only; hydrate clears the bit.
 - **Unicode:** paths normalized to NFC before DB/server.
 - **`FEANORFS_AGENT` / `FEANORFS_AGENT_DIR`** env vars on `agent run`.
+- **Sync scope docs** — [docs/sync-scope.md](docs/sync-scope.md) records ignore policy and admission criteria.
 
 ### Changed
 
@@ -36,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New workspaces created via `start` / hidden `setup` write `format_version: 2`.
 - AEAD decrypt failure message: "wrong encryption key for this workspace".
 - Agent spawn runs a full sync first and refuses when the folder has pending conflicts.
+
+### Fixed
+
+- **release-plz:** workspace path dependencies now include version requirements so `cargo package` manifest verification succeeds.
 
 ### Security
 
@@ -52,5 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
 - **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
-[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rapm94/feanorfs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0
