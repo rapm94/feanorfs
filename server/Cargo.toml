@@ -21,7 +21,7 @@ name = "feanorfs-server"
 path = "src/main.rs"
 
 [dependencies]
-feanorfs-common = { path = "../common" }
+feanorfs-common = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }

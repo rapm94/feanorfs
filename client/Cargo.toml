@@ -21,8 +21,8 @@ name = "feanorfs_client"
 path = "src/lib.rs"
 
 [dependencies]
-feanorfs-common = { path = "../common" }
-feanorfs-server = { path = "../server" }
+feanorfs-common = { workspace = true }
+feanorfs-server = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }
@@ -48,7 +48,7 @@ unicode-normalization = { workspace = true }
 diffy = { workspace = true }
 
 [dev-dependencies]
-feanorfs-server = { path = "../server" }
+feanorfs-server = { workspace = true }
 tempfile = { workspace = true }
 axum = { workspace = true }
 
