@@ -8,44 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Agent workspaces** — `feanorfs agent spawn|commit|list|clean|run` for copy-on-write isolation and three-way concurrent-edit detection.
-- **Library API** — `feanorfs_client` crate exposes `sync`, `push`, `pull`, `hydrate`, `cat`, and agent helpers for programmatic use.
-- **JSON output** — global `--json` flag on status-returning commands.
-- **Catch-up summary** — `feanorfs summary [--summarize]` diffs against the previous session marker.
-- **Predictive hydration** — co-occurrence prefetch after `hydrate`/`cat` (local-only access log).
-- **Integration tests** — in-process Axum harness in `client/tests/sync_engine.rs`.
+
+- **Single binary:** install `feanorfs` only — sync client and blob hub (`feanorfs serve`) in one executable. `feanorfs-server` remains an optional legacy server-only release artifact.
+- **Agent loop (complete):** `agent check`, `agent land`, `agent refresh`. `agent commit` remains a `land` alias.
+- **`conflicts keep`** — resolve with `local`, `cloud`, `both`, or `--file <reconciled>` (`conflicts resolve` aliased).
+- **Conflict artifacts** use `.original` / `.local` / `.cloud` suffixes (legacy `.base`/`.ours`/`.theirs` still readable).
+- **`feanorfs start`** — one-flow connect + mirror + sync + watch.
+- **`feanorfs migrate`** — pull, re-seal AEAD blobs, bump workspace to format v2.
+- **`feanorfs events`** — NDJSON event stream for orchestrators.
+- **`feanorfs mcp`** — MCP tool server for orchestrators.
+- **`conflicts show` / `conflicts open`** — terminal diff and editor compare handoff.
+- **Default ignores** — built-in denylist (`target/`, `node_modules/`, …) plus `.feanorfsignore`.
+- **Process sync lock** — `.feanorfs/sync.lock` serializes concurrent sync/land passes.
+- **Land lock** — `.feanorfs/land.lock` serializes concurrent agent lands.
+- **Server GC** — `feanorfs serve --gc-only` and `--gc-interval` periodic blob/tombstone cleanup.
+- **Security:** `format_version` in config; format v2 rejects legacy XOR blobs (`LegacyPolicy::Reject`); 64-hex encryption key enforced on v2 workspaces.
+- **Spawn:** pre-sync honest base, placeholder refusal, APFS `reflink` with copy fallback, `--no-sync` / `--replace` flags.
+- **Placeholders:** lazy placeholders written read-only; hydrate clears the bit.
+- **Unicode:** paths normalized to NFC before DB/server.
+- **`FEANORFS_AGENT` / `FEANORFS_AGENT_DIR`** env vars on `agent run`.
 
 ### Changed
-- **`feanorfs setup`** — one-step mirror onboarding (connect + create workspace).
-- **`feanorfs attach`** — link folder to existing mirror (`join` remains alias).
-- **`summary`** — remembers session baseline by default (`--no-remember` to opt out).
-- **`--json` status** — adds `mirror_state` for tray UIs (`idle`, `out_of_sync`, `offline`, `conflict`, `error`, `syncing`).
-- User-facing copy uses mirror vocabulary; encryption **key** vs server **token** (not Git terms).
 
-### Fixed
-- Filesystem watcher observes workspace `current_dir`, not `"."`.
-- Blob download uses single-read TOCTOU-safe path.
+- **CLI consolidation:** `start` absorbs create/join/resume (URL or `fnr1-…` positional). `config --key` replaces `show-key`. `agent status` merges list + check. Bare `feanorfs agent` and `feanorfs conflicts` default to list. `conflicts show --open` replaces `open`. Removed `conflicts resolve`.
+- Hidden compatibility aliases: `setup`, `init`, `join`, `attach`, `connect`, `push`, `pull`, `watch`, `show-key`, `workspaces`, `events`, `mcp`, `agent check`, `agent commit`, `conflicts open`, `conflicts history`.
+- `init`/`setup`/`attach` preserve legacy semantics (setup-only / link-only, no auto-sync+watch). `start` accepts folder paths, bare `host:port`, and re-link via invite or `--encryption-key`.
+- New workspaces created via `start` / hidden `setup` write `format_version: 2`.
+- AEAD decrypt failure message: "wrong encryption key for this workspace".
+- Agent spawn runs a full sync first and refuses when the folder has pending conflicts.
+
+### Security
+
+- Format v2 workspaces hard-fail on non-AEAD blob decrypt (closes downgrade path when migrated). Run `feanorfs migrate` on existing v1 workspaces.
 
 ## [0.1.0] - 2026-06-23
 
 ### Added
+
 - Initial release of FeanorFS, a developer-focused zero-knowledge filesystem sync tool.
 - **Client CLI** (`feanorfs`) with subcommands: `init`, `status`, `push`, `pull`, `sync`, `hydrate`, `cat`, `watch`.
 - **Server** (`feanorfs-server`) — Axum-based blob storage server with SQLite metadata coordination.
-  - `POST /api/sync/diff` — metadata delta negotiation.
-  - `POST /api/upload` — encrypted blob upload with hash verification.
-  - `GET /api/download/:hash` — encrypted blob download.
-- **End-to-end encryption** via Blake3 XOF symmetric XOR keystream, keyed by `(password, relative_path)`.
-- **Content-addressed storage** — blobs stored by Blake3 hash, enabling deduplication and upload integrity verification.
-- **Local cache** — SQLite-backed `local_cache.db` mapping `(path, mtime, size)` to `(plaintext_hash, encrypted_hash)` to avoid redundant re-hashing.
-- **Lazy hydration** — `pull --lazy` fetches metadata only and creates 0-byte placeholders; `hydrate` and `cat` download and decrypt on demand.
-- **Real-time watch** — `watch` subcommand monitors filesystem changes with 500ms debounce and auto-syncs.
-- **Cross-platform path normalization** — all tracked paths use forward slashes.
-- **All files synced** — `.gitignore` is not honored; FeanorFS syncs all files except `.feanorfs/` and `.git/`.
-
-### Security
-- Zero-knowledge server: only encrypted hashes and ciphertext blobs are stored server-side.
-- See `SECURITY.md` for the full threat model and known limitations.
+- **End-to-end encryption** via Blake3 XOF symmetric XOR keystream (legacy; superseded by AEAD for new blobs).
+- **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
+- **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
 [Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0

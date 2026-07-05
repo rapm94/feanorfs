@@ -22,17 +22,14 @@ cargo test
 ### Running locally
 
 ```bash
-# Terminal 1: start the blob server
-cargo run --bin feanorfs-server
+# Terminal 1: blob hub (same binary as the sync client)
+cargo run --bin feanorfs -- serve --token "dev-secret"
 
-# Terminal 2: initialize a test workspace and exercise the CLI
+# Terminal 2: workspace
 mkdir /tmp/feanorfs-test && cd /tmp/feanorfs-test
-cargo run --bin feanorfs -- init http://localhost:3030 --workspace test --password "test-pass"
+cargo run --bin feanorfs -- start http://localhost:3030 --workspace test --token "dev-secret" --no-watch
 cargo run --bin feanorfs -- status
-cargo run --bin feanorfs -- push
-cargo run --bin feanorfs -- pull
-cargo run --bin feanorfs -- sync --lazy
-cargo run --bin feanorfs -- hydrate
+cargo run --bin feanorfs -- sync --no-watch
 ```
 
 ## Code style

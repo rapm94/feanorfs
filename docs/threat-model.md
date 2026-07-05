@@ -53,7 +53,9 @@ This document provides a detailed security analysis of FeanorFS. For the policy 
 **Goal:** Alter decrypted file contents on the client, inject malicious files, or recover plaintext.
 
 **Result:** **Partially defended against.**
-- **Ciphertext tampering**: The encryption scheme is an unauthenticated XOR stream (Blake3 XOF). There is no MAC/AEAD. On download, the client re-hashes the ciphertext and compares it to the expected `encrypted_hash` from sync metadata before decrypting — this catches blob substitution when metadata is honest, but a malicious server can still lie in `SyncResponse` (supply a hash that matches substituted ciphertext). **Do not use FeanorFS against an untrusted server.**
+- **Ciphertext tampering (new blobs)**: New blobs are sealed with ChaCha20-Poly1305 AEAD (`pack_bytes`). Tampered ciphertext fails authentication on decrypt. Additionally, the client re-hashes downloaded ciphertext against the expected `encrypted_hash` before decrypting.
+- **Legacy downgrade (v1 workspaces only)**: Format v2 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to the legacy XOR stream on decrypt — run `feanorfs migrate`. Removing the XOR path entirely is [SEC-6](roadmap.md). Do not sync unmigrated workspaces against untrusted servers.
+- **Metadata lies**: a malicious server can still lie in `SyncResponse` (supply a hash matching substituted ciphertext); AEAD limits this to replaying validly-encrypted blobs for that same path.
 - **Replay attacks**: The server can replay an older version of a blob (since blobs are content-addressed, old versions are still valid by hash). The client has no version counter or nonce to detect this.
 - **Metadata manipulation**: The server can lie about `SyncResponse` — claiming no downloads are needed, or injecting fake file states. The client trusts the server's metadata.
 
@@ -87,22 +89,32 @@ This document provides a detailed security analysis of FeanorFS. For the policy 
 
 ## Cryptographic analysis
 
-### Encryption construction
+### Current encryption construction (AEAD, new blobs)
 
 ```
-keystream = Blake3_XOF(blake3(password_bytes ‖ path_bytes), length = len(data))
-ciphertext = plaintext XOR keystream
+key       = blake3("feanorfs-aead-v1" ‖ len(password) ‖ password ‖ len(path) ‖ path)
+nonce     = blake3("feanorfs-aead-nonce-v1" ‖ key ‖ len(data) ‖ data)[..12]
+blob      = 0x01 ‖ nonce ‖ ChaCha20-Poly1305(key, nonce, plaintext)
 ```
 
 **Properties:**
-- **Symmetric**: `decrypt = encrypt` (XOR is self-inverse).
-- **Deterministic**: Same `(password, path, plaintext)` always produces the same ciphertext. This is required for content-addressed storage (the encrypted hash must be stable across clients).
-- **Path-dependent**: The keystream is different for each file path, so identical plaintext files at different paths produce different ciphertexts (and different encrypted hashes).
+- **Authenticated**: tampered ciphertext fails the Poly1305 tag check on decrypt.
+- **Deterministic (SIV-style)**: the nonce is derived from the key and plaintext, so the same `(password, path, plaintext)` always produces the same blob. This is required for content-addressed storage (the encrypted hash must be stable across clients) and for cheap change detection. Since each `(key, nonce)` pair only ever seals one plaintext, nonce reuse is not a concern.
+- **Path-dependent** with length-prefix domain separation: `(password="ab", path="cdef")` and `(password="abc", path="def")` derive different keys.
 
-**Weaknesses:**
-1. **No authentication**: There is no MAC. Ciphertext can be modified without detection. An attacker who knows the plaintext at a given position can replace it with arbitrary content by XORing the difference.
-2. **No nonce**: The keystream for a given `(password, path)` is always the same. This is acceptable for content-addressed storage (identical content must produce identical ciphertext), but it means the scheme is vulnerable to known-plaintext attacks if the same key is reused for different data at the same path (which does not happen in the current design).
-3. **Fast key derivation**: `blake3(password ‖ path)` is computed in nanoseconds. No brute-force resistance beyond the password's own entropy.
+**Known properties / weaknesses:**
+1. **Determinism leaks reverts**: identical plaintext at the same path always yields identical ciphertext, so the server can observe "this file returned to a previous state." Accepted trade-off — see roadmap non-fix note.
+2. **Legacy XOR fallback (v1 only)**: unmigrated workspaces still decrypt pre-AEAD blobs via XOR. Run `feanorfs migrate`; removal of XOR decrypt is [SEC-6](roadmap.md).
+3. **Fast key derivation**: single Blake3 pass — v2 workspaces require 64-hex generated keys (256-bit CSPRNG).
+
+### Legacy construction (pre-AEAD blobs, decrypt-only)
+
+```
+keystream  = Blake3_XOF(len(password) ‖ password ‖ len(path) ‖ path)
+ciphertext = plaintext XOR keystream
+```
+
+Unauthenticated and malleable — an attacker who knows plaintext at a position can substitute arbitrary content by XORing the difference. Retained only so pre-AEAD blobs remain readable until `feanorfs migrate` re-seals them.
 
 ### Hash usage
 
@@ -114,8 +126,9 @@ ciphertext = plaintext XOR keystream
 
 | Risk | Severity | Mitigation | Status |
 |---|---|---|---|
-| Plaintext leakage via weak password | High | Use high-entropy password (≥ 20 chars) | User responsibility |
-| Ciphertext tampering (no AEAD) | High | Use trusted server only; future: migrate to ChaCha20-Poly1305 | Known limitation |
+| Plaintext leakage via weak password | High | Use the auto-generated 64-hex key; planned: reject human passphrases (SEC-7) | User responsibility |
+| Legacy XOR decrypt path (unmigrated v1 workspaces) | Medium | `feanorfs migrate` to format v2; then remove XOR path ([SEC-6](roadmap.md)) | Open |
+| Ciphertext tampering (AEAD blobs) | — | ChaCha20-Poly1305 authentication | Implemented |
 | No TLS (network MITM) | High | Run behind reverse proxy or VPN; future: native TLS support | Known limitation |
 | No server authentication | Medium | Run with `--token`; clients send `Authorization: Bearer` | Implemented (optional) |
 | Password stored in plaintext | Medium | `chmod 700 .feanorfs/`; future: OS keychain integration | Known limitation |
@@ -125,7 +138,20 @@ ciphertext = plaintext XOR keystream
 
 ## Planned security improvements
 
-1. **AEAD encryption** — Replace raw XOR stream with ChaCha20-Poly1305. The deterministic key derivation can be preserved by deriving the AEAD key from `blake3(password ‖ path)` and using a fixed nonce (acceptable since each `(key, nonce)` pair is only ever used for one plaintext).
-2. **Password stretching** — Replace direct `blake3(password ‖ path)` with `Argon2id(password, salt=path)` to add brute-force resistance. The salt being the path preserves per-path key uniqueness.
-3. **Native TLS** — Add optional TLS to the Axum server (`axum-server` + `rustls`) and HTTPS support to the client's `reqwest::Client`.
-4. **Path obfuscation** — Encrypt file paths in the metadata using the same password-derived key, so the server only sees opaque path identifiers.
+See [roadmap.md](roadmap.md):
+
+1. **Remove legacy XOR decrypt** (SEC-6) — after all workspaces run `feanorfs migrate`.
+2. **Native TLS** — optional TLS on the Axum server; until then, reverse proxy.
+3. **Path obfuscation** — encrypt file paths in metadata.
+
+## Process isolation (agents)
+
+FeanorFS's agent workspaces provide **data isolation, not process sandboxing.**
+
+**What IS isolated (data):** each agent works in its own copy under `.feanorfs/agents/<name>/`; nothing reaches the main folder or the server without going through `agent land`'s three-way diff. Conflicted paths are blocked from sync with all versions preserved (on disk and as immutable content-addressed blobs). An honest agent cannot make a mess.
+
+**What is NOT isolated (processes):** `agent run` sets the child's working directory — nothing else. The child inherits the full filesystem (absolute-path writes escape the agent folder), network access, and environment variables. An agent that pushes to another repo, exfiltrates secrets, or runs a malicious `build.rs` is not stopped by FeanorFS.
+
+**Composition rule:** run untrusted or highly autonomous agents inside a sandboxed harness (Claude Code / Cursor sandboxes, containers, `sandbox-exec`, firejail) pointed at the agent folder. FeanorFS contains honest mistakes; the sandbox contains everything else.
+
+**Reconciliation trust:** conflict resolution is performed by a consumer (human or LLM), never by FeanorFS. Resolution requires explicit `conflicts keep`; all versions remain recoverable. LLM merges should be verified in a spawned agent workspace before `conflicts keep --file`. Open agent edge-case tests: [roadmap.md](roadmap.md).

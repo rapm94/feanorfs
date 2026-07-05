@@ -1,19 +1,27 @@
 # Usage
 
-Full reference for the FeanorFS CLI (`feanorfs`) and server (`feanorfs-server`).
+Full reference for the FeanorFS CLI (`feanorfs`) — one binary for sync client and blob hub (`feanorfs serve`). The standalone `feanorfs-server` package is an optional legacy server-only install.
 
 ## What FeanorFS is (and isn't)
 
-FeanorFS is a working-directory mirror for developers who use more than one machine. It keeps your current files in sync across machines automatically, including untracked and uncommitted work that Git doesn't see.
+FeanorFS is a working-directory mirror for developers who use more than one machine — think **Dropbox for the folder you are actively working in**, not for your git history. It keeps current files in sync across machines, including paths that are not in version control.
 
-**It is not version control.** No history, no branches, no commits, no diffs, no conflict resolution. It captures a snapshot of what your files look like right now, nothing more. Use Git for history and collaboration. Use FeanorFS for the uncommitted in-between state that you want available on your other machine without thinking about it.
+**It is not version control.** No history, branches, or merge UI — only the current snapshot on disk. Use a VCS for history and collaboration.
 
 ## Server
 
 ### Start the blob server
 
 ```bash
-cargo run --bin feanorfs-server -- --password "your-server-secret"
+feanorfs serve --token "your-server-secret"
+feanorfs serve --gc-only --data-dir server-data
+feanorfs serve --mdns
+```
+
+Legacy server-only binary (same router, optional separate install):
+
+```bash
+feanorfs-server --token "your-server-secret"
 ```
 
 The server listens on `0.0.0.0:3030` and creates its data directory at `server-data/` (relative to the working directory where it was launched):
@@ -30,6 +38,8 @@ server-data/
 | `--port <PORT>` | Port to listen on. Use different ports for multi-instance deployments. | `3030` |
 | `--data-dir <DIR>` | Data directory for SQLite DB and blob storage. Each instance should have its own. | `./server-data` |
 | `--mdns` | Enable mDNS service advertisement for LAN discovery | off |
+| `--gc-only` | Run blob/tombstone GC once and exit (no HTTP listener) | off |
+| `--gc-interval <SECS>` | Periodic GC while serving (`feanorfs serve` only) | off |
 
 All flags can also be set via environment variables: `FEANORFS_TOKEN`, `FEANORFS_PORT`, `FEANORFS_DATA_DIR`.
 
@@ -38,8 +48,8 @@ All flags can also be set via environment variables: `FEANORFS_TOKEN`, `FEANORFS
 For internet-facing deployments, put a TLS-terminating reverse proxy (Caddy) in front and run the server with `--token`:
 
 ```bash
-# Server (on your VPS/cloud):
-feanorfs-server --token "server-secret"
+# Hub (recommended — same binary as the sync client)
+feanorfs serve --token "server-secret"
 
 # TLS via Caddy (auto-HTTPS, port 443):
 caddy reverse-proxy localhost:3030
@@ -49,11 +59,9 @@ mDNS is off by default — it's only useful on LAN and can't cross routers.
 
 ### Multi-instance deployment (SaaS-ready)
 
-Run multiple isolated instances behind a single Caddy, each with its own data directory and port:
-
 ```bash
-feanorfs-server --port 3001 --data-dir /data/alice --token "alice-token"
-feanorfs-server --port 3002 --data-dir /data/bob   --token "bob-token"
+feanorfs serve --port 3001 --data-dir /data/alice --token "alice-token"
+feanorfs serve --port 3002 --data-dir /data/bob   --token "bob-token"
 ```
 
 Caddy routes subdomains to ports:
@@ -69,157 +77,81 @@ Each instance is fully isolated: separate SQLite DB, separate blob storage, sepa
 For local-only setups, enable mDNS so clients can auto-discover without typing an IP:
 
 ```bash
-feanorfs-server --mdns
+feanorfs serve --mdns
 ```
 
-Clients can then use `feanorfs connect --lan` to find the server automatically.
+Clients can then use `feanorfs start --lan` to find the server automatically.
 
 Log verbosity can be tuned via `RUST_LOG` (see [Environment](#environment) below).
 
 ## Client
 
-### `setup` — mirror this folder (recommended)
+### Visible commands
 
-```bash
-feanorfs setup --workspace <NAME> [SERVER_URL] [--encryption-key <KEY>] [--token <SERVER_TOKEN>]
-feanorfs setup --workspace <NAME> --lan [--token <SERVER_TOKEN>]
-```
-
-One step: connect to the server (or discover via `--lan`), create a mirrored workspace, and save config. If `--encryption-key` is omitted, a key is generated, copied to the clipboard, and an `attach` command is printed for your other machines.
-
-**New mirror on machine A:**
-```bash
-feanorfs setup https://my-server.com:3030 --workspace my-project --token "server-token"
-```
-
-**Link the same mirror on machine B:**
-```bash
-feanorfs attach my-project --encryption-key <KEY_FROM_MACHINE_A> --server-url https://my-server.com:3030
-```
-
-(`join` remains an alias for `attach`.)
-
-### `connect` — connect to a server (cached for future commands)
-
-```bash
-feanorfs connect <URL> [--password <SERVER_PASS>]
-feanorfs connect --lan [--password <SERVER_PASS>]
-```
-
-| Argument / Flag | Description |
+| Command | Purpose |
 |---|---|
-| `URL` (required unless `--lan`) | Server URL (e.g. `https://my-server.com:3030`). |
-| `--token <TOKEN>` | Server access token (Bearer auth). `--password` is accepted as an alias. If omitted and server requires auth, prompts interactively. |
-| `--lan` | Discover server on local network via mDNS instead of providing a URL. |
+| `start` | Create, join, or resume a workspace — then sync and watch |
+| `sync` | Upload/download changes; enters watch mode by default |
+| `status` | Read-only diff vs the mirror |
+| `hydrate` / `cat` | Materialize lazy placeholders / print a file |
+| `summary` | What changed since your last session |
+| `config` | Inspect workspace config (`--key` for full key + invite) |
+| `doctor` | Troubleshoot connection and config |
+| `serve` | Run a blob hub |
+| `migrate` | Upgrade v1 workspaces to format v2 (AEAD) |
+| `agent` | Isolated agent workspaces (`status`, `spawn`, `land`, …) |
+| `conflicts` | List and resolve sync conflicts (`keep`, `show`) |
 
-Caches the server URL (and optional token) in `~/.feanorfs/global.json` so that subsequent commands (`init`, `sync`, etc.) don't need an explicit URL.
+Hidden aliases remain for scripts: `setup`, `init`, `join`, `attach`, `connect`, `push`, `pull`, `watch`, `show-key`, `workspaces`, `prune-ignored`, `events`, `mcp`, `agent check`, `agent commit`, `conflicts open`, `conflicts history`.
 
-**Internet (primary):** `feanorfs connect https://my-server.com:3030 --token "server-token"`
-
-**LAN (with mDNS):** `feanorfs connect --lan` (requires server started with `--mdns`)
-
-### `init` — initialize a workspace
-
-```bash
-feanorfs init [SERVER_URL] --workspace <WORKSPACE_ID> [--password <E2EE_PASS>] [--server-password <SERVER_PASS>]
-```
-
-| Argument / Flag | Description | Default |
-|---|---|---|
-| `SERVER_URL` (optional) | Server URL. If omitted, uses the URL cached by `feanorfs connect`. Use `--lan` to discover via mDNS instead. | from cache |
-| `--workspace`, `-w` | Workspace ID to sync with | `default` |
-| `--password`, `-p` | E2EE encryption password. If omitted, one is auto-generated, copied to clipboard, and a ready-to-paste `join` command is printed. | auto-generated |
-| `--server-token` | Server access token (overrides cached value from `connect`). `--server-password` accepted as alias. | from cache |
-| `--lan` | Discover server on local network via mDNS instead of using cached URL | off |
-
-Creates `.feanorfs/config.json` and `.feanorfs/local_cache.db` in the current directory.
-
-If a server URL is provided, `init` implicitly caches it (same as running `connect` first). This means on machine A you can do everything in one command:
+### `start` — create, join, or resume (recommended entry point)
 
 ```bash
-feanorfs init https://my-server.com:3030 --workspace my-project
-# → caches server URL, generates E2EE key, copies to clipboard, prints join command
+feanorfs start                                    # resume existing workspace
+feanorfs start https://my-server.com:3030         # create on server
+feanorfs start 127.0.0.1:3030                     # bare host:port (http:// added)
+feanorfs start fnr1-…                             # join from invite
+feanorfs start ~/projects/my-app                  # operate in another folder
+feanorfs start --local                            # embedded local hub
+feanorfs start --local --encryption-key <KEY>     # local hub with explicit key
+feanorfs start --lan                              # mDNS discovery + create
+feanorfs start --no-watch                         # sync once, no watch loop
 ```
 
-**Internet (primary flow):**
-```bash
-feanorfs connect https://my-server.com:3030 --password "server-secret"
-feanorfs init --workspace my-project
-# → generates E2EE key, copies to clipboard, prints join command
-```
-
-**LAN (with mDNS):**
-```bash
-feanorfs init --workspace my-project --lan
-# → discovers server, generates E2EE key, prints join command
-```
-
-When the E2EE password is auto-generated, the output looks like:
-
-```
-Initialized FeanorFS workspace!
-  Blob Server:  http://192.168.1.50:3030
-  Workspace ID: my-project
-  Encryption:   Enabled (Blake3 XOF E2EE)
-
-E2EE password: a1b2c3d4e5f6...
-Copied to clipboard.
-
-On your other machine, link the same workspace:
-  feanorfs attach my-project --encryption-key a1b2c3d4e5f6...
-
-Save this key! Without it, your files cannot be decrypted.
-```
-
-### `attach` — link to an existing mirrored workspace
-
-```bash
-feanorfs attach <WORKSPACE> --encryption-key <KEY> [--server-url <URL>] [--token <SERVER_TOKEN>]
-```
-
-Alias: `join` (legacy Git-adjacent name).
-
-| Argument / Flag | Description |
+| Flag / positional | Description |
 |---|---|
-| `WORKSPACE` (required) | Workspace name to link to |
-| `--encryption-key` | Workspace encryption key from the machine that ran `setup` (`--password` accepted as alias) |
-| `--server-url` | Server URL if not cached |
+| `target` (positional) | Server URL, `host:port`, `fnr1-…` invite, or folder path |
+| `--folder` | Workspace directory (alternative to folder-as-target) |
+| `--workspace`, `-w` | Workspace name (default: `default`) |
+| `--encryption-key` | Manual re-link with explicit key (requires `--workspace`; allowed on configured folders) |
 | `--token` | Server access token (`--password` accepted as alias) |
 | `--lan` | Discover server via mDNS |
+| `--local` | Embedded in-process hub (no remote server) |
+| `--no-watch` | Sync once and exit (no watch loop) |
 
+Hidden `init` / `setup` / `attach` / `join` remain for scripts: they configure only (no auto-sync+watch). Use `feanorfs start` for the full onboarding flow.
+
+**Machine A — create:**
 ```bash
-feanorfs attach my-project --encryption-key a1b2c3d4... --server-url https://my-server.com:3030
-feanorfs sync --no-watch
+feanorfs start https://my-server.com:3030 --workspace my-project --token "server-token"
+# → fnr1-… invite + encryption key on clipboard
 ```
 
-### `config` — show current configuration
+**Machine B — join:**
+```bash
+feanorfs start fnr1-...
+```
+
+Remote setups print a `fnr1-…` invite. Local-hub workspaces (`--local`) are not portable via invite — share with `feanorfs serve --data-dir .feanorfs/hub-data`.
+
+### `config` — show configuration
 
 ```bash
 feanorfs config
+feanorfs config --key    # full E2EE key + invite, copied to clipboard
 ```
 
-Prints both the global connection state (`~/.feanorfs/global.json`) and the workspace config (`.feanorfs/config.json`) in the current directory. Useful for checking which server you're connected to and whether E2EE is enabled.
-
-```
-Global connection (~/.feanorfs/global.json):
-  Server:        http://192.168.1.50:3030
-  Server auth:   enabled
-
-Workspace (.feanorfs/config.json):
-  Server:        http://192.168.1.50:3030
-  Workspace ID:  my-project
-  E2EE:          enabled
-  E2EE key:      a1b2c3...d4e5
-  Server auth:   enabled
-```
-
-### `show-key` — show E2EE password
-
-```bash
-feanorfs show-key
-```
-
-Prints the workspace encryption key and copies it to your clipboard. Also prints a ready-to-paste `attach` command for other machines.
+Prints global connection (`~/.feanorfs/global.json`) and workspace config (`.feanorfs/config.json`). Default output truncates the key; `--key` shows the full value.
 
 ### `doctor` — diagnose connection issues
 
@@ -227,22 +159,7 @@ Prints the workspace encryption key and copies it to your clipboard. Also prints
 feanorfs doctor
 ```
 
-Runs a health check: verifies global config, workspace config, E2EE status, server reachability, workspace existence on server, and local cache DB. Reports `[OK]`, `[WARN]`, `[INFO]`, or `[FAIL]` for each check.
-
-```
-Running diagnostics...
-
-[OK]  Global config: server at https://my-server.com:3030
-[OK]  Workspace config: my-project on https://my-server.com:3030
-[OK]  E2EE: enabled
-[OK]  Server reachable: 3 workspace(s) found
-[OK]  Workspace 'my-project' exists on server
-[OK]  Local cache DB: accessible
-
-All checks passed.
-```
-
-Use `doctor` as the first troubleshooting step when something isn't working.
+Runs health checks: workspace config, E2EE, server reachability, local cache DB. Suggests `feanorfs migrate` for v1 workspaces.
 
 ### `status` — show local vs. remote differences
 
@@ -250,117 +167,30 @@ Use `doctor` as the first troubleshooting step when something isn't working.
 feanorfs status
 ```
 
-Scans the workspace, queries the server for a diff, and prints:
-- **Local changes to push** — files modified, added, or deleted locally.
-- **Remote changes to pull** — files modified or added on the server.
-- **Remote deletions to apply** — files deleted on the server that still exist locally.
+Read-only scan + server diff. Does not modify files.
 
-Does not modify any files. Safe to run anytime.
-
-### `push` — upload local changes
-
-```bash
-feanorfs push
-```
-
-Uploads all locally-modified files (encrypted) to the server and cleans up cache entries for deleted files. Does not download anything.
-
-### `pull` — download remote changes
-
-```bash
-feanorfs pull [--lazy]
-```
-
-| Flag | Description |
-|---|---|
-| `--lazy` | Fetch metadata only; create 0-byte placeholder files instead of downloading full contents |
-
-Downloads all remote changes and applies remote deletions. With `--lazy`, creates placeholder files that can be hydrated later with `hydrate` or `cat`.
-
-### `sync` — bidirectional sync
+### `sync` — upload, download, watch
 
 ```bash
 feanorfs sync [--lazy] [--no-watch]
+feanorfs sync --up [--no-watch]      # upload only
+feanorfs sync --down [--lazy]        # download only
 ```
 
 | Flag | Description |
 |---|---|
-| `--lazy` | Fetch metadata only; create 0-byte placeholder files instead of downloading full contents |
-| `--no-watch` | Perform a single sync pass and exit. Do not enter the real-time watch loop. |
+| `--up` / `--down` | One direction only (replaces hidden `push` / `pull`) |
+| `--lazy` | Metadata only; 0-byte placeholders |
+| `--no-watch` | Single pass and exit (scripts/CI) |
 
-Performs `pull` then `push` in a single pass. Downloads are processed first so that local state is aligned before uploading.
+By default, `sync` enters real-time watch after the initial pass. Debounced 500 ms.
 
-By default, `sync` enters real-time watch mode after the initial pass (same as `feanorfs watch`). This is the intended seamless workflow — run `feanorfs sync` once and it keeps your workspace mirrored across machines as you work. Pass `--no-watch` to run a single sync and exit — useful in scripts, CI, or cron jobs where blocking forever is undesirable.
-
-### `hydrate` — download and decrypt placeholders
-
-```bash
-feanorfs hydrate [PATH]
-```
-
-| Argument | Description |
-|---|---|
-| `PATH` (optional) | Specific file to hydrate. If omitted, hydrates all unhydrated placeholders. |
-
-Downloads and decrypts the actual file contents for lazy placeholders. Updates the local cache to mark the file as hydrated.
-
-### `cat` — print file contents (auto-hydrates)
+### `hydrate` / `cat`
 
 ```bash
-feanorfs cat <PATH>
+feanorfs hydrate [PATH]     # materialize lazy placeholder(s)
+feanorfs cat <PATH>         # print file (auto-hydrates)
 ```
-
-Prints the file's contents to stdout. If the file is an unhydrated placeholder, it is hydrated first automatically.
-
-### `watch` — real-time sync
-
-```bash
-feanorfs watch
-```
-
-Monitors the workspace for filesystem changes and auto-syncs with the server. Uses a 500ms debounce to coalesce burst events (e.g., editor save sequences).
-
-Performs an initial sync on startup to ensure state is aligned. Press `Ctrl+C` to stop.
-
-### `workspaces` — show server workspaces
-
-```bash
-feanorfs workspaces [SERVER_URL]
-```
-
-| Argument | Description |
-|---|---|
-| `SERVER_URL` (optional) | Server URL to query. If omitted, uses the configured workspace's server. |
-
-Queries the server and prints all workspace IDs that have at least one non-deleted file. Aliased as `feanorfs list` and `feanorfs ls` for convenience.
-
-**Note:** workspaces are listed based on file metadata on the server. A freshly `init`-ed workspace that has never pushed any files will not appear in the list.
-
-### Global flags
-
-| Flag | Description |
-|---|---|
-| `--json` | Emit structured JSON. `status` includes `mirror_state` (`idle`, `out_of_sync`, `offline`, `conflict`, `error`, `syncing`) for tray clients. |
-
-### `agent` — isolated workspace sandboxes
-
-```bash
-feanorfs agent spawn <NAME>
-feanorfs agent commit <NAME> [--json]
-feanorfs agent list
-feanorfs agent clean <NAME>
-feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
-```
-
-| Subcommand | Description |
-|---|---|
-| `spawn` | Create a copy-on-write snapshot under `.feanorfs/agents/<NAME>/` and record the server's per-file view as the base snapshot. Requires the workspace E2EE password. |
-| `commit` | Diff the agent workspace against its base snapshot. Detects concurrent edits (base/ours/theirs) and writes conflict files under `.feanorfs/conflicts/`. FeanorFS does **not** merge — reconcile conflicts yourself, then sync. |
-| `list` | List agent workspaces with active snapshots. |
-| `clean` | Remove an agent workspace and its snapshot rows. |
-| `run` | Execute a command with the agent directory as the working directory (cwd-scoped, not a kernel-level sandbox). |
-
-Agent names must be simple identifiers (no `/`, `\`, `.`, or `..`).
 
 ### `summary` — session catch-up diff
 
@@ -368,40 +198,96 @@ Agent names must be simple identifiers (no `/`, `\`, `.`, or `..`).
 feanorfs summary [--summarize] [--no-remember]
 ```
 
-Compares the current workspace against the previous session baseline. By default, saves the current snapshot as the new baseline after showing the diff (`--no-remember` to skip).
+| Flag | Description |
+|---|---|
+| `--summarize` | Pipe paths/metadata to `FEANORFS_SUMMARY_CMD` (default `feanorfs-llm`) |
+| `--no-remember` | Do not update the session baseline |
+
+### `migrate` — upgrade to format v2
+
+```bash
+feanorfs migrate [--rekey]
+```
+
+Re-seals blobs as AEAD and bumps `format_version` to 2. `sync` nudges v1 workspaces to run this.
+
+### Global flags
 
 | Flag | Description |
 |---|---|
-| `--summarize` | Pipe paths/metadata to `FEANORFS_SUMMARY_CMD` for prose (default `feanorfs-llm`) |
-| `--no-remember` | Do not update the session baseline after this diff |
+| `--json` | Structured JSON. `status` includes `mirror_state` for tray clients. |
+
+### `agent` — isolated workspace copies
+
+```bash
+feanorfs agent                    # list agents (one-line state when online)
+feanorfs agent status [NAME]      # list all, or preview one agent
+feanorfs agent spawn <NAME> [--no-sync] [--replace]
+feanorfs agent refresh <NAME>
+feanorfs agent land <NAME> [--clean] [--propose]
+feanorfs agent clean <NAME>
+feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
+```
+
+| Subcommand | Description |
+|---|---|
+| `status` | List all agents (enriched when server reachable; names-only offline). Hidden `agent list` returns legacy JSON `{"agents": ["name"]}`. |
+| `spawn` | APFS clonefile/copy snapshot with server base hashes |
+| `refresh` | Pull cloud changes the agent hasn't touched |
+| `land` | Apply clean work, upload, register conflicts |
+| `clean` | Remove agent dir and snapshot rows |
+| `run` | Run a command in the agent dir — not a sandbox |
+
+**Isolation caveat:** data isolation only — see [threat-model.md](threat-model.md).
+
+### `conflicts` — list, compare, resolve
+
+```bash
+feanorfs conflicts                              # list pending paths
+feanorfs conflicts keep <PATH> --local|--cloud|--both
+feanorfs conflicts keep <PATH> --file <RECONCILED>
+feanorfs conflicts show <PATH> [--open]
+```
+
+Version files use `.original`/`.local`/`.cloud` suffixes.
+
+| Subcommand | Description |
+|---|---|
+| (bare) / `list` | Pending paths blocked from sync |
+| `keep` | Resolve by keeping local, cloud, both, or a reconciled file |
+| `show` | Unified diff; `--open` launches editor compare |
+
+### Orchestrator surfaces (hidden)
+
+```bash
+feanorfs events    # NDJSON: sync_state, folder_changed, conflict_risk, …
+feanorfs mcp       # MCP protocol + tools (agent_*, conflicts_*, sync_status)
+```
+
+File contents never leave the machine on either surface.
 
 ## Examples
 
 ### First-time setup across two machines
 
 ```bash
-# Machine A: start server + init + push
-machine-a$ cargo run --bin feanorfs-server &
+# Machine A: start server + create workspace
+machine-a$ feanorfs serve --token "server-secret" &
 machine-a$ cd /path/to/project
-machine-a$ feanorfs init http://localhost:3030 --workspace proj --password "s3cret-pass"
-machine-a$ feanorfs push
+machine-a$ feanorfs start http://localhost:3030 --workspace proj --token "server-secret" --no-watch
 
-# Machine B: init + lazy pull + hydrate on demand
+# Machine B: join + lazy sync
 machine-b$ cd /path/to/project
-machine-b$ feanorfs init http://machine-a:3030 --workspace proj --password "s3cret-pass"
-machine-b$ feanorfs pull --lazy
+machine-b$ feanorfs start fnr1-... --no-watch
+machine-b$ feanorfs sync --down --lazy --no-watch
 machine-b$ feanorfs cat src/main.rs   # hydrates + prints
 ```
 
 ### Continuous sync while working
 
 ```bash
-# Terminal 1: watch for changes
-feanorfs watch
-
-# Terminal 2: edit files normally
-vim src/lib.rs
-# watch will auto-sync within 500ms of saving
+feanorfs start          # resume + watch (or feanorfs sync)
+vim src/lib.rs          # auto-syncs within 500ms of saving
 ```
 
 ### Check what changed before syncing
@@ -409,19 +295,52 @@ vim src/lib.rs
 ```bash
 feanorfs status
 # Output:
-#   Local changes to push (run 'feanorfs push'):
+#   Local changes not yet on the mirror (run 'feanorfs sync --up'):
 #     [modify/add] src/lib.rs
-#   Remote changes to pull (run 'feanorfs pull'):
+#   Changes on other machines to download (run 'feanorfs sync --down'):
 #     [download]   README.md (2.3 KB)
 ```
 
 ## Synced files
 
-FeanorFS syncs all files in the workspace directory. `.gitignore` is **not** honored — FeanorFS is not Git, and ignoring files based on Git's notion of what's untracked would silently drop files you may want on your other machine (`.env.local`, build configs, etc.).
-
-The following directories are **always skipped**:
+FeanorFS syncs all files in the workspace directory. `.gitignore` is **not** honored — use `.feanorfsignore` for exclusions. The following directories are **always skipped**:
 - `.feanorfs/` — client state (config, cache DB)
 - `.git/` — Git repository metadata
+
+## Agent loop and reconciliation (orchestrators)
+
+FeanorFS isolates **files**, not processes. An agent workspace is a normal folder under `.feanorfs/agents/<name>/` — point any coding agent's cwd at it. `agent run` sets `FEANORFS_AGENT` and `FEANORFS_AGENT_DIR` on the child; it does **not** sandbox the process — absolute-path writes can escape the agent dir (see [threat-model.md](threat-model.md)).
+
+### Loop
+
+```bash
+feanorfs sync --no-watch          # optional: ensure folder is current
+feanorfs agent spawn ci1
+feanorfs agent run ci1 -- cargo test
+feanorfs agent status ci1           # read-only preview
+feanorfs agent refresh ci1          # pull cloud changes agent hasn't touched
+feanorfs agent land ci1             # apply clean work; register needs-attention
+feanorfs conflicts
+feanorfs conflicts keep <path> --local | --cloud | --both | --file <reconciled>
+```
+
+### Reconciliation protocol (LLM harnesses)
+
+1. `feanorfs --json agent land <name>` — read `conflicts[]` with `original_file`, `local_file`, `cloud_file`, `hint`.
+2. Optional: `feanorfs agent land <name> --propose` writes `<path>.proposed` via diff3 (text only; never auto-applied).
+3. Reconcile locally — human or agent writes a candidate file.
+4. **Verify** in a spawned agent workspace: `agent spawn verify` → copy candidate → `agent run verify -- <tests>`.
+5. Only a green run earns `feanorfs conflicts keep <path> --file <candidate>`.
+
+**Tiered policy:** clean `--propose` → reconciler agent → human escalation (binary files, sensitivity-list paths, or N failed verifications).
+
+Resolution history: `feanorfs conflicts history --json` (records method, resolver from `FEANORFS_AGENT` or `human`).
+
+### Demo script
+
+```bash
+./scripts/demo-agent-loop.sh
+```
 
 ## Exit codes
 
@@ -436,10 +355,10 @@ The server respects `RUST_LOG` for controlling log verbosity. The client writes 
 
 ```bash
 # Server: enable debug logging for the server crate and tower-http
-RUST_LOG=feanorfs_server=debug,tower_http=debug cargo run --bin feanorfs-server
+RUST_LOG=feanorfs_server=debug,tower_http=debug feanorfs serve --token "secret"
 
 # Server: silence everything except warnings
-RUST_LOG=warn cargo run --bin feanorfs-server
+RUST_LOG=warn feanorfs serve
 ```
 
 If `RUST_LOG` is unset, the server defaults to `feanorfs_server=info,tower_http=info`.

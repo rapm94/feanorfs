@@ -2,39 +2,37 @@
 
 **Generated:** 2026-06-23T18:15:00+02:00
 **Branch:** main
-**Status:** E2EE Sync + Lazy Hydration + Agent Workspaces + JSON API + Predictive Hydration + Catch-up Summary
+**Status:** E2EE sync, agent workspaces, single binary (`feanorfs` + `feanorfs serve`, in-process local hub), MCP/events, catch-up summary.
 
 ## Unifying Principle
 
 **FeanorFS is dumb storage, smart transport.** FeanorFS never makes decisions about file content (no auto-merge, no summarization, no chat). Its job is to decide _what_ to transport, _when_ to transport it, and _how_ to isolate and preserve files safely. Anything requiring file-semantic understanding belongs in the consumer/agent layer.
 
-## Product direction
-
-**Dropbox for dev — zero mental burden.** The user should install, point at a folder, and forget. Sync runs in the background; they only hear from FeanorFS when something needs attention (auth failure, conflict, offline backlog).
+## Layers
 
 | Layer | Role |
 |---|---|
-| **Server** (`feanorfs-server`) | OSS blob + metadata backend. Same binary for self-host and managed SaaS (`--port`, `--data-dir`, `--token` per tenant). |
-| **Engine** (`feanorfs_client` + CLI) | Headless sync library + power-user CLI. All behavior lives here; `--json` is the contract for any UI shell. |
-| **Tray client** (future) | Minimal system-tray UI: connected / syncing / up-to-date / error, workspace switcher, pause, “open folder”. No duplicate sync logic — calls the library or CLI with `--json`. |
+| **Hub** (`feanorfs serve`) | Blob + metadata backend in the same binary as the sync client. Same router as the optional legacy `feanorfs-server` crate binary (`--port`, `--data-dir`, `--token` per instance). |
+| **Engine** (`feanorfs_client` + CLI) | Sync library + CLI. Embeds the hub for local workspaces (`hub.rs`, in-process `ApiClient`) and exposes `feanorfs serve` for network hubs. `--json` is the contract for any UI shell. |
+| **Tray client** (future) | Optional system-tray UI. No duplicate sync logic — calls the library or CLI with `--json`. |
 
-**Ergonomics rules for all clients:**
-- Prefer smart defaults over flags (`summary` should remember session state; tray should auto-watch without asking).
-- Setup is one flow, not `connect` + `init` + `join` trivia — collapse for first-run; keep granular commands for power users.
-- Server auth = **token**; workspace secrecy = **encryption key** — never overload “password” in user-facing copy.
-- Surface conflicts, never auto-merge. Tray shows “needs attention”, not a merge UI.
-- SaaS and self-host must share the same API and client; hosted is “someone else runs `feanorfs-server` with TLS + per-user token.”
+**Defaults:**
+- Prefer smart defaults over flags where practical (`feanorfs start`, watch after sync).
+- Server auth = **token**; workspace secrecy = **encryption key** (distinct concepts in user-facing copy).
+- Surface conflicts; never auto-merge file content.
+- Self-host and hosted deployments share the same API and client binary.
 
 ## OVERVIEW
 `FeanorFS` is a developer-focused uncommitted-code synchronization tool written in Rust. It utilizes a **self-contained local-first architecture**:
 1. **Metadata Synchronization**: SQLite on both sides. Server in `server-data/db.sqlite`, client cache in `.feanorfs/local_cache.db`. Client queries `/api/sync/diff` with its metadata and receives a delta.
 2. **Blob Storage**: Content-addressed storage (CAS) blobs identified by Blake3 hashes on a lightweight Axum server.
-3. **End-to-End Encryption (E2EE)**: Symmetric keystream from `Blake3 XOF(password, path)` with length-prefixed domain separation — cloud sees only encrypted hashes and scrambled bytes. Client re-verifies downloaded blob integrity by re-hashing the ciphertext and comparing to the expected `encrypted_hash` before decrypting, mitigating active-server-tampering attacks (substitute AEAD mitigation until ChaCha20-Poly1305 lands).
-4. **On-Demand Hydration (Lazy Sync)**: `pull --lazy` creates 0-byte placeholders; actual bytes fetched via `hydrate` or `cat`.
-5. **Workspace Isolation**: `agent spawn` creates copy-on-write snapshots under `.feanorfs/agents/<name>/` (hardlinks + fallback copy) and records the server's per-file view into `agent_snapshots`. Requires the workspace E2EE password so uncached files get correct base hashes. `agent commit` detects concurrent edits (base/ours/theirs) by sending the base snapshot back to `/api/sync/diff` as the "client" view — every server-side change since spawn shows up as `download_required`. Conflicts are written under `.feanorfs/conflicts/` preserving directory structure; FeanorFS does NOT merge — the consumer (human or AI agent) reconciles. `agent run` executes a command with the agent directory as its working directory (NOT a kernel-level sandbox — the child process inherits parent filesystem, network, and environment access).
-6. **Agent Library API**: Client crate is split into `lib.rs` + `main.rs`; `feanorfs_client::sync/push/pull/hydrate/cat` are callable from any Rust program. `--json` flag on the CLI emits structurally-typed results for every status-returning command.
-7. **Catch-Up Summary**: `summary` command diffs current workspace against the previous session marker (stored in `last_session` table) and lists added/modified/deleted paths. `--summarize` shells out to `FEANORFS_SUMMARY_CMD` (default `feanorfs-llm`) feeding it the structured result as JSON; if the binary is absent, falls back to plain path listing. Zero-knowledge is preserved by never shipping file contents to a remote LLM.
-8. **Predictive Hydration**: `file_access_log` table tracks co-occurrence (path × sibling_path × weight × updated_at). After `cat`/`hydrate`, `predictive::record_access_with_recent` loads the rolling 5-path history from `last_session`, bumps the weights of recently-touched siblings, and saves the updated list back; `predictive::prefetch_related` runs after `Hydrate` to fetch top-5 co-occurring siblings in the background. Each run applies a 0.95 time-decay factor — no ML, pure weighted co-occurrence.
+3. **End-to-End Encryption (E2EE)**: New blobs are sealed with ChaCha20-Poly1305 AEAD (`pack_bytes`/`unpack_bytes`), key derived from `blake3(domain ‖ len-prefixed password ‖ len-prefixed path)`, deterministic SIV-style nonce (required for CAS stability). Format v2 workspaces reject non-AEAD blobs (`LegacyPolicy::Reject`); unmigrated v1 workspaces still fall back to legacy XOR on decrypt until `feanorfs migrate` — removing that path is [SEC-6](docs/roadmap.md). Client re-hashes downloaded ciphertext against `encrypted_hash` before decrypting.
+4. **Local hub (in-process)**: `setup --local` / `hub_local` config uses `LocalHub` + `tower::oneshot` — no socket, no daemon. Share on the network via `feanorfs serve --data-dir .feanorfs/hub-data` (invites are not portable for embedded hubs).
+5. **On-Demand Hydration (Lazy Sync)**: `pull --lazy` creates 0-byte placeholders; actual bytes fetched via `hydrate` or `cat`.
+6. **Workspace Isolation**: `agent spawn` creates snapshots under `.feanorfs/agents/<name>/` (APFS clonefile / copy fallback) and records the server's per-file view into `agent_snapshots`. `agent check` previews; `agent land` applies clean work, uploads, and registers conflicts. Conflicts are written under `.feanorfs/conflicts/` as `.original`/`.local`/`.cloud`; FeanorFS does NOT merge.
+7. **Agent Library API**: Client crate is split into `lib.rs` + `main.rs`; `feanorfs_client::sync/push/pull/hydrate/cat` are callable from any Rust program. `--json` flag on the CLI emits structurally-typed results for every status-returning command.
+8. **Catch-Up Summary**: `summary` command diffs current workspace against the previous session marker (stored in `last_session` table) and lists added/modified/deleted paths. `--summarize` shells out to `FEANORFS_SUMMARY_CMD` (default `feanorfs-llm`) feeding it the structured result as JSON; if the binary is absent, falls back to plain path listing. Zero-knowledge is preserved by never shipping file contents to a remote LLM.
+9. **Predictive Hydration**: `file_access_log` table tracks co-occurrence (path × sibling_path × weight × updated_at). After `cat`/`hydrate`, `predictive::record_access_with_recent` loads the rolling 5-path history from `last_session`, bumps the weights of recently-touched siblings, and saves the updated list back; `predictive::prefetch_related` runs after `Hydrate` to fetch top-5 co-occurring siblings in the background. Each run applies a 0.95 time-decay factor — no ML, pure weighted co-occurrence.
 
 ---
 
@@ -42,17 +40,23 @@
 ```
 feanorfs/
 ├── common/              # Shared data models and utilities
-│   └── src/lib.rs       # FileState, SyncRequest/Response, AgentSnapshotEntry, ConcurrentEdit, AgentCommitResult, Blake3 XOF crypt_bytes and hashing
+│   └── src/lib.rs       # FileState, SyncRequest/Response, invite encode/decode, crypto
 ├── server/              # Pure blob storage server
 │   ├── src/db.rs        # SQLite metadata DB coordinator using SQLx
 │   ├── src/app.rs       # Axum routes for sync negotiation, blob uploads & downloads
+│   ├── src/serve.rs     # run_http_server, GC, shared with client embed
 │   ├── src/lib.rs       # feanorfs_server library (build_router, init_app_state)
 │   └── src/main.rs      # CLI entrypoint
 ├── client/              # CLI terminal client + library crate
 │   ├── src/lib.rs       # feanorfs_client lib export surface (sync/push/pull/hydrate/cat, types, Db, ApiClient)
-│   ├── src/api.rs       # HTTP client request wrappers for blob transport
+│   ├── src/api.rs       # HTTP + in-process ApiClient backends
+│   ├── src/hub.rs       # In-process local hub (LocalHub + tower oneshot)
 │   ├── src/commands.rs  # Push/pull/sync/hydrate/cat command implementations (Serialize'd result types)
-│   ├── src/agent.rs     # Workspace Isolation: spawn/commit/list/clean, CoW snapshots, three-way conflict detection
+│   ├── src/agent.rs     # Workspace Isolation: spawn/check/land/refresh, snapshots, three-way conflict detection
+│   ├── src/conflicts.rs # Workspace sync conflict gate: last_synced_files three-way detection, conflict_registry, resolve
+│   ├── src/conflict_artifacts.rs # Conflict version files (.original/.local/.cloud) + sentinel placeholders
+│   ├── src/fs_util.rs   # atomic_write (temp+rename), file mtime helpers
+│   ├── src/cli/         # CLI handlers (agent, conflicts, serve, start, mcp, events, workspace, …)
 │   ├── src/summary.rs   # Catch-up summary: diff against last_session, FEANORFS_SUMMARY_CMD shell-out with plain fallback
 │   ├── src/predictive.rs # Predictive hydration: access recording + co-occurrence prefetch + time decay
 │   ├── src/local.rs     # Client-side config, ignore rules, local cache DB, agent_snapshots, file_access_log, last_session tables
@@ -67,7 +71,7 @@ feanorfs/
 To avoid unnecessary re-hashing of unchanged local files, the client maintains a local cache database:
 1. **`local_cache.db`** (Local Cache): SQLite database created via `sqlx::SqlitePool`. Contains:
    - **`local_files`**: maps disk path modifications (`mtime`/`size` -> hashes), including `server_mtime` and `hydrated` flag.
-   - **`agent_snapshots`**: per-agent `(agent_name, path)` → `(base_hash, base_size, base_mtime)` — the server's view at spawn time. `agent commit` uses this as the "base" leg of three-way concurrent-edit detection.
+   - **`agent_snapshots`**: per-agent `(agent_name, path)` → `(base_hash, base_size, base_mtime)` — base leg for three-way diff; advanced after `agent land` from post-land main `FileState`.
    - **`file_access_log`**: `(path, sibling_path, weight, updated_at)` — co-occurrence table for predictive hydration. Weights accumulate then decay by 0.95 on each prefetch pass.
    - **`last_session`**: simple `(key, value)` key-value. The `last_scan` key stores a JSON-serialized `HashMap<String, FileState>` snapshot that `summary` diffs against on next session.
 2. **Double-hash and Server Mtime Tracking** in `local_files`:
@@ -82,15 +86,16 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Task / Feature | Location | Notes |
 | :--- | :--- | :--- |
 | FileState definition | [lib.rs](common/src/lib.rs) | Tracks relative path, Blake3 hash (encrypted), size, mtime, and deleted status. |
-| Agent snapshot + conflict types | [lib.rs](common/src/lib.rs) | `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentCommitResult` — the wire types `agent commit` returns. |
-| Blake3 XOF E2EE | [lib.rs](common/src/lib.rs) | Symmetric XOR cipher driven by Blake3 Extendable Output Function (XOF) with length-prefixed domain separation. Also exports `is_valid_hash` for path-traversal defense. |
+| Agent snapshot + conflict types | [lib.rs](common/src/lib.rs) | `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentCommitResult` — wire types returned by `agent land` (`commit` alias). |
+| E2EE primitives | [lib.rs](common/src/lib.rs) | `pack_bytes`/`unpack_bytes` (ChaCha20-Poly1305 AEAD, deterministic SIV-style nonce) with legacy `crypt_bytes` XOR fallback on decrypt for unmigrated v1. Format v2 rejects non-AEAD. Also exports `is_valid_hash` for path-traversal defense. |
 | Library API surface | [lib.rs](client/src/lib.rs) | `feanorfs_client::sync/push/pull/hydrate/cat` callable from any Rust program. Re-exports `ApiClient`, `ClientDb`, `Config`, types. |
-| Local Cache DB + tables | [local.rs](client/src/local.rs) | Schema for `local_files`, `agent_snapshots`, `file_access_log`, `last_session`. CRUD on each. |
+| Local Cache DB + tables | [local.rs](client/src/local.rs) | Schema for `local_files`, `agent_snapshots`, `file_access_log`, `last_session`, `last_synced_files`, `conflict_registry`. CRUD on each. |
 | Directory Scanning | [local.rs](client/src/local.rs) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
-| HTTP API Wrappers | [api.rs](client/src/api.rs) | Wraps `/api/sync/diff`, `/api/upload`, `/api/download/:hash`, `/api/workspaces`. Sends Bearer auth header when configured. |
-| CLI Actions | [main.rs](client/src/main.rs) | Subcommand router. Global `--json` flag. Agent subcommand with Spawn/Commit/List/Clean/Run actions. |
+| Transport (`ApiClient`) | [api.rs](client/src/api.rs) + [hub.rs](client/src/hub.rs) | HTTP or in-process hub via `Backend::Http` / `Backend::Local`. Wraps `/api/sync/diff`, upload, download, workspaces. |
+| CLI Actions | [main.rs](client/src/main.rs) + [cli/](client/src/cli/) | Subcommand router. Global `--json`. Agent: spawn/check/refresh/land (commit alias). Workspace: start/setup/join/serve. |
 | Sync Engine | [commands.rs](client/src/commands.rs) | Pure sync logic returning `Serialize`-derived result types (`SyncResult`, `PushResult`, etc.). No `println!` — UI-agnostic. |
-| Workspace Isolation | [agent.rs](client/src/agent.rs) | `spawn_agent` (hardlink CoW + fallback copy + per-file base snapshot, requires E2EE password), `commit_agent` (three-way concurrent edit via `/api/sync/diff`), `list_agents`, `clean_agent`, `write_conflict_files`. |
+| Workspace Isolation | [agent.rs](client/src/agent.rs) | `spawn_agent`, `check_agent`, `land_agent` (`commit_agent` alias), `refresh_agent`, `list_agents`, `clean_agent`. Three-way via `/api/sync/peek` + diff. |
+| Workspace sync conflicts | [conflicts.rs](client/src/conflicts.rs) | `negotiate_sync_with_conflict_gate`, `last_synced_files`, `conflict_registry`, `resolve_conflict` (`conflicts keep`), join/attach divergent-path guards. |
 | Catch-up Summary | [summary.rs](client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
 | Predictive Hydration | [predictive.rs](client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
 | Change Watching | [watch.rs](client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
@@ -103,11 +108,11 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 - `FileState`: Schema for paths, hashes, sizes, mtimes, and deleted states.
 - `SyncRequest` & `SyncResponse`: Serialization structs for endpoint negotiation.
 - `AgentSnapshotEntry`: One row of the per-agent base snapshot — `(agent_name, path, base_hash, base_size, base_mtime)`.
-- `ConcurrentEdit`: Three-way triple (base/ours/theirs) emitted by `agent commit` for conflicting paths. FeanorFS does not merge — consumers reconcile.
-- `AgentCommitResult`: Aggregate result of `agent commit` — `our_changes`, `their_changes`, `conflicts`.
+- `ConcurrentEdit`: Three-way triple (base/ours/theirs) emitted by `agent land` for conflicting paths. FeanorFS does not merge — consumers reconcile.
+- `AgentCommitResult`: Aggregate result of `agent land` — `our_changes`, `their_changes`, `conflicts`.
 
 ### Server API Endpoints ([server/src/app.rs](server/src/app.rs))
-- `POST /api/sync/diff`: Compares incoming client list with `files` table and returns a delta response. **Reused by `agent commit`**: the client sends the base snapshot as the "client" view, so every server-side change since spawn surfaces as `download_required`. No new endpoint needed. Deletions are propagated via `upload_required` with `deleted=true` in the `FileState` payload (handled inside the diff handler).
+- `POST /api/sync/diff`: Compares incoming client list with `files` table and returns a delta response. **Reused by `agent land`**: the client sends the base snapshot as the "client" view, so every server-side change since spawn surfaces as `download_required`. No new endpoint needed. Deletions are propagated via `upload_required` with `deleted=true` in the `FileState` payload (handled inside the diff handler).
 - `POST /api/upload?workspace_id=...`: Receives raw encrypted bytes, writes them to `server-data/blobs/<hash>`, and upserts DB metadata. If the DB upsert fails, the orphaned blob is removed from disk before returning an error (no partial state). Request body size capped at 100 MB via `DefaultBodyLimit` to prevent memory-exhaustion DoS.
 - `GET /api/download/:hash`: Streams raw file contents. Rejects non-hex hashes via `is_valid_hash` to prevent path traversal.
 - `GET /api/workspaces`: Lists all workspace IDs that have at least one non-deleted file.
@@ -116,11 +121,13 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 - **Multi-instance**: `--port` and `--data-dir` flags allow running multiple isolated instances behind a reverse proxy (SaaS deployment model).
 
 ### Client Database Schema ([client/src/local.rs](client/src/local.rs))
-- `local_files` table: `path` (PK), `plaintext_hash`, `encrypted_hash`, `size`, `mtime` (disk), `server_mtime` (remote), `hydrated`.
+- `local_files` table: `path` (PK), `plaintext_hash`, `encrypted_hash`, `size`, `mtime` (disk), `server_mtime` (remote), `hydrated`, `deleted_at`.
 - `agent_snapshots` table: `agent_name`, `path`, `base_hash`, `base_size`, `base_mtime`. Primary key `(agent_name, path)`.
 - `file_access_log` table: `path`, `sibling_path`, `weight`, `updated_at`. Primary key `(path, sibling_path)`.
+- `last_synced_files` table: per-path last-agreed state (`path`, `hash`, `size`, `mtime`, `deleted`) — the base leg for workspace conflict detection.
+- `conflict_registry` table: pending needs-attention paths (`path`, `kind`, `conflict_dir`, `opened_at`, `status`) — blocks LWW sync until resolved.
 - `last_session` table: `key` (PK), `value`. Currently stores `last_scan` = JSON-serialized `HashMap<String, FileState>` of the previous session.
-- Global config: `~/.feanorfs/global.json` stores server URL + optional server password, cached by `feanorfs connect`.
+- Global config: `~/.feanorfs/global.json` stores server URL + optional server password (cached automatically by `feanorfs start <URL>`; hidden `connect` also writes it).
 - Workspace config: `.feanorfs/config.json` stores server URL, workspace ID, E2EE password, and optional server password.
 
 ---
@@ -128,10 +135,11 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 ## CONVENTIONS
 1. **Cross-Platform Paths**: All files are tracked and uploaded using forward slashes (`/`). Always normalize path slashes using `feanorfs_common::normalize_path` before doing DB operations.
 2. **No Redundant Hashing**: Check disk files against `local_cache.db` first. Rehash only if `mtime` or `size` differs.
-3. **Zero-Knowledge Encryption**: Always encrypt file contents using `crypt_bytes` before calling `api.upload_file` and store the resulting `encrypted_hash` in the database.
+3. **Zero-Knowledge Encryption**: Always encrypt file contents using `pack_bytes` (AEAD) before calling `api.upload_file` and store the resulting `encrypted_hash` in the database. `crypt_bytes` is decrypt-only legacy fallback — never use it for new uploads.
 4. **Library-First Result Types**: Commands return `Serialize`-derived structs (`SyncResult`, `PushResult`, etc.) so the `--json` flag and `feanorfs_client::` library callers see the same shape.
-5. **No Auto-Merge**: `agent commit` emits three-way `ConcurrentEdit` triples under `.feanorfs/conflicts/`. Reconciliation is the consumer's job (human edits, or LLM agent invokes reconcile). FeanorFS never decides file content.
+5. **No Auto-Merge**: `agent land` emits three-way `ConcurrentEdit` triples under `.feanorfs/conflicts/` (`.original`/`.local`/`.cloud`). Reconciliation is the consumer's job via `conflicts keep`.
 6. **Predictive Hydration is Local-Only**: `file_access_log` never leaves the client. Weights and access patterns stay in `.feanorfs/local_cache.db`.
+7. **Data Isolation ≠ Sandbox**: agent workspaces isolate files, not processes. Never claim sandboxing in code or copy; link the "Process isolation" section of [docs/threat-model.md](docs/threat-model.md) instead.
 
 ---
 
@@ -139,9 +147,9 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 - **DO NOT** scan the `.feanorfs`, `.git`, or `.feanorfs/agents/` directories as part of the main workspace scan. They are hardcoded as skipped. Agents have their own scan inside their workspace dir (separate `ClientDb`).
 - **DO NOT** trigger syncs on every raw filesystem change event. Filesystem saves are noisy. Debounce updates for 500ms using a channel.
 - **DO NOT** download remote file bytes immediately during sync if `--lazy` is enabled. Write 0-byte placeholders instead.
-- **DO NOT** add a new server endpoint when `agent commit` can reuse `/api/sync/diff` by sending the base snapshot as the client view. Reuse keeps the server dumb.
+- **DO NOT** add a new server endpoint when `agent land` can reuse `/api/sync/diff` by sending the base snapshot as the client view. Reuse keeps the server dumb.
 - **DO NOT** ship file contents to a remote LLM when implementing `--summarize`. The shell-out tool is fed paths and metadata only; the E2EE password and file bytes stay local.
-- **DO NOT** attempt to merge concurrent edits. `agent commit` writes three files (`path.base`, `path.ours`, `path.theirs`) under `.feanorfs/conflicts/` and stops. A consumer reconciles.
+- **DO NOT** attempt to merge concurrent edits. `agent land` writes `.original`/`.local`/`.cloud` under `.feanorfs/conflicts/` and stops. A consumer reconciles with `conflicts keep`.
 
 ---
 
@@ -156,85 +164,58 @@ cargo build
 cargo test
 ```
 
-### Starting the Blob Server
+### Starting the Blob Hub
 ```bash
-# Runs the Axum server on port 3030
+# Same binary as the sync client (recommended)
+cargo run --bin feanorfs -- serve --port 3030 --data-dir server-data
+cargo run --bin feanorfs -- serve --gc-only --data-dir server-data
+
+# Legacy server-only binary (optional)
 cargo run --bin feanorfs-server
 ```
 
 ### Client CLI Usage
 ```bash
-# Connect to a server (internet: explicit URL; LAN: --lan for mDNS discovery)
-# If server requires auth and no --password given, prompts interactively
-cargo run --bin feanorfs -- connect https://my-server.com:3030 --password "server-pass"
-cargo run --bin feanorfs -- connect --lan
+# Begin: create, join, or resume — then sync + watch
+cargo run --bin feanorfs -- start ~/projects/app   # folder-as-target
+cargo run --bin feanorfs -- start 127.0.0.1:3030 --workspace my-workspace --token "server-pass"
+cargo run --bin feanorfs -- start fnr1-...
+cargo run --bin feanorfs -- start --local --workspace my-workspace
+cargo run --bin feanorfs -- start --no-watch       # sync once after create/join
 
-# Initialize a workspace (uses cached server, auto-generates E2EE key)
-# Prints a ready-to-paste join command and copies key to clipboard
-cargo run --bin feanorfs -- init --workspace my-workspace
-cargo run --bin feanorfs -- init --workspace my-workspace --lan
+# Hidden script aliases (configure only — no auto watch)
+cargo run --bin feanorfs -- setup --workspace my-workspace https://my-server.com:3030
+cargo run --bin feanorfs -- init 127.0.0.1:3030 --workspace my-workspace
+cargo run --bin feanorfs -- attach my-workspace --encryption-key <KEY> --server-url https://my-server.com:3030
 
-# Join an existing workspace from another machine (combines connect + init)
-cargo run --bin feanorfs -- join my-workspace --password "e2ee-key-from-machine-A"
-
-# Show current connection and workspace configuration
+# Inspect
 cargo run --bin feanorfs -- config
+cargo run --bin feanorfs -- config --key
+cargo run --bin feanorfs -- doctor
 
-# Check differences between local directory and server
+# Sync
 cargo run --bin feanorfs -- status
-
-# Upload local additions, updates, and deletes
-cargo run --bin feanorfs -- push
-
-# Download remote updates and deletes (fully hydrated)
-cargo run --bin feanorfs -- pull
-
-# Perform a lazy pull (downloads metadata only, creating placeholder files)
-cargo run --bin feanorfs -- pull --lazy
-
-# Perform a bidirectional sync (pull + push)
-cargo run --bin feanorfs -- sync
-
-# Perform a lazy bidirectional sync
-cargo run --bin feanorfs -- sync --lazy
-
-# Perform a single sync pass without entering watch mode (for scripts/CI)
 cargo run --bin feanorfs -- sync --no-watch
-
-# Download and decrypt a specific placeholder file
+cargo run --bin feanorfs -- sync --up --no-watch
+cargo run --bin feanorfs -- sync --down --lazy --no-watch
 cargo run --bin feanorfs -- hydrate src/main.rs
-
-# Download and decrypt all unhydrated placeholder files
-cargo run --bin feanorfs -- hydrate
-
-# Print a file's contents, automatically hydrating it if it is a placeholder
 cargo run --bin feanorfs -- cat src/main.rs
-
-# Start real-time watch and sync loop
-cargo run --bin feanorfs -- watch
-
-# List all active workspaces on the server
-cargo run --bin feanorfs -- workspaces
 ```
 
-### Agent Workspace & Sandbox Commands
+### Agent Workspace Commands
 ```bash
-# Spawn an isolated agent workspace (CoW snapshot via hardlinks, server snapshot recorded)
+cargo run --bin feanorfs -- agent                    # list agents
+cargo run --bin feanorfs -- agent status ci1         # preview one agent
 cargo run --bin feanorfs -- agent spawn ci1
-
-# Diff agent workspace against the base snapshot
-# Emits clean-our / clean-their / conflicts; writes base/ours/theirs files under .feanorfs/conflicts/
-cargo run --bin feanorfs -- agent commit ci1
-
-# List all agent workspaces
-cargo run --bin feanorfs -- agent list
-
-# Remove an agent workspace and its snapshot rows
-cargo run --bin feanorfs -- agent clean ci1
-
-# Run a command inside the agent workspace (cwd-scoped, not a sandbox)
-# Example: `cargo test` runs in .feanorfs/agents/ci1/
+cargo run --bin feanorfs -- agent land ci1
 cargo run --bin feanorfs -- agent run ci1 -- cargo test
+```
+
+### Conflict Commands
+```bash
+cargo run --bin feanorfs -- conflicts
+cargo run --bin feanorfs -- conflicts keep src/main.rs --local
+cargo run --bin feanorfs -- conflicts show src/main.rs --open
 ```
 
 ### Catch-Up & Predictive Commands
@@ -245,10 +226,7 @@ cargo run --bin feanorfs -- summary
 # Shell out to FEANORFS_SUMMARY_CMD (default: feanorfs-llm) feeding it the structured diff as JSON
 cargo run --bin feanorfs -- summary --summarize
 
-# Also persist the current state as the next session's "previous" snapshot
-cargo run --bin feanorfs -- summary --commit
-
-# Predictive hydration is automatic: `cat`/`hydrate` record access patterns and
+# Session baseline is updated by default; pass --no-remember to skip `cat`/`hydrate` record access patterns and
 # `prefetch_related` fetches the top-5 co-occurring siblings in the background.
 # No explicit command needed.
 ```
@@ -257,7 +235,7 @@ cargo run --bin feanorfs -- summary --commit
 ```bash
 # Global --json flag emits machine-readable structs for Status/Push/Pull/Sync/Hydrate/Cat/Summary/Agent
 cargo run --bin feanorfs -- --json status
-cargo run --bin feanorfs -- --json agent commit ci1
+cargo run --bin feanorfs -- --json agent land ci1
 ```
 
 ```rust
@@ -266,7 +244,7 @@ use feanorfs_client::{ApiClient, ClientDb, Config, sync};
 
 let config = Config { /* ... */ };
 let db = ClientDb::new(".feanorfs").await?;
-let api = ApiClient::new(&config.server_url, config.server_password.as_deref());
+let api = ApiClient::from_config(std::path::Path::new("."), &config).await?;
 let result = sync(&api, &db, std::path::Path::new("."), &config.workspace_id,
                   config.encryption_password.as_deref(), /* lazy */ false).await?;
 ```
@@ -351,6 +329,10 @@ Default section order:
 ## User Preferences
 
 When the user requests a durable behavior change, record it here or in the relevant child AGENTS.md
+
+## Planning
+
+Prioritized backlog: [docs/roadmap.md](docs/roadmap.md). **Active:** tray MVP (DX-26–28). **Freeze list** (bug fixes only until tray MVP): `predictive.rs`, `summary --summarize`, mDNS LAN discovery.
 
 ## Child DOX Index
 

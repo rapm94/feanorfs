@@ -21,37 +21,38 @@ Please do not disclose the vulnerability publicly until a fix has been released.
 
 ## Threat model
 
+Full analysis: [docs/threat-model.md](docs/threat-model.md). Open backlog: [docs/roadmap.md](docs/roadmap.md) (SEC-6, etc.).
+
 ### What FeanorFS protects
 
-- **File contents at rest on the server** — All file bytes are encrypted on the client before upload using a symmetric XOR keystream derived from Blake3's Extendable Output Function (XOF), keyed by `(password, relative_path)`. The server stores only ciphertext blobs and encrypted Blake3 hashes. Without the password, the server cannot recover plaintext.
+- **File contents at rest on the server** — New blobs are sealed with ChaCha20-Poly1305 AEAD (`pack_bytes`) before upload. Keys are derived per path from the workspace encryption key. The server stores only ciphertext and encrypted Blake3 hashes. Without the key, the server cannot recover plaintext.
+- **Ciphertext integrity (AEAD blobs)** — Tampered ciphertext fails authentication on decrypt. The client also re-hashes downloaded ciphertext against the expected `encrypted_hash` before decrypting.
+- **Optional server auth** — Run `feanorfs serve --token <TOKEN>` to require Bearer auth on all API routes.
 
 ### What FeanorFS does NOT protect
 
-- **Metadata leakage** — The server sees: file paths, file sizes, modification times, and encrypted hashes. An adversary with server access can observe the structure of your workspace, the number of files, their sizes, and when they change. **Paths are NOT encrypted.**
-- **Ciphertext integrity** — The encryption scheme is an unauthenticated XOR stream cipher (Blake3 XOF). It does not use AEAD (AES-GCM, ChaCha20-Poly1305). An attacker who can modify blobs on the server could tamper with ciphertext, and the client has no built-in mechanism to detect tampering beyond hash verification of the encrypted bytes. **Do not use FeanorFS against a malicious or compromised server.**
-- **Server API access** — The server has no authentication or authorization. Anyone with network access to port 3030 can list, upload, or download blobs and query sync state. **Run the server on a trusted network, behind a VPN, or bind to localhost.**
-- **Password storage** — The encryption password is stored in plaintext in `.feanorfs/config.json`. Anyone with read access to your workspace directory can recover it. **Protect the workspace directory permissions.**
-- **Side-channel attacks** — The server can observe access patterns (which blobs are downloaded, when, and by whom). There is no oblivious RAM or access pattern obfuscation.
-- **Brute-force resistance** — The encryption key is derived directly from `blake3(password || path)` with no KDF stretching (no Argon2, no PBKDF2, no salt). A low-entropy password may be brute-forced offline by an attacker who obtains a ciphertext blob and knows the corresponding path. **Use a high-entropy password.**
+- **Metadata leakage** — The server sees file paths, sizes, modification times, and encrypted hashes. Paths are not encrypted.
+- **Legacy XOR blobs (v1 workspaces)** — Unmigrated workspaces still decrypt pre-AEAD blobs via an unauthenticated XOR stream. Run `feanorfs migrate` to format v2, which rejects non-AEAD blobs. Do not sync unmigrated workspaces against untrusted servers.
+- **No TLS by default** — HTTP on port 3030. Use a reverse proxy or VPN for internet deployments.
+- **Password storage** — Encryption keys and server tokens are stored in plaintext in `.feanorfs/config.json` and `~/.feanorfs/global.json`. Protect directory permissions.
+- **Brute-force resistance** — Key derivation is a single Blake3 pass with no KDF stretching. v2 workspaces require 64-hex generated keys (256-bit CSPRNG). Human passphrases remain weak if used manually.
+- **Replay of old blob versions** — Content-addressed storage allows the server to serve an older valid blob for a path.
 
 ### Security goals for future versions
 
-The following are known gaps tracked for future work. Contributions are welcome:
-
-1. **AEAD encryption** — Replace the raw XOR stream with ChaCha20-Poly1305 or AES-GCM to provide ciphertext integrity and authentication.
-2. **KDF for password stretching** — Replace direct `blake3(password || path)` key derivation with Argon2id + salt to resist offline brute-force.
-3. **Server authentication** — Add token-based or mTLS authentication to the server API.
-4. **Path obfuscation** — Encrypt file paths in the metadata database so the server cannot observe workspace structure.
+1. **Remove legacy XOR decrypt** (SEC-6) — after all workspaces migrate to format v2.
+2. **Native TLS** on the Axum server (or document reverse-proxy as the only supported internet path).
+3. **Path obfuscation** — encrypt paths in server metadata.
+4. **OS keychain** for stored keys/tokens.
 
 ## Cryptographic primitives
 
 | Component | Primitive | Usage |
 |---|---|---|
-| Hashing | Blake3 | Content-addressed storage keys, plaintext/encrypted file identification |
-| Encryption | Blake3 XOF (XOR stream) | Symmetric encryption of file contents; key = `blake3(password ‖ path)` extended to file length |
-| Key derivation | Direct Blake3 hash | No KDF, no salt, no stretching (see limitations above) |
-
-Blake3 is a cryptographic hash function; its XOF mode produces a keystream. However, using it as a raw XOR stream cipher without authentication is not a standard encryption construction. The current design prioritizes simplicity and zero external crypto dependencies over defense against active attackers.
+| Hashing | Blake3 | CAS blob keys, plaintext/encrypted file identification |
+| Encryption (new blobs) | ChaCha20-Poly1305 AEAD | `pack_bytes` / `unpack_bytes`; deterministic SIV-style nonce for CAS stability |
+| Encryption (legacy, decrypt-only) | Blake3 XOF XOR stream | Pre-AEAD blobs until `feanorfs migrate` |
+| Key derivation | Blake3 with length-prefix domain separation | `blake3(domain ‖ len ‖ key ‖ len ‖ path)` — no salt, no KDF stretching |
 
 ## Responsible disclosure
 
