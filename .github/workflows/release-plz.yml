@@ -4,11 +4,12 @@ name: Release-plz
 # from Conventional Commits. GitHub Releases and binary artifacts are handled
 # by cargo-dist (.github/workflows/release.yml) when the tag is pushed.
 #
-# Prerequisite (repository secret, exact name):
-#   RELEASE_PLZ_TOKEN — fine-grained or classic PAT with contents:write and
-#   pull-requests:write. Must be a repo Actions secret (Settings → Secrets →
-#   Actions), not only an environment secret unless this job sets `environment:`.
-#   The default GITHUB_TOKEN cannot trigger downstream workflows on tag push.
+# Prerequisite — secret RELEASE_PLZ_TOKEN (PAT with contents:write +
+# pull-requests:write), either:
+#   • Repository secret: Settings → Secrets and variables → Actions
+#   • Environment secret: Settings → Environments → prod → Environment secrets
+#     (requires `environment: prod` on each job below)
+# The default GITHUB_TOKEN cannot trigger downstream workflows on tag push.
 
 on:
   push:
@@ -20,6 +21,7 @@ jobs:
   release-plz-pr:
     name: Release PR
     runs-on: ubuntu-latest
+    environment: prod
     permissions:
       contents: write
       pull-requests: write
@@ -27,6 +29,15 @@ jobs:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
     steps:
+      - name: Verify release token
+        run: |
+          if [ -z "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
+            echo "::error::Missing secret RELEASE_PLZ_TOKEN."
+            echo "Add it as a repository secret (Settings → Secrets → Actions)"
+            echo "or as an environment secret on the 'prod' environment."
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -35,14 +46,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify release token
-        run: |
-          if [ -z "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
-            echo "::error::Missing repository secret RELEASE_PLZ_TOKEN (exact name, case-sensitive)."
-            echo "Add it under Settings → Secrets and variables → Actions."
-            exit 1
-          fi
 
       - name: Run release-plz (release-pr)
         uses: release-plz/action@v0.5
@@ -55,10 +58,20 @@ jobs:
   release-plz-release:
     name: Release
     runs-on: ubuntu-latest
+    environment: prod
     permissions:
       contents: write
       pull-requests: read
     steps:
+      - name: Verify release token
+        run: |
+          if [ -z "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
+            echo "::error::Missing secret RELEASE_PLZ_TOKEN."
+            echo "Add it as a repository secret (Settings → Secrets → Actions)"
+            echo "or as an environment secret on the 'prod' environment."
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -67,13 +80,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify release token
-        run: |
-          if [ -z "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
-            echo "::error::Missing repository secret RELEASE_PLZ_TOKEN (exact name, case-sensitive)."
-            exit 1
-          fi
 
       - name: Run release-plz (release)
         uses: release-plz/action@v0.5
