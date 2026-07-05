@@ -45,6 +45,12 @@ tempfile = { workspace = true }
 axum = { workspace = true }
 
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ bin }-v{ version }-{ target }{ binary-ext }"
-pkg-fmt = "bin"
+# Artifacts are built by cargo-dist (see dist-workspace.toml).
+pkg-url = "{ repo }/releases/download/v{ version }/feanorfs-client-{ target }.tar.xz"
+pkg-fmt = "txz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/feanorfs-client-{ target }.zip"
+pkg-fmt = "zip"
 
