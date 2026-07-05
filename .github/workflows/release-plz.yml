@@ -1,13 +1,14 @@
 name: Release-plz
 
-# release-plz automates semantic versioning, changelog generation, and
-# GitHub release creation based on Conventional Commits.
+# release-plz automates semantic versioning, changelog generation, and git tags
+# from Conventional Commits. GitHub Releases and binary artifacts are handled
+# by cargo-dist (.github/workflows/release.yml) when the tag is pushed.
 #
 # Prerequisite (repository secret, exact name):
 #   RELEASE_PLZ_TOKEN — fine-grained or classic PAT with contents:write and
 #   pull-requests:write. Must be a repo Actions secret (Settings → Secrets →
 #   Actions), not only an environment secret unless this job sets `environment:`.
-#   The default GITHUB_TOKEN cannot trigger the release.yml tag build workflow.
+#   The default GITHUB_TOKEN cannot trigger downstream workflows on tag push.
 
 on:
   push:
@@ -30,7 +31,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -62,7 +63,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
