@@ -59,25 +59,35 @@ For a deeper breakdown, see [docs/architecture.md](docs/architecture.md) and [do
 
 ### Pre-built binaries (cargo-binstall)
 
-If you have Rust installed, this is the easiest method — cargo-binstall
-downloads the pre-built binary for your platform and installs it to
-`~/.cargo/bin` with the execute bit already set:
+If you have Rust installed, cargo-binstall downloads the pre-built archive for
+your platform and installs it to `~/.cargo/bin`:
 
 ```bash
 cargo install cargo-binstall
-cargo binstall feanorfs
+cargo binstall feanorfs-client
 cargo binstall feanorfs-server
 ```
 
 ### Install script (no Rust required)
 
 ```bash
-curl -fsSL https://github.com/rapm94/feanorfs/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rapm94/feanorfs/main/scripts/install.sh | sh
 ```
 
-Installs both `feanorfs` and `feanorfs-server` to `/usr/local/bin` (or
-`~/.local/bin` if that's not writable). Supports Linux and macOS on x86_64
-and ARM64.
+Installs both `feanorfs` and `feanorfs-server` via [cargo-dist](https://github.com/axodotdev/cargo-dist)
+installers. Supports Linux and macOS on x86_64 and ARM64.
+
+Per-app installers are also published on each release:
+
+```bash
+# client only
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/rapm94/feanorfs/releases/latest/download/feanorfs-client-installer.sh | sh
+
+# server only
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/rapm94/feanorfs/releases/latest/download/feanorfs-server-installer.sh | sh
+```
 
 ### From source
 
