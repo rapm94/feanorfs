@@ -91,6 +91,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Library API surface | [lib.rs](client/src/lib.rs) | `feanorfs_client::sync/push/pull/hydrate/cat` callable from any Rust program. Re-exports `ApiClient`, `ClientDb`, `Config`, types. |
 | Local Cache DB + tables | [local.rs](client/src/local.rs) | Schema for `local_files`, `agent_snapshots`, `file_access_log`, `last_session`, `last_synced_files`, `conflict_registry`. CRUD on each. |
 | Directory Scanning | [local.rs](client/src/local.rs) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
+| Sync scope & ignores | [sync-scope.md](docs/sync-scope.md) | Why we sync gitignored paths, small `DEFAULT_IGNORES`, no `.gitignore`, optional `.feanorfsignore`, planned `CACHEDIR.TAG`. |
 | Transport (`ApiClient`) | [api.rs](client/src/api.rs) + [hub.rs](client/src/hub.rs) | HTTP or in-process hub via `Backend::Http` / `Backend::Local`. Wraps `/api/sync/diff`, upload, download, workspaces. |
 | CLI Actions | [main.rs](client/src/main.rs) + [cli/](client/src/cli/) | Subcommand router. Global `--json`. Agent: spawn/check/refresh/land (commit alias). Workspace: start/setup/join/serve. |
 | Sync Engine | [commands.rs](client/src/commands.rs) | Pure sync logic returning `Serialize`-derived result types (`SyncResult`, `PushResult`, etc.). No `println!` — UI-agnostic. |
@@ -140,6 +141,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 5. **No Auto-Merge**: `agent land` emits three-way `ConcurrentEdit` triples under `.feanorfs/conflicts/` (`.original`/`.local`/`.cloud`). Reconciliation is the consumer's job via `conflicts keep`.
 6. **Predictive Hydration is Local-Only**: `file_access_log` never leaves the client. Weights and access patterns stay in `.feanorfs/local_cache.db`.
 7. **Data Isolation ≠ Sandbox**: agent workspaces isolate files, not processes. Never claim sandboxing in code or copy; link the "Process isolation" section of [docs/threat-model.md](docs/threat-model.md) instead.
+8. **Sync scope**: mirror disk contents (including gitignored paths); hard skip `.feanorfs/` and `.git/`; small frozen `DEFAULT_IGNORES` only — see [docs/sync-scope.md](docs/sync-scope.md). Do not honor `.gitignore` or expand defaults into a framework-specific denylist.
 
 ---
 
@@ -150,6 +152,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 - **DO NOT** add a new server endpoint when `agent land` can reuse `/api/sync/diff` by sending the base snapshot as the client view. Reuse keeps the server dumb.
 - **DO NOT** ship file contents to a remote LLM when implementing `--summarize`. The shell-out tool is fed paths and metadata only; the E2EE password and file bytes stay local.
 - **DO NOT** attempt to merge concurrent edits. `agent land` writes `.original`/`.local`/`.cloud` under `.feanorfs/conflicts/` and stops. A consumer reconciles with `conflicts keep`.
+- **DO NOT** honor `.gitignore` or grow `DEFAULT_IGNORES` into a per-framework cache list. Follow [docs/sync-scope.md](docs/sync-scope.md) admission criteria; use `.feanorfsignore` for project-specific exclusions.
 
 ---
 

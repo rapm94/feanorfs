@@ -303,9 +303,17 @@ feanorfs status
 
 ## Synced files
 
-FeanorFS syncs all files in the workspace directory. `.gitignore` is **not** honored — use `.feanorfsignore` for exclusions. The following directories are **always skipped**:
-- `.feanorfs/` — client state (config, cache DB)
-- `.git/` — Git repository metadata
+FeanorFS syncs the **current contents** of the workspace folder — including hidden files and paths that git would ignore (`.env`, local config, scratch WIP). That is intentional: those files are often exactly what you want on another machine.
+
+**Always skipped:** `.feanorfs/` (client state), `.git/` (VCS metadata).
+
+**Default artifact ignores:** `target/`, `node_modules/`, `.venv/`, `__pycache__/`, `dist/`, `build/`, `.next/`, `.cache/`, plus editor swap files and `.DS_Store`. These are high-churn build/install trees — syncing them would hammer the watcher on every compile, not just slow the first sync.
+
+**`.gitignore` is not read.** FeanorFS is not a git companion; workspaces need not be repos.
+
+**`.feanorfsignore` is optional** — gitignore syntax for project-specific exclusions (custom `out/`, `vendor/`, etc.). Most projects never need it; do not copy your entire `.gitignore` (that would exclude the files FeanorFS is for).
+
+Full rationale: [sync-scope.md](sync-scope.md).
 
 ## Agent loop and reconciliation (orchestrators)
 

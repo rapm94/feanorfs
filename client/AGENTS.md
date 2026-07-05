@@ -28,7 +28,7 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
 
 - All paths stored in `local_cache.db` use forward slashes via `feanorfs_common::normalize_path`. Always normalize BEFORE any DB operation.
 - Avoid redundant hashing: check `local_cache.db` first and re-hash only if `mtime`/`size` differs from the cached entry. For unchanged placeholders (`hydrated=false`, `size==0`), reuse the cached hashes so the sync diff remains correct without downloading bytes.
-- Scanner honors built-in default ignores (`DEFAULT_IGNORES`) and `.feanorfsignore`. Does NOT honor `.gitignore`, `.ignore`, or global gitignore.
+- **Sync scope:** mirror the working directory (including gitignored/untracked paths). Hard skip `.feanorfs/`, `.git/`. Small frozen `DEFAULT_IGNORES` plus optional `.feanorfsignore` — does NOT honor `.gitignore`. Rationale and admission criteria: [docs/sync-scope.md](../docs/sync-scope.md). Do not grow `DEFAULT_IGNORES` without meeting all three criteria there.
 - Zero-knowledge: always `pack_bytes` plaintext BEFORE calling `api.upload_file` and store the resulting `encrypted_hash` in the cache. `unpack_bytes` handles ChaCha20-Poly1305 blobs and legacy XOR on unmigrated v1 workspaces. On download, re-hash ciphertext before decrypting.
 - Result types are `Serialize`-derived. The `--json` CLI flag and `feanorfs_client::` library callers MUST see the same shape; do not add `println!` in `commands.rs` or `agent.rs` — keep UI in `main.rs` only.
 - Workspace conflicts: bare `feanorfs conflicts` or `conflicts list`; `keep`; `show [--open]`. Registry in `conflict_registry`; artifacts under `.feanorfs/conflicts/<ts>/`.

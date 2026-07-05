@@ -10,7 +10,7 @@ It is designed for one specific situation: you write code on more than one machi
 
 FeanorFS mirrors the **current contents** of a working directory to a blob server. It is **not version control**: no history, branches, tags, or merge UI. Use a VCS for that.
 
-It syncs files on disk (including untracked paths), skips `.git/` and `.feanorfs/`, and does not read `.gitignore` — use `.feanorfsignore` for exclusions.
+It syncs files on disk (including gitignored/untracked paths — often the point), skips `.git/` and `.feanorfs/`, and blocks common artifact trees (`target/`, `node_modules/`, …) by default. It does not read `.gitignore`. See [docs/sync-scope.md](docs/sync-scope.md).
 
 ## Features
 
@@ -20,7 +20,7 @@ It syncs files on disk (including untracked paths), skips `.git/` and `.feanorfs
 
 - **Zero-knowledge E2EE** — ChaCha20-Poly1305 AEAD for new blobs; format v2 rejects legacy XOR. Run `feanorfs migrate` on older workspaces.
 - **Content-addressed storage** — Blake3-hashed blobs with deduplication and upload integrity checks.
-- **Default ignores** — `target/`, `node_modules/`, etc. plus `.feanorfsignore` (does not honor `.gitignore` by design).
+- **Default ignores** — small built-in denylist for high-churn artifacts; optional `.feanorfsignore` for edge cases (does not honor `.gitignore`).
 - **One verb onboarding** — `feanorfs start` creates, joins (`fnr1-…`), or resumes; then syncs and watches.
 - **Single binary** — install `feanorfs` once; `feanorfs serve` runs the blob hub, `start --local` uses an in-process hub (no daemon).
 - **Agent loop** — `spawn` → `status` → `refresh` → `land` → `conflicts keep`. Data isolation, not process sandboxing.
@@ -178,7 +178,7 @@ The global server connection is cached in `~/.feanorfs/global.json`:
 }
 ```
 
-All files in the workspace directory are synced, including hidden files and files that would be ignored by `.gitignore`. The `.feanorfs/` and `.git/` directories are always skipped.
+All files in the workspace directory are synced, including hidden files and paths git would ignore. `.feanorfs/` and `.git/` are always skipped; common build trees are skipped by default. Details: [docs/sync-scope.md](docs/sync-scope.md).
 
 ## Development
 

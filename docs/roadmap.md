@@ -47,6 +47,7 @@
 | DX-23 | Server-rollback UX when server metadata regresses vs `last_synced_files`. |
 | DX-24 | Profile 10k+ trees; parallelize hashing only if needed. |
 | DX-25 | Bulk-touch test (branch switch → single debounced sync pass). |
+| DX-29 | Skip directories containing `CACHEDIR.TAG` (complements small `DEFAULT_IGNORES`; see [sync-scope.md](sync-scope.md)). |
 | SEC-6 | Remove `LegacyPolicy` + XOR decrypt when no v1 workspaces remain. |
 | GC-7 | Optional server `file_history` (time machine). |
 
