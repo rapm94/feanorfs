@@ -130,4 +130,24 @@ impl Db {
 
         Ok(workspaces)
     }
+
+    pub async fn get_referenced_hashes(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT DISTINCT hash FROM files WHERE deleted = 0")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("hash"))
+            .collect())
+    }
+
+    pub async fn purge_old_tombstones(&self, older_than_ms: i64) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM files WHERE deleted = 1 AND updated_at < datetime(? / 1000, 'unixepoch')",
+        )
+        .bind(older_than_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }

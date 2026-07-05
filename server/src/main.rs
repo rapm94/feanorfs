@@ -1,60 +1,73 @@
-use clap::Parser;
-use feanorfs_server::{build_router, init_app_state};
-use std::net::SocketAddr;
+use clap::{Parser, Subcommand};
+use feanorfs_server::{run_gc, run_http_server, ServeOptions};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "feanorfs-server")]
 #[command(about = "Content-addressed blob storage and sync metadata server for FeanorFS")]
 struct Cli {
-    /// Authentication token. Clients must send this as a Bearer token. In SaaS mode, this becomes a per-user API key.
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the HTTP sync server (default).
+    Serve(ServeArgs),
+    /// Garbage-collect unreferenced blobs and old tombstones.
+    Gc(GcArgs),
+}
+
+#[derive(Parser, Clone)]
+struct ServeArgs {
     #[arg(long, env = "FEANORFS_TOKEN", visible_alias = "password")]
     token: Option<String>,
-
-    /// Allow starting without an auth token (development only).
     #[arg(long)]
     allow_open: bool,
-
-    /// Enable mDNS service advertisement for LAN discovery (off by default for internet deployments)
     #[arg(long)]
     mdns: bool,
-
-    /// Port to listen on (default: 3030). Use different ports when running multiple instances behind a reverse proxy.
     #[arg(long, default_value = "3030", env = "FEANORFS_PORT")]
     port: u16,
-
-    /// Data directory for SQLite DB and blob storage (default: ./server-data). Each instance should have its own.
     #[arg(long, default_value = "server-data", env = "FEANORFS_DATA_DIR")]
-    data_dir: std::path::PathBuf,
+    data_dir: PathBuf,
+    #[arg(long, env = "FEANORFS_GC_INTERVAL", default_value = "0")]
+    gc_interval: u64,
+    #[arg(long, default_value = "10")]
+    gc_grace_minutes: u64,
+    #[arg(long, default_value = "30")]
+    tombstone_retention_days: u64,
 }
 
-fn local_ip() -> anyhow::Result<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?;
-    Ok(socket.local_addr()?.ip().to_string())
+#[derive(Parser)]
+struct GcArgs {
+    #[arg(long, default_value = "server-data", env = "FEANORFS_DATA_DIR")]
+    data_dir: PathBuf,
+    #[arg(long, default_value = "10")]
+    gc_grace_minutes: u64,
+    #[arg(long, default_value = "30")]
+    tombstone_retention_days: u64,
 }
 
-fn register_mdns(port: u16) -> anyhow::Result<mdns_sd::ServiceDaemon> {
-    use mdns_sd::{ServiceDaemon, ServiceInfo};
-
-    let daemon = ServiceDaemon::new()?;
-    let ip = local_ip()?;
-    let props: &[(&str, &str)] = &[("v", "1")];
-    let service_info = ServiceInfo::new(
-        "_feanorfs._tcp.local.",
-        "feanorfs-server",
-        "feanorfs-server",
-        &ip,
-        port,
-        props,
-    )?;
-    daemon.register(service_info)?;
-    Ok(daemon)
+impl From<ServeArgs> for ServeOptions {
+    fn from(a: ServeArgs) -> Self {
+        ServeOptions {
+            data_dir: a.data_dir,
+            port: a.port,
+            token: a.token,
+            allow_open: a.allow_open,
+            mdns: a.mdns,
+            gc_interval_secs: a.gc_interval,
+            gc_grace_minutes: a.gc_grace_minutes,
+            tombstone_retention_days: a.tombstone_retention_days,
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -62,49 +75,25 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let token = if cli.token.is_some() {
-        cli.token
-    } else if cli.allow_open {
-        tracing::warn!("--allow-open: server accepts unauthenticated requests (development only)");
-        None
-    } else {
-        anyhow::bail!(
-            "Authentication token required. Set FEANORFS_TOKEN / --token, or pass --allow-open for local dev."
-        );
-    };
-
-    let state = init_app_state(cli.data_dir.clone(), token.clone()).await?;
-    let app = build_router(state);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
-    tracing::info!(
-        "FeanorFS Sync Server starting on http://{} (data: {})",
-        addr,
-        cli.data_dir.display()
-    );
-
-    let _mdns_daemon = if cli.mdns {
-        match register_mdns(addr.port()) {
-            Ok(d) => {
-                tracing::info!("mDNS service registered (discoverable on local network)");
-                Some(d)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to register mDNS service: {}", e);
-                None
-            }
-        }
-    } else {
-        tracing::info!("mDNS disabled (default). Use --mdns to enable LAN discovery.");
-        None
-    };
-
-    if token.is_some() {
-        tracing::info!("Authentication enabled (token required)");
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Commands::Gc(args)) => run_gc_once(&args).await,
+        Some(Commands::Serve(args)) => run_http_server(args.into()).await,
+        None => run_http_server(cli.serve.into()).await,
     }
+}
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-
+async fn run_gc_once(args: &GcArgs) -> anyhow::Result<()> {
+    let opts = ServeOptions {
+        data_dir: args.data_dir.clone(),
+        gc_grace_minutes: args.gc_grace_minutes,
+        tombstone_retention_days: args.tombstone_retention_days,
+        ..ServeOptions::default()
+    };
+    let stats = run_gc(&opts).await?;
+    println!(
+        "GC complete: {} blobs deleted ({} bytes), {} tombstones purged",
+        stats.blobs_deleted, stats.bytes_freed, stats.tombstones_purged
+    );
     Ok(())
 }

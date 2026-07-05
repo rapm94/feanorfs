@@ -1,7 +1,10 @@
 pub mod app;
 pub mod db;
+pub mod gc;
+pub mod serve;
 
 pub use app::{build_router, AppState};
+pub use serve::{resolve_auth_token, run_gc, run_http_server, ServeOptions};
 
 use std::path::PathBuf;
 use std::sync::Arc;
