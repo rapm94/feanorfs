@@ -61,7 +61,10 @@ pub async fn run_gc(
             continue;
         }
         let size = meta.len();
-        fs::remove_file(&path).await?;
+        if let Err(e) = fs::remove_file(&path).await {
+            tracing::warn!("failed to remove orphan blob {}: {e}", path.display());
+            continue;
+        }
         stats.blobs_deleted += 1;
         stats.bytes_freed += size;
     }

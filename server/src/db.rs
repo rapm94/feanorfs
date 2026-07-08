@@ -1,27 +1,7 @@
 use anyhow::{Context, Result};
-use feanorfs_common::FileState;
+use feanorfs_common::{file_size_from_db, file_size_to_db, FileState};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::path::Path;
-
-fn file_size_from_db(size: i64) -> u64 {
-    u64::try_from(size).unwrap_or_else(|_| {
-        tracing::warn!(
-            "stored file size {} exceeds u64::MAX, saturating to u64::MAX",
-            size
-        );
-        u64::MAX
-    })
-}
-
-fn file_size_to_db(size: u64) -> i64 {
-    i64::try_from(size).unwrap_or_else(|_| {
-        tracing::warn!(
-            "file size {} exceeds i64::MAX, saturating to i64::MAX",
-            size
-        );
-        i64::MAX
-    })
-}
 
 pub struct Db {
     pool: SqlitePool,
@@ -53,6 +33,12 @@ impl Db {
     }
 
     async fn init_schema(&self) -> Result<()> {
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS files (
                 workspace_id TEXT NOT NULL,

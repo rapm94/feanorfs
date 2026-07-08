@@ -44,9 +44,14 @@ pub fn resolve_auth_token(token: Option<String>, allow_open: bool) -> Result<Opt
 }
 
 fn local_ip() -> Result<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?;
-    Ok(socket.local_addr()?.ip().to_string())
+    for iface in if_addrs::get_if_addrs()? {
+        if !iface.is_loopback() {
+            if let std::net::IpAddr::V4(ip) = iface.ip() {
+                return Ok(ip.to_string());
+            }
+        }
+    }
+    anyhow::bail!("no non-loopback IPv4 address found")
 }
 
 fn register_mdns(port: u16) -> Result<mdns_sd::ServiceDaemon> {

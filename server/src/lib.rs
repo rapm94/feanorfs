@@ -6,6 +6,9 @@ pub mod serve;
 pub use app::{build_router, AppState};
 pub use serve::{resolve_auth_token, run_gc, run_http_server, ServeOptions};
 
+/// Maximum request/response body size for upload/download (100 MiB).
+pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

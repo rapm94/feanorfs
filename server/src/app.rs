@@ -42,7 +42,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/upload", post(handle_upload))
         .route("/api/download/:hash", get(handle_download))
         .route("/api/workspaces", get(handle_get_workspaces))
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(crate::MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -174,18 +174,20 @@ async fn handle_download(
     }
     let blob_path = state.storage_dir.join("blobs").join(&hash);
 
-    let file_content = match fs::read(&blob_path).await {
-        Ok(bytes) => bytes,
+    let file = match tokio::fs::File::open(&blob_path).await {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(StatusCode::NOT_FOUND);
         }
         Err(e) => {
-            tracing::error!("Failed to read blob file: {:?}", e);
+            tracing::error!("Failed to open blob file: {:?}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
-    Ok(file_content)
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+    Ok(body)
 }
 
 async fn handle_get_workspaces(
@@ -196,4 +198,78 @@ async fn handle_get_workspaces(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     Ok(Json(workspaces))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use tempfile::TempDir;
+    use tower::util::ServiceExt;
+
+    async fn app_state() -> AppState {
+        let dir = TempDir::new().unwrap();
+        let state = crate::init_app_state(dir.path().to_path_buf(), None)
+            .await
+            .unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_unsafe_path() {
+        let state = app_state().await;
+        let app = build_router(state);
+        let req = Request::post("/api/upload?workspace_id=ws&path=../etc/passwd&hash=a&size=0&mtime=0")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_invalid_hash() {
+        let state = app_state().await;
+        let app = build_router(state);
+        let req = Request::post("/api/upload?workspace_id=ws&path=safe.txt&hash=not-a-hash&size=0&mtime=0")
+            .body(Body::from("data"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn download_rejects_invalid_hash() {
+        let state = app_state().await;
+        let app = build_router(state);
+        let req = Request::get("/api/download/too-short")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn download_nonexistent_blob_returns_404() {
+        let state = app_state().await;
+        let app = build_router(state);
+        let req = Request::get(format!("/api/download/{}", "a".repeat(64)))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auth_required_when_token_set() {
+        let dir = TempDir::new().unwrap();
+        let state = crate::init_app_state(dir.path().to_path_buf(), Some("secret".into()))
+            .await
+            .unwrap();
+        let app = build_router(state);
+        let req = Request::get("/api/workspaces")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

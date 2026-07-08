@@ -36,6 +36,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 mdns-sd = { workspace = true }
 constant_time_eq = { workspace = true }
+tokio-util = { workspace = true }
+if-addrs = { workspace = true }
+tower = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
