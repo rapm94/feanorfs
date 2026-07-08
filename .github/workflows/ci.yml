@@ -56,7 +56,7 @@ jobs:
         run: bash examples/sdk-agent-loop.sh
         env:
           FEANORFS_BIN: ${{ github.workspace }}/target/release/feanorfs
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
       - name: SDK-5 Node loop
