@@ -633,6 +633,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "feanorfs-agent-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "diffy",
+ "feanorfs-common",
+ "feanorfs-server",
+ "http",
+ "ignore",
+ "libc",
+ "reflink",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "unicode-normalization",
+ "urlencoding",
+]
+
+[[package]]
 name = "feanorfs-client"
 version = "0.2.0"
 dependencies = [
@@ -641,6 +667,7 @@ dependencies = [
  "chrono",
  "clap",
  "diffy",
+ "feanorfs-agent-core",
  "feanorfs-common",
  "feanorfs-server",
  "http",
@@ -687,12 +714,15 @@ dependencies = [
  "constant_time_eq",
  "feanorfs-common",
  "futures-util",
+ "if-addrs 0.13.4",
  "mdns-sd",
  "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-util",
+ "tower",
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
@@ -1240,6 +1270,16 @@ dependencies = [
 
 [[package]]
 name = "if-addrs"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "if-addrs"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
@@ -1456,7 +1496,7 @@ checksum = "892f96f6d2ebe1ea641279f986ac52a2a6bac71e8f743bb258315cfe2bd7e88e"
 dependencies = [
  "fastrand",
  "flume",
- "if-addrs",
+ "if-addrs 0.15.0",
  "log",
  "mio 1.2.1",
  "socket-pktinfo",

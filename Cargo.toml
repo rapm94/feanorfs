@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "server", "client"]
+members = ["common", "server", "client", "agent-core"]
 resolver = "2"
 
 [workspace.package]
@@ -17,6 +17,7 @@ categories = ["command-line-utilities", "filesystem"]
 [workspace.dependencies]
 feanorfs-common = { version = "0.2.0", path = "common" }
 feanorfs-server = { version = "0.2.0", path = "server" }
+feanorfs-agent-core = { version = "0.2.0", path = "agent-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,41 @@
+[package]
+name = "feanorfs-agent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Embeddable agent workspace isolation for FeanorFS (spawn, land, conflicts)"
+
+[lib]
+name = "feanorfs_agent_core"
+path = "src/lib.rs"
+
+[dependencies]
+feanorfs-common = { workspace = true }
+feanorfs-server = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+http = { workspace = true }
+urlencoding = { workspace = true }
+ignore = { workspace = true }
+reflink = { workspace = true }
+unicode-normalization = { workspace = true }
+diffy = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
