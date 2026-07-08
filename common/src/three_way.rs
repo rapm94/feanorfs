@@ -96,6 +96,29 @@ pub fn detect_concurrent_edits(
                     ));
                 }
             }
+        } else if let (Some(our_state), Some(their_state)) = (ours, their_changed.get(&path)) {
+            // No base snapshot — both sides independently created the same path.
+            // Flag as conflict when their content or deletion status differs.
+            if our_state.hash != their_state.hash
+                || our_state.deleted != their_state.deleted
+            {
+                let kind = if our_state.deleted && !their_state.deleted {
+                    ConflictKind::DeleteEdit
+                } else if !our_state.deleted && their_state.deleted {
+                    ConflictKind::EditDelete
+                } else {
+                    ConflictKind::EditEdit
+                };
+                out.push((
+                    ConcurrentEdit::new(
+                        path.clone(),
+                        None,
+                        Some(our_state.clone()),
+                        Some(their_state.clone()),
+                    ),
+                    kind,
+                ));
+            }
         }
     }
 

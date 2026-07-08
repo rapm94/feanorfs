@@ -21,6 +21,9 @@ pub fn encode_invite(invite: &WorkspaceInvite) -> Result<String> {
 }
 
 pub fn decode_invite(token: &str) -> Result<WorkspaceInvite> {
+    if token.len() > 8192 {
+        bail!("invite too long ({})", token.len());
+    }
     let hex_part = token
         .strip_prefix(INVITE_PREFIX)
         .with_context(|| format!("invite must start with {INVITE_PREFIX}"))?;
@@ -63,6 +66,12 @@ mod tests {
         let enc = encode_invite(&inv).unwrap();
         assert!(enc.starts_with(INVITE_PREFIX));
         assert_eq!(decode_invite(&enc).unwrap(), inv);
+    }
+
+    #[test]
+    fn decode_invite_rejects_oversized() {
+        let giant = format!("fnr1-{}", "aa".repeat(5000));
+        assert!(decode_invite(&giant).is_err());
     }
 
     #[test]

@@ -1,7 +1,11 @@
+pub mod agent_contract;
 pub mod invite;
 pub mod sync_delta;
 pub mod three_way;
 
+pub use agent_contract::{
+    AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, SpawnResult,
+};
 pub use invite::{decode_invite, encode_invite, looks_like_invite, WorkspaceInvite, INVITE_PREFIX};
 
 pub use sync_delta::compute_sync_delta;
@@ -51,13 +55,12 @@ pub enum ConflictKind {
 }
 
 impl ConflictKind {
-    #[must_use]
-    pub fn from_db_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Result<Self> {
         match s {
-            "edit_edit" => Self::EditEdit,
-            "edit_delete" => Self::EditDelete,
-            "delete_edit" => Self::DeleteEdit,
-            _ => Self::EditEdit,
+            "edit_edit" => Ok(Self::EditEdit),
+            "edit_delete" => Ok(Self::EditDelete),
+            "delete_edit" => Ok(Self::DeleteEdit),
+            other => anyhow::bail!("unknown conflict kind in db: {other}"),
         }
     }
 
@@ -98,7 +101,7 @@ pub struct SyncResponse {
 
 /// Snapshot row recorded when an agent workspace is spawned.
 /// Represents the server's view of a file at spawn time, which becomes the
-/// "base" version used by `agent commit` to detect concurrent edits.
+/// "base" version used by agent land/check to detect concurrent edits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSnapshotEntry {
     pub agent_name: String,
@@ -234,6 +237,16 @@ pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Convert file size from SQLite i64 to native u64, saturating at u64::MAX.
+pub fn file_size_from_db(size: i64) -> u64 {
+    u64::try_from(size).unwrap_or(u64::MAX)
+}
+
+/// Convert file size from native u64 to SQLite i64, saturating at i64::MAX.
+pub fn file_size_to_db(size: u64) -> i64 {
+    i64::try_from(size).unwrap_or(i64::MAX)
+}
+
 /// Normalizes a path to use forward slashes for cross-platform consistency.
 #[must_use]
 pub fn normalize_path(path: &str) -> String {
@@ -247,8 +260,13 @@ pub fn is_safe_rel_path(path: &str) -> bool {
         return false;
     }
     let normalized = normalize_path(path);
-    if normalized.starts_with('/') || normalized.contains("..") {
+    if normalized.starts_with('/') {
         return false;
+    }
+    for component in normalized.split('/') {
+        if component == ".." {
+            return false;
+        }
     }
     if normalized == ".feanorfs"
         || normalized == ".git"
@@ -387,7 +405,7 @@ pub fn unpack_bytes_with_policy(
 /// Used to reject path-traversal attempts in blob download/upload endpoints.
 #[must_use]
 pub fn is_valid_hash(hash: &str) -> bool {
-    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+    hash.len() == 64 && hash.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
 #[cfg(test)]
@@ -472,6 +490,19 @@ mod tests {
         assert_ne!(ciphertext, plaintext);
         let recovered = crypt_bytes(&ciphertext, "", "path");
         assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn is_safe_rel_path_allows_file_with_dot_dot_prefix() {
+        assert!(is_safe_rel_path("file..txt"));
+        assert!(is_safe_rel_path("v1..v2.patch"));
+    }
+
+    #[test]
+    fn is_safe_rel_path_rejects_directory_traversal_components() {
+        assert!(!is_safe_rel_path("../etc/passwd"));
+        assert!(!is_safe_rel_path("src/../../etc/passwd"));
+        assert!(!is_safe_rel_path("foo/../bar"));
     }
 
     // --- hash_bytes ---
@@ -597,7 +628,14 @@ mod tests {
     #[test]
     fn is_valid_hash_rejects_non_hex() {
         assert!(!is_valid_hash(&"z".repeat(64)));
-        assert!(!is_valid_hash(&"G".repeat(64)));
+    }
+
+    #[test]
+    fn is_valid_hash_rejects_uppercase_hex() {
+        assert!(!is_valid_hash(&"A".repeat(64)));
+        assert!(!is_valid_hash(&"F".repeat(64)));
+        assert!(is_valid_hash(&"a".repeat(64)));
+        assert!(is_valid_hash(&"f".repeat(64)));
     }
 
     #[test]

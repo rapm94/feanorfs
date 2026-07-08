@@ -178,3 +178,62 @@ fn file_state_with_large_mtime_and_size_roundtrips() {
     assert_eq!(decoded.size, u64::MAX);
     assert_eq!(decoded.mtime, i64::MAX);
 }
+
+use feanorfs_common::detect_concurrent_edits;
+use std::collections::{HashMap, HashSet};
+
+fn fs(path: &str, hash: &str, deleted: bool) -> FileState {
+    FileState { path: path.to_string(), hash: hash.to_string(), size: 10, mtime: 100, deleted }
+}
+
+#[test]
+fn no_base_leg_both_create_same_path_different_content_yields_conflict() {
+    let base: HashMap<String, FileState> = HashMap::new();
+    let mut local = HashMap::new();
+    local.insert("new.txt".into(), fs("new.txt", "aaa", false));
+    let mut cloud = HashMap::new();
+    cloud.insert("new.txt".into(), fs("new.txt", "bbb", false));
+    let empty: HashSet<String> = HashSet::new();
+
+    let conflicts = detect_concurrent_edits(
+        &base, &local, &cloud, &HashSet::new(),
+        vec!["new.txt".into()], &empty,
+    );
+
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].0.path, "new.txt");
+    assert_eq!(conflicts[0].0.base, None);
+}
+
+#[test]
+fn no_base_leg_same_content_no_conflict() {
+    let base: HashMap<String, FileState> = HashMap::new();
+    let mut local = HashMap::new();
+    local.insert("same.txt".into(), fs("same.txt", "xxx", false));
+    let mut cloud = HashMap::new();
+    cloud.insert("same.txt".into(), fs("same.txt", "xxx", false));
+    let empty: HashSet<String> = HashSet::new();
+
+    let conflicts = detect_concurrent_edits(
+        &base, &local, &cloud, &HashSet::new(),
+        vec!["same.txt".into()], &empty,
+    );
+
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn no_base_leg_only_one_side_has_path_no_conflict() {
+    let base: HashMap<String, FileState> = HashMap::new();
+    let mut local = HashMap::new();
+    local.insert("only_here.txt".into(), fs("only_here.txt", "aaa", false));
+    let cloud: HashMap<String, FileState> = HashMap::new();
+    let empty: HashSet<String> = HashSet::new();
+
+    let conflicts = detect_concurrent_edits(
+        &base, &local, &cloud, &HashSet::new(),
+        vec!["only_here.txt".into()], &empty,
+    );
+
+    assert!(conflicts.is_empty());
+}
