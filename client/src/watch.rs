@@ -64,11 +64,7 @@ pub async fn run_watch(
     let mut poll = tokio::time::interval(IDLE_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    if consecutive_errors > 0 {
-        eprintln!("Offline — changes will sync when the server is reachable.");
-    } else {
-        println!("Performing initial sync...");
-    }
+    println!("Performing initial sync...");
     if let Err(e) = sync_once(
         api,
         db,
@@ -155,7 +151,7 @@ async fn sync_once(
 ) -> Result<()> {
     tracing::info!("{label}");
     if announce {
-        println!("{label}...");
+        println!("{}...", label);
     }
     let result = do_sync(api, db, current_dir, workspace_id, password, false).await?;
     println!(

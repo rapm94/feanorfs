@@ -173,7 +173,10 @@ async fn open_conflict_compare(db: &ClientDb, path: &str) -> anyhow::Result<()> 
             anyhow::bail!("editor exited with {:?}", status.code());
         }
     } else if let Ok(editor) = std::env::var("EDITOR") {
-        let status = Command::new(&editor).arg(&local).arg(&cloud).status()?;
+        let mut parts = editor.split_whitespace();
+        let bin = parts.next().unwrap_or("vi");
+        let bin_args: Vec<&str> = parts.collect();
+        let status = Command::new(bin).args(&bin_args).arg(&local).arg(&cloud).status()?;
         if !status.success() {
             anyhow::bail!("editor exited with {:?}", status.code());
         }

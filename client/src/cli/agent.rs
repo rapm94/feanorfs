@@ -1,7 +1,8 @@
 use clap::Subcommand;
 use feanorfs_client::{
     check_agent, clean_agent, land_agent, list_agents, load_config, refresh_agent, spawn_agent,
-    ApiClient, ClientDb,
+    AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, ApiClient, ClientDb,
+    SpawnResult,
 };
 use std::path::Path;
 
@@ -80,10 +81,10 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             )
             .await?;
             if json {
-                output_json(&serde_json::json!({
-                    "agent": name,
-                    "files_copied": count,
-                }))?;
+                output_json(&SpawnResult {
+                    agent: name.clone(),
+                    files_copied: count,
+                })?;
             } else {
                 println!(
                     "Agent '{}' spawned with {} files at .feanorfs/agents/{}/",
@@ -139,7 +140,7 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
             clean_agent(current_dir, &db, &name).await?;
             if json {
-                output_json(&serde_json::json!({ "cleaned": name }))?;
+                output_json(&AgentCleanResult { cleaned: name })?;
             } else {
                 println!("Agent '{}' removed.", name);
             }
@@ -209,7 +210,7 @@ async fn run_agent_list_legacy(current_dir: &Path, json: bool) -> anyhow::Result
     let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
     let names = list_agents(current_dir, &db).await?;
     if json {
-        output_json(&serde_json::json!({ "agents": names }))?;
+        output_json(&AgentListOfflineResult { agents: names })?;
     } else if names.is_empty() {
         println!("No agent workspaces.");
     } else {
@@ -267,11 +268,14 @@ async fn run_agent_status_list(current_dir: &Path, json: bool) -> anyhow::Result
                     name,
                 )
                 .await;
-                agents.push(serde_json::json!({ "name": name, "state": state }));
+                agents.push(AgentListEntry {
+                    name: name.clone(),
+                    state,
+                });
             }
-            output_json(&serde_json::json!({ "agents": agents }))?;
+            output_json(&AgentListResult { agents })?;
         } else {
-            output_json(&serde_json::json!({ "agents": names }))?;
+            output_json(&AgentListOfflineResult { agents: names })?;
         }
     } else if names.is_empty() {
         println!("No agent workspaces.");

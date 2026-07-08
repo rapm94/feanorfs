@@ -1,6 +1,6 @@
 mod support;
 
-use feanorfs_client::{commit_agent, do_pull_only, do_push_only, do_sync, spawn_agent};
+use feanorfs_client::{commit_agent, do_pull_only, do_push_only, do_sync, land_agent, spawn_agent};
 use support::{
     read_workspace_file, spawn_test_client, spawn_test_client_with_server, spawn_test_server,
     write_workspace_file, TEST_PASSWORD, WORKSPACE_ID,
@@ -197,6 +197,54 @@ async fn agent_commit_detects_concurrent_edit() {
     assert!(commit.conflicts[0].ours.is_some());
     assert!(commit.conflicts[0].theirs.is_some());
     assert!(commit.our_changes.is_empty());
+}
+
+#[tokio::test]
+async fn agent_greenfield_spawn_land_new_file() {
+    let server = spawn_test_server().await;
+    let main = spawn_test_client_with_server(&server).await;
+    let base = main.workspace.path();
+
+    let copied = spawn_agent(
+        base,
+        &main.db,
+        &server.api,
+        WORKSPACE_ID,
+        "green",
+        Some(TEST_PASSWORD),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(copied, 0);
+
+    write_workspace_file(
+        &base.join(".feanorfs/agents/green"),
+        "task.txt",
+        b"new work",
+    )
+    .await;
+
+    let land = land_agent(
+        base,
+        &main.db,
+        &server.api,
+        WORKSPACE_ID,
+        "green",
+        Some(TEST_PASSWORD),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        land.landed.iter().any(|p| p.path == "task.txt"),
+        "expected task.txt landed: {:?}",
+        land.landed
+    );
+    assert_eq!(read_workspace_file(base, "task.txt").await, b"new work");
 }
 
 #[tokio::test]

@@ -67,10 +67,6 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
         db.delete_cache_entry(path).await?;
         resealed += 1;
     }
-    // Re-scan so the cache is rebuilt with fresh `encrypted_hash` values
-    // derived from the current (possibly new) key. `do_push_only` will then
-    // observe every non-deleted path as a change and re-upload it.
-    let _ = crate::local::scan_local_directory(base, &db, Some(password.as_str())).await?;
 
     println!("Pushing re-sealed blobs...");
     do_push_only(
@@ -98,5 +94,5 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
 }
 
 pub fn legacy_policy_for_config(config: &Config) -> LegacyPolicy {
-    LegacyPolicy::from_format_version(config.format_version)
+    feanorfs_agent_core::legacy_policy_for_config(config)
 }

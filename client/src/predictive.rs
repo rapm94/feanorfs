@@ -1,10 +1,9 @@
 use crate::api::ApiClient;
-use crate::fs_util::atomic_write;
+use crate::fs_util::{atomic_write, file_mtime_ms};
 use crate::local::{CacheEntry, ClientDb};
 use anyhow::Result;
 use feanorfs_common::unpack_bytes;
 use std::path::Path;
-use tokio::fs;
 
 const DEFAULT_NEIGHBORS: usize = 5;
 const DECAY_FACTOR: f64 = 0.95;
@@ -63,6 +62,9 @@ pub async fn prefetch_related(
     seed_paths: &[String],
 ) -> Result<PrefetchReport> {
     let password_str = password.unwrap_or(feanorfs_common::LEGACY_DEFAULT_PASSWORD);
+    if password.is_none() {
+        tracing::warn!("No E2EE password set; using insecure legacy default for predictive hydration.");
+    }
     let mut report = PrefetchReport::default();
     let cache = db.get_cache_entries().await?;
 
@@ -118,13 +120,8 @@ async fn hydrate_one(
     let plain = unpack_bytes(&encrypted, password, &entry.path)?;
     atomic_write(base, &entry.path, &plain).await?;
 
-    let full = base.join(&entry.path);
-    let actual_mtime = fs::metadata(&full)
-        .await?
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    let actual_mtime = file_mtime_ms(&base.join(&entry.path))
+        .await
         .unwrap_or(entry.server_mtime);
 
     let plaintext_hash = feanorfs_common::hash_bytes(&plain);

@@ -2,11 +2,11 @@
 
 ## Purpose
 
-CLI + library crate. Owns the local cache DB, directory scanner, sync engine, agent workspace isolation, predictive hydration, catch-up summary, and the real-time watcher. Exposes both a CLI binary (`feanorfs`) and a Rust library (`feanorfs_client`) so external Rust programs can drive sync imperatively. Never makes decisions about file content — it only decides what to transport, when, and how. The library result types (`SyncResult`, `PushResult`, `PullResult`, `HydrateResult`, `CatResult`, `StatusResult`, plus the re-exported `AgentCommitResult`, `ConcurrentEdit`, `FileState`) are the contract for the `--json` flag and library callers.
+CLI + library crate. Owns the local cache DB, directory scanner, sync engine, agent workspace isolation, predictive hydration, catch-up summary, and the real-time watcher. Exposes both a CLI binary (`feanorfs`) and a Rust library (`feanorfs_client`) so external Rust programs can drive sync imperatively. Never makes decisions about file content — it only decides what to transport, when, and how. The library result types (`SyncResult`, `PushResult`, `PullResult`, `HydrateResult`, `CatResult`, `StatusResult`, plus agent contract types from `feanorfs_common::agent_contract` and `AgentLandResult`) are the contract for the `--json` flag and library callers.
 
 ## Ownership
 
-- Crates: `feanorfs-client` produces binary `feanorfs` (sync + `serve` hub + agents) and library `feanorfs_client`.
+- Crates: `feanorfs-client` produces binary `feanorfs` (sync + `serve` hub + agents) and library `feanorfs_client`. Agent workspace logic lives in `feanorfs-agent-core` — this crate re-exports `Runtime`, `Workspace`, and thin `agent.rs` / `conflicts.rs` wrappers.
 - Modules under `client/src/`:
   - `lib.rs` — public API re-export surface. Add new public functions here; downstream Rust consumers depend on this list.
   - `api.rs` — HTTP + in-process hub transport (`Backend::Http` | `Backend::Local`). `ApiClient::from_config` / `open_for_workspace`.
@@ -18,7 +18,7 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
   - `cli/` — CLI helpers (`util`, `agent`, `conflicts`, `serve`, `start`, `mcp`, `events`, `workspace`, …). Keeps `main.rs` under 1k lines.
   - `fs_util.rs` — `atomic_write` (temp + rename), `file_mtime_ms`.
   - `local.rs` — `Config` (`hub_local`, `format_version`), `ClientDb`, `scan_local_directory`.
-  - `agent.rs` — workspace isolation via three-way diff. After `land`, snapshot base advances from post-land main `FileState`. `land_agent(..., propose)` optional diff3 artifacts. Spawn holds `SyncLock` during snapshot walk.
+  - `agent.rs` — re-exports `feanorfs_agent_core` agent ops; CLI `--json` uses the same shapes as [docs/agent-api.md](../docs/agent-api.md).
   - `predictive.rs` — `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay). Local-only.
   - `summary.rs` — `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool`. Zero-knowledge — never ships file contents to a remote LLM.
   - `watch.rs` — debounced (500 ms) filesystem watcher that drives `do_sync` on changes. Watcher path MUST be the workspace `current_dir`, never `"."`.

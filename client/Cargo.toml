@@ -23,6 +23,7 @@ path = "src/lib.rs"
 [dependencies]
 feanorfs-common = { workspace = true }
 feanorfs-server = { workspace = true }
+feanorfs-agent-core = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }

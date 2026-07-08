@@ -1,0 +1,1 @@
+{"agent_name":"ci1","our_changes":[{"path":"doc.txt","hash":"a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456","size":42,"mtime":1719500000000,"deleted":false}],"their_changes":[],"conflicts":[],"conflict_risk":["notes.md"]}
