@@ -21,6 +21,7 @@
 - Server auth = **token**; workspace secrecy = **encryption key** (distinct concepts in user-facing copy).
 - Surface conflicts; never auto-merge file content.
 - Self-host and hosted deployments share the same API and client binary.
+- Agent-first, human-legible: every agent capability keeps a plain-files, plain-language human path (working copy stays normal files; conflicts resolved by editing + `conflicts keep`/tray). Transport/snapshot internals stay invisible to humans until needed — FeanorFS is not a VCS and grows no git-shaped porcelain.
 
 ## OVERVIEW
 `FeanorFS` is a developer-focused uncommitted-code synchronization tool written in Rust. It utilizes a **self-contained local-first architecture**:
@@ -47,6 +48,10 @@ feanorfs/
 │   ├── src/serve.rs     # run_http_server, GC, shared with client embed
 │   ├── src/lib.rs       # feanorfs_server library (build_router, init_app_state)
 │   └── src/main.rs      # CLI entrypoint
+├── agent-core/          # Embeddable agent SDK (Runtime, Workspace, spawn/land/conflicts)
+│   └── src/             # agent, local, hub, api, conflicts, sync_pass, …
+├── feanorfs-ffi/        # C ABI (JSON strings in/out) + feanorfs.h
+├── bindings/ts/         # @feanorfs/agent napi-rs Node bindings
 ├── client/              # CLI terminal client + library crate
 │   ├── src/lib.rs       # feanorfs_client lib export surface (sync/push/pull/hydrate/cat, types, Db, ApiClient)
 │   ├── src/api.rs       # HTTP + in-process ApiClient backends
@@ -86,7 +91,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Task / Feature | Location | Notes |
 | :--- | :--- | :--- |
 | FileState definition | [lib.rs](common/src/lib.rs) | Tracks relative path, Blake3 hash (encrypted), size, mtime, and deleted status. |
-| Agent snapshot + conflict types | [lib.rs](common/src/lib.rs) | `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentCommitResult` — wire types returned by `agent land` (`commit` alias). |
+| Agent snapshot + conflict types | [lib.rs](common/src/lib.rs) | `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentLandResult` (land JSON); `AgentCommitResult` is a legacy subset alias. |
 | E2EE primitives | [lib.rs](common/src/lib.rs) | `pack_bytes`/`unpack_bytes` (ChaCha20-Poly1305 AEAD, deterministic SIV-style nonce) with legacy `crypt_bytes` XOR fallback on decrypt for unmigrated v1. Format v2 rejects non-AEAD. Also exports `is_valid_hash` for path-traversal defense. |
 | Library API surface | [lib.rs](client/src/lib.rs) | `feanorfs_client::sync/push/pull/hydrate/cat` callable from any Rust program. Re-exports `ApiClient`, `ClientDb`, `Config`, types. |
 | Local Cache DB + tables | [local.rs](client/src/local.rs) | Schema for `local_files`, `agent_snapshots`, `file_access_log`, `last_session`, `last_synced_files`, `conflict_registry`. CRUD on each. |
@@ -111,7 +116,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 - `SyncRequest` & `SyncResponse`: Serialization structs for endpoint negotiation.
 - `AgentSnapshotEntry`: One row of the per-agent base snapshot — `(agent_name, path, base_hash, base_size, base_mtime)`.
 - `ConcurrentEdit`: Three-way triple (base/ours/theirs) emitted by `agent land` for conflicting paths. FeanorFS does not merge — consumers reconcile.
-- `AgentCommitResult`: Aggregate result of `agent land` — `our_changes`, `their_changes`, `conflicts`.
+- `AgentLandResult`: Aggregate result of `agent land` — `our_changes`, `their_changes`, `conflicts`, `landed`, `message`. `AgentCommitResult` is a legacy subset (no `landed`/`message`).
 
 ### Server API Endpoints ([server/src/app.rs](server/src/app.rs))
 - `POST /api/sync/diff`: Compares incoming client list with `files` table and returns a delta response. **Reused by `agent land`**: the client sends the base snapshot as the "client" view, so every server-side change since spawn surfaces as `download_required`. No new endpoint needed. Deletions are propagated via `upload_required` with `deleted=true` in the `FileState` payload (handled inside the diff handler).
@@ -336,7 +341,7 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Planning
 
-Prioritized backlog: [docs/roadmap.md](docs/roadmap.md). **Active:** tray MVP (DX-26–28). **Freeze list** (bug fixes only until tray MVP): `predictive.rs`, `summary --summarize`, mDNS LAN discovery.
+Prioritized backlog: [docs/roadmap.md](docs/roadmap.md). **Active:** tray MVP (DX-26–28). **Post-tray flagship:** Merkle snapshot engine (MERK-1..7 — immutable tree snapshots over the encrypted CAS, working-copy-as-snapshot, first-class conflicts). **Freeze list** (bug fixes only until tray MVP): `predictive.rs`, `summary --summarize`, mDNS LAN discovery.
 
 ## Child DOX Index
 
@@ -346,4 +351,5 @@ Each direct child owns a crate boundary; subdirectories inside crates share file
 | :--- | :--- |
 | [common/](common/AGENTS.md) | Shared data models and Blake3 XOF encryption primitives. Zero I/O, zero side effects — depends only on `blake3`, `getrandom`, `chrono`, and `serde`/`serde_json`. |
 | [server/](server/AGENTS.md) | Axum blob storage server and SQLite metadata coordinator. Pure transport — never decrypts, never inspects file content. |
-| [client/](client/AGENTS.md) | CLI + library crate. Owns local cache, sync engine, agent workspaces, predictive hydration, catch-up summary, watch loop. |
+| [client/](client/AGENTS.md) | CLI + library crate. Sync engine, watch, summary, predictive; agent ops delegate to agent-core. |
+| [agent-core/](agent-core/AGENTS.md) | Embeddable agent SDK: `Runtime`, `Workspace`, local hub, conflict gate. Consumed by client, FFI, and Node bindings. |

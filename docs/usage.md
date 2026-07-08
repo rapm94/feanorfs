@@ -203,6 +203,8 @@ feanorfs summary [--summarize] [--no-remember]
 | `--summarize` | Pipe paths/metadata to `FEANORFS_SUMMARY_CMD` (default `feanorfs-llm`) |
 | `--no-remember` | Do not update the session baseline |
 
+`FEANORFS_SUMMARY_CMD` must be a path to an executable file (e.g. `/usr/local/bin/feanorfs-llm`). It is invoked directly — not interpreted by a shell — so arguments like `--model` must be wrapped in a shell script.
+
 ### `migrate` — upgrade to format v2
 
 ```bash
