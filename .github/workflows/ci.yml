@@ -1,4 +1,4 @@
-name: CI
+# CI
 
 on:
   push:
@@ -33,6 +33,53 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  sdk:
+    name: Agent SDK smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI (release)
+        run: cargo build --release -p feanorfs-client
+      # Debug FFI matches zig build.zig profile_dir (.Debug => target/debug)
+      - name: Build FFI (debug for zig)
+        run: cargo build -p feanorfs-ffi
+      - name: Verify feanorfs.h is committed
+        run: git diff --exit-code feanorfs-ffi/feanorfs.h
+      - name: SDK-2 CLI loop
+        run: bash examples/sdk-agent-loop.sh
+        env:
+          FEANORFS_BIN: ${{ github.workspace }}/target/release/feanorfs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: SDK-5 Node loop
+        run: |
+          cd bindings/ts
+          npm ci
+          npm run build
+          FEANORFS_BIN=${{ github.workspace }}/target/release/feanorfs node test/loop.mjs
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: SDK-6 Zig example
+        run: |
+          WS=$(mktemp -d)/ws
+          mkdir -p "$WS"
+          cd "$WS"
+          ${{ github.workspace }}/target/release/feanorfs start --local --workspace zig-ci --no-watch
+          echo seed > seed.txt
+          ${{ github.workspace }}/target/release/feanorfs sync --no-watch
+          export FEANORFS_WORKSPACE="$WS"
+          cd ${{ github.workspace }}/examples/zig-agent
+          zig build
+          ./zig-out/bin/zig-agent-demo
 
   test:
     name: Test
