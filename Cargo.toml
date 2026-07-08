@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "server", "client", "agent-core", "feanorfs-ffi"]
+members = ["common", "server", "client", "agent-core", "feanorfs-ffi", "bindings/ts"]
 resolver = "2"
 
 [workspace.package]
@@ -18,6 +18,8 @@ categories = ["command-line-utilities", "filesystem"]
 feanorfs-common = { version = "0.2.0", path = "common" }
 feanorfs-server = { version = "0.2.0", path = "server" }
 feanorfs-agent-core = { version = "0.2.0", path = "agent-core" }
+napi = { version = "2", default-features = false, features = ["napi4"] }
+napi-derive = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }

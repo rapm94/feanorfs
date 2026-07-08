@@ -1,0 +1,47 @@
+{
+  "name": "@feanorfs/agent",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Native Node bindings for FeanorFS agent workspaces",
+  "main": "api.mjs",
+  "types": "contract.d.ts",
+  "exports": {
+    ".": {
+      "types": "./contract.d.ts",
+      "import": "./api.mjs"
+    },
+    "./native": {
+      "default": "./native.js"
+    }
+  },
+  "files": [
+    "api.mjs",
+    "contract.d.ts",
+    "index.js",
+    "native.js",
+    "*.node"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rapm94/feanorfs.git",
+    "directory": "bindings/ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "napi": {
+    "name": "feanorfs-agent-node",
+    "triples": {
+      "defaults": true,
+      "additional": []
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release -p feanorfs-agent-node",
+    "test": "node test/loop.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "license": "MIT"
+}
