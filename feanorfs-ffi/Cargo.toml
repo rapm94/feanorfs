@@ -1,0 +1,27 @@
+[package]
+name = "feanorfs-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "C ABI for FeanorFS agent SDK (JSON over UTF-8 strings)"
+
+[lib]
+name = "feanorfs_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+feanorfs-agent-core = { workspace = true }
+feanorfs-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+feanorfs-common = { workspace = true }

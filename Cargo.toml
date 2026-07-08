@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "server", "client", "agent-core"]
+members = ["common", "server", "client", "agent-core", "feanorfs-ffi"]
 resolver = "2"
 
 [workspace.package]
