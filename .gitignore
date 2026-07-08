@@ -4,4 +4,8 @@
 /test-client-a
 /test-client-b
 /.sisyphus
+/bindings/ts/node_modules
+/bindings/ts/*.node
+/examples/zig-agent/zig-out
+/examples/zig-agent/.zig-cache
 
