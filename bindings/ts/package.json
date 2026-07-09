@@ -41,7 +41,7 @@
     "test": "node test/loop.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.0"
+    "@napi-rs/cli": "^3.7.0"
   },
   "license": "MIT"
 }
