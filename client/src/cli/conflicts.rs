@@ -1,7 +1,8 @@
 use clap::Subcommand;
 use feanorfs_client::{
+    build_conflict_show,
     conflict_artifacts::{is_binary_content, resolve_artifact, ArtifactRole},
-    conflicts, load_config, ApiClient, ClientDb, ResolveKeep, SyncCtx,
+    conflicts, load_config, ApiClient, ClientDb, ConflictKeepResult, ResolveKeep, SyncCtx,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -97,7 +98,7 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
             let (keep, file_path) = parse_keep_flags(local, cloud, both, file)?;
             conflicts::resolve_conflict(&ctx, &path, keep, file_path.as_deref()).await?;
             if json {
-                output_json(&serde_json::json!({ "resolved": path }))?;
+                output_json(&ConflictKeepResult { resolved: path })?;
             } else {
                 println!("Resolved '{path}'. Run 'feanorfs sync' to continue.");
             }
@@ -105,6 +106,9 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
         ConflictsAction::Show { path, open } => {
             if open {
                 open_conflict_compare(&db, &path).await?;
+            } else if json {
+                let result = build_conflict_show(&db, &path).await?;
+                output_json(&result)?;
             } else {
                 show_conflict_diff(&db, &path).await?;
             }
@@ -176,7 +180,11 @@ async fn open_conflict_compare(db: &ClientDb, path: &str) -> anyhow::Result<()> 
         let mut parts = editor.split_whitespace();
         let bin = parts.next().unwrap_or("vi");
         let bin_args: Vec<&str> = parts.collect();
-        let status = Command::new(bin).args(&bin_args).arg(&local).arg(&cloud).status()?;
+        let status = Command::new(bin)
+            .args(&bin_args)
+            .arg(&local)
+            .arg(&cloud)
+            .status()?;
         if !status.success() {
             anyhow::bail!("editor exited with {:?}", status.code());
         }

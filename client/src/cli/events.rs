@@ -1,3 +1,4 @@
+use feanorfs_client::commands::MirrorState;
 use feanorfs_client::conflicts::load_last_synced;
 use feanorfs_client::lock::try_acquire_sync_lock;
 use feanorfs_client::watch::event_paths_warrant_sync;
@@ -44,7 +45,7 @@ pub async fn run_events(current_dir: &Path) -> anyhow::Result<()> {
     )
     .await
     {
-        emit("sync_state", None, Some(status.mirror_state.to_string()));
+        emit("sync_state", None, Some(status.mirror_state));
     }
 
     let mut poll = tokio::time::interval(Duration::from_secs(30));
@@ -77,7 +78,7 @@ pub async fn run_events(current_dir: &Path) -> anyhow::Result<()> {
                     tracing::warn!("events poll: status check failed; will retry");
                     continue;
                 };
-                emit("sync_state", None, Some(status.mirror_state.to_string()));
+                emit("sync_state", None, Some(status.mirror_state));
 
                 let last = load_last_synced(&db).await.unwrap_or_default();
                 let pending_set: HashSet<&String> = status.pending_conflicts.iter().collect();
@@ -112,10 +113,16 @@ pub async fn run_events(current_dir: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn emit(event: &'static str, path: Option<String>, mirror_state: Option<String>) {
+fn emit(event: &'static str, path: Option<String>, mirror_state: Option<MirrorState>) {
+    let mirror_str = mirror_state.map(|s| {
+        serde_json::to_value(s)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "idle".into())
+    });
     let ev = FeanorEvent {
         event,
-        mirror_state,
+        mirror_state: mirror_str,
         path,
     };
     if let Ok(line) = serde_json::to_string(&ev) {
