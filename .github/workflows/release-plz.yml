@@ -61,7 +61,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          ref: main
+
+      - name: Verify CI-tested commit
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::main advanced to $ACTUAL_SHA after CI tested $EXPECTED_SHA."
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
@@ -103,7 +114,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          ref: main
+
+      - name: Verify CI-tested commit
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::main advanced to $ACTUAL_SHA after CI tested $EXPECTED_SHA."
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30

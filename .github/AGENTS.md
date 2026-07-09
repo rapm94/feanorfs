@@ -24,6 +24,9 @@ contributor templates.
 - Checkout steps set `persist-credentials: false`.
 - Core Linux/Windows jobs exclude `feanorfs-tray`; tray checks and releases run
   on macOS.
+- Pull requests require the fast Linux gates: format, Clippy, tests,
+  dependency policy, and workflow lint. MSRV, macOS/Windows tests, docs,
+  release builds, SDK, tray, and CodeQL run on `main` before release.
 - Release-plz may tag only after successful CI on a trusted `main` push.
 - Privileged `workflow_run` jobs validate source repository, event, branch/tag,
   conclusion, and exact commit before using secrets or uploading artifacts.
