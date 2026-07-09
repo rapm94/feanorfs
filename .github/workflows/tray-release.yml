@@ -52,7 +52,7 @@ jobs:
             exit 1
           fi
       - name: Checkout release commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
@@ -62,7 +62,7 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build feanorfs + tray
         run: >-
           cargo build --release -p feanorfs-client -p feanorfs-tray
@@ -79,7 +79,7 @@ jobs:
           cd ..
           shasum -a 256 "feanorfs-tray-$TARGET.zip" > "feanorfs-tray-$TARGET.zip.sha256"
       - name: Attest artifacts
-        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999 # v4
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: |
             feanorfs-tray-${{ matrix.target }}.zip
