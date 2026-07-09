@@ -1,4 +1,6 @@
-use feanorfs_client::{do_sync, load_config, load_global_config, watch, ApiClient, ClientDb};
+use feanorfs_client::{
+    do_sync, load_config, load_global_config, register_workspace, watch, ApiClient, ClientDb,
+};
 use feanorfs_common::looks_like_invite;
 use std::path::{Path, PathBuf};
 
@@ -93,6 +95,8 @@ async fn finish_sync_watch(work_dir: &Path, no_watch: bool) -> anyhow::Result<()
         false,
     )
     .await?;
+
+    let _ = register_workspace(work_dir);
 
     if !no_watch {
         watch::run_watch(
