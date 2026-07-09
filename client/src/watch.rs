@@ -1,6 +1,7 @@
 use crate::api::ApiClient;
 use crate::commands::do_sync;
 use crate::local::ClientDb;
+use crate::tray_state::{clear_watch_pid, is_paused, write_watch_pid};
 use anyhow::Result;
 use feanorfs_common::normalize_path;
 use notify::Watcher;
@@ -58,6 +59,14 @@ pub async fn run_watch(
         })?;
 
     watcher.watch(current_dir, notify::RecursiveMode::Recursive)?;
+    write_watch_pid(current_dir);
+    struct WatchPidGuard<'a>(&'a Path);
+    impl Drop for WatchPidGuard<'_> {
+        fn drop(&mut self) {
+            clear_watch_pid(self.0);
+        }
+    }
+    let _watch_guard = WatchPidGuard(current_dir);
     println!("Watching for changes... (Press Ctrl+C to stop)");
 
     let mut consecutive_errors = 0u32;
@@ -65,21 +74,25 @@ pub async fn run_watch(
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     println!("Performing initial sync...");
-    if let Err(e) = sync_once(
-        api,
-        db,
-        current_dir,
-        workspace_id,
-        password,
-        "initial sync",
-        false,
-    )
-    .await
-    {
-        consecutive_errors = consecutive_errors.saturating_add(1);
-        tracing::error!("Initial sync failed: {:?}", e);
-        eprintln!("Initial sync failed: {:?}", e);
-        eprintln!("Offline — changes will sync when the server is reachable.");
+    if !is_paused(current_dir) {
+        if let Err(e) = sync_once(
+            api,
+            db,
+            current_dir,
+            workspace_id,
+            password,
+            "initial sync",
+            false,
+        )
+        .await
+        {
+            consecutive_errors = consecutive_errors.saturating_add(1);
+            tracing::error!("Initial sync failed: {:?}", e);
+            eprintln!("Initial sync failed: {:?}", e);
+            eprintln!("Offline — changes will sync when the server is reachable.");
+        }
+    } else {
+        println!("Sync paused — skipping initial sync.");
     }
 
     loop {
@@ -93,6 +106,9 @@ pub async fn run_watch(
                 while rx.try_recv().is_ok() {}
 
                 if backoff > Duration::ZERO {
+                    continue;
+                }
+                if is_paused(current_dir) {
                     continue;
                 }
 
@@ -116,7 +132,13 @@ pub async fn run_watch(
                 }
             }
             _ = poll.tick() => {
+                // Refresh the pid file so `is_watching` doesn't treat a
+                // long-running watcher as stale (24h age cutoff).
+                write_watch_pid(current_dir);
                 if backoff > Duration::ZERO {
+                    continue;
+                }
+                if is_paused(current_dir) {
                     continue;
                 }
                 if let Err(e) = sync_once(
