@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-09
+
+### Added
+
+- **Tray MVP (`feanorfs-tray`):** macOS menu-bar companion shelling `feanorfs --json` — state icon, pause/resume, open folder, workspace switcher, conflict keep actions, and agent land shortcuts.
+- **Tray CLI:** hidden `feanorfs tray status|pause|resume|recent|activate` commands and `TrayStatusResult` contract in `common/src/tray_contract.rs`.
+- **Agent SDK:** embeddable `feanorfs-agent-core` crate with C ABI (`feanorfs-ffi`) and Node.js bindings (`@feanorfs/agent`).
+- **Release attestations:** GitHub Artifact Attestations on release archives/installers.
+
+### Changed
+
+- Agent and conflict logic moved from client into `agent-core`; client delegates to the SDK.
+- `feanorfs start` registers the workspace in `~/.feanorfs/recent.json` for the tray switcher.
+- Tracing warnings route to stderr so `--json` stdout stays clean.
+
+### Fixed
+
+- Sync lock check ignores the current process pid (fixes false "syncing" in tray status).
+- Watch loop skips sync while paused and refreshes `watch.pid` on poll so long-running watchers are not marked stale.
+- P-4 JSON gaps: `conflicts show --json`, `ConflictKeepResult`, events `mirror_state` snake_case.
+- Server: streamed downloads, WAL pragmas, route hardening.
+
 ## [0.2.0] - 2026-07-05
 
 ### Added
@@ -59,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
 - **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
-[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rapm94/feanorfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rapm94/feanorfs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0
