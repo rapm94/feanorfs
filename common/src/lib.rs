@@ -2,11 +2,16 @@ pub mod agent_contract;
 pub mod invite;
 pub mod sync_delta;
 pub mod three_way;
+pub mod tray_contract;
 
 pub use agent_contract::{
     AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, SpawnResult,
 };
 pub use invite::{decode_invite, encode_invite, looks_like_invite, WorkspaceInvite, INVITE_PREFIX};
+pub use tray_contract::{
+    ConflictKeepResult, ConflictShowResult, RecentWorkspaceEntry, RecentWorkspacesResult,
+    TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayPauseResult, TrayStatusResult,
+};
 
 pub use sync_delta::compute_sync_delta;
 pub use three_way::{classify_conflict_kind, conflict_candidate_paths, detect_concurrent_edits};
