@@ -105,7 +105,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Catch-up Summary | [summary.rs](client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
 | Predictive Hydration | [predictive.rs](client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
 | Change Watching | [watch.rs](client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
-| Release packaging + attestations | [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml), [dist-workspace.toml](dist-workspace.toml), [SECURITY.md](SECURITY.md) | Cargo-dist owns its generated release workflow. After it succeeds, the tray workflow builds and attests both macOS archives, then attaches them to the existing GitHub Release. Verify with `gh attestation verify`. |
+| Release packaging + attestations | [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml), [dist-workspace.toml](dist-workspace.toml), [SECURITY.md](SECURITY.md) | Cargo-dist allowlists client/server with precise package builds and owns its generated workflow. After it succeeds, the tray workflow builds and attests both macOS archives, then attaches them to the existing GitHub Release. Verify with `gh attestation verify`. |
 
 ---
 

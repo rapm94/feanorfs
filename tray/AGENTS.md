@@ -19,6 +19,7 @@ macOS menu-bar companion for FeanorFS. Shells `feanorfs --json` for status, conf
 - `StatusReady` carries `task_generation` + workspace path — stale fetches after workspace switch are ignored.
 - Pause = `feanorfs tray pause` (`.feanorfs/paused`); the watch loop in `feanorfs-client` respects it. On pause CLI failure, tray re-reads `.feanorfs/paused` from disk.
 - Recent workspaces live in `~/.feanorfs/recent.json` (written by `feanorfs start` and `feanorfs tray register`).
+- `package.metadata.dist.dist = false` keeps this macOS-only crate out of cargo-dist; `tray-release.yml` owns its release artifacts.
 
 ## Work Guidance
 
