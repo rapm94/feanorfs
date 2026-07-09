@@ -1,7 +1,7 @@
 [workspace]
 # Explicitly list dist-able packages — excludes `tray` (macOS-only GUI).
-# Release archives for `feanorfs-tray` are built alongside cargo-dist in
-# `.github/workflows/release.yml`.
+# `.github/workflows/tray-release.yml` builds tray archives after cargo-dist
+# completes, leaving its generated `.github/workflows/release.yml` unchanged.
 members = ["cargo:client", "cargo:server"]
 
 # Config for 'dist'

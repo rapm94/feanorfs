@@ -29,7 +29,7 @@ macOS menu-bar companion for FeanorFS. Shells `feanorfs --json` for status, conf
 
 - `cargo build -p feanorfs-tray`
 - CI job `tray` on `macos-latest` (CLI smoke)
-- Release workflow `build-tray-artifacts` packages attested arm64 and x86_64 macOS archives before creating the GitHub Release.
+- `tray-release.yml` runs after cargo-dist succeeds, then builds, attests, and uploads arm64 and x86_64 macOS archives to the existing GitHub Release.
 - Manual: `feanorfs-tray` with `FEANORFS_WORKSPACE` set
 
 ## Child DOX Index

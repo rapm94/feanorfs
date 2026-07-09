@@ -1,0 +1,56 @@
+# Build the macOS tray after cargo-dist has created the GitHub Release.
+# Keeping this separate leaves cargo-dist's generated release.yml reproducible.
+name: Tray release
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+jobs:
+  build-tray:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    name: feanorfs-tray (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build feanorfs + tray
+        run: cargo build --release -p feanorfs-client -p feanorfs-tray --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p tray-dist
+          cp target/${{ matrix.target }}/release/feanorfs tray-dist/
+          cp target/${{ matrix.target }}/release/feanorfs-tray tray-dist/
+          cd tray-dist
+          zip -9 ../feanorfs-tray-${{ matrix.target }}.zip feanorfs feanorfs-tray
+      - name: Attest archive
+        uses: actions/attest@v4
+        with:
+          subject-path: feanorfs-tray-${{ matrix.target }}.zip
+      - name: Upload archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: gh release upload "$RELEASE_TAG" "feanorfs-tray-${{ matrix.target }}.zip" --clobber
