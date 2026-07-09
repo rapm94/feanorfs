@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "server", "client", "agent-core", "feanorfs-ffi", "bindings/ts"]
+members = ["common", "server", "client", "agent-core", "feanorfs-ffi", "bindings/ts", "tray"]
 resolver = "2"
 
 [workspace.package]

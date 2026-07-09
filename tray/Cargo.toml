@@ -1,0 +1,23 @@
+[package]
+name = "feanorfs-tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "FeanorFS menu-bar tray — shells feanorfs --json, no duplicate sync logic"
+
+[[bin]]
+name = "feanorfs-tray"
+path = "src/main.rs"
+
+[dependencies]
+feanorfs-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tao = "0.30"
+tray-icon = "0.19"
+muda = "0.15"
+open = "5"
+libc = "0.2"
