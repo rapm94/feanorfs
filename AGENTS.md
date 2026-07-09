@@ -105,7 +105,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Catch-up Summary | [summary.rs](client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
 | Predictive Hydration | [predictive.rs](client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
 | Change Watching | [watch.rs](client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
-| Release packaging + attestations | [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml), [dist-workspace.toml](dist-workspace.toml), [SECURITY.md](SECURITY.md) | Cargo-dist allowlists client/server with precise package builds and owns its generated workflow. After it succeeds, the tray workflow builds and attests both macOS archives, then attaches them to the existing GitHub Release. Verify with `gh attestation verify`. |
+| CI, security, and releases | [ci.yml](.github/workflows/ci.yml), [security.yml](.github/workflows/security.yml), [release-plz.yml](.github/workflows/release-plz.yml), [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml), [dist-workspace.toml](dist-workspace.toml), [SECURITY.md](SECURITY.md) | Core gates exclude the macOS-only tray on Linux/Windows; tray gates run on macOS. Release-plz runs after trusted `main` CI succeeds. Cargo-dist owns its generated workflow and allowlists client/server; the post-release tray workflow verifies the tag commit, builds, checksums, attests, and uploads both macOS archives. |
 
 ---
 
@@ -148,6 +148,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 6. **Predictive Hydration is Local-Only**: `file_access_log` never leaves the client. Weights and access patterns stay in `.feanorfs/local_cache.db`.
 7. **Data Isolation ≠ Sandbox**: agent workspaces isolate files, not processes. Never claim sandboxing in code or copy; link the "Process isolation" section of [docs/threat-model.md](docs/threat-model.md) instead.
 8. **Sync scope**: mirror disk contents (including gitignored paths); hard skip `.feanorfs/` and `.git/`; small frozen `DEFAULT_IGNORES` only — see [docs/sync-scope.md](docs/sync-scope.md). Do not honor `.gitignore` or expand defaults into a framework-specific denylist.
+9. **CI/CD ownership**: Pin repository-owned actions to immutable SHAs, keep permissions least-privilege, and validate workflows with actionlint/zizmor. Never hand-edit cargo-dist's generated `.github/workflows/release.yml`; change `dist-workspace.toml` and regenerate it.
 
 ---
 
@@ -166,11 +167,14 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 
 ### Workspace Commands
 ```bash
-# Build all crates
-cargo build
+# Cross-platform core (tray is macOS-only)
+cargo build --workspace --exclude feanorfs-tray --locked
 
-# Run unit and integration tests
-cargo test
+# Core unit and integration tests
+cargo test --workspace --exclude feanorfs-tray --all-features --locked
+
+# macOS tray checks
+cargo test -p feanorfs-tray --locked
 ```
 
 ### Starting the Blob Hub
@@ -339,16 +343,19 @@ Default section order:
 
 When the user requests a durable behavior change, record it here or in the relevant child AGENTS.md
 
+- CI/CD should favor mainstream tooling, immutable action pins, least privilege, cross-platform coverage, release provenance, and enforced quality gates over minimal workflow setup.
+
 ## Planning
 
 Prioritized backlog: [docs/roadmap.md](docs/roadmap.md). **Active:** Merkle snapshot engine (MERK-1..7). **Shipped:** tray MVP (`feanorfs-tray`, `feanorfs tray status`). **Freeze list** (bug fixes only until MERK-1): `predictive.rs`, `summary --summarize`, mDNS LAN discovery.
 
 ## Child DOX Index
 
-Each direct child owns a crate boundary; subdirectories inside crates share files at the top level and do not merit separate AGENTS.md.
+Direct children own durable crate or automation boundaries; subdirectories inside crates share files at the top level and do not merit separate AGENTS.md.
 
 | Child | Purpose |
 | :--- | :--- |
+| [.github/](.github/AGENTS.md) | CI, security scanning, dependency automation, release orchestration, and contributor templates. |
 | [common/](common/AGENTS.md) | Shared data models and Blake3 XOF encryption primitives. Zero I/O, zero side effects — depends only on `blake3`, `getrandom`, `chrono`, and `serde`/`serde_json`. |
 | [server/](server/AGENTS.md) | Axum blob storage server and SQLite metadata coordinator. Pure transport — never decrypts, never inspects file content. |
 | [client/](client/AGENTS.md) | CLI + library crate. Sync engine, watch, summary, predictive; agent ops delegate to agent-core. |

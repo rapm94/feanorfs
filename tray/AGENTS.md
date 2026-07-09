@@ -19,7 +19,7 @@ macOS menu-bar companion for FeanorFS. Shells `feanorfs --json` for status, conf
 - `StatusReady` carries `task_generation` + workspace path — stale fetches after workspace switch are ignored.
 - Pause = `feanorfs tray pause` (`.feanorfs/paused`); the watch loop in `feanorfs-client` respects it. On pause CLI failure, tray re-reads `.feanorfs/paused` from disk.
 - Recent workspaces live in `~/.feanorfs/recent.json` (written by `feanorfs start` and `feanorfs tray register`).
-- `package.metadata.dist.dist = false` keeps this macOS-only crate out of cargo-dist; `tray-release.yml` owns its release artifacts.
+- `package.metadata.dist.dist = false` keeps this macOS-only crate out of cargo-dist; `tray-release.yml` owns its checksummed and attested release artifacts.
 
 ## Work Guidance
 
@@ -29,8 +29,8 @@ macOS menu-bar companion for FeanorFS. Shells `feanorfs --json` for status, conf
 ## Verification
 
 - `cargo build -p feanorfs-tray`
-- CI job `tray` on `macos-latest` (CLI smoke)
-- `tray-release.yml` runs after cargo-dist succeeds, then builds, attests, and uploads arm64 and x86_64 macOS archives to the existing GitHub Release.
+- CI job `tray` on `macos-latest` enforces Rust 1.88, Clippy, tests, a release build, and CLI smoke coverage.
+- `tray-release.yml` runs after cargo-dist succeeds, verifies the release tag resolves to the triggering commit, then builds, checksums, attests, and uploads arm64 and x86_64 macOS archives to the existing GitHub Release.
 - Manual: `feanorfs-tray` with `FEANORFS_WORKSPACE` set
 
 ## Child DOX Index

@@ -1,0 +1,8 @@
+# cargo-dist owns release.yml; suppress only its generated ShellCheck findings.
+# Syntax, expressions, action inputs, and every repository-owned script remain
+# fully checked.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      - "shellcheck reported issue in this script: SC2086:.+"
+      - "shellcheck reported issue in this script: SC2129:.+"

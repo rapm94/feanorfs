@@ -12,11 +12,11 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
     "0BSD",
+    "MPL-2.0",
 ]
 # Fail build on unapproved licenses
 confidence-threshold = 0.93

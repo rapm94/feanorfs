@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.3.3"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 license = "MIT"
 authors = ["Raul Puigbó <raulapuigbo@gmail.com>"]
 repository = "https://github.com/rapm94/feanorfs"
