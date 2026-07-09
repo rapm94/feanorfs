@@ -21,8 +21,8 @@ pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
 
     let log_file_clone = log_file.try_clone()?;
 
-    let stdout_layer = fmt::layer()
-        .with_writer(std::io::stdout)
+    let stderr_layer = fmt::layer()
+        .with_writer(std::io::stderr)
         .with_target(false)
         .without_time()
         .with_filter(EnvFilter::new("warn"));
@@ -39,7 +39,7 @@ pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
         .with_filter(EnvFilter::new("debug"));
 
     let _ = Registry::default()
-        .with(stdout_layer)
+        .with(stderr_layer)
         .with(file_layer)
         .try_init();
 
