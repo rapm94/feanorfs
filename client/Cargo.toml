@@ -47,6 +47,7 @@ rpassword = { workspace = true }
 reflink = { workspace = true }
 unicode-normalization = { workspace = true }
 diffy = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 feanorfs-server = { workspace = true }
