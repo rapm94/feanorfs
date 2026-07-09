@@ -2,7 +2,6 @@
 # FeanorFS install script — installs the `feanorfs` binary from GitHub Releases.
 #
 # One install covers sync client + blob hub (`feanorfs serve`).
-# Set FEANORFS_INSTALL_SERVER=1 to also install legacy server-only `feanorfs-server`.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/rapm94/feanorfs/main/scripts/install.sh | sh
@@ -24,16 +23,10 @@ BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
 
 if [ -n "${BINDIR:-}" ]; then
     export FEANORFS_CLIENT_INSTALL_DIR="$BINDIR"
-    export FEANORFS_SERVER_INSTALL_DIR="$BINDIR"
 fi
 
 echo "Installing feanorfs ${VERSION}..."
 curl -fsSL "${BASE_URL}/feanorfs-client-installer.sh" | sh
-
-if [ "${FEANORFS_INSTALL_SERVER:-0}" = "1" ]; then
-    echo "Installing feanorfs-server ${VERSION} (legacy server-only binary)..."
-    curl -fsSL "${BASE_URL}/feanorfs-server-installer.sh" | sh
-fi
 
 echo ""
 echo "Done. feanorfs ${VERSION} installed."

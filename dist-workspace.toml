@@ -7,9 +7,14 @@ members = ["cargo:."]
 
 # Config for 'dist'
 [dist]
-# Only the cross-platform CLI and legacy server are cargo-dist applications.
+# `feanorfs` includes both sync and `feanorfs serve`; the legacy server-only
+# binary remains source-buildable but is not a separate release product.
 # The macOS-only tray is released by `.github/workflows/tray-release.yml`.
-packages = ["feanorfs-client", "feanorfs-server"]
+packages = ["feanorfs-client"]
+# Keep cargo package naming internal while presenting the product consistently.
+display-name = "FeanorFS"
+# GitHub already exposes source archives for every tag.
+source-tarball = false
 # Avoid `cargo build --workspace`, which would compile the tray on Linux.
 precise-builds = true
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)

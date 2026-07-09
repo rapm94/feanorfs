@@ -1,6 +1,7 @@
 # Usage
 
-Full reference for the FeanorFS CLI (`feanorfs`) — one binary for sync client and blob hub (`feanorfs serve`). The standalone `feanorfs-server` package is an optional legacy server-only install.
+Full reference for the FeanorFS CLI (`feanorfs`) — one binary for sync client
+and blob hub (`feanorfs serve`).
 
 ## What FeanorFS is (and isn't)
 
@@ -16,12 +17,6 @@ FeanorFS is a working-directory mirror for developers who use more than one mach
 feanorfs serve --token "your-server-secret"
 feanorfs serve --gc-only --data-dir server-data
 feanorfs serve --mdns
-```
-
-Legacy server-only binary (same router, optional separate install):
-
-```bash
-feanorfs-server --token "your-server-secret"
 ```
 
 The server listens on `0.0.0.0:3030` and creates its data directory at `server-data/` (relative to the working directory where it was launched):

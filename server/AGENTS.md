@@ -6,7 +6,9 @@ Content-addressed blob storage and sync metadata server. Axum HTTP server backed
 
 ## Ownership
 
-- Crate: `feanorfs-server` (library + optional legacy binary `feanorfs-server`). Production path: embedded in the `feanorfs` binary via `feanorfs serve`.
+- Crate: `feanorfs-server` (library + source-only compatibility binary
+  `feanorfs-server`). The supported production and release path is embedded in
+  the `feanorfs` binary via `feanorfs serve`.
 - Source layout: `src/main.rs`, `src/serve.rs` (HTTP + GC entry), `src/app.rs` (routes), `src/db.rs` (SQLite), `src/gc.rs`. Sync delta logic lives in `feanorfs_common::compute_sync_delta`.
 - Runtime data lives in `server-data/` which is git-ignored and MUST stay server-local — never include it in distributions.
 
