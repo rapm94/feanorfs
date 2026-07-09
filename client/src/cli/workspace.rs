@@ -127,6 +127,12 @@ pub enum WorkspaceAction {
     /// Stdio MCP tool server for orchestrators
     #[command(hide = true)]
     Mcp,
+    /// Tray companion commands (status, pause, recent workspaces).
+    #[command(hide = true)]
+    Tray {
+        #[command(subcommand)]
+        action: super::tray::TrayAction,
+    },
 }
 
 pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> anyhow::Result<()> {
@@ -229,6 +235,7 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
         }
         WorkspaceAction::Events => super::events::run_events(current_dir).await,
         WorkspaceAction::Mcp => super::mcp::run_mcp(current_dir).await,
+        WorkspaceAction::Tray { action } => super::tray::run(current_dir, action, json).await,
     }
 }
 

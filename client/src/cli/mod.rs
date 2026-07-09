@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod serve;
 pub mod start;
 pub mod sync;
+pub mod tray;
 pub mod util;
 pub mod workspace;
 
