@@ -219,9 +219,10 @@ mod tests {
     async fn upload_rejects_unsafe_path() {
         let state = app_state().await;
         let app = build_router(state);
-        let req = Request::post("/api/upload?workspace_id=ws&path=../etc/passwd&hash=a&size=0&mtime=0")
-            .body(Body::empty())
-            .unwrap();
+        let req =
+            Request::post("/api/upload?workspace_id=ws&path=../etc/passwd&hash=a&size=0&mtime=0")
+                .body(Body::empty())
+                .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
@@ -230,9 +231,11 @@ mod tests {
     async fn upload_rejects_invalid_hash() {
         let state = app_state().await;
         let app = build_router(state);
-        let req = Request::post("/api/upload?workspace_id=ws&path=safe.txt&hash=not-a-hash&size=0&mtime=0")
-            .body(Body::from("data"))
-            .unwrap();
+        let req = Request::post(
+            "/api/upload?workspace_id=ws&path=safe.txt&hash=not-a-hash&size=0&mtime=0",
+        )
+        .body(Body::from("data"))
+        .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
@@ -266,9 +269,7 @@ mod tests {
             .await
             .unwrap();
         let app = build_router(state);
-        let req = Request::get("/api/workspaces")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::get("/api/workspaces").body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }

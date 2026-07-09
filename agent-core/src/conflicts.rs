@@ -1,5 +1,6 @@
 use crate::conflict_artifacts::{
-    is_sentinel_content, resolve_artifact, write_conflict_triple, ArtifactRole,
+    is_cloud_deleted_sentinel, is_sentinel_content, resolve_artifact, write_conflict_triple,
+    ArtifactRole,
 };
 use crate::crypto::seal;
 use crate::ctx::SyncCtx;
@@ -212,11 +213,21 @@ pub async fn resolve_conflict(
             let theirs_file = resolve_artifact(&conflict_dir, path, ArtifactRole::Cloud);
             if theirs_file.exists() {
                 let content = fs::read(&theirs_file).await?;
-                if is_sentinel_content(&content) {
+                if is_cloud_deleted_sentinel(&content) {
+                    let ours_path = ctx.base.join(path);
+                    if ours_path.exists() {
+                        fs::remove_file(&ours_path).await?;
+                    }
+                    upload_tombstone_for(ctx, path).await?;
+                } else if is_sentinel_content(&content) {
                     bail!("theirs version unavailable on disk; re-run sync while online");
+                } else {
+                    atomic_write(ctx.base, path, &content).await?;
+                    upload_sealed(ctx, path, &content, chrono::Utc::now().timestamp_millis())
+                        .await?;
                 }
-                atomic_write(ctx.base, path, &content).await?;
-                upload_sealed(ctx, path, &content, chrono::Utc::now().timestamp_millis()).await?;
+            } else {
+                bail!("cloud version artifact missing for {path}");
             }
         }
         ResolveKeep::Both => {
@@ -226,7 +237,13 @@ pub async fn resolve_conflict(
                 .unwrap_or_else(|_| "other".into());
             let safe_path: String = path
                 .chars()
-                .map(|c| if c.is_control() || "/\\:|".contains(c) { '_' } else { c })
+                .map(|c| {
+                    if c.is_control() || "/\\:|".contains(c) {
+                        '_'
+                    } else {
+                        c
+                    }
+                })
                 .collect();
             let alt_path = format!("{safe_path} (conflicted copy {hostname})");
             if theirs_file.exists() {
@@ -257,7 +274,10 @@ pub async fn resolve_conflict(
 
     if ctx.db.count_pending_in_dir(&record.conflict_dir).await? == 0 && conflict_dir.is_dir() {
         if let Err(e) = fs::remove_dir_all(&conflict_dir).await {
-            tracing::warn!("failed to clean conflict dir {}: {e}", conflict_dir.display());
+            tracing::warn!(
+                "failed to clean conflict dir {}: {e}",
+                conflict_dir.display()
+            );
         }
     }
     Ok(())

@@ -1,8 +1,8 @@
 use clap::Subcommand;
 use feanorfs_client::{
-    check_agent, clean_agent, land_agent, list_agents, load_config, refresh_agent, spawn_agent,
-    AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, ApiClient, ClientDb,
-    SpawnResult,
+    check_agent, clean_agent, invalidate_agent_cache, land_agent, list_agents, load_config,
+    refresh_agent, spawn_agent, AgentCleanResult, AgentListEntry, AgentListOfflineResult,
+    AgentListResult, ApiClient, ClientDb, SpawnResult,
 };
 use std::path::Path;
 
@@ -111,6 +111,7 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 propose,
             )
             .await?;
+            invalidate_agent_cache(current_dir);
             if json {
                 output_json(&result)?;
             } else {

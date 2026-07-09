@@ -9,7 +9,7 @@ use feanorfs::{
 use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
 use icons::{icon_for, visual_from_state, TrayVisual};
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -25,13 +25,18 @@ const FAST_EXIT_SECS: u64 = 10;
 #[derive(Debug, Clone)]
 enum Action {
     Refresh,
-    StatusReady(Option<TrayStatusResult>),
+    StatusReady {
+        generation: u64,
+        workspace: PathBuf,
+        status: Option<TrayStatusResult>,
+    },
     MenuClick(String),
     TaskDone {
         error: Option<String>,
         restart_watch: bool,
-        /// `Some` only for pause/resume tasks — optimistic pause flag on success.
+        /// `Some` only for pause/resume tasks — applied on success only.
         set_paused: Option<bool>,
+        generation: u64,
     },
     SwitchDone {
         path: PathBuf,
@@ -47,6 +52,8 @@ struct AppState {
     last_spawn_at: Option<Instant>,
     respawn_disabled: bool,
     status_inflight: bool,
+    status_pending: bool,
+    task_generation: u64,
     last_status: Option<TrayStatusResult>,
     error_message: Option<String>,
     recent: Option<RecentWorkspacesResult>,
@@ -63,6 +70,8 @@ impl AppState {
             last_spawn_at: None,
             respawn_disabled: false,
             status_inflight: false,
+            status_pending: false,
+            task_generation: 0,
             last_status: None,
             error_message: None,
             recent: None,
@@ -76,6 +85,16 @@ impl AppState {
 
     fn external_watcher_active(&self) -> bool {
         self.watch_child.is_none() && self.last_status.as_ref().is_some_and(|s| s.watching)
+    }
+
+    fn reject_external_sync(&mut self) -> bool {
+        if self.external_watcher_active() {
+            self.error_message =
+                Some("Sync already running in an external feanorfs sync process".into());
+            true
+        } else {
+            false
+        }
     }
 
     fn start_watch(&mut self) {
@@ -101,7 +120,6 @@ impl AppState {
                 self.watch_child = Some(child);
                 self.owns_watch = true;
                 self.last_spawn_at = Some(Instant::now());
-                self.watch_failures = 0;
             }
             Err(e) => {
                 self.respawn_disabled = true;
@@ -139,10 +157,25 @@ impl AppState {
                     }
                     self.start_watch();
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if self
+                        .last_spawn_at
+                        .is_some_and(|t| t.elapsed() >= Duration::from_secs(FAST_EXIT_SECS))
+                    {
+                        self.watch_failures = 0;
+                    }
+                }
                 Err(_) => {
                     self.watch_child = None;
                     self.owns_watch = false;
+                    self.watch_failures = self.watch_failures.saturating_add(1);
+                    if self.watch_failures >= MAX_WATCH_FAILURES {
+                        self.respawn_disabled = true;
+                        self.error_message = Some(
+                            "Sync watcher keeps crashing — check FEANORFS_BIN and workspace".into(),
+                        );
+                        return;
+                    }
                     self.start_watch();
                 }
             }
@@ -203,9 +236,27 @@ fn graceful_stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn is_paused_on_disk(workspace: &Path) -> bool {
+    workspace.join(".feanorfs/paused").is_file()
+}
+
 fn resolve_initial_workspace() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("FEANORFS_WORKSPACE") {
-        return Some(PathBuf::from(p));
+        let path = expand_tilde(&p);
+        return workspace_has_config(&path).then_some(path);
     }
     let recent = tray_recent()?;
     recent
@@ -449,9 +500,15 @@ fn parse_menu_action(id: &str) -> Option<MenuAction> {
 }
 
 fn apply_ui(state: &AppState, tray: &TrayIcon, visual: &mut TrayVisual) {
-    let v = match &state.last_status {
-        Some(s) => visual_from_state(&s.mirror_state, s.paused),
-        None => TrayVisual::Error,
+    let status_fetch_failed =
+        state.error_message.as_deref() == Some("Could not read workspace status (feanorfs failed)");
+    let v = if state.last_status.is_none() || status_fetch_failed {
+        TrayVisual::Error
+    } else {
+        match &state.last_status {
+            Some(s) => visual_from_state(&s.mirror_state, s.paused),
+            None => TrayVisual::Error,
+        }
     };
     if v != *visual {
         let _ = tray.set_icon(Some(icon_for(v)));
@@ -463,14 +520,21 @@ fn apply_ui(state: &AppState, tray: &TrayIcon, visual: &mut TrayVisual) {
 
 fn request_status_fetch(state: &mut AppState, proxy: &tao::event_loop::EventLoopProxy<Action>) {
     if state.status_inflight {
+        state.status_pending = true;
         return;
     }
     state.status_inflight = true;
+    state.status_pending = false;
+    let generation = state.task_generation;
     let workspace = state.workspace.clone();
     let proxy = proxy.clone();
     std::thread::spawn(move || {
         let status = tray_status(&workspace);
-        let _ = proxy.send_event(Action::StatusReady(status));
+        let _ = proxy.send_event(Action::StatusReady {
+            generation,
+            workspace,
+            status,
+        });
     });
 }
 
@@ -491,11 +555,9 @@ fn handle_menu_action(
             let pause = !state.is_paused();
             if pause {
                 state.stop_watch();
-                if let Some(ref mut s) = state.last_status {
-                    s.paused = true;
-                }
             }
             let workspace = state.workspace.clone();
+            let generation = state.task_generation;
             let proxy = proxy.clone();
             std::thread::spawn(move || {
                 let error = tray_pause(&workspace, pause).err();
@@ -503,12 +565,17 @@ fn handle_menu_action(
                     error,
                     restart_watch: !pause,
                     set_paused: Some(pause),
+                    generation,
                 });
             });
         }
         MenuAction::SyncNow => {
+            if state.reject_external_sync() {
+                return;
+            }
             state.stop_watch();
             let workspace = state.workspace.clone();
+            let generation = state.task_generation;
             let proxy = proxy.clone();
             std::thread::spawn(move || {
                 let error = sync_once(&workspace).err();
@@ -516,30 +583,47 @@ fn handle_menu_action(
                     error,
                     restart_watch: true,
                     set_paused: None,
+                    generation,
                 });
             });
         }
         MenuAction::Keep { path, choice } => {
+            if state.reject_external_sync() {
+                return;
+            }
+            state.stop_watch();
             let workspace = state.workspace.clone();
+            let generation = state.task_generation;
             let proxy = proxy.clone();
             std::thread::spawn(move || {
-                let error = conflicts_keep(&workspace, &path, &choice).err();
+                let error = conflicts_keep(&workspace, &path, &choice)
+                    .err()
+                    .or_else(|| sync_once(&workspace).err());
                 let _ = proxy.send_event(Action::TaskDone {
                     error,
-                    restart_watch: false,
+                    restart_watch: true,
                     set_paused: None,
+                    generation,
                 });
             });
         }
         MenuAction::Land { agent } => {
+            if state.reject_external_sync() {
+                return;
+            }
+            state.stop_watch();
             let workspace = state.workspace.clone();
+            let generation = state.task_generation;
             let proxy = proxy.clone();
             std::thread::spawn(move || {
-                let error = agent_land(&workspace, &agent).err();
+                let error = agent_land(&workspace, &agent)
+                    .err()
+                    .or_else(|| sync_once(&workspace).err());
                 let _ = proxy.send_event(Action::TaskDone {
                     error,
-                    restart_watch: false,
+                    restart_watch: true,
                     set_paused: None,
+                    generation,
                 });
             });
         }
@@ -551,6 +635,7 @@ fn handle_menu_action(
                 ));
                 return;
             }
+            state.task_generation = state.task_generation.saturating_add(1);
             let proxy = proxy.clone();
             std::thread::spawn(move || {
                 let error = tray_activate(&path).err();
@@ -627,7 +712,22 @@ fn main() {
             Action::Refresh => {
                 request_status_fetch(&mut st, &proxy);
             }
-            Action::StatusReady(status) => {
+            Action::StatusReady {
+                generation,
+                workspace,
+                status,
+            } => {
+                let stale = generation != st.task_generation || workspace != st.workspace;
+                if stale {
+                    if st.status_inflight {
+                        st.status_inflight = false;
+                        if st.status_pending {
+                            st.status_pending = false;
+                            request_status_fetch(&mut st, &proxy);
+                        }
+                    }
+                    return;
+                }
                 st.status_inflight = false;
                 match status {
                     Some(s) => {
@@ -643,6 +743,10 @@ fn main() {
                 st.check_watch_alive();
                 st.cached_recent();
                 apply_ui(&st, &tray, &mut visual);
+                if st.status_pending {
+                    st.status_pending = false;
+                    request_status_fetch(&mut st, &proxy);
+                }
             }
             Action::MenuClick(id) => {
                 if let Some(menu_action) = parse_menu_action(&id) {
@@ -662,16 +766,30 @@ fn main() {
                 error,
                 restart_watch,
                 set_paused,
+                generation,
             } => {
+                if generation != st.task_generation {
+                    return;
+                }
                 if let Some(e) = error {
                     st.error_message = Some(e);
+                    if let Some(wanted_paused) = set_paused {
+                        let workspace = st.workspace.clone();
+                        let paused_on_disk = is_paused_on_disk(&workspace);
+                        if let Some(ref mut s) = st.last_status {
+                            s.paused = paused_on_disk;
+                        }
+                        if wanted_paused && !paused_on_disk {
+                            st.start_watch();
+                        }
+                    }
                 } else {
                     st.error_message = None;
                     if let (Some(p), Some(ref mut s)) = (set_paused, st.last_status.as_mut()) {
                         s.paused = p;
                     }
                 }
-                if restart_watch && !st.is_paused() {
+                if restart_watch && !st.is_paused() && !st.external_watcher_active() {
                     st.start_watch();
                 }
                 request_status_fetch(&mut st, &proxy);
@@ -685,8 +803,6 @@ fn main() {
                     st.workspace = path;
                     st.invalidate_recent();
                     st.reset_watch_policy();
-                    // Old workspace's status (paused/watching) no longer applies;
-                    // the refetch below restarts the watcher via check_watch_alive.
                     st.last_status = None;
                     request_status_fetch(&mut st, &proxy);
                 }

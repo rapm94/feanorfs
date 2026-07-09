@@ -66,7 +66,7 @@ pub fn tray_status(workspace: &Path) -> Option<TrayStatusResult> {
 
 pub fn tray_pause(workspace: &Path, pause: bool) -> Result<(), String> {
     let sub = if pause { "pause" } else { "resume" };
-    run_checked(workspace, &["tray", sub])
+    run_checked(workspace, &["--json", "tray", sub])
 }
 
 pub fn tray_recent() -> Option<RecentWorkspacesResult> {
@@ -91,15 +91,18 @@ pub fn conflicts_keep(workspace: &Path, path: &str, choice: &str) -> Result<(), 
         "both" => "--both",
         _ => return Err(format!("unknown keep choice: {choice}")),
     };
-    run_checked(workspace, &["conflicts", "keep", flag, "--", path])
+    run_checked(
+        workspace,
+        &["--json", "conflicts", "keep", flag, "--", path],
+    )
 }
 
 pub fn agent_land(workspace: &Path, name: &str) -> Result<(), String> {
-    run_checked(workspace, &["agent", "land", "--", name])
+    run_checked(workspace, &["--json", "agent", "land", "--", name])
 }
 
 pub fn sync_once(workspace: &Path) -> Result<(), String> {
-    run_checked(workspace, &["sync", "--no-watch"])
+    run_checked(workspace, &["--json", "sync", "--no-watch"])
 }
 
 #[cfg(test)]

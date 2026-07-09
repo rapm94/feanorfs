@@ -12,9 +12,9 @@ use crate::lock::{LandLock, SyncLock};
 use crate::paths::{agent_dir, legacy_policy_for_config, validate_name};
 use anyhow::{bail, Context, Result};
 use feanorfs_common::{
-    detect_concurrent_edits, normalize_path, AgentCheckResult,
-    AgentLandResult, AgentRefreshResult, AgentSnapshotEntry, ConcurrentEdit, ConflictKind,
-    FileState, LandedPath, SyncRequest, SyncResponse,
+    detect_concurrent_edits, normalize_path, AgentCheckResult, AgentLandResult, AgentRefreshResult,
+    AgentSnapshotEntry, ConcurrentEdit, ConflictKind, FileState, LandedPath, SyncRequest,
+    SyncResponse,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -669,10 +669,7 @@ pub async fn commit_agent(
     name: &str,
     password: Option<&str>,
 ) -> Result<feanorfs_common::AgentCommitResult> {
-    let land = land_agent(
-        base, db, api, workspace_id, name, password, false, false,
-    )
-    .await?;
+    let land = land_agent(base, db, api, workspace_id, name, password, false, false).await?;
     Ok(feanorfs_common::AgentCommitResult {
         agent_name: land.agent_name,
         our_changes: land.our_changes,
@@ -703,7 +700,9 @@ pub async fn clean_agent(base: &Path, db: &ClientDb, name: &str) -> Result<()> {
 }
 
 fn write_proposal_if_clean(conflict_dir: &Path, edit: &mut ConcurrentEdit) -> Result<()> {
-    use crate::conflict_artifacts::{is_binary_content, is_sentinel_content, resolve_artifact, ArtifactRole};
+    use crate::conflict_artifacts::{
+        is_binary_content, is_sentinel_content, resolve_artifact, ArtifactRole,
+    };
     let original = resolve_artifact(conflict_dir, &edit.path, ArtifactRole::Original);
     let local = resolve_artifact(conflict_dir, &edit.path, ArtifactRole::Local);
     let cloud = resolve_artifact(conflict_dir, &edit.path, ArtifactRole::Cloud);

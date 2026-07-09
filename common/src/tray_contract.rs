@@ -76,3 +76,88 @@ pub struct ConflictShowResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
 }
+
+/// Canonical JSON fixtures — update only with a semver-major contract bump.
+pub mod fixtures {
+    use super::*;
+
+    pub fn tray_status_result() -> TrayStatusResult {
+        TrayStatusResult {
+            mirror_state: "idle".into(),
+            paused: false,
+            watching: true,
+            workspace_path: "/Users/dev/project".into(),
+            workspace_id: "my-workspace".into(),
+            workspace_label: "my-workspace".into(),
+            pending_conflicts: vec![TrayConflictEntry {
+                path: "notes.txt".into(),
+                kind: "edit_edit".into(),
+                label: "Both sides changed notes.txt".into(),
+                choices: vec!["local".into(), "cloud".into(), "both".into()],
+            }],
+            agents: TrayAgentsSummary {
+                working: 1,
+                need_attention: 0,
+                entries: vec![TrayAgentEntry {
+                    name: "ci1".into(),
+                    state: "changes".into(),
+                    change_count: 2,
+                    conflict_count: 0,
+                }],
+            },
+        }
+    }
+
+    pub fn recent_workspaces_result() -> RecentWorkspacesResult {
+        RecentWorkspacesResult {
+            active: Some("/Users/dev/project".into()),
+            workspaces: vec![RecentWorkspaceEntry {
+                path: "/Users/dev/project".into(),
+                workspace_id: "my-workspace".into(),
+                label: "my-workspace".into(),
+            }],
+        }
+    }
+
+    pub fn tray_pause_result() -> TrayPauseResult {
+        TrayPauseResult { paused: true }
+    }
+
+    pub fn conflict_keep_result() -> ConflictKeepResult {
+        ConflictKeepResult {
+            resolved: "notes.txt".into(),
+        }
+    }
+
+    pub fn conflict_show_result() -> ConflictShowResult {
+        ConflictShowResult {
+            path: "notes.txt".into(),
+            kind: "edit_edit".into(),
+            local_path: ".feanorfs/conflicts/1719500000000/notes.txt.local".into(),
+            cloud_path: ".feanorfs/conflicts/1719500000000/notes.txt.cloud".into(),
+            original_path: ".feanorfs/conflicts/1719500000000/notes.txt.original".into(),
+            is_binary: false,
+            diff: Some("--- notes.txt\n+++ notes.txt\n@@\n-local\n+cloud\n".into()),
+        }
+    }
+
+    pub fn tray_status_json() -> String {
+        serde_json::to_string(&tray_status_result()).unwrap()
+    }
+
+    pub fn recent_workspaces_json() -> String {
+        serde_json::to_string(&recent_workspaces_result()).unwrap()
+    }
+
+    pub fn tray_pause_json() -> String {
+        serde_json::to_string(&tray_pause_result()).unwrap()
+    }
+
+    pub fn conflict_keep_json() -> String {
+        serde_json::to_string(&conflict_keep_result()).unwrap()
+    }
+
+    pub fn conflict_show_json() -> String {
+        serde_json::to_string(&conflict_show_result()).unwrap()
+    }
+}

@@ -105,7 +105,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Catch-up Summary | [summary.rs](client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
 | Predictive Hydration | [predictive.rs](client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
 | Change Watching | [watch.rs](client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
-| Release attestations | [dist-workspace.toml](dist-workspace.toml), [SECURITY.md](SECURITY.md) | GitHub Artifact Attestations on release archives/installers; verify with `gh attestation verify`. |
+| Release packaging + attestations | [release.yml](.github/workflows/release.yml), [dist-workspace.toml](dist-workspace.toml), [SECURITY.md](SECURITY.md) | Cargo-dist artifacts and both macOS tray archives are assembled before one GitHub Release is created. Archives/installers receive GitHub Artifact Attestations; verify with `gh attestation verify`. |
 
 ---
 

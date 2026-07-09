@@ -2,7 +2,8 @@ use clap::Subcommand;
 use feanorfs_client::{
     build_conflict_show,
     conflict_artifacts::{is_binary_content, resolve_artifact, ArtifactRole},
-    conflicts, load_config, ApiClient, ClientDb, ConflictKeepResult, ResolveKeep, SyncCtx,
+    conflicts, invalidate_agent_cache, load_config, ApiClient, ClientDb, ConflictKeepResult,
+    ResolveKeep, SyncCtx,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -97,6 +98,7 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
         } => {
             let (keep, file_path) = parse_keep_flags(local, cloud, both, file)?;
             conflicts::resolve_conflict(&ctx, &path, keep, file_path.as_deref()).await?;
+            invalidate_agent_cache(current_dir);
             if json {
                 output_json(&ConflictKeepResult { resolved: path })?;
             } else {

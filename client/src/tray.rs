@@ -13,14 +13,50 @@ use feanorfs_common::tray_contract::{
     TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayStatusResult,
 };
 use feanorfs_common::{ConflictKind, ConflictRecord};
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+const AGENT_CACHE_FILE: &str = "tray-agent-cache.json";
 const AGENT_CACHE_TTL: Duration = Duration::from_secs(30);
 
-static AGENT_CACHE: Mutex<Option<HashMap<String, (Instant, TrayAgentsSummary)>>> = Mutex::new(None);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedAgents {
+    cached_at_ms: i64,
+    summary: TrayAgentsSummary,
+}
+
+fn agent_cache_path(current_dir: &Path) -> PathBuf {
+    current_dir.join(".feanorfs").join(AGENT_CACHE_FILE)
+}
+
+fn cache_agents(current_dir: &Path, summary: &TrayAgentsSummary) {
+    let entry = CachedAgents {
+        cached_at_ms: chrono::Utc::now().timestamp_millis(),
+        summary: summary.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&entry) {
+        let _ = std::fs::write(agent_cache_path(current_dir), json);
+    }
+}
+
+fn cached_agents(current_dir: &Path) -> Option<TrayAgentsSummary> {
+    let content = std::fs::read_to_string(agent_cache_path(current_dir)).ok()?;
+    let entry: CachedAgents = serde_json::from_str(&content).ok()?;
+    let age_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_sub(entry.cached_at_ms);
+    if age_ms < i64::try_from(AGENT_CACHE_TTL.as_millis()).unwrap_or(i64::MAX) {
+        Some(entry.summary)
+    } else {
+        None
+    }
+}
+
+/// Drop cached agent summary after land/keep so the next tray status is fresh.
+pub fn invalidate_agent_cache(current_dir: &Path) {
+    let _ = std::fs::remove_file(agent_cache_path(current_dir));
+}
 
 fn conflict_kind_str(kind: ConflictKind) -> &'static str {
     match kind {
@@ -62,24 +98,6 @@ fn workspace_label(current_dir: &Path) -> String {
         .to_string()
 }
 
-fn cache_agents(workspace_key: &str, summary: &TrayAgentsSummary) {
-    if let Ok(mut guard) = AGENT_CACHE.lock() {
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(workspace_key.to_string(), (Instant::now(), summary.clone()));
-    }
-}
-
-fn cached_agents(workspace_key: &str) -> Option<TrayAgentsSummary> {
-    let guard = AGENT_CACHE.lock().ok()?;
-    let map = guard.as_ref()?;
-    let (at, summary) = map.get(workspace_key)?;
-    if at.elapsed() < AGENT_CACHE_TTL {
-        Some(summary.clone())
-    } else {
-        None
-    }
-}
-
 async fn load_agents_summary(
     current_dir: &Path,
     db: &ClientDb,
@@ -87,8 +105,7 @@ async fn load_agents_summary(
     workspace_id: &str,
     password: Option<&str>,
 ) -> Result<TrayAgentsSummary> {
-    let cache_key = current_dir.to_string_lossy().into_owned();
-    if let Some(cached) = cached_agents(&cache_key) {
+    if let Some(cached) = cached_agents(current_dir) {
         return Ok(cached);
     }
 
@@ -135,7 +152,7 @@ async fn load_agents_summary(
         need_attention,
         entries,
     };
-    cache_agents(&cache_key, &summary);
+    cache_agents(current_dir, &summary);
     Ok(summary)
 }
 
@@ -155,15 +172,20 @@ async fn cheap_tray_status(
         })
         .collect();
 
-    let cache_key = current_dir.to_string_lossy().into_owned();
-    let agents = cached_agents(&cache_key).unwrap_or(TrayAgentsSummary {
+    let agents = cached_agents(current_dir).unwrap_or(TrayAgentsSummary {
         working: 0,
         need_attention: 0,
         entries: vec![],
     });
 
+    let mirror = if pending_conflicts.is_empty() {
+        MirrorState::Syncing
+    } else {
+        MirrorState::Conflict
+    };
+
     Ok(TrayStatusResult {
-        mirror_state: mirror_state_str(MirrorState::Syncing),
+        mirror_state: mirror_state_str(mirror),
         paused: is_paused(current_dir),
         watching: is_watching(current_dir),
         workspace_path: current_dir.to_string_lossy().into_owned(),
@@ -275,5 +297,28 @@ mod tests {
             conflict_choices(ConflictKind::DeleteEdit),
             vec!["local", "cloud"]
         );
+    }
+
+    #[test]
+    fn conflict_labels_are_plain_language() {
+        use feanorfs_common::ConflictRecord;
+
+        let edit_edit = ConflictRecord {
+            path: "a.txt".into(),
+            kind: ConflictKind::EditEdit,
+            conflict_dir: "/tmp/c".into(),
+            opened_at: 0,
+            status: "pending".into(),
+        };
+        assert!(conflict_label(&edit_edit).contains("both changed"));
+
+        let edit_delete = ConflictRecord {
+            path: "b.txt".into(),
+            kind: ConflictKind::EditDelete,
+            conflict_dir: "/tmp/c".into(),
+            opened_at: 0,
+            status: "pending".into(),
+        };
+        assert!(conflict_label(&edit_delete).contains("cloud deleted"));
     }
 }

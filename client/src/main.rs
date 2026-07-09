@@ -85,6 +85,7 @@ mod cli_tests {
     fn cli_parses_tray_subprocess_shapes() {
         Cli::try_parse_from(["feanorfs", "--json", "tray", "status"]).unwrap();
         Cli::try_parse_from(["feanorfs", "tray", "pause"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "--json", "tray", "pause"]).unwrap();
         Cli::try_parse_from(["feanorfs", "tray", "resume"]).unwrap();
         Cli::try_parse_from(["feanorfs", "--json", "tray", "recent"]).unwrap();
         Cli::try_parse_from(["feanorfs", "tray", "activate", "--", "/tmp/ws"]).unwrap();

@@ -371,9 +371,7 @@ impl ClientDb {
         .await?;
         rows.into_iter()
             .map(|r| {
-                let kind = feanorfs_common::ConflictKind::from_db_str(
-                    &r.get::<String, _>("kind"),
-                )?;
+                let kind = feanorfs_common::ConflictKind::from_db_str(&r.get::<String, _>("kind"))?;
                 Ok(feanorfs_common::ConflictRecord {
                     path: r.get("path"),
                     kind,
@@ -396,8 +394,7 @@ impl ClientDb {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|r| {
-            let kind =
-                feanorfs_common::ConflictKind::from_db_str(&r.get::<String, _>("kind"))?;
+            let kind = feanorfs_common::ConflictKind::from_db_str(&r.get::<String, _>("kind"))?;
             Ok(feanorfs_common::ConflictRecord {
                 path: r.get("path"),
                 kind,

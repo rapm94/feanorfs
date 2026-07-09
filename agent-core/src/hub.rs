@@ -23,10 +23,14 @@ pub struct LocalHub {
 impl LocalHub {
     pub async fn open(data_dir: PathBuf, auth_token: Option<String>) -> Result<Arc<Self>> {
         let key = data_dir.canonicalize().or_else(|_| {
-            std::fs::create_dir_all(&data_dir)
-                .and_then(|_| data_dir.canonicalize())
+            std::fs::create_dir_all(&data_dir).and_then(|_| data_dir.canonicalize())
         })?;
-        if let Some(hub) = hub_cache().lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
+        if let Some(hub) = hub_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
             return Ok(hub);
         }
         let state = init_app_state(data_dir, auth_token).await?;
@@ -36,7 +40,10 @@ impl LocalHub {
             router,
             _state: state,
         });
-        hub_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(key, hub.clone());
+        hub_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, hub.clone());
         Ok(hub)
     }
 

@@ -1011,3 +1011,166 @@ async fn tray_status_and_pause() {
     set_paused(base, false).unwrap();
     assert!(!is_paused(base));
 }
+
+#[tokio::test]
+async fn tray_status_lists_working_agent() {
+    use feanorfs_client::{do_tray_status, spawn_agent};
+
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let base = client.workspace.path();
+
+    write_workspace_file(base, "task.txt", b"base").await;
+    do_sync(
+        &server.api,
+        &client.db,
+        base,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    spawn_agent(
+        base,
+        &client.db,
+        &server.api,
+        WORKSPACE_ID,
+        "ci1",
+        Some(TEST_PASSWORD),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    write_workspace_file(
+        &base.join(".feanorfs/agents/ci1"),
+        "task.txt",
+        b"agent edit",
+    )
+    .await;
+
+    let status = do_tray_status(base).await.unwrap();
+    assert!(
+        status.agents.working >= 1,
+        "expected at least one working agent: {:?}",
+        status.agents
+    );
+    assert!(
+        status
+            .agents
+            .entries
+            .iter()
+            .any(|e| e.name == "ci1" && e.change_count > 0),
+        "ci1 should report local changes"
+    );
+}
+
+#[tokio::test]
+async fn conflicts_keep_cloud_honors_remote_deletion() {
+    use feanorfs_client::{conflicts, resolve_conflict, ResolveKeep, SyncCtx};
+
+    let server = spawn_test_server().await;
+    let client_a = spawn_test_client().await;
+    let client_b = spawn_test_client().await;
+    let base_a = client_a.workspace.path();
+    let base_b = client_b.workspace.path();
+
+    write_workspace_file(base_a, "edited.txt", b"original").await;
+    do_push_only(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &client_b.db,
+        base_b,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    tokio::fs::remove_file(base_b.join("edited.txt"))
+        .await
+        .unwrap();
+    do_sync(
+        &server.api,
+        &client_b.db,
+        base_b,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    write_workspace_file(base_a, "edited.txt", b"local edit").await;
+    do_sync(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let records = client_a.db.list_conflict_records().await.unwrap();
+    let record = records
+        .iter()
+        .find(|r| r.path == "edited.txt")
+        .expect("edit/delete conflict on edited.txt");
+    assert_eq!(record.kind, feanorfs_common::ConflictKind::EditDelete);
+
+    let ctx = SyncCtx::new(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        feanorfs_common::LegacyPolicy::Reject,
+    );
+    resolve_conflict(&ctx, "edited.txt", ResolveKeep::Cloud, None)
+        .await
+        .unwrap();
+
+    assert!(!base_a.join("edited.txt").exists());
+    let pending = conflicts::pending_conflict_paths(&client_a.db)
+        .await
+        .unwrap();
+    assert!(!conflicts::conflicts_pending(Some(&pending)));
+
+    let after = do_sync(
+        &server.api,
+        &client_a.db,
+        base_a,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(after.uploads, 0);
+    assert_eq!(after.downloads, 0);
+    assert!(!base_a.join("edited.txt").exists());
+}

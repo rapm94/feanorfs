@@ -63,7 +63,9 @@ pub async fn prefetch_related(
 ) -> Result<PrefetchReport> {
     let password_str = password.unwrap_or(feanorfs_common::LEGACY_DEFAULT_PASSWORD);
     if password.is_none() {
-        tracing::warn!("No E2EE password set; using insecure legacy default for predictive hydration.");
+        tracing::warn!(
+            "No E2EE password set; using insecure legacy default for predictive hydration."
+        );
     }
     let mut report = PrefetchReport::default();
     let cache = db.get_cache_entries().await?;

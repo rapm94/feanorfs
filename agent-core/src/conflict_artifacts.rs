@@ -22,6 +22,23 @@ pub fn is_sentinel_content(content: &[u8]) -> bool {
     content.starts_with(SENTINEL_PREFIX.as_bytes())
 }
 
+/// Label inside `<feanorfs-sentinel:{label}>\n`, if present.
+#[must_use]
+pub fn sentinel_label(content: &[u8]) -> Option<&str> {
+    if !is_sentinel_content(content) {
+        return None;
+    }
+    let s = std::str::from_utf8(content).ok()?;
+    let rest = s.strip_prefix(SENTINEL_PREFIX)?;
+    rest.strip_suffix(">\n").or_else(|| rest.strip_suffix('>'))
+}
+
+/// Cloud-side deletion artifact (edit/delete or delete/edit conflicts).
+#[must_use]
+pub fn is_cloud_deleted_sentinel(content: &[u8]) -> bool {
+    sentinel_label(content) == Some("deleted")
+}
+
 pub fn is_binary_content(content: &[u8]) -> bool {
     content.is_empty() || content.contains(&0)
 }
@@ -198,4 +215,24 @@ fn set_kind_hint(edit: &mut ConcurrentEdit, kind: ConflictKind) {
         "feanorfs conflicts keep {} --local | --cloud | --both | --file <reconciled>",
         edit.path
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_cloud_deleted_sentinel, is_sentinel_content, sentinel_label, SENTINEL_PREFIX};
+
+    #[test]
+    fn cloud_deleted_sentinel_is_recognized() {
+        let deleted = format!("{SENTINEL_PREFIX}deleted>\n");
+        assert!(is_sentinel_content(deleted.as_bytes()));
+        assert_eq!(sentinel_label(deleted.as_bytes()), Some("deleted"));
+        assert!(is_cloud_deleted_sentinel(deleted.as_bytes()));
+    }
+
+    #[test]
+    fn download_failed_sentinel_is_not_cloud_deleted() {
+        let failed = format!("{SENTINEL_PREFIX}download-failed offline>\n");
+        assert!(is_sentinel_content(failed.as_bytes()));
+        assert!(!is_cloud_deleted_sentinel(failed.as_bytes()));
+    }
 }

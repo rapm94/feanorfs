@@ -95,14 +95,18 @@ jobs:
           WS=$(mktemp -d)/ws
           mkdir -p "$WS"
           cd "$WS"
-          ${{ github.workspace }}/target/release/feanorfs start --local --workspace tray-ci --no-watch
+          FNR="${{ github.workspace }}/target/release/feanorfs"
+          $FNR start --local --workspace tray-ci --no-watch
           echo hello > hello.txt
-          ${{ github.workspace }}/target/release/feanorfs sync --no-watch
-          ${{ github.workspace }}/target/release/feanorfs --json tray status | jq -e '.mirror_state'
-          ${{ github.workspace }}/target/release/feanorfs tray pause
+          $FNR sync --no-watch
+          $FNR --json tray status | jq -e '.mirror_state and .agents'
+          $FNR --json tray recent | jq -e '.workspaces | length >= 1'
+          $FNR tray pause
           test -f .feanorfs/paused
-          ${{ github.workspace }}/target/release/feanorfs tray resume
+          $FNR --json tray pause | jq -e '.paused == true'
+          $FNR tray resume
           ! test -f .feanorfs/paused
+          $FNR --json conflicts list | jq -e 'length == 0'
 
   test:
     name: Test

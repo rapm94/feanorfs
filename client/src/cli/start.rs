@@ -96,7 +96,9 @@ async fn finish_sync_watch(work_dir: &Path, no_watch: bool) -> anyhow::Result<()
     )
     .await?;
 
-    let _ = register_workspace(work_dir);
+    if let Err(e) = register_workspace(work_dir) {
+        eprintln!("Warning: could not register workspace for tray: {e}");
+    }
 
     if !no_watch {
         watch::run_watch(

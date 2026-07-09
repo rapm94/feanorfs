@@ -364,7 +364,7 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
                 })
                 .count() as u32;
             Ok(StatusResult {
-                mirror_state: MirrorState::Offline,
+                mirror_state: derive_mirror_state(None, Some(&pending)),
                 upload_required: Vec::new(),
                 download_required: Vec::new(),
                 delete_local: Vec::new(),
@@ -509,6 +509,15 @@ mod mirror_state_tests {
     #[test]
     fn offline_when_server_unreachable() {
         assert_eq!(derive_mirror_state(None, None), MirrorState::Offline);
+    }
+
+    #[test]
+    fn conflict_over_offline_when_pending_paths() {
+        let pending = HashSet::from(["a.txt".into()]);
+        assert_eq!(
+            derive_mirror_state(None, Some(&pending)),
+            MirrorState::Conflict
+        );
     }
 
     #[test]

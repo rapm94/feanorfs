@@ -22,6 +22,7 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
   - `predictive.rs` — `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay). Local-only.
   - `summary.rs` — `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool`. Zero-knowledge — never ships file contents to a remote LLM.
   - `watch.rs` — debounced (500 ms) filesystem watcher that drives `do_sync` on changes. Watcher path MUST be the workspace `current_dir`, never `"."`.
+  - `tray.rs` — tray dashboard aggregation (`do_tray_status`, `build_conflict_show`). Agent summary cached on disk at `.feanorfs/tray-agent-cache.json` (30 s TTL); `invalidate_agent_cache` after land/keep.
 - Local runtime data lives in `.feanorfs/` (git-ignored by FeanorFS itself; never include in distributions).
 
 ## Local Contracts
@@ -31,7 +32,7 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
 - **Sync scope:** mirror the working directory (including gitignored/untracked paths). Hard skip `.feanorfs/`, `.git/`. Small frozen `DEFAULT_IGNORES` plus optional `.feanorfsignore` — does NOT honor `.gitignore`. Rationale and admission criteria: [docs/sync-scope.md](../docs/sync-scope.md). Do not grow `DEFAULT_IGNORES` without meeting all three criteria there.
 - Zero-knowledge: always `pack_bytes` plaintext BEFORE calling `api.upload_file` and store the resulting `encrypted_hash` in the cache. `unpack_bytes` handles ChaCha20-Poly1305 blobs and legacy XOR on unmigrated v1 workspaces. On download, re-hash ciphertext before decrypting.
 - Result types are `Serialize`-derived. The `--json` CLI flag and `feanorfs_client::` library callers MUST see the same shape; do not add `println!` in `commands.rs` or `agent.rs` — keep UI in `main.rs` only.
-- Workspace conflicts: bare `feanorfs conflicts` or `conflicts list`; `keep`; `show [--open]`. Registry in `conflict_registry`; artifacts under `.feanorfs/conflicts/<ts>/`.
+- Workspace conflicts: bare `feanorfs conflicts` or `conflicts list`; `keep`; `show [--open]`. Registry in `conflict_registry`; artifacts under `.feanorfs/conflicts/<ts>/`. `ResolveKeep::Cloud` on `edit_delete` conflicts removes the local file and uploads a tombstone when the cloud artifact is a deletion sentinel.
 - `agent status` (or bare `agent`) lists agents with one-line state when online; hidden `agent list` keeps legacy JSON shape. `agent status <name>` / hidden `agent check` peek via `/api/sync/peek`.
 - Agent workspaces isolate DATA, not processes — `agent run` is cwd-scoping only. Never claim sandboxing; link [docs/threat-model.md](../docs/threat-model.md) § Process isolation.
 - Predictive hydration is local-only: `file_access_log` never leaves the client.
@@ -48,7 +49,7 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
 
 ## Verification
 
-- `cargo test --workspace` — unit tests + `client/tests/sync_engine.rs` integration harness (96 tests).
+- `cargo test --workspace` — unit tests + `client/tests/sync_engine.rs` integration harness + `client/tests/tray_contract_snapshots.rs`.
 - `cargo clippy -p feanorfs-client --all-targets -- -D warnings`.
 - `cargo fmt -p feanorfs-client -- --check`.
 

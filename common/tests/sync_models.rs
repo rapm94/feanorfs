@@ -183,7 +183,13 @@ use feanorfs_common::detect_concurrent_edits;
 use std::collections::{HashMap, HashSet};
 
 fn fs(path: &str, hash: &str, deleted: bool) -> FileState {
-    FileState { path: path.to_string(), hash: hash.to_string(), size: 10, mtime: 100, deleted }
+    FileState {
+        path: path.to_string(),
+        hash: hash.to_string(),
+        size: 10,
+        mtime: 100,
+        deleted,
+    }
 }
 
 #[test]
@@ -196,8 +202,12 @@ fn no_base_leg_both_create_same_path_different_content_yields_conflict() {
     let empty: HashSet<String> = HashSet::new();
 
     let conflicts = detect_concurrent_edits(
-        &base, &local, &cloud, &HashSet::new(),
-        vec!["new.txt".into()], &empty,
+        &base,
+        &local,
+        &cloud,
+        &HashSet::new(),
+        vec!["new.txt".into()],
+        &empty,
     );
 
     assert_eq!(conflicts.len(), 1);
@@ -215,8 +225,12 @@ fn no_base_leg_same_content_no_conflict() {
     let empty: HashSet<String> = HashSet::new();
 
     let conflicts = detect_concurrent_edits(
-        &base, &local, &cloud, &HashSet::new(),
-        vec!["same.txt".into()], &empty,
+        &base,
+        &local,
+        &cloud,
+        &HashSet::new(),
+        vec!["same.txt".into()],
+        &empty,
     );
 
     assert!(conflicts.is_empty());
@@ -231,8 +245,12 @@ fn no_base_leg_only_one_side_has_path_no_conflict() {
     let empty: HashSet<String> = HashSet::new();
 
     let conflicts = detect_concurrent_edits(
-        &base, &local, &cloud, &HashSet::new(),
-        vec!["only_here.txt".into()], &empty,
+        &base,
+        &local,
+        &cloud,
+        &HashSet::new(),
+        vec!["only_here.txt".into()],
+        &empty,
     );
 
     assert!(conflicts.is_empty());

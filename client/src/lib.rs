@@ -49,7 +49,7 @@ pub use local::{
 };
 pub use migrate::{legacy_policy_for_config, migrate_workspace};
 pub use recent::{list_recent_workspaces, register_workspace, set_active_workspace};
-pub use tray::{build_conflict_show, do_tray_status};
+pub use tray::{build_conflict_show, do_tray_status, invalidate_agent_cache};
 pub use tray_state::{
     clear_watch_pid, is_paused, is_syncing, is_watching, set_paused, write_watch_pid,
 };

@@ -23,6 +23,8 @@ Wire types and semver JSON contract live in `feanorfs_common::agent_contract` â€
 
 - Blocking facade: `Runtime::new()` owns a multi-thread Tokio runtime; all public methods use `block_on`.
 - JSON shapes returned to FFI/Node/CLI `--json` MUST match `docs/agent-api.md`; snapshot tests in `client/tests/contract_snapshots.rs`.
+- Tray JSON shapes live in `feanorfs_common::tray_contract` with fixtures + snapshots in `client/tests/tray_contract_snapshots.rs`.
+- `ResolveKeep::Cloud` on `edit_delete` conflicts: when the cloud artifact is the deletion sentinel, remove the local file and upload a tombstone (`is_cloud_deleted_sentinel` in `conflict_artifacts.rs`).
 - Agent workspaces isolate data, not processes â€” never claim sandboxing.
 - Spawn with an empty main tree records zero snapshot rows; land still works for paths the agent adds after spawn (greenfield workflows).
 
@@ -37,6 +39,7 @@ Wire types and semver JSON contract live in `feanorfs_common::agent_contract` â€
 - `cargo test -p feanorfs-agent-core`
 - `cargo test -p feanorfs-ffi` (C ABI smoke)
 - `cargo test -p feanorfs-client contract_snapshots`
+- `cargo test -p feanorfs-client tray_contract_snapshots`
 
 ## Child DOX Index
 

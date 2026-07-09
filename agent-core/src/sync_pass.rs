@@ -233,7 +233,9 @@ pub(crate) async fn process_downloads(
             atomic_write(ctx.base, path, &plain_content).await?;
 
             let actual_mtime = file_mtime_ms(&full_path).await.unwrap_or_else(|e| {
-                tracing::warn!("failed to read mtime after download of {path}: {e}; using server mtime");
+                tracing::warn!(
+                    "failed to read mtime after download of {path}: {e}; using server mtime"
+                );
                 replica_file.mtime
             });
             let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
