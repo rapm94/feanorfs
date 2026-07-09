@@ -33,7 +33,7 @@ fn read_lock_meta(path: &Path) -> Option<(u32, u64)> {
     Some((pid, ts))
 }
 
-fn is_stale(path: &Path, max_age_secs: u64) -> bool {
+pub fn is_stale(path: &Path, max_age_secs: u64) -> bool {
     let Some((pid, ts)) = read_lock_meta(path) else {
         return true;
     };
@@ -45,6 +45,15 @@ fn is_stale(path: &Path, max_age_secs: u64) -> bool {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     now.saturating_sub(ts) > max_age_secs
+}
+
+/// Check whether the sync lock is actively held (not stale) by another process.
+pub fn is_sync_lock_active(base: &Path) -> bool {
+    let path = lock_path(base, "sync.lock");
+    if !path.exists() || is_stale(&path, STALE_SYNC_SECS) {
+        return false;
+    }
+    read_lock_meta(&path).is_some_and(|(pid, _)| pid != std::process::id())
 }
 
 fn write_pid_ts(file: &mut File) -> Result<()> {
