@@ -1,6 +1,10 @@
 [workspace]
 # FeanorFS is distributed as pre-built binaries, not via crates.io.
 publish = false
+# Cargo package verification cannot resolve unpublished internal workspace
+# crates from crates.io and provides no useful release gate for binary-only
+# distribution. API compatibility remains covered by workspace CI.
+semver_check = false
 
 # Unpublished workspace: derive versions from git tags, not crates.io.
 git_only = true

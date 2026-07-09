@@ -24,6 +24,9 @@ contributor templates.
 - Checkout steps set `persist-credentials: false`.
 - Core Linux/Windows jobs exclude `feanorfs-tray`; tray checks and releases run
   on macOS.
+- GitHub Releases expose only the cross-platform `feanorfs` CLI and optional
+  macOS tray. The legacy server binary remains source-only because
+  `feanorfs serve` is the supported hub entrypoint.
 - Pull requests require the fast Linux gates: format, Clippy, tests,
   dependency policy, and workflow lint. MSRV, macOS/Windows tests, docs,
   release builds, SDK, tray, and CodeQL run on `main` before release.

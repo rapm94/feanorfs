@@ -105,7 +105,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 | Catch-up Summary | [summary.rs](client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
 | Predictive Hydration | [predictive.rs](client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
 | Change Watching | [watch.rs](client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
-| CI, security, and releases | [ci.yml](.github/workflows/ci.yml), [security.yml](.github/workflows/security.yml), [release-plz.yml](.github/workflows/release-plz.yml), [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml), [dist-workspace.toml](dist-workspace.toml), [SECURITY.md](SECURITY.md) | Core gates exclude the macOS-only tray on Linux/Windows; tray gates run on macOS. Release-plz runs after trusted `main` CI succeeds. Cargo-dist owns its generated workflow and allowlists client/server; the post-release tray workflow verifies the tag commit, builds, checksums, attests, and uploads both macOS archives. |
+| CI, security, and releases | [ci.yml](.github/workflows/ci.yml), [security.yml](.github/workflows/security.yml), [release-plz.yml](.github/workflows/release-plz.yml), [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml), [dist-workspace.toml](dist-workspace.toml), [SECURITY.md](SECURITY.md) | Core gates exclude the macOS-only tray on Linux/Windows; tray gates run on macOS. Release-plz runs after trusted `main` CI succeeds. Cargo-dist owns its generated workflow and packages only the `feanorfs` CLI; the post-release tray workflow verifies the tag commit, builds, checksums, attests, and uploads both macOS archives. |
 
 ---
 
@@ -183,7 +183,7 @@ cargo test -p feanorfs-tray --locked
 cargo run --bin feanorfs -- serve --port 3030 --data-dir server-data
 cargo run --bin feanorfs -- serve --gc-only --data-dir server-data
 
-# Legacy server-only binary (optional)
+# Source-only compatibility binary; not a release product
 cargo run --bin feanorfs-server
 ```
 
@@ -347,6 +347,9 @@ When the user requests a durable behavior change, record it here or in the relev
 - Keep pull-request CI lean: require fast Linux quality gates, then run
   expensive cross-platform, release, SDK, tray, and CodeQL checks on `main`
   before release.
+- Keep GitHub Releases product-focused: ship the `feanorfs` binary and optional
+  macOS tray with integrity metadata, not internal crates or compatibility
+  binaries already covered by `feanorfs serve`.
 
 ## Planning
 

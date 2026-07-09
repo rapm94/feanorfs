@@ -19,7 +19,7 @@ Shipped agent SDK: [docs/agent-api.md](agent-api.md), `agent-core/`, `feanorfs-f
 | Agent work | `agent spawn` / `status` / `refresh` / `land` | `agent check`, `agent commit`, `agent list` |
 | Conflicts | `conflicts` (list) / `keep` / `show --open` | `conflicts list`, `conflicts open`, `conflicts history` |
 | Config / key | `config` / `config --key` | `show-key` |
-| Hub | `feanorfs serve` | `feanorfs-server` (legacy server-only install) |
+| Hub | `feanorfs serve` | — |
 | Orchestrators | — | `events`, `mcp`, `workspaces` |
 
 ---

@@ -12,6 +12,11 @@ keywords.workspace = true
 categories.workspace = true
 description = "Content-addressed blob storage and sync metadata server for FeanorFS"
 
+[package.metadata.dist]
+# The supported hub ships inside `feanorfs serve`; keep this compatibility
+# binary source-buildable without duplicating every release artifact.
+dist = false
+
 [lib]
 name = "feanorfs_server"
 path = "src/lib.rs"
@@ -42,14 +47,3 @@ tower = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-
-[package.metadata.binstall]
-# Artifacts are built by cargo-dist (see dist-workspace.toml).
-pkg-url = "{ repo }/releases/download/v{ version }/feanorfs-server-{ target }.tar.xz"
-pkg-fmt = "txz"
-bin-dir = "{ bin }{ binary-ext }"
-
-[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "{ repo }/releases/download/v{ version }/feanorfs-server-{ target }.zip"
-pkg-fmt = "zip"
-
