@@ -985,3 +985,29 @@ async fn local_hub_in_process_sync() {
     let workspaces = api.get_workspaces().await.unwrap();
     assert!(workspaces.contains(&"local-ws".to_string()));
 }
+
+#[tokio::test]
+async fn tray_status_and_pause() {
+    use feanorfs_client::{
+        do_tray_status, is_paused, list_recent_workspaces, register_workspace, set_paused,
+    };
+
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let base = client.workspace.path();
+
+    register_workspace(base).unwrap();
+    let recent = list_recent_workspaces().unwrap();
+    assert!(recent.workspaces.iter().any(|w| w.path.contains("tmp")));
+
+    set_paused(base, true).unwrap();
+    assert!(is_paused(base));
+
+    let status = do_tray_status(base).await.unwrap();
+    assert!(status.paused);
+    assert_eq!(status.mirror_state, "idle");
+    assert!(status.pending_conflicts.is_empty());
+
+    set_paused(base, false).unwrap();
+    assert!(!is_paused(base));
+}

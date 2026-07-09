@@ -79,4 +79,25 @@ mod cli_tests {
         Cli::try_parse_from(["feanorfs", "setup", "--workspace", "w"]).unwrap();
         Cli::try_parse_from(["feanorfs", "init", "127.0.0.1:3030", "--workspace", "w"]).unwrap();
     }
+
+    /// The tray app shells these exact argument shapes (`--` before untrusted values).
+    #[test]
+    fn cli_parses_tray_subprocess_shapes() {
+        Cli::try_parse_from(["feanorfs", "--json", "tray", "status"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "tray", "pause"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "tray", "resume"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "--json", "tray", "recent"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "tray", "activate", "--", "/tmp/ws"]).unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "conflicts",
+            "keep",
+            "--local",
+            "--",
+            "--weird.txt",
+        ])
+        .unwrap();
+        Cli::try_parse_from(["feanorfs", "agent", "land", "--", "-name"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "sync", "--no-watch"]).unwrap();
+    }
 }
