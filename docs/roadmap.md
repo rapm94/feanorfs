@@ -1,7 +1,8 @@
 # FeanorFS Roadmap
 
-**Focus:** tray MVP (DX-26–28), then the Merkle snapshot engine (MERK-1..7) and Phase C polish.  
-**Freeze list** (bug fixes only until tray MVP): `predictive.rs`, `summary --summarize`, mDNS LAN discovery.
+**Focus:** Merkle snapshot engine (MERK-1..7) and Phase C polish.  
+Shipped tray MVP: `tray/` (`feanorfs-tray`), `feanorfs tray status|pause|resume|recent`, conflict `show --json`, `TrayStatusResult` contract in `common/src/tray_contract.rs`.
+**Freeze list** (bug fixes only until MERK-1): `predictive.rs`, `summary --summarize`, mDNS LAN discovery.
 
 **Strategy:** One OSS stack for self-host and managed hosting — **agent loop** (concurrent agents, conflict surfacing) + **background sync** (uncommitted files across machines).
 
@@ -25,14 +26,14 @@ Shipped agent SDK: [docs/agent-api.md](agent-api.md), `agent-core/`, `feanorfs-f
 
 ## Backlog
 
-### P1 — Tray MVP
+### P1 — Tray MVP (shipped)
 
 | ID | Task |
 |----|------|
-| DX-26 | Menu-bar app: state icon (up to date / syncing / offline / needs attention / paused), pause toggle, open folder, workspace switcher. Shells `feanorfs --json` — no duplicate sync logic. |
-| DX-27 | Needs-attention view: per conflict, plain-language keep local / cloud / both; calls `conflicts keep`. |
-| DX-28 | Agent presence: "N agents working · M need attention" with land shortcuts. |
-| P-4 | Invest list completion: `--json` gaps, conflicts UX polish. |
+| DX-26 | Menu-bar app (`feanorfs-tray`): state icon, pause toggle, open folder, workspace switcher. Shells `feanorfs --json`. |
+| DX-27 | Needs-attention submenu: plain-language labels, `conflicts keep` actions. |
+| DX-28 | Agent presence line + Land shortcuts. |
+| P-4 | `TrayStatusResult`, `conflicts show --json`, `ConflictKeepResult`, events `mirror_state` snake_case, pause file + watch respect. |
 
 ### P2 — Agent & sync polish
 
@@ -175,14 +176,12 @@ Acceptance: a v2 workspace migrates in place and round-trips; `cargo test --work
 
 ## Suggested order
 
-1. DX-26, DX-27 (tray MVP)
-2. DX-28, P-4
-3. AG-28..AG-30 (agent edge tests)
-4. MERK-1 → MERK-7 in order (snapshot engine; subsumes SDK-7a and GC-7; re-scope the SDK-7 remainder after MERK-5). SDK-5b when publishing npm.
-5. DX-11, DX-14, DX-23, DX-25
-6. SEC-6
-7. CONN-6, CONN-7 when hosted tier exists
-8. DX-12, CHUNK-* on demand
+1. MERK-1 → MERK-7 in order (snapshot engine; subsumes SDK-7a and GC-7; re-scope the SDK-7 remainder after MERK-5). SDK-5b when publishing npm.
+2. AG-28..AG-30 (agent edge tests)
+3. DX-11, DX-14, DX-23, DX-25
+4. SEC-6
+5. CONN-6, CONN-7 when hosted tier exists
+6. DX-12, CHUNK-* on demand
 
 ---
 
@@ -190,7 +189,7 @@ Acceptance: a v2 workspace migrates in place and round-trips; `cargo test --work
 
 | Area | Files |
 |------|-------|
-| Tray (new) | TBD native shell calling `feanorfs --json` |
+| Tray (shipped) | `tray/src/main.rs`, `tray/README.md`, `client/src/cli/tray.rs`, `client/src/tray.rs`, `common/src/tray_contract.rs` |
 | Merkle engine (MERK) | `common/src/tree.rs` (new), `agent-core/src/objects.rs` (new), `agent-core/src/agent.rs`, `agent-core/src/conflicts.rs`, `agent-core/src/sync_pass.rs`, `server/src/{db,app}.rs`, `client/src/cli/{agent,conflicts,events,mcp}.rs` |
 | SDK storage (SDK-7) | `agent-core/src/local.rs`, `client/src/local.rs`, `server/src/db.rs`, `agent-core/src/hub.rs` |
 | Agent edge cases | `agent-core/src/agent.rs`, `client/tests/sync_engine.rs` |

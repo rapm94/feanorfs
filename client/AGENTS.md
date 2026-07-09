@@ -37,7 +37,7 @@ CLI + library crate. Owns the local cache DB, directory scanner, sync engine, ag
 - Predictive hydration is local-only: `file_access_log` never leaves the client.
 - Local-hub workspaces (`hub_local` / `start --local`): in-process transport via `hub.rs`. Do not print portable invites; share with `feanorfs serve --data-dir .feanorfs/hub-data`.
 - Remote join: `fnr1-…` invite via `common/src/invite.rs`; `start fnr1-…` or hidden `join` (full initial sync). Hidden `attach`/`init`/`setup` configure only.
-- CLI surface: visible verbs are `start`, `sync`, `status`, `hydrate`, `cat`, `summary`, `config`, `doctor`, `serve`, `migrate`, `agent`, `conflicts`. Onboarding is `feanorfs start` only.
+- CLI surface: visible verbs are `start`, `sync`, `status`, `hydrate`, `cat`, `summary`, `config`, `doctor`, `serve`, `migrate`, `agent`, `conflicts`. Hidden `tray` subcommands (`status`, `pause`, `resume`, `recent`, `activate`) feed `feanorfs-tray`. Onboarding is `feanorfs start` only.
 
 ## Work Guidance
 

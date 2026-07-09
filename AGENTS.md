@@ -14,7 +14,7 @@
 |---|---|
 | **Hub** (`feanorfs serve`) | Blob + metadata backend in the same binary as the sync client. Same router as the optional legacy `feanorfs-server` crate binary (`--port`, `--data-dir`, `--token` per instance). |
 | **Engine** (`feanorfs_client` + CLI) | Sync library + CLI. Embeds the hub for local workspaces (`hub.rs`, in-process `ApiClient`) and exposes `feanorfs serve` for network hubs. `--json` is the contract for any UI shell. |
-| **Tray client** (future) | Optional system-tray UI. No duplicate sync logic — calls the library or CLI with `--json`. |
+| **Tray client** (shipped) | `tray/` — `feanorfs-tray` menu-bar app. Shells `feanorfs --json tray status`, `conflicts keep`, `agent land`. No duplicate sync logic. |
 
 **Defaults:**
 - Prefer smart defaults over flags where practical (`feanorfs start`, watch after sync).
@@ -341,7 +341,7 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Planning
 
-Prioritized backlog: [docs/roadmap.md](docs/roadmap.md). **Active:** tray MVP (DX-26–28). **Post-tray flagship:** Merkle snapshot engine (MERK-1..7 — immutable tree snapshots over the encrypted CAS, working-copy-as-snapshot, first-class conflicts). **Freeze list** (bug fixes only until tray MVP): `predictive.rs`, `summary --summarize`, mDNS LAN discovery.
+Prioritized backlog: [docs/roadmap.md](docs/roadmap.md). **Active:** Merkle snapshot engine (MERK-1..7). **Shipped:** tray MVP (`feanorfs-tray`, `feanorfs tray status`). **Freeze list** (bug fixes only until MERK-1): `predictive.rs`, `summary --summarize`, mDNS LAN discovery.
 
 ## Child DOX Index
 
@@ -352,4 +352,5 @@ Each direct child owns a crate boundary; subdirectories inside crates share file
 | [common/](common/AGENTS.md) | Shared data models and Blake3 XOF encryption primitives. Zero I/O, zero side effects — depends only on `blake3`, `getrandom`, `chrono`, and `serde`/`serde_json`. |
 | [server/](server/AGENTS.md) | Axum blob storage server and SQLite metadata coordinator. Pure transport — never decrypts, never inspects file content. |
 | [client/](client/AGENTS.md) | CLI + library crate. Sync engine, watch, summary, predictive; agent ops delegate to agent-core. |
+| [tray/](tray/) | macOS menu-bar companion (`feanorfs-tray`). Shells CLI `--json`; see [tray/README.md](tray/README.md). |
 | [agent-core/](agent-core/AGENTS.md) | Embeddable agent SDK: `Runtime`, `Workspace`, local hub, conflict gate. Consumed by client, FFI, and Node bindings. |
