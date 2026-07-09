@@ -3,6 +3,8 @@ name: Release-plz
 # release-plz automates semantic versioning, changelog generation, and git tags
 # from Conventional Commits. GitHub Releases and binary artifacts are handled
 # by cargo-dist (.github/workflows/release.yml) when the tag is pushed.
+# This workflow runs only after CI succeeds on a trusted main-branch push, so a
+# failing commit cannot publish a release. workflow_dispatch is the recovery path.
 #
 # Prerequisite — secret RELEASE_PLZ_TOKEN (PAT with contents:write +
 # pull-requests:write), either:
@@ -12,60 +14,42 @@ name: Release-plz
 # The default GITHUB_TOKEN cannot trigger downstream workflows on tag push.
 
 on:
-  push:
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: ["CI"]
     branches:
       - main
+    types: [completed]
   workflow_dispatch:
 
+permissions: {}
+
+concurrency:
+  group: release-plz-main
+  cancel-in-progress: false
+
 jobs:
-  release-plz-pr:
-    name: Release PR
-    runs-on: ubuntu-latest
-    environment: prod
-    permissions:
-      contents: write
-      pull-requests: write
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - name: Verify release token
-        run: |
-          if [ -z "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
-            echo "::error::Missing secret RELEASE_PLZ_TOKEN."
-            echo "Add it as a repository secret (Settings → Secrets → Actions)"
-            echo "or as an environment secret on the 'prod' environment."
-            exit 1
-          fi
-
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run release-plz (release-pr)
-        uses: release-plz/action@v0.5
-        with:
-          command: release-pr
-          forge: github
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-
   release-plz-release:
     name: Release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: prod
     permissions:
       contents: write
       pull-requests: read
     steps:
       - name: Verify release token
+        env:
+          HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN != '' }}
         run: |
-          if [ -z "${{ secrets.RELEASE_PLZ_TOKEN }}" ]; then
+          if [ "$HAS_RELEASE_TOKEN" != "true" ]; then
             echo "::error::Missing secret RELEASE_PLZ_TOKEN."
             echo "Add it as a repository secret (Settings → Secrets → Actions)"
             echo "or as an environment secret on the 'prod' environment."
@@ -73,18 +57,63 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
 
       - name: Run release-plz (release)
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@975e932b313daccbd2db607a53c63c9c5300279b # v0.5.130
         with:
           command: release
+          forge: github
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  release-plz-pr:
+    name: Release PR
+    needs: release-plz-release
+    if: ${{ needs.release-plz-release.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: prod
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Verify release token
+        env:
+          HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN != '' }}
+        run: |
+          if [ "$HAS_RELEASE_TOKEN" != "true" ]; then
+            echo "::error::Missing secret RELEASE_PLZ_TOKEN."
+            echo "Add it as a repository secret (Settings → Secrets → Actions)"
+            echo "or as an environment secret on the 'prod' environment."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+
+      - name: Run release-plz (release-pr)
+        uses: release-plz/action@975e932b313daccbd2db607a53c63c9c5300279b # v0.5.130
+        with:
+          command: release-pr
           forge: github
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

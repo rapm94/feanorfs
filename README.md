@@ -1,5 +1,9 @@
 # FeanorFS
 
+[![CI](https://github.com/rapm94/feanorfs/actions/workflows/ci.yml/badge.svg)](https://github.com/rapm94/feanorfs/actions/workflows/ci.yml)
+[![Security](https://github.com/rapm94/feanorfs/actions/workflows/security.yml/badge.svg)](https://github.com/rapm94/feanorfs/actions/workflows/security.yml)
+[![Release](https://github.com/rapm94/feanorfs/actions/workflows/release.yml/badge.svg)](https://github.com/rapm94/feanorfs/actions/workflows/release.yml)
+
 > **Dropbox for your uncommitted code** — end-to-end encrypted, self-host or managed.
 
 FeanorFS synchronizes your working directory to a lightweight blob server using content-addressed storage (CAS) and end-to-end encryption (E2EE). The server only ever sees encrypted hashes and scrambled bytes — your plaintext never leaves your machine.

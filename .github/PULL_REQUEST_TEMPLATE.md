@@ -17,9 +17,11 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo clippy --all-targets -- -D warnings` passes
-- [ ] `cargo test --all` passes
+- [ ] `cargo fmt --all -- --check` passes
+- [ ] Core Clippy passes (`--workspace --exclude feanorfs-tray --all-targets --all-features`)
+- [ ] Core tests pass (`--workspace --exclude feanorfs-tray --all-features`)
+- [ ] macOS tray checks pass if `tray/` changed
+- [ ] `cargo deny check` passes if dependencies changed
 - [ ] `CHANGELOG.md` updated under `## [Unreleased]` (if user-facing change)
 - [ ] `SECURITY.md` and/or `docs/threat-model.md` updated (if security-relevant change)
 - [ ] `README.md` and `docs/` updated (if user-facing behavior changed)

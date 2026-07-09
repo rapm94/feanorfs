@@ -2,7 +2,8 @@
 
 ## Supported versions
 
-FeanorFS is pre-1.0 software (`0.1.x`). Security fixes are applied only to the latest `main` branch. There are no LTS releases yet.
+FeanorFS is pre-1.0 software. Security fixes are applied only to the latest
+release and `main`; there are no LTS branches.
 
 ## Reporting a vulnerability
 
@@ -21,9 +22,10 @@ Please do not disclose the vulnerability publicly until a fix has been released.
 
 ## Verifying release artifacts
 
-FeanorFS release binaries are built by [cargo-dist](https://github.com/axodotdev/cargo-dist) in GitHub Actions (`.github/workflows/release.yml`). Each release archive and installer script is signed with a **GitHub Artifact Attestation** (SLSA build provenance via Sigstore). The attestation proves the file was produced by the official Release workflow from a specific commit in this repository — a tampered artifact on the release page fails verification even if the download URL looks correct.
+FeanorFS release binaries are built by [cargo-dist](https://github.com/axodotdev/cargo-dist) in GitHub Actions (`.github/workflows/release.yml`). The macOS tray archives are built by `.github/workflows/tray-release.yml` only after the cargo-dist release succeeds. Release archives and installer scripts are signed with a **GitHub Artifact Attestation** (SLSA build provenance via Sigstore). The attestation proves the file was produced by an official release workflow from a specific commit in this repository — a tampered artifact on the release page fails verification even if the download URL looks correct.
 
-Attestations apply from the **next tagged release** after this workflow ships (not retroactive on v0.2.0).
+Attestations are not retroactive. Older releases that predate this pipeline must
+be built from source for equivalent provenance.
 
 ### Verify with GitHub CLI (recommended)
 
@@ -34,7 +36,7 @@ gh attestation verify feanorfs-client-x86_64-apple-darwin.tar.xz \
   --repo rapm94/feanorfs
 ```
 
-Use the filename you downloaded (`*.tar.xz`, `*.zip`, `feanorfs-client-installer.sh`, or `feanorfs-client-installer.ps1`). Success prints the linked workflow run and commit; failure means do not run the binary.
+Use the filename you downloaded (`*.tar.xz`, `*.zip`, `feanorfs-client-installer.sh`, or `feanorfs-client-installer.ps1`). This includes `feanorfs-tray-*.zip`. Success prints the linked workflow run and commit; failure means do not run the binary.
 
 List attestations for a release tag:
 
@@ -55,6 +57,24 @@ shasum -a 256 -c feanorfs-client-x86_64-apple-darwin.tar.xz.sha256
 ```
 
 Checksums detect accidental corruption; attestations additionally bind the file to the CI build that produced it.
+
+## CI and supply-chain controls
+
+- CI tests the core workspace on Linux, macOS, and Windows; the macOS-only tray
+  has a separate native build, Clippy, test, and smoke-test gate.
+- Rust 1.88 is the declared and continuously tested minimum supported version.
+- `cargo-deny` blocks known advisories, yanked crates, unapproved licenses, and
+  untrusted dependency sources. A scheduled run catches newly published
+  advisories even when the repository is idle.
+- CodeQL scans Rust and GitHub Actions. `actionlint` validates workflow syntax
+  and embedded shell, while `zizmor` audits repository-owned workflows.
+- Repository-owned actions are pinned to immutable commit SHAs. Cargo-dist's
+  generated `release.yml` remains generator-owned and is never patched by hand.
+- Dependabot covers Cargo, npm, and GitHub Actions. Version updates use a
+  cooldown; security updates are not intentionally delayed.
+- `release-plz` runs only after CI succeeds on a trusted `main` push. Cargo-dist
+  then builds and attests the tag, and the tray workflow verifies that the tag
+  resolves to the exact release commit before uploading its artifacts.
 
 ### Build from source
 

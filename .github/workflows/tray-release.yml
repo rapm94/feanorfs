@@ -3,23 +3,30 @@
 name: Tray release
 
 on:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows: ["Release"]
     types: [completed]
 
-permissions:
-  contents: write
-  attestations: write
-  id-token: write
+permissions: {}
+
+concurrency:
+  group: tray-release-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
 
 jobs:
   build-tray:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       startsWith(github.event.workflow_run.head_branch, 'v')
     name: feanorfs-tray (${{ matrix.target }})
     runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -27,30 +34,63 @@ jobs:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v6
+      - name: Verify release tag
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          TAG_OBJECT="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"
+          TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"
+          if [ "$TAG_TYPE" = "tag" ]; then
+            TAG_SHA="$(gh api "repos/$REPOSITORY/git/tags/$TAG_SHA" --jq '.object.sha')"
+          fi
+          if [ "$TAG_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Release tag resolves to $TAG_SHA, expected $EXPECTED_SHA."
+            exit 1
+          fi
+      - name: Checkout release commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Build feanorfs + tray
-        run: cargo build --release -p feanorfs-client -p feanorfs-tray --target ${{ matrix.target }}
+        run: >-
+          cargo build --release -p feanorfs-client -p feanorfs-tray
+          --target ${{ matrix.target }} --locked
       - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           mkdir -p tray-dist
-          cp target/${{ matrix.target }}/release/feanorfs tray-dist/
-          cp target/${{ matrix.target }}/release/feanorfs-tray tray-dist/
+          cp "target/$TARGET/release/feanorfs" tray-dist/
+          cp "target/$TARGET/release/feanorfs-tray" tray-dist/
           cd tray-dist
-          zip -9 ../feanorfs-tray-${{ matrix.target }}.zip feanorfs feanorfs-tray
-      - name: Attest archive
-        uses: actions/attest@v4
+          zip -9 "../feanorfs-tray-$TARGET.zip" feanorfs feanorfs-tray
+          cd ..
+          shasum -a 256 "feanorfs-tray-$TARGET.zip" > "feanorfs-tray-$TARGET.zip.sha256"
+      - name: Attest artifacts
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999 # v4
         with:
-          subject-path: feanorfs-tray-${{ matrix.target }}.zip
-      - name: Upload archive
+          subject-path: |
+            feanorfs-tray-${{ matrix.target }}.zip
+            feanorfs-tray-${{ matrix.target }}.zip.sha256
+      - name: Upload artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
-        run: gh release upload "$RELEASE_TAG" "feanorfs-tray-${{ matrix.target }}.zip" --clobber
+          TARGET: ${{ matrix.target }}
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          "feanorfs-tray-$TARGET.zip"
+          "feanorfs-tray-$TARGET.zip.sha256"
+          --clobber

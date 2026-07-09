@@ -1,145 +1,296 @@
-# CI
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: "1"
 
 jobs:
   fmt:
-    name: Format check
+    name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
           components: rustfmt
-      - name: cargo fmt --check
+      - name: Check formatting
         run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: Clippy (core)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Run Clippy
+        run: >-
+          cargo clippy --workspace --exclude feanorfs-tray
+          --all-targets --all-features --locked -- -D warnings
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Check minimum supported Rust version
+        run: >-
+          cargo check --workspace --exclude feanorfs-tray
+          --all-targets --all-features --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Run tests
+        run: >-
+          cargo test --workspace --exclude feanorfs-tray
+          --all-features --locked
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Build documentation
+        run: >-
+          cargo doc --workspace --exclude feanorfs-tray
+          --all-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  build:
+    name: Release build (core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Build optimized workspace
+        run: >-
+          cargo build --release --workspace --exclude feanorfs-tray --locked
 
   sdk:
     name: Agent SDK smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Build CLI (release)
-        run: cargo build --release -p feanorfs-client
-      # Debug FFI matches zig build.zig profile_dir (.Debug => target/debug)
-      - name: Build FFI (debug for zig)
-        run: cargo build -p feanorfs-ffi
+        run: cargo build --release -p feanorfs-client --locked
+      # Debug FFI matches zig build.zig profile_dir (.Debug => target/debug).
+      - name: Build FFI (debug for Zig)
+        run: cargo build -p feanorfs-ffi --locked
       - name: Verify feanorfs.h is committed
-        run: git diff --exit-code feanorfs-ffi/feanorfs.h
+        run: git diff --exit-code -- feanorfs-ffi/feanorfs.h
       - name: SDK-2 CLI loop
         run: bash examples/sdk-agent-loop.sh
         env:
           FEANORFS_BIN: ${{ github.workspace }}/target/release/feanorfs
-      - uses: actions/setup-node@v4
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: bindings/ts/package-lock.json
       - name: SDK-5 Node loop
+        working-directory: bindings/ts
         run: |
-          cd bindings/ts
-          npm ci
+          npm ci --ignore-scripts
           npm run build
-          FEANORFS_BIN=${{ github.workspace }}/target/release/feanorfs node test/loop.mjs
-      - uses: mlugg/setup-zig@v2
+          FEANORFS_BIN="${{ github.workspace }}/target/release/feanorfs" node test/loop.mjs
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
       - name: SDK-6 Zig example
         run: |
-          WS=$(mktemp -d)/ws
+          WS="$(mktemp -d)/ws"
           mkdir -p "$WS"
           cd "$WS"
-          ${{ github.workspace }}/target/release/feanorfs start --local --workspace zig-ci --no-watch
+          "${{ github.workspace }}/target/release/feanorfs" start --local --workspace zig-ci --no-watch
           echo seed > seed.txt
-          ${{ github.workspace }}/target/release/feanorfs sync --no-watch
+          "${{ github.workspace }}/target/release/feanorfs" sync --no-watch
           export FEANORFS_WORKSPACE="$WS"
-          cd ${{ github.workspace }}/examples/zig-agent
+          cd "${{ github.workspace }}/examples/zig-agent"
           zig build
           ./zig-out/bin/zig-agent-demo
 
   tray:
-    name: Tray MVP (macOS)
+    name: Tray (macOS)
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Install MSRV Rust
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Check tray MSRV
+        run: cargo +1.88.0 check -p feanorfs-tray --all-targets --locked
+      - name: Run tray Clippy
+        run: cargo clippy -p feanorfs-tray --all-targets --locked -- -D warnings
+      - name: Run tray tests
+        run: cargo test -p feanorfs-tray --locked
       - name: Build feanorfs + tray
-        run: cargo build --release -p feanorfs-client -p feanorfs-tray
+        run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
       - name: Tray CLI smoke
         run: |
-          WS=$(mktemp -d)/ws
+          WS="$(mktemp -d)/ws"
           mkdir -p "$WS"
           cd "$WS"
           FNR="${{ github.workspace }}/target/release/feanorfs"
-          $FNR start --local --workspace tray-ci --no-watch
+          "$FNR" start --local --workspace tray-ci --no-watch
           echo hello > hello.txt
-          $FNR sync --no-watch
-          $FNR --json tray status | jq -e '.mirror_state and .agents'
-          $FNR --json tray recent | jq -e '.workspaces | length >= 1'
-          $FNR tray pause
+          "$FNR" sync --no-watch
+          "$FNR" --json tray status | jq -e '.mirror_state and .agents'
+          "$FNR" --json tray recent | jq -e '.workspaces | length >= 1'
+          "$FNR" tray pause
           test -f .feanorfs/paused
-          $FNR --json tray pause | jq -e '.paused == true'
-          $FNR tray resume
-          ! test -f .feanorfs/paused
-          $FNR --json conflicts list | jq -e 'length == 0'
+          "$FNR" --json tray pause | jq -e '.paused == true'
+          "$FNR" tray resume
+          if test -f .feanorfs/paused; then
+            echo "::error::Tray pause sentinel still exists after resume."
+            exit 1
+          fi
+          "$FNR" --json conflicts list | jq -e 'length == 0'
 
-  test:
-    name: Test
+  dependencies:
+    name: Dependencies
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test
-        run: cargo test --all --all-features
-      - name: cargo doc
-        run: cargo doc --no-deps --all
-        env:
-          RUSTDOCFLAGS: "-D warnings"
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87 # v2
+        with:
+          command: check
+          arguments: --all-features
 
-  deny:
-    name: License & advisory audit
+  workflow-lint:
+    name: Workflow syntax
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
-      - name: cargo deny check
-        run: cargo deny check
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Run actionlint
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2
 
-  build:
-    name: Build (release)
+  ci-success:
+    name: CI success
+    if: ${{ always() }}
+    needs:
+      - fmt
+      - clippy
+      - msrv
+      - test
+      - docs
+      - build
+      - sdk
+      - tray
+      - dependencies
+      - workflow-lint
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo build --release
-        run: cargo build --release --all
+      - name: Require every CI job
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled') ||
+          contains(needs.*.result, 'skipped')
+        run: exit 1
+      - name: Confirm CI success
+        run: echo "All required CI jobs passed."

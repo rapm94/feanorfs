@@ -97,14 +97,14 @@ async fn compute_agent_diff(ctx: &SyncCtx<'_>, name: &str) -> Result<AgentDiff> 
         .filter(|f| {
             base_map
                 .get(&f.path)
-                .map_or(true, |b| b.hash != f.hash || b.deleted != f.deleted)
+                .is_none_or(|b| b.hash != f.hash || b.deleted != f.deleted)
         })
         .map(|f| (f.path.clone(), f))
         .collect();
     let their_deleted: HashSet<String> = response
         .delete_local
         .into_iter()
-        .filter(|path| base_map.get(path).map_or(true, |b| !b.deleted))
+        .filter(|path| base_map.get(path).is_none_or(|b| !b.deleted))
         .collect();
 
     let agent_cache = ClientDb::new(agent_path.join(".feanorfs")).await?;
