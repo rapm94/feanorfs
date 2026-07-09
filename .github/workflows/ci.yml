@@ -81,6 +81,29 @@ jobs:
           zig build
           ./zig-out/bin/zig-agent-demo
 
+  tray:
+    name: Tray MVP (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build feanorfs + tray
+        run: cargo build --release -p feanorfs-client -p feanorfs-tray
+      - name: Tray CLI smoke
+        run: |
+          WS=$(mktemp -d)/ws
+          mkdir -p "$WS"
+          cd "$WS"
+          ${{ github.workspace }}/target/release/feanorfs start --local --workspace tray-ci --no-watch
+          echo hello > hello.txt
+          ${{ github.workspace }}/target/release/feanorfs sync --no-watch
+          ${{ github.workspace }}/target/release/feanorfs --json tray status | jq -e '.mirror_state'
+          ${{ github.workspace }}/target/release/feanorfs tray pause
+          test -f .feanorfs/paused
+          ${{ github.workspace }}/target/release/feanorfs tray resume
+          ! test -f .feanorfs/paused
+
   test:
     name: Test
     runs-on: ubuntu-latest
