@@ -18,6 +18,7 @@ concurrency:
 jobs:
   codeql:
     name: CodeQL (${{ matrix.language }})
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -98,11 +99,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require security jobs
+      - name: Require workflow security
+        if: ${{ needs.workflow-security.result != 'success' }}
+        run: exit 1
+      - name: Require CodeQL outside pull requests
         if: >-
-          contains(needs.*.result, 'failure') ||
-          contains(needs.*.result, 'cancelled') ||
-          contains(needs.*.result, 'skipped')
+          github.event_name != 'pull_request' &&
+          needs.codeql.result != 'success'
         run: exit 1
       - name: Confirm security success
-        run: echo "All required security jobs passed."
+        run: echo "All required security jobs for this event passed."

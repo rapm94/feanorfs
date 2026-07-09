@@ -344,6 +344,9 @@ Default section order:
 When the user requests a durable behavior change, record it here or in the relevant child AGENTS.md
 
 - CI/CD should favor mainstream tooling, immutable action pins, least privilege, cross-platform coverage, release provenance, and enforced quality gates over minimal workflow setup.
+- Keep pull-request CI lean: require fast Linux quality gates, then run
+  expensive cross-platform, release, SDK, tray, and CodeQL checks on `main`
+  before release.
 
 ## Planning
 

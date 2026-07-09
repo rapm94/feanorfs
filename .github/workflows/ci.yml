@@ -59,6 +59,7 @@ jobs:
 
   msrv:
     name: MSRV (Rust 1.88)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -77,13 +78,33 @@ jobs:
           --all-targets --all-features --locked
 
   test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run tests
+        run: >-
+          cargo test --workspace --exclude feanorfs-tray
+          --all-features --locked
+
+  cross-platform:
     name: Test (${{ matrix.os }})
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -101,6 +122,7 @@ jobs:
 
   docs:
     name: Documentation
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -122,6 +144,7 @@ jobs:
 
   build:
     name: Release build (core)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -140,6 +163,7 @@ jobs:
 
   sdk:
     name: Agent SDK smoke (${{ matrix.os }})
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -198,6 +222,7 @@ jobs:
 
   tray:
     name: Tray (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -277,6 +302,7 @@ jobs:
       - clippy
       - msrv
       - test
+      - cross-platform
       - docs
       - build
       - sdk
@@ -286,11 +312,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require every CI job
+      - name: Require fast PR gates
         if: >-
-          contains(needs.*.result, 'failure') ||
-          contains(needs.*.result, 'cancelled') ||
-          contains(needs.*.result, 'skipped')
+          needs.fmt.result != 'success' ||
+          needs.clippy.result != 'success' ||
+          needs.test.result != 'success' ||
+          needs.dependencies.result != 'success' ||
+          needs.workflow-lint.result != 'success'
+        run: exit 1
+      - name: Require pre-release gates
+        if: >-
+          github.event_name != 'pull_request' &&
+          (
+            needs.msrv.result != 'success' ||
+            needs.cross-platform.result != 'success' ||
+            needs.docs.result != 'success' ||
+            needs.build.result != 'success' ||
+            needs.sdk.result != 'success' ||
+            needs.tray.result != 'success'
+          )
         run: exit 1
       - name: Confirm CI success
-        run: echo "All required CI jobs passed."
+        run: echo "All required CI jobs for this event passed."
