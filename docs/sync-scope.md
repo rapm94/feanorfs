@@ -26,6 +26,8 @@ FeanorFS mirrors the **current contents** of a workspace folder. This document r
 | `.feanorfs/` | Client state: config, cache DB, agent dirs, locks |
 | `.git/` | VCS metadata — not user work product |
 | `.feanorfs/agents/` | Scanned only inside agent isolation; excluded from main workspace walk |
+| Symlinks | Reported by `status` as sorted, deduplicated skipped paths; links are never followed |
+| Valid `CACHEDIR.TAG` directories | Regeneratable cache trees declared by their owning tools; contents remain untouched on disk |
 
 ## Default ignores (`DEFAULT_IGNORES`)
 
@@ -64,17 +66,23 @@ Optional, gitignore-syntax file at the workspace root. Use for project-specific 
 - **Not a substitute for git** — duplicating an entire `.gitignore` defeats the product goal (sync what git ignores).
 - Hidden `prune-ignored` removes server metadata for paths that newly match ignore rules.
 
-## Planned: `CACHEDIR.TAG`
+## `CACHEDIR.TAG`
 
 [Cachedir Tag Specification](https://bford.info/cachedir/): tools mark regeneratable cache directories with a `CACHEDIR.TAG` file (Cargo writes one in `target/`). Skipping tagged directories is principled and self-maintaining — tool authors declare caches; FeanorFS does not curate framework names.
 
-Tracked as **DX-29** in [roadmap.md](roadmap.md). Will complement (not replace) the small `DEFAULT_IGNORES` list — e.g. `node_modules/` does not use the tag today.
+FeanorFS prunes a tagged directory from both main-workspace and agent-workspace scans only when `CACHEDIR.TAG` starts with this exact signature, including the trailing LF:
+
+```text
+Signature: 8a477f597d28d172789f06886806bc55
+```
+
+A missing LF, different signature, non-file tag, or symlinked tag is invalid and does not prune the directory. A tag at the workspace root is deliberately exempt: pruning the root could hide the whole workspace and turn existing tracked files into remote deletions, so the root tag and its siblings sync normally. FeanorFS never follows links to inspect tags and never deletes skipped cache contents. Tag support complements (not replaces) the small `DEFAULT_IGNORES` list — e.g. `node_modules/` does not use the tag today.
 
 ## Implementation map
 
 | Concern | Location |
 |---------|----------|
-| `DEFAULT_IGNORES`, walker, `.feanorfsignore` | `client/src/local.rs` — `build_workspace_walker`, `scan_local_directory` |
+| `DEFAULT_IGNORES`, walker, `.feanorfsignore` | `agent-core/src/local.rs` — `build_workspace_walker`, `scan_local_directory` |
 | Prune tracked paths matching ignores | `client/src/commands.rs` — `prune_ignored` |
 | Agent workspace scan | Separate walk under `.feanorfs/agents/<name>/`; same ignore machinery |
 

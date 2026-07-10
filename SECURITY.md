@@ -102,7 +102,7 @@ Full analysis: [docs/threat-model.md](docs/threat-model.md). Open backlog: [docs
 ### What FeanorFS does NOT protect
 
 - **Metadata leakage** — The server sees file paths, sizes, modification times, and encrypted hashes. Paths are not encrypted.
-- **Legacy XOR blobs (v1 workspaces)** — Unmigrated workspaces still decrypt pre-AEAD blobs via an unauthenticated XOR stream. Run `feanorfs migrate` to format v2, which rejects non-AEAD blobs. Do not sync unmigrated workspaces against untrusted servers.
+- **Legacy XOR blobs (v1 workspaces)** — Unmigrated workspaces still decrypt pre-AEAD blobs via an unauthenticated XOR stream. Run `feanorfs migrate` to format v3, which rejects non-AEAD blobs and encrypts workspace structure. Do not sync unmigrated workspaces against untrusted servers.
 - **No TLS by default** — HTTP on port 3030. Use a reverse proxy or VPN for internet deployments.
 - **Password storage** — Encryption keys and server tokens are stored in plaintext in `.feanorfs/config.json` and `~/.feanorfs/global.json`. Protect directory permissions.
 - **Brute-force resistance** — Key derivation is a single Blake3 pass with no KDF stretching. v2 workspaces require 64-hex generated keys (256-bit CSPRNG). Human passphrases remain weak if used manually.
@@ -110,7 +110,7 @@ Full analysis: [docs/threat-model.md](docs/threat-model.md). Open backlog: [docs
 
 ### Security goals for future versions
 
-1. **Remove legacy XOR decrypt** (SEC-6) — after all workspaces migrate to format v2.
+1. **Remove legacy XOR decrypt** (SEC-6) — after all workspaces migrate to format v3.
 2. **Native TLS** on the Axum server (or document reverse-proxy as the only supported internet path).
 3. **Path obfuscation** — encrypt paths in server metadata.
 4. **OS keychain** for stored keys/tokens.

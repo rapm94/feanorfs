@@ -11,18 +11,18 @@ This document provides a detailed security analysis of FeanorFS. For the policy 
 │  ┌───────────────┐   ┌─────────────────┐                    │
 │  │  feanorfs CLI │   │ .feanorfs/      │                    │
 │  │  (encrypt/    │   │  config.json    │ ← plaintext pass   │
-│  │   decrypt)    │   │  local_cache.db │ ← plaintext hashes │
+│  │   decrypt)    │   │  local_state.json│ ← plaintext hashes │
 │  └───────┬───────┘   └─────────────────┘                    │
 │          │                                                  │
 └──────────┼──────────────────────────────────────────────────┘
-           │ encrypted blobs + metadata (HTTPS not enforced)
+           │ encrypted blobs + opaque object IDs (HTTPS not enforced)
            │
 ┌──────────┼──────────────────────────────────────────────────┐
 │          ▼          Untrusted zone (server)                  │
 │  ┌───────────────┐   ┌─────────────────┐                    │
 │  │  Axum server  │   │ server-data/    │                    │
-│  │  (opt. token) │   │  db.sqlite      │ ← paths, sizes,    │
-│  │               │   │  blobs/<hash>   │   encrypted hashes │
+│  │  (opt. token) │   │  db.sqlite      │ ← heads, manifests │
+│  │               │   │  blobs/<hash>   │   encrypted objects│
 │  └───────────────┘   └─────────────────┘                    │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -31,20 +31,21 @@ This document provides a detailed security analysis of FeanorFS. For the policy 
 
 1. **File contents (plaintext)** — the data being synced. Confidentiality is the primary security goal.
 2. **Encryption password** — the secret that protects file contents.
-3. **File metadata** — paths, sizes, modification times, hashes. Partial confidentiality expected (paths are not encrypted).
-4. **Local cache integrity** — `local_cache.db` and `config.json` on the client. Tampering could cause desync or data loss.
+3. **Workspace structure** — format-v3 paths and executable intent live inside encrypted tree objects. Legacy formats expose paths, sizes, modification times, and hashes.
+4. **Local cache integrity** — `local_state.json` and `config.json` on the client. Tampering could cause desync or data loss. Legacy `local_cache.db` files remain only until the one-time importer archives them.
 
 ## Adversary model
 
 ### Adversary A: Passive server operator
 
-**Can observe:** All encrypted blobs, all metadata (paths, sizes, mtimes, encrypted hashes), all API requests.
+**Can observe:** All encrypted blobs, workspace heads, reachability manifests containing opaque blob IDs, ciphertext sizes, object counts, access timing, and all API requests. A migrated format-v3 workspace does not store filenames or directory structure in server metadata.
 
 **Goal:** Recover plaintext file contents.
 
-**Result:** **Defended against** (with caveats). Without the password, the server cannot decrypt blobs. The XOR keystream is derived from `blake3(password ‖ path)`, which the server does not know. However:
+**Result:** **Defended against** for format-v3 object contents and structure, with caveats. Without the encryption key, the server cannot decrypt file, tree, or snapshot objects. However:
 - A weak password can be brute-forced offline if the attacker knows any `(path, plaintext)` pair (they can verify a password guess by checking if `crypt_bytes(plaintext, guess, path) == stored_ciphertext`). **Use a high-entropy password.**
-- The server sees file paths in cleartext. If the path itself reveals sensitive information (e.g., `credentials/bank-passwords.txt`), that information is exposed.
+- Legacy format-v1 and format-v2 workspaces expose file paths in cleartext until migration completes.
+- Reachability manifests expose equality, object counts, retention, and access patterns even though their IDs reveal no plaintext names.
 
 ### Adversary B: Active server operator (malicious or compromised)
 
@@ -54,10 +55,11 @@ This document provides a detailed security analysis of FeanorFS. For the policy 
 
 **Result:** **Partially defended against.**
 - **Ciphertext tampering (new blobs)**: New blobs are sealed with ChaCha20-Poly1305 AEAD (`pack_bytes`). Tampered ciphertext fails authentication on decrypt. Additionally, the client re-hashes downloaded ciphertext against the expected `encrypted_hash` before decrypting.
-- **Legacy downgrade (v1 workspaces only)**: Format v2 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to the legacy XOR stream on decrypt — run `feanorfs migrate`. Removing the XOR path entirely is [SEC-6](roadmap.md). Do not sync unmigrated workspaces against untrusted servers.
+- **Legacy downgrade (v1 workspaces only)**: Format-v2 and format-v3 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to the legacy XOR stream on decrypt. Run `feanorfs migrate`; removing XOR entirely remains [SEC-6](roadmap.md).
 - **Metadata lies**: a malicious server can still lie in `SyncResponse` (supply a hash matching substituted ciphertext); AEAD limits this to replaying validly-encrypted blobs for that same path.
-- **Replay attacks**: The server can replay an older version of a blob (since blobs are content-addressed, old versions are still valid by hash). The client has no version counter or nonce to detect this.
-- **Metadata manipulation**: The server can lie about `SyncResponse` — claiming no downloads are needed, or injecting fake file states. The client trusts the server's metadata.
+- **Replay attacks**: The server can replay an older valid snapshot head or blob. Compare-and-swap prevents honest concurrent writers from silently replacing each other, but it does not authenticate a malicious server's head response.
+- **Metadata manipulation**: A malicious server can hide snapshots, omit objects, or return an older head. Authenticated encryption detects modified ciphertext, not omission or rollback.
+- **Migration races**: A durable workspace fence rejects writes without the migration token from the initial pull through format stamping. The stamp, flat-row deletion, and fence release share one SQLite transaction.
 
 ### Adversary C: Network attacker (MITM)
 
@@ -73,7 +75,7 @@ This document provides a detailed security analysis of FeanorFS. For the policy 
 
 ### Adversary D: Local attacker on client machine
 
-**Can observe:** All files in the workspace directory, including `.feanorfs/config.json` (plaintext password) and `.feanorfs/local_cache.db` (plaintext hashes).
+**Can observe:** All files in the workspace directory, including `.feanorfs/config.json` (plaintext password) and `.feanorfs/local_state.json` (plaintext hashes, conflict metadata, session markers, and local access history).
 
 **Goal:** Recover the encryption password, then decrypt all server-side blobs.
 
@@ -127,14 +129,15 @@ Unauthenticated and malleable — an attacker who knows plaintext at a position 
 | Risk | Severity | Mitigation | Status |
 |---|---|---|---|
 | Plaintext leakage via weak password | High | Use the auto-generated 64-hex key; planned: reject human passphrases (SEC-7) | User responsibility |
-| Legacy XOR decrypt path (unmigrated v1 workspaces) | Medium | `feanorfs migrate` to format v2; then remove XOR path ([SEC-6](roadmap.md)) | Open |
+| Legacy XOR decrypt path (unmigrated v1 workspaces) | Medium | `feanorfs migrate` to format v3; then remove XOR path ([SEC-6](roadmap.md)) | Open |
 | Ciphertext tampering (AEAD blobs) | — | ChaCha20-Poly1305 authentication | Implemented |
 | No TLS (network MITM) | High | Run behind reverse proxy or VPN; future: native TLS support | Known limitation |
 | No server authentication | Medium | Run with `--token`; clients send `Authorization: Bearer` | Implemented (optional) |
 | Password stored in plaintext | Medium | `chmod 700 .feanorfs/`; future: OS keychain integration | Known limitation |
-| Metadata leakage (paths, sizes) | Medium | Future: path encryption, size padding | Known limitation |
+| Migration journal stores old and target keys | Medium | Journal stays under `.feanorfs/` and is removed after successful cutover | Temporary local exposure |
+| Metadata leakage (sizes, counts, equality, timing) | Medium | Format v3 encrypts paths and structure; size padding remains deferred | Known limitation |
 | No KDF / brute-force resistance | Medium | Use high-entropy password; future: Argon2id + salt | Known limitation |
-| Replay attacks (old blob versions) | Low | Future: version counters or monotonic sequence numbers | Known limitation |
+| Replay attacks (old snapshot heads or blobs) | Low | Future: authenticated monotonic head evidence | Known limitation |
 
 ## Planned security improvements
 
@@ -142,7 +145,6 @@ See [roadmap.md](roadmap.md):
 
 1. **Remove legacy XOR decrypt** (SEC-6) — after all workspaces run `feanorfs migrate`.
 2. **Native TLS** — optional TLS on the Axum server; until then, reverse proxy.
-3. **Path obfuscation** — encrypt file paths in metadata.
 
 ## Process isolation (agents)
 
