@@ -149,6 +149,7 @@ To avoid unnecessary re-hashing of unchanged local files, the client maintains a
 7. **Data Isolation ≠ Sandbox**: agent workspaces isolate files, not processes. Never claim sandboxing in code or copy; link the "Process isolation" section of [docs/threat-model.md](docs/threat-model.md) instead.
 8. **Sync scope**: mirror disk contents (including gitignored paths); hard skip `.feanorfs/` and `.git/`; small frozen `DEFAULT_IGNORES` only — see [docs/sync-scope.md](docs/sync-scope.md). Do not honor `.gitignore` or expand defaults into a framework-specific denylist.
 9. **CI/CD ownership**: Pin repository-owned actions to immutable SHAs, keep permissions least-privilege, and validate workflows with actionlint/zizmor. Never hand-edit cargo-dist's generated `.github/workflows/release.yml`; change `dist-workspace.toml` and regenerate it.
+10. **Release changelog ownership**: Root `CHANGELOG.md` is canonical. Release-plz must use `changelog_path = "./CHANGELOG.md"`; do not create crate-local changelogs.
 
 ---
 
