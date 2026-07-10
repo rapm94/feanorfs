@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use feanorfs_client::{ApiClient, ClientDb, Config};
 use feanorfs_server::{build_router, init_app_state};
 use std::path::{Path, PathBuf};

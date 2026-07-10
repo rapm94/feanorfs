@@ -1,5 +1,9 @@
+#![allow(unused_imports)]
 use clap::Subcommand;
-use feanorfs_client::{commands, load_config, watch, ApiClient, ClientDb};
+
+use feanorfs_client::ApiClient;
+use feanorfs_client::ClientDb;
+use feanorfs_client::{commands, load_config, watch};
 use std::path::Path;
 
 use super::util::output_json;
@@ -66,8 +70,8 @@ async fn open(
     current_dir: &Path,
 ) -> anyhow::Result<(feanorfs_client::Config, ClientDb, ApiClient)> {
     let config = load_config(current_dir)?;
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-    let api = ApiClient::from_config(current_dir, &config).await?;
+    let db = crate::open_client_db(current_dir).await?;
+    let api = crate::open_api_client(current_dir, &config).await?;
     Ok((config, db, api))
 }
 

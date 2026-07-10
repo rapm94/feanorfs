@@ -20,6 +20,10 @@ pub struct ServeCli {
     pub gc_grace_minutes: u64,
     #[arg(long, default_value = "30")]
     pub tombstone_retention_days: u64,
+    #[arg(long, default_value = "30")]
+    pub snapshot_retention_days: u64,
+    #[arg(long, default_value = "50")]
+    pub snapshot_keep_last: usize,
     /// Run blob GC once and exit (no HTTP server)
     #[arg(long)]
     pub gc_only: bool,
@@ -36,6 +40,8 @@ impl From<ServeCli> for ServeOptions {
             gc_interval_secs: c.gc_interval,
             gc_grace_minutes: c.gc_grace_minutes,
             tombstone_retention_days: c.tombstone_retention_days,
+            snapshot_retention_days: c.snapshot_retention_days,
+            snapshot_keep_last: c.snapshot_keep_last,
         }
     }
 }
@@ -52,6 +58,8 @@ pub async fn run_gc_cli(args: ServeCli) -> anyhow::Result<()> {
         data_dir: args.data_dir,
         gc_grace_minutes: args.gc_grace_minutes,
         tombstone_retention_days: args.tombstone_retention_days,
+        snapshot_retention_days: args.snapshot_retention_days,
+        snapshot_keep_last: args.snapshot_keep_last,
         ..ServeOptions::default()
     })
     .await?;

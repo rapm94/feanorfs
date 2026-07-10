@@ -35,6 +35,13 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ConflictsAction>,
     },
+    /// Show immutable workspace snapshot history.
+    Log {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Restore a historical snapshot as a new snapshot.
+    Undo { snapshot_id: String },
 }
 
 #[tokio::main]
@@ -58,10 +65,16 @@ async fn main() -> anyhow::Result<()> {
             let action = action.unwrap_or(ConflictsAction::List);
             cli::conflicts::run(&current_dir, action, cli.json).await?
         }
+        Commands::Log { limit } => cli::history::log(&current_dir, limit, cli.json).await?,
+        Commands::Undo { snapshot_id } => {
+            cli::history::undo(&current_dir, &snapshot_id, cli.json).await?
+        }
     }
 
     Ok(())
 }
+
+use feanorfs_client::{open_api_client, open_client_db};
 
 #[cfg(test)]
 mod cli_tests {

@@ -1,6 +1,4 @@
-use feanorfs_client::{
-    do_sync, load_config, load_global_config, register_workspace, watch, ApiClient, ClientDb,
-};
+use feanorfs_client::{do_sync, load_config, load_global_config, register_workspace, watch};
 use feanorfs_common::looks_like_invite;
 use std::path::{Path, PathBuf};
 
@@ -79,11 +77,11 @@ fn parse_target(raw: &str) -> anyhow::Result<ParsedTarget> {
 
 async fn finish_sync_watch(work_dir: &Path, no_watch: bool) -> anyhow::Result<()> {
     let config = load_config(work_dir)?;
-    if config.format_version < 2 {
-        eprintln!("Note: run `feanorfs migrate` to upgrade this workspace to format v2.");
+    if config.format_version < 3 {
+        eprintln!("Note: run `feanorfs migrate` to upgrade this workspace to format v3.");
     }
-    let db = ClientDb::new(work_dir.join(".feanorfs")).await?;
-    let api = ApiClient::from_config(work_dir, &config).await?;
+    let db = crate::open_client_db(work_dir).await?;
+    let api = crate::open_api_client(work_dir, &config).await?;
 
     println!("Running sync...");
     do_sync(

@@ -27,6 +27,12 @@ pub fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
 
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
+
+async fn drain_event_burst(rx: &mut tokio::sync::mpsc::Receiver<()>, delay: Duration) {
+    tokio::time::sleep(delay).await;
+    while rx.try_recv().is_ok() {}
+}
 
 fn backoff_duration(consecutive_errors: u32) -> Duration {
     if consecutive_errors == 0 {
@@ -102,8 +108,7 @@ pub async fn run_watch(
                 if maybe.is_none() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                while rx.try_recv().is_ok() {}
+                drain_event_burst(&mut rx, DEBOUNCE_INTERVAL).await;
 
                 if backoff > Duration::ZERO {
                     continue;
@@ -189,7 +194,7 @@ async fn sync_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_duration, event_paths_warrant_sync};
+    use super::{backoff_duration, drain_event_burst, event_paths_warrant_sync};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -225,5 +230,30 @@ mod tests {
         assert_eq!(backoff_duration(0), Duration::ZERO);
         assert_eq!(backoff_duration(1), Duration::from_secs(10));
         assert!(backoff_duration(10) <= Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn bulk_event_burst_runs_one_debounce_pass() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        tx.try_send(()).expect("queue initial event");
+        let delayed_tx = tx.clone();
+        let delayed_events = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for _ in 0..99 {
+                delayed_tx
+                    .try_send(())
+                    .expect("queue event during debounce");
+            }
+        });
+
+        let delay = Duration::from_millis(25);
+        let started = tokio::time::Instant::now();
+        rx.recv().await.expect("receive initial event");
+        drain_event_burst(&mut rx, delay).await;
+        delayed_events.await.expect("send delayed events");
+        drop(tx);
+
+        assert!(started.elapsed() >= delay);
+        assert!(rx.try_recv().is_err(), "entire timed burst must be drained");
     }
 }

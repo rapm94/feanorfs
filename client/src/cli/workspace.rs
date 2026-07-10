@@ -1,6 +1,6 @@
 use clap::Subcommand;
 use feanorfs_client::{
-    load_config, load_global_config, save_global_config, summary, ApiClient, ClientDb, GlobalConfig,
+    load_config, load_global_config, save_global_config, summary, ApiClient, GlobalConfig,
 };
 use std::path::Path;
 
@@ -451,10 +451,10 @@ async fn run_doctor(current_dir: &Path) -> anyhow::Result<()> {
             } else {
                 println!("[WARN] E2EE: no password set (using insecure default)");
             }
-            if c.format_version < 2 {
-                println!("[WARN] Workspace format v1 — run `feanorfs migrate`");
+            if c.format_version < 3 {
+                println!("[WARN] Legacy workspace format — run `feanorfs migrate`");
             }
-            let api = ApiClient::from_config(current_dir, &c).await?;
+            let api = crate::open_api_client(current_dir, &c).await?;
             match api.get_workspaces().await {
                 Ok(workspaces) => {
                     println!(
@@ -475,7 +475,7 @@ async fn run_doctor(current_dir: &Path) -> anyhow::Result<()> {
                     all_ok = false;
                 }
             }
-            match ClientDb::new(current_dir.join(".feanorfs")).await {
+            match crate::open_client_db(current_dir).await {
                 Ok(_) => println!("[OK]  Local cache DB: accessible"),
                 Err(e) => {
                     println!("[FAIL] Local cache DB: {}", e);
@@ -535,7 +535,7 @@ async fn run_summary(
     let password = load_config(current_dir)
         .ok()
         .and_then(|c| c.encryption_password);
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+    let db = crate::open_client_db(current_dir).await?;
     let result = summary::diff_since_last_session(current_dir, &db, password.as_deref()).await?;
     if !no_remember {
         summary::commit_session_marker(current_dir, &db, password.as_deref()).await?;

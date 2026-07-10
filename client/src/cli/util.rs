@@ -1,8 +1,7 @@
 use anyhow::Context as _;
 use feanorfs_client::{
     conflicts, do_sync, encode_invite, hub::LocalHub, load_global_config, save_config,
-    save_global_config, validate_e2ee_key, ApiClient, ClientDb, Config, GlobalConfig,
-    WorkspaceInvite, LOCAL_HUB_URL,
+    save_global_config, validate_e2ee_key, Config, GlobalConfig, WorkspaceInvite, LOCAL_HUB_URL,
 };
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -244,22 +243,22 @@ pub async fn initialize_new_mirror(
         workspace_id: workspace.clone(),
         encryption_password: Some(e2ee_key.clone()),
         server_password: srv_pass.clone(),
-        format_version: 2,
+        format_version: 3,
         hub_local,
     };
-    if let Err(e) = validate_e2ee_key(&e2ee_key, 2) {
+    if let Err(e) = validate_e2ee_key(&e2ee_key, 3) {
         if !was_generated {
             return Err(e);
         }
     }
     save_config(current_dir, &config)?;
 
+    let _db = crate::open_client_db(current_dir).await?;
+
     if hub_local {
         let hub_dir = config.hub_data_dir(current_dir);
         LocalHub::open(hub_dir, srv_pass.clone()).await?;
     }
-
-    let _db = ClientDb::new(current_dir.join(".feanorfs")).await?;
 
     println!("This folder is now mirrored to FeanorFS.");
     if hub_local {
@@ -339,17 +338,17 @@ pub async fn link_existing_mirror(
         workspace_id: workspace.clone(),
         encryption_password: Some(encryption_key.clone()),
         server_password: srv_pass.clone(),
-        format_version: 2,
+        format_version: 3,
         hub_local,
     };
-    validate_e2ee_key(&encryption_key, 2)?;
+    validate_e2ee_key(&encryption_key, 3)?;
     save_config(current_dir, &config)?;
+
+    let db = crate::open_client_db(current_dir).await?;
 
     if hub_local {
         LocalHub::open(config.hub_data_dir(current_dir), srv_pass.clone()).await?;
     }
-
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
 
     println!("Linked this folder to mirrored workspace '{}'.", workspace);
     if hub_local {
@@ -362,7 +361,7 @@ pub async fn link_existing_mirror(
         println!("  Server auth: enabled");
     }
 
-    let api = ApiClient::from_config(current_dir, &config).await?;
+    let api = crate::open_api_client(current_dir, &config).await?;
     let local_files =
         feanorfs_client::local::scan_local_directory(current_dir, &db, Some(&encryption_key))
             .await?;

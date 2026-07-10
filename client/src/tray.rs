@@ -198,7 +198,7 @@ async fn cheap_tray_status(
 
 pub async fn do_tray_status(current_dir: &Path) -> Result<TrayStatusResult> {
     let config = load_config(current_dir)?;
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+    let db = crate::open_client_db(current_dir).await?;
 
     if is_syncing(current_dir) {
         return cheap_tray_status(current_dir, &config, &db).await;
@@ -210,7 +210,7 @@ pub async fn do_tray_status(current_dir: &Path) -> Result<TrayStatusResult> {
     }
     let _sync_guard = lock_wait?;
 
-    let api = ApiClient::from_config(current_dir, &config).await?;
+    let api = crate::open_api_client(current_dir, &config).await?;
     let password = config.encryption_password.as_deref();
 
     let status = do_status(&api, &db, current_dir, &config.workspace_id, password).await?;

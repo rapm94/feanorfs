@@ -1,0 +1,1 @@
+{"entries":[{"snapshot_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","parents":["fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"],"author":"ci1","created_at_ms":1719500000000,"message":"land","changed_paths":["src/main.rs"]}]}
