@@ -2,8 +2,8 @@ use clap::Subcommand;
 use feanorfs_client::{
     build_conflict_show,
     conflict_artifacts::{is_binary_content, resolve_artifact, ArtifactRole},
-    conflicts, invalidate_agent_cache, load_config, ApiClient, ClientDb, ConflictKeepResult,
-    ResolveKeep, SyncCtx,
+    conflicts, invalidate_agent_cache, load_config, ClientDb, ConflictKeepResult, ResolveKeep,
+    SyncCtx,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -72,8 +72,8 @@ fn parse_keep_flags(
 
 pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> anyhow::Result<()> {
     let config = load_config(current_dir)?;
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-    let api = ApiClient::from_config(current_dir, &config).await?;
+    let db = crate::open_client_db(current_dir).await?;
+    let api = crate::open_api_client(current_dir, &config).await?;
     let ctx = SyncCtx::from_config(&api, &db, current_dir, &config)?;
     match action {
         ConflictsAction::List => {

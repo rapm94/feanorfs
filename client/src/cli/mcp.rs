@@ -1,7 +1,6 @@
 use anyhow::Context;
 use feanorfs_client::{
-    check_agent, land_agent, load_config, refresh_agent, spawn_agent, ApiClient, ClientDb,
-    ResolveKeep, SyncCtx,
+    check_agent, land_agent, load_config, refresh_agent, spawn_agent, ResolveKeep, SyncCtx,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -98,6 +97,15 @@ fn tool_list() -> Value {
                 "required": ["path", "keep"]
             })),
             tool("sync_status", "Workspace sync status", json!({ "type": "object", "properties": {} })),
+            tool("workspace_log", "List workspace snapshot history", json!({
+                "type": "object",
+                "properties": { "limit": { "type": "integer", "minimum": 0, "maximum": 1000 } }
+            })),
+            tool("workspace_undo", "Restore a reachable snapshot", json!({
+                "type": "object",
+                "properties": { "snapshot_id": { "type": "string", "minLength": 8 } },
+                "required": ["snapshot_id"]
+            })),
         ]
     })
 }
@@ -132,8 +140,8 @@ async fn dispatch(current_dir: &Path, method: &str, params: &Value) -> anyhow::R
 
 async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Result<Value> {
     let config = load_config(current_dir)?;
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-    let api = ApiClient::from_config(current_dir, &config).await?;
+    let db = crate::open_client_db(current_dir).await?;
+    let api = crate::open_api_client(current_dir, &config).await?;
     let ctx = SyncCtx::from_config(&api, &db, current_dir, &config)?;
     let pw = config.encryption_password.as_deref();
 
@@ -210,6 +218,21 @@ async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Re
             let r = feanorfs_client::do_status(&api, &db, current_dir, &config.workspace_id, pw)
                 .await?;
             Ok(serde_json::to_value(r)?)
+        }
+        "workspace_log" => {
+            let limit = params["limit"]
+                .as_u64()
+                .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+                .unwrap_or(20);
+            let result = feanorfs_agent_core::history::log(&ctx, limit).await?;
+            Ok(serde_json::to_value(result)?)
+        }
+        "workspace_undo" => {
+            let snapshot_id = params["snapshot_id"]
+                .as_str()
+                .context("snapshot_id required")?;
+            let result = feanorfs_agent_core::history::undo(&ctx, snapshot_id).await?;
+            Ok(serde_json::to_value(result)?)
         }
         other => anyhow::bail!("unknown method: {other}"),
     }

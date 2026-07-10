@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod conflicts;
 pub mod events;
+pub mod history;
 pub mod hydrate;
 pub mod mcp;
 pub mod serve;

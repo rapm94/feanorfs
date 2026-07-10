@@ -24,3 +24,5 @@ contract_snapshot!(agent_check_json, fixtures::agent_check_json());
 contract_snapshot!(agent_land_json, fixtures::agent_land_json());
 contract_snapshot!(agent_refresh_json, fixtures::agent_refresh_json());
 contract_snapshot!(agent_clean_json, fixtures::agent_clean_json());
+contract_snapshot!(log_json, fixtures::log_json());
+contract_snapshot!(undo_json, fixtures::undo_json());

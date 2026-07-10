@@ -1,5 +1,5 @@
 use crate::api::ApiClient;
-use crate::fs_util::{atomic_write, file_mtime_ms};
+use crate::fs_util::{apply_executable_mode, atomic_write, file_mtime_ms};
 use crate::local::{CacheEntry, ClientDb};
 use anyhow::Result;
 use feanorfs_common::unpack_bytes;
@@ -121,6 +121,7 @@ async fn hydrate_one(
     }
     let plain = unpack_bytes(&encrypted, password, &entry.path)?;
     atomic_write(base, &entry.path, &plain).await?;
+    apply_executable_mode(&base.join(&entry.path), entry.mode).await?;
 
     let actual_mtime = file_mtime_ms(&base.join(&entry.path))
         .await
@@ -135,6 +136,7 @@ async fn hydrate_one(
         size: plain.len() as u64,
         mtime: actual_mtime,
         server_mtime: entry.server_mtime,
+        mode: entry.mode,
         hydrated: true,
         deleted_at: None,
     })

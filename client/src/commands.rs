@@ -1,9 +1,8 @@
 use crate::api::ApiClient;
 use crate::conflicts;
 use crate::ctx::SyncCtx;
-use crate::fs_util::{atomic_write, file_mtime_ms, set_readonly};
-use crate::local::{load_config, CacheEntry, ClientDb};
-use crate::migrate::legacy_policy_for_config;
+use crate::fs_util::{apply_executable_mode, atomic_write, file_mtime_ms, set_readonly};
+use crate::local::{load_config, CacheEntry, ClientDb, Config};
 use anyhow::Result;
 use feanorfs_agent_core::sync_pass::{self, SyncMode};
 use feanorfs_common::{unpack_bytes_with_policy, FileState, SyncResponse};
@@ -169,6 +168,23 @@ pub async fn do_pull_only(
     })
 }
 
+pub(crate) async fn do_pull_only_with_config(
+    api: &ApiClient,
+    db: &ClientDb,
+    base_path: &Path,
+    config: &Config,
+    lazy: bool,
+) -> Result<PullResult> {
+    let ctx = SyncCtx::from_config(api, db, base_path, config)?;
+    let (outcome, blocked) = sync_pass::run_sync_pass(&ctx, SyncMode::Pull, lazy).await?;
+    Ok(PullResult {
+        mirror_state: mirror_state_after_apply(&blocked, false),
+        downloads: outcome.downloads,
+        placeholders: outcome.placeholders,
+        deletes: outcome.deletes_local,
+    })
+}
+
 pub async fn do_sync(
     api: &ApiClient,
     db: &ClientDb,
@@ -249,6 +265,7 @@ async fn do_hydrate_with_ctx(
             }
             set_readonly(&full_path, false).await?;
             atomic_write(ctx.base, &path, &plain_content).await?;
+            apply_executable_mode(&full_path, entry.mode).await?;
 
             let actual_mtime = file_mtime_ms(&full_path).await.unwrap_or(entry.mtime);
             let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
@@ -260,6 +277,7 @@ async fn do_hydrate_with_ctx(
                 size: plain_content.len() as u64,
                 mtime: actual_mtime,
                 server_mtime: entry.server_mtime,
+                mode: entry.mode,
                 hydrated: true,
                 deleted_at: None,
             };
@@ -351,7 +369,7 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
     let local_files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     let skipped_symlinks = crate::local::collect_symlink_warnings(ctx.base);
     let pending = conflicts::pending_conflict_paths(ctx.db).await?;
-    let last = conflicts::load_last_synced(ctx.db).await?;
+    let last = conflicts::load_last_synced_snapshot(ctx).await?;
 
     match conflicts::negotiate_sync_with_conflict_gate(ctx, &local_files, false).await {
         Err(_) => {
@@ -376,7 +394,10 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
             })
         }
         Ok((response, blocked)) => {
-            let server_files: Vec<FileState> = response.download_required.clone();
+            let server_files: Vec<FileState> = conflicts::load_server_view(ctx)
+                .await?
+                .into_values()
+                .collect();
             Ok(StatusResult {
                 mirror_state: derive_mirror_state(Some(&response), Some(&blocked)),
                 upload_required: response.upload_required,
@@ -401,14 +422,11 @@ pub async fn prune_ignored(
     dry_run: bool,
 ) -> Result<PruneIgnoredResult> {
     let config = load_config(base_path)?;
-    let ctx = SyncCtx::new(
-        api,
-        db,
-        base_path,
-        workspace_id,
-        config.encryption_password.as_deref(),
-        legacy_policy_for_config(&config),
+    anyhow::ensure!(
+        config.workspace_id == workspace_id,
+        "workspace id does not match local configuration"
     );
+    let ctx = SyncCtx::from_config(api, db, base_path, &config)?;
     prune_ignored_with_ctx(&ctx, dry_run).await
 }
 
@@ -445,17 +463,22 @@ async fn prune_ignored_with_ctx(ctx: &SyncCtx<'_>, dry_run: bool) -> Result<Prun
     }
     let mut pruned = Vec::new();
     for path in &to_prune {
-        let mtime = chrono::Utc::now().timestamp_millis();
-        let hash = feanorfs_common::hash_bytes(b"");
-        ctx.api
-            .upload_tombstone(ctx.workspace_id(), path, &hash, mtime)
-            .await?;
+        if ctx.format_version() < 3 {
+            let mtime = chrono::Utc::now().timestamp_millis();
+            let hash = feanorfs_common::hash_bytes(b"");
+            ctx.api
+                .upload_tombstone(ctx.workspace_id(), path, &hash, mtime)
+                .await?;
+        }
         ctx.db.delete_cache_entry(path).await?;
         let full = ctx.base.join(path);
         if full.exists() {
             tokio::fs::remove_file(&full).await.ok();
         }
         pruned.push(path.clone());
+    }
+    if ctx.format_version() >= 3 && !pruned.is_empty() {
+        sync_pass::run_sync_pass(ctx, SyncMode::Push, false).await?;
     }
     Ok(PruneIgnoredResult {
         pruned,

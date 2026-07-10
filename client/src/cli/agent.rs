@@ -1,8 +1,8 @@
 use clap::Subcommand;
 use feanorfs_client::{
     check_agent, clean_agent, invalidate_agent_cache, land_agent, list_agents, load_config,
-    refresh_agent, spawn_agent, AgentCleanResult, AgentListEntry, AgentListOfflineResult,
-    AgentListResult, ApiClient, ClientDb, SpawnResult,
+    refresh_agent_with_options, spawn_agent, AgentCleanResult, AgentListEntry,
+    AgentListOfflineResult, AgentListResult, ApiClient, ClientDb, RefreshOptions, SpawnResult,
 };
 use std::path::Path;
 
@@ -37,7 +37,11 @@ pub enum AgentAction {
         propose: bool,
     },
     /// Pull cloud changes into the agent for paths the agent hasn't edited.
-    Refresh { name: String },
+    Refresh {
+        name: String,
+        #[arg(long)]
+        replace: bool,
+    },
     /// Remove an agent workspace and its snapshot rows.
     Clean { name: String },
     /// Run a command with the agent workspace as its working directory.
@@ -67,8 +71,8 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             replace,
         } => {
             let config = load_config(current_dir)?;
-            let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::from_config(current_dir, &config).await?;
+            let db = crate::open_client_db(current_dir).await?;
+            let api = crate::open_api_client(current_dir, &config).await?;
             let count = spawn_agent(
                 current_dir,
                 &db,
@@ -98,8 +102,8 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             propose,
         } => {
             let config = load_config(current_dir)?;
-            let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::from_config(current_dir, &config).await?;
+            let db = crate::open_client_db(current_dir).await?;
+            let api = crate::open_api_client(current_dir, &config).await?;
             let result = land_agent(
                 current_dir,
                 &db,
@@ -118,17 +122,18 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 println!("{}", result.message);
             }
         }
-        AgentAction::Refresh { name } => {
+        AgentAction::Refresh { name, replace } => {
             let config = load_config(current_dir)?;
-            let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-            let api = ApiClient::from_config(current_dir, &config).await?;
-            let result = refresh_agent(
+            let db = crate::open_client_db(current_dir).await?;
+            let api = crate::open_api_client(current_dir, &config).await?;
+            let result = refresh_agent_with_options(
                 current_dir,
                 &db,
                 &api,
                 &config.workspace_id,
                 &name,
                 config.encryption_password.as_deref(),
+                RefreshOptions { replace },
             )
             .await?;
             if json {
@@ -138,7 +143,7 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             }
         }
         AgentAction::Clean { name } => {
-            let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+            let db = crate::open_client_db(current_dir).await?;
             clean_agent(current_dir, &db, &name).await?;
             if json {
                 output_json(&AgentCleanResult { cleaned: name })?;
@@ -176,8 +181,8 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
 
 async fn run_agent_check(current_dir: &Path, name: &str, json: bool) -> anyhow::Result<()> {
     let config = load_config(current_dir)?;
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
-    let api = ApiClient::from_config(current_dir, &config).await?;
+    let db = crate::open_client_db(current_dir).await?;
+    let api = crate::open_api_client(current_dir, &config).await?;
     let result = check_agent(
         current_dir,
         &db,
@@ -208,7 +213,7 @@ async fn run_agent_check(current_dir: &Path, name: &str, json: bool) -> anyhow::
 }
 
 async fn run_agent_list_legacy(current_dir: &Path, json: bool) -> anyhow::Result<()> {
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+    let db = crate::open_client_db(current_dir).await?;
     let names = list_agents(current_dir, &db).await?;
     if json {
         output_json(&AgentListOfflineResult { agents: names })?;
@@ -245,11 +250,11 @@ async fn agent_one_line_state(
 }
 
 async fn run_agent_status_list(current_dir: &Path, json: bool) -> anyhow::Result<()> {
-    let db = ClientDb::new(current_dir.join(".feanorfs")).await?;
+    let db = crate::open_client_db(current_dir).await?;
     let names = list_agents(current_dir, &db).await?;
 
     let enriched = match load_config(current_dir) {
-        Ok(config) => match ApiClient::from_config(current_dir, &config).await {
+        Ok(config) => match crate::open_api_client(current_dir, &config).await {
             Ok(api) => Some((config, api)),
             Err(_) => None,
         },

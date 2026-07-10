@@ -48,6 +48,9 @@ reflink = { workspace = true }
 unicode-normalization = { workspace = true }
 diffy = { workspace = true }
 libc = "0.2"
+fs2 = "0.4"
+atomic-write-file = "0.3"
+blake3 = { workspace = true }
 
 [dev-dependencies]
 feanorfs-server = { workspace = true }
