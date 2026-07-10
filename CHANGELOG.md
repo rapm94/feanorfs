@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-10
+
+### Changed
+
+- GitHub Releases now focus on the unified `feanorfs` binary and optional macOS tray artifacts.
+- Tray artifacts start only for version tags and wait for cargo-dist to create the release.
+
+### Fixed
+
+- Release automation now runs only after trusted `main` CI and checks the exact tested commit.
+- Release-plz package verification no longer re-enters Cargo metadata from the FFI header build.
+- Privileged tray release builds no longer restore pull-request-populated Rust caches.
+
+## [0.3.3] - 2026-07-09
+
+### Fixed
+
+- Excluded the macOS-only tray crate from cargo-dist workspace package discovery.
+
+## [0.3.2] - 2026-07-09
+
+### Fixed
+
+- Moved tray packaging into its own post-release workflow.
+
+## [0.3.1] - 2026-07-09
+
+### Fixed
+
+- Hardened tray runtime behavior and release orchestration.
+
 ## [0.3.0] - 2026-07-09
 
 ### Added
@@ -81,7 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
 - **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
-[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/rapm94/feanorfs/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/rapm94/feanorfs/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/rapm94/feanorfs/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/rapm94/feanorfs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/rapm94/feanorfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rapm94/feanorfs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0
