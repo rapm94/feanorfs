@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { agentList, agentSpawn, agentStatus, agentRefresh, agentLand, agentClean, conflictsKeep } = nativeBinding
+const { agentList, agentSpawn, agentStatus, agentRefresh, agentLand, agentClean, historyLog, undo, conflictsKeep } = nativeBinding
 
 module.exports.agentList = agentList
 module.exports.agentSpawn = agentSpawn
@@ -318,4 +318,6 @@ module.exports.agentStatus = agentStatus
 module.exports.agentRefresh = agentRefresh
 module.exports.agentLand = agentLand
 module.exports.agentClean = agentClean
+module.exports.historyLog = historyLog
+module.exports.undo = undo
 module.exports.conflictsKeep = conflictsKeep

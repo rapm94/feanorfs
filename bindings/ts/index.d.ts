@@ -17,5 +17,7 @@ export declare function agentStatus(root: string, name: string): Promise<string>
 export declare function agentRefresh(root: string, name: string): Promise<string>
 export declare function agentLand(root: string, name: string, opts?: LandOptionsJs | undefined | null): Promise<string>
 export declare function agentClean(root: string, name: string): Promise<string>
+export declare function historyLog(root: string, limit?: number | undefined | null): Promise<string>
+export declare function undo(root: string, snapshotId: string): Promise<string>
 /** keep: 0=local, 1=cloud, 2=both, 3=file (requires filePath) */
 export declare function conflictsKeep(root: string, path: string, keep: number, filePath?: string | undefined | null): Promise<void>

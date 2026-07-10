@@ -137,6 +137,32 @@ pub async fn agent_clean(root: String, name: String) -> Result<String> {
     .await
 }
 
+#[napi]
+pub async fn history_log(root: String, limit: Option<u32>) -> Result<String> {
+    run(move || {
+        let result = open(&root)?
+            .log(
+                limit
+                    .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+                    .unwrap_or(20),
+            )
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
+    })
+    .await
+}
+
+#[napi]
+pub async fn undo(root: String, snapshot_id: String) -> Result<String> {
+    run(move || {
+        let result = open(&root)?
+            .undo(&snapshot_id)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
+    })
+    .await
+}
+
 /// keep: 0=local, 1=cloud, 2=both, 3=file (requires filePath)
 #[napi]
 pub async fn conflicts_keep(

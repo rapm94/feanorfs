@@ -43,6 +43,7 @@ export interface AgentLandResult {
   conflicts: ConcurrentEdit[]
   landed: LandedPath[]
   message: string
+  readonly snapshot_id?: string
 }
 
 export interface AgentRefreshResult {
@@ -53,6 +54,25 @@ export interface AgentRefreshResult {
 
 export interface AgentCleanResult {
   cleaned: string
+}
+
+export interface LogEntry {
+  readonly snapshot_id: string
+  readonly parents: readonly string[]
+  readonly author: string
+  readonly created_at_ms: number
+  readonly message: string | null
+  readonly changed_paths: readonly string[]
+}
+
+export interface LogResult {
+  readonly entries: readonly LogEntry[]
+}
+
+export interface UndoResult {
+  readonly snapshot_id: string
+  readonly restored_snapshot_id: string
+  readonly changed_paths: readonly string[]
 }
 
 export interface LandedPath {
@@ -103,6 +123,8 @@ export declare function land(
   opts?: LandOptions,
 ): Promise<AgentLandResult>
 export declare function clean(root: string, name: string): Promise<AgentCleanResult>
+export declare function log(root: string, limit?: number): Promise<LogResult>
+export declare function undo(root: string, snapshotId: string): Promise<UndoResult>
 export declare function conflictsKeep(
   root: string,
   path: string,
