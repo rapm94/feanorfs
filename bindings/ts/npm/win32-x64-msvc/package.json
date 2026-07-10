@@ -1,0 +1,27 @@
+{
+  "name": "@feanorfs/agent-win32-x64-msvc",
+  "version": "0.3.3",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "feanorfs-agent-node.win32-x64-msvc.node",
+  "files": [
+    "feanorfs-agent-node.win32-x64-msvc.node"
+  ],
+  "description": "Native Node bindings for FeanorFS agent workspaces",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rapm94/feanorfs.git",
+    "directory": "bindings/ts"
+  }
+}

@@ -1,0 +1,300 @@
+name: npm native release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  trust:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      dry-run: ${{ steps.release.outputs.dry-run }}
+      sha: ${{ steps.release.outputs.sha }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Verify tag, main reachability, version, and trusted CI
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          PACKAGE_VERSION="$(jq -r '.version' bindings/ts/package.json)"
+          if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
+            echo "::error::bindings/ts version $PACKAGE_VERSION does not match workspace $VERSION."
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            TAG_OBJECT="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+            TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"
+            TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"
+            if [ "$TAG_TYPE" = "tag" ]; then
+              TAG_SHA="$(gh api "repos/$REPOSITORY/git/tags/$TAG_SHA" --jq '.object.sha')"
+            fi
+            if [ "$TAG_SHA" != "$EXPECTED_SHA" ]; then
+              echo "::error::Tag resolves to $TAG_SHA, expected $EXPECTED_SHA."
+              exit 1
+            fi
+            if [ "$RELEASE_TAG" != "v$VERSION" ]; then
+              echo "::error::Tag $RELEASE_TAG does not match workspace version v$VERSION."
+              exit 1
+            fi
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$EXPECTED_SHA" origin/main; then
+              echo "::error::Release commit is not reachable from origin/main."
+              exit 1
+            fi
+            RUNS="$(gh api --method GET "repos/$REPOSITORY/actions/workflows/ci.yml/runs" \
+              -f head_sha="$EXPECTED_SHA" -f event=push -f status=completed -f per_page=100)"
+            if ! jq -e --arg repository "$REPOSITORY" \
+              'any(.workflow_runs[]; .conclusion == "success" and .head_branch == "main" and .head_repository.full_name == $repository)' \
+              <<<"$RUNS" >/dev/null; then
+              echo "::error::No successful trusted main push CI found for $EXPECTED_SHA."
+              exit 1
+            fi
+            echo "dry-run=false" >>"$GITHUB_OUTPUT"
+          else
+            if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$REF" != "refs/heads/main" ]; then
+              echo "::error::Manual dry runs must dispatch from main."
+              exit 1
+            fi
+            echo "dry-run=true" >>"$GITHUB_OUTPUT"
+          fi
+          echo "sha=$EXPECTED_SHA" >>"$GITHUB_OUTPUT"
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+
+  build-native:
+    name: Build ${{ matrix.target }}
+    needs: trust
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: darwin-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: feanorfs-agent-node.darwin-x64.node
+            zig: false
+          - id: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            artifact: feanorfs-agent-node.darwin-arm64.node
+            zig: false
+          - id: linux-x64-gnu
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: feanorfs-agent-node.linux-x64-gnu.node
+            zig: false
+          - id: linux-arm64-gnu
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: feanorfs-agent-node.linux-arm64-gnu.node
+            zig: true
+          - id: win32-x64-msvc
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: feanorfs-agent-node.win32-x64-msvc.node
+            zig: false
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          ref: ${{ needs.trust.outputs.sha }}
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Install Zig
+        if: ${{ matrix.zig }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Install napi-rs CLI
+        working-directory: bindings/ts
+        run: npm ci --ignore-scripts
+      - name: Build native addon
+        shell: bash
+        working-directory: bindings/ts
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+          USE_ZIG: ${{ matrix.zig }}
+        run: |
+          set -euo pipefail
+          args=(build --release -p feanorfs-agent-node --target "$TARGET")
+          if [ "$USE_ZIG" = "true" ]; then
+            args+=(--zig)
+          fi
+          ./node_modules/.bin/napi "${args[@]}"
+          test -f "$ARTIFACT"
+          mkdir artifact
+          cp "$ARTIFACT" artifact/
+      - name: Upload immutable native artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-${{ matrix.id }}-${{ needs.trust.outputs.sha }}
+          path: bindings/ts/artifact/${{ matrix.artifact }}
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Assemble and test npm packages
+    needs: [trust, build-native]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          ref: ${{ needs.trust.outputs.sha }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Download native artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          merge-multiple: true
+          path: bindings/ts/artifacts
+          pattern: native-*-${{ needs.trust.outputs.sha }}
+      - name: Assemble deterministic packages
+        working-directory: bindings/ts
+        run: |
+          npm ci --ignore-scripts
+          npm run create-npm-dir
+          npm run assemble-packages
+          npm run verify-packages
+      - name: Pack six tarballs
+        working-directory: bindings/ts
+        run: |
+          mkdir -p dist/npm
+          npm pack --pack-destination dist/npm .
+          for package_dir in npm/darwin-x64 npm/darwin-arm64 npm/linux-x64-gnu npm/linux-arm64-gnu npm/win32-x64-msvc; do
+            npm pack --pack-destination dist/npm "./$package_dir"
+          done
+      - name: Test resumable publishing logic
+        working-directory: bindings/ts
+        run: TARBALL_DIR=dist/npm npm run test:publish-packages
+      - name: Build CLI for packed-package smoke
+        run: cargo build --release -p feanorfs-client --locked
+      - name: Test packed facade offline
+        working-directory: bindings/ts
+        env:
+          FEANORFS_BIN: ${{ github.workspace }}/target/release/feanorfs
+          VERSION: ${{ needs.trust.outputs.version }}
+        run: |
+          smoke="$(mktemp -d)"
+          trap 'rm -rf "$smoke"' EXIT
+          cp test/loop.mjs "$smoke/loop.mjs"
+          printf '%s\n' '{"name":"packed-smoke","private":true,"type":"module"}' >"$smoke/package.json"
+          npm install --prefix "$smoke" --offline --ignore-scripts \
+            --registry=http://127.0.0.1:9 \
+            "$PWD/dist/npm/feanorfs-agent-$VERSION.tgz" \
+            "$PWD/dist/npm/feanorfs-agent-linux-x64-gnu-$VERSION.tgz"
+          FEANORFS_AGENT_IMPORT=@feanorfs/agent node "$smoke/loop.mjs"
+      - name: Registry dry run
+        if: ${{ needs.trust.outputs.dry-run == 'true' }}
+        working-directory: bindings/ts
+        run: npm run publish-packages -- --tarball-dir dist/npm --dry-run
+      - name: Upload immutable npm tarballs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-tarballs-${{ needs.trust.outputs.sha }}
+          path: bindings/ts/dist/npm/*.tgz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish npm packages
+    if: ${{ github.event_name == 'push' && needs.trust.outputs.dry-run == 'false' }}
+    needs: [trust, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          ref: ${{ needs.trust.outputs.sha }}
+      - name: Install Node with npm registry
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+          registry-url: https://registry.npmjs.org
+      - name: Download verified npm tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: npm-tarballs-${{ needs.trust.outputs.sha }}
+          path: bindings/ts/dist/npm
+      - name: Verify npm authentication mode
+        env:
+          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+          TRUSTED_PUBLISHING: ${{ vars.NPM_TRUSTED_PUBLISHING == 'true' }}
+        run: |
+          npm_major="$(npm --version | cut -d. -f1)"
+          npm_minor="$(npm --version | cut -d. -f2)"
+          if [ "$npm_major" -lt 11 ] || { [ "$npm_major" -eq 11 ] && [ "$npm_minor" -lt 5 ]; }; then
+            echo "::error::Trusted publishing requires npm 11.5.1 or newer."
+            exit 1
+          fi
+          if [ "$HAS_NPM_TOKEN" != "true" ] && [ "$TRUSTED_PUBLISHING" != "true" ]; then
+            echo "::error::Configure NPM_TOKEN or set NPM_TRUSTED_PUBLISHING=true."
+            exit 1
+          fi
+      - name: Publish or verify exact packages
+        working-directory: bindings/ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/publish-packages.mjs --tarball-dir dist/npm

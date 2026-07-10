@@ -1,0 +1,30 @@
+{
+  "name": "@feanorfs/agent-linux-x64-gnu",
+  "version": "0.3.3",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "feanorfs-agent-node.linux-x64-gnu.node",
+  "files": [
+    "feanorfs-agent-node.linux-x64-gnu.node"
+  ],
+  "description": "Native Node bindings for FeanorFS agent workspaces",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rapm94/feanorfs.git",
+    "directory": "bindings/ts"
+  },
+  "libc": [
+    "glibc"
+  ]
+}
