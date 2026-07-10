@@ -11,7 +11,7 @@ contributor templates.
 - `workflows/security.yml` — CodeQL, zizmor, and scheduled dependency audits.
 - `workflows/release-plz.yml` — post-CI version PR and tag automation.
 - `workflows/release.yml` — generated cargo-dist release workflow.
-- `workflows/tray-release.yml` — post-release macOS tray artifacts.
+- `workflows/tray-release.yml` — post-tag macOS tray artifacts (waits for cargo-dist).
 - `dependabot.yml` — Cargo, npm, and GitHub Actions updates.
 - `actionlint.yaml` — narrow suppressions for generated workflow shell.
 
@@ -33,6 +33,8 @@ contributor templates.
 - Release-plz may tag only after successful CI on a trusted `main` push.
 - Privileged `workflow_run` jobs validate source repository, event, branch/tag,
   conclusion, and exact commit before using secrets or uploading artifacts.
+  Tray release triggers on `v*` tag push and polls until cargo-dist publishes
+  the GitHub Release before building.
 - `release.yml` is cargo-dist generated. Configure `dist-workspace.toml` and
   regenerate; never patch the workflow directly.
 

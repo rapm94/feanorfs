@@ -30,7 +30,9 @@ macOS menu-bar companion for FeanorFS. Shells `feanorfs --json` for status, conf
 
 - `cargo build -p feanorfs-tray`
 - CI job `tray` on `macos-latest` enforces Rust 1.88, Clippy, tests, a release build, and CLI smoke coverage.
-- `tray-release.yml` runs after cargo-dist succeeds, verifies the release tag resolves to the triggering commit, then builds, checksums, attests, and uploads arm64 and x86_64 macOS archives to the existing GitHub Release.
+- `tray-release.yml` triggers on `v*` tag push, waits for cargo-dist to publish
+  the GitHub Release, verifies the tag resolves to the tagged commit, then
+  builds, checksums, attests, and uploads arm64 and x86_64 macOS archives.
 - Manual: `feanorfs-tray` with `FEANORFS_WORKSPACE` set
 
 ## Child DOX Index
