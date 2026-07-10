@@ -8,6 +8,7 @@ fn sample_file_state(path: &str, hash: &str, size: u64, mtime: i64, deleted: boo
         size,
         mtime,
         deleted,
+        mode: 0,
     }
 }
 
@@ -189,6 +190,7 @@ fn fs(path: &str, hash: &str, deleted: bool) -> FileState {
         size: 10,
         mtime: 100,
         deleted,
+        mode: 0,
     }
 }
 
@@ -234,6 +236,50 @@ fn no_base_leg_same_content_no_conflict() {
     );
 
     assert!(conflicts.is_empty());
+}
+
+#[test]
+fn both_changed_to_same_content_converges_despite_mtime_skew() {
+    let mut base = HashMap::new();
+    base.insert("same.txt".into(), fs("same.txt", "base", false));
+    let mut ours = fs("same.txt", "shared", false);
+    ours.mtime = i64::MAX;
+    let mut theirs = fs("same.txt", "shared", false);
+    theirs.mtime = i64::MIN;
+    let local = HashMap::from([("same.txt".into(), ours)]);
+    let cloud = HashMap::from([("same.txt".into(), theirs)]);
+
+    let conflicts = detect_concurrent_edits(
+        &base,
+        &local,
+        &cloud,
+        &HashSet::new(),
+        vec!["same.txt".into()],
+        &HashSet::new(),
+    );
+
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn both_changed_to_different_executable_intent_conflicts() {
+    let mut ours = fs("script.sh", "shared", false);
+    ours.mode = 1;
+    let theirs = fs("script.sh", "shared", false);
+    let base = HashMap::new();
+    let local = HashMap::from([("script.sh".to_string(), ours)]);
+    let cloud = HashMap::from([("script.sh".to_string(), theirs)]);
+
+    let conflicts = detect_concurrent_edits(
+        &base,
+        &local,
+        &cloud,
+        &HashSet::new(),
+        vec!["script.sh".to_string()],
+        &HashSet::new(),
+    );
+
+    assert_eq!(conflicts.len(), 1);
 }
 
 #[test]

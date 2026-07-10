@@ -39,6 +39,31 @@ pub struct AgentCleanResult {
     pub cleaned: String,
 }
 
+/// One immutable workspace snapshot exposed through history APIs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEntry {
+    pub snapshot_id: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub created_at_ms: i64,
+    pub message: Option<String>,
+    pub changed_paths: Vec<String>,
+}
+
+/// Structured workspace history result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogResult {
+    pub entries: Vec<LogEntry>,
+}
+
+/// Result of restoring a historical snapshot as a new commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndoResult {
+    pub snapshot_id: String,
+    pub restored_snapshot_id: String,
+    pub changed_paths: Vec<String>,
+}
+
 fn sample_file_state(path: &str) -> FileState {
     FileState {
         path: path.to_string(),
@@ -46,6 +71,7 @@ fn sample_file_state(path: &str) -> FileState {
         size: 42,
         mtime: 1_719_500_000_000,
         deleted: false,
+        mode: 0,
     }
 }
 
@@ -121,6 +147,7 @@ pub mod fixtures {
                 action: "applied".to_string(),
             }],
             message: "Landed 1 path; 1 needs attention.".to_string(),
+            snapshot_id: None,
         }
     }
 
@@ -135,6 +162,32 @@ pub mod fixtures {
     pub fn agent_clean_result() -> AgentCleanResult {
         AgentCleanResult {
             cleaned: "ci1".to_string(),
+        }
+    }
+
+    pub fn log_result() -> LogResult {
+        LogResult {
+            entries: vec![LogEntry {
+                snapshot_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                parents: vec![
+                    "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
+                ],
+                author: "ci1".to_string(),
+                created_at_ms: 1_719_500_000_000,
+                message: Some("land".to_string()),
+                changed_paths: vec!["src/main.rs".to_string()],
+            }],
+        }
+    }
+
+    pub fn undo_result() -> UndoResult {
+        UndoResult {
+            snapshot_id: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
+            restored_snapshot_id:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            changed_paths: vec!["src/main.rs".to_string()],
         }
     }
 
@@ -164,5 +217,13 @@ pub mod fixtures {
 
     pub fn agent_clean_json() -> String {
         serde_json::to_string(&agent_clean_result()).unwrap()
+    }
+
+    pub fn log_json() -> String {
+        serde_json::to_string(&log_result()).unwrap()
+    }
+
+    pub fn undo_json() -> String {
+        serde_json::to_string(&undo_result()).unwrap()
     }
 }

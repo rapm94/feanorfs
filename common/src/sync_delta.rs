@@ -65,6 +65,7 @@ mod tests {
             size: 10,
             mtime,
             deleted: false,
+            mode: 0,
         }
     }
 
@@ -75,6 +76,7 @@ mod tests {
             size: 0,
             mtime,
             deleted: true,
+            mode: 0,
         }
     }
 
