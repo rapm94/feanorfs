@@ -16,43 +16,59 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-const LAST_SYNCED_KEY: &str = "last_synced_state";
-
 fn file_changed_since(base: Option<&FileState>, current: &FileState) -> bool {
     match base {
         None => true,
-        Some(b) => current.hash != b.hash || current.deleted != b.deleted,
+        Some(base) => {
+            current.hash != base.hash
+                || current.deleted != base.deleted
+                || current.mode != base.mode
+        }
     }
 }
 
-pub async fn load_last_synced(db: &ClientDb) -> Result<HashMap<String, FileState>> {
-    let from_table = db.load_last_synced_files().await?;
-    if !from_table.is_empty() {
-        return Ok(from_table);
-    }
-    match db.get_session_key(LAST_SYNCED_KEY).await? {
-        Some(s) => match serde_json::from_str::<HashMap<String, FileState>>(&s) {
-            Ok(map) => {
-                if !map.is_empty() {
-                    db.replace_last_synced_files(&map).await?;
-                }
-                Ok(map)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse {LAST_SYNCED_KEY}: {e}");
-                Ok(HashMap::new())
-            }
-        },
-        None => Ok(HashMap::new()),
+fn live_state(state: Option<&FileState>) -> Option<&FileState> {
+    state.filter(|state| !state.deleted)
+}
+
+fn same_content(left: Option<&FileState>, right: Option<&FileState>) -> bool {
+    match (live_state(left), live_state(right)) {
+        (Some(left), Some(right)) => left.hash == right.hash && left.mode == right.mode,
+        (None, None) => true,
+        _ => false,
     }
 }
 
-pub async fn commit_last_synced(
-    db: &ClientDb,
-    updates: &HashMap<String, FileState>,
-    exclude_paths: &HashSet<String>,
-) -> Result<()> {
-    db.upsert_last_synced_files(updates, exclude_paths).await
+/// Load the complete active server view without relying on LWW delta direction.
+pub async fn load_server_view(ctx: &SyncCtx<'_>) -> Result<HashMap<String, FileState>> {
+    if ctx.format_version() >= 3 {
+        return match ctx.api.get_head(ctx.workspace_id()).await? {
+            Some(head) => {
+                crate::snapshot::SnapshotEngine::new(ctx)
+                    .load_files(&head)
+                    .await
+            }
+            None => Ok(HashMap::new()),
+        };
+    }
+    let response = ctx
+        .api
+        .peek_sync(&SyncRequest {
+            workspace_id: ctx.workspace_id().to_string(),
+            files: Vec::new(),
+        })
+        .await?;
+    Ok(response
+        .download_required
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect())
+}
+
+pub async fn load_last_synced_snapshot(ctx: &SyncCtx<'_>) -> Result<HashMap<String, FileState>> {
+    crate::snapshot::SnapshotEngine::new(ctx)
+        .load_last_synced()
+        .await
 }
 
 pub async fn pending_conflict_paths(db: &ClientDb) -> Result<HashSet<String>> {
@@ -74,23 +90,38 @@ pub async fn detect_workspace_conflicts(
     response: &SyncResponse,
     already_pending: &HashSet<String>,
 ) -> Result<Vec<(ConcurrentEdit, ConflictKind)>> {
-    if last_synced.is_empty() {
-        return Ok(Vec::new());
-    }
+    let server_files = load_server_view(ctx).await?;
+    detect_workspace_conflicts_with_server_view(
+        last_synced,
+        local_files,
+        response,
+        already_pending,
+        &server_files,
+    )
+}
 
-    let base_request = SyncRequest {
-        workspace_id: ctx.workspace_id().to_string(),
-        files: last_synced.values().cloned().collect(),
-    };
-    let base_response = ctx.api.peek_sync(&base_request).await?;
-    let their_changed: HashMap<String, FileState> = base_response
-        .download_required
-        .into_iter()
-        .map(|f| (f.path.clone(), f))
+fn detect_workspace_conflicts_with_server_view(
+    last_synced: &HashMap<String, FileState>,
+    local_files: &HashMap<String, FileState>,
+    response: &SyncResponse,
+    already_pending: &HashSet<String>,
+    server_files: &HashMap<String, FileState>,
+) -> Result<Vec<(ConcurrentEdit, ConflictKind)>> {
+    let their_changed: HashMap<String, FileState> = server_files
+        .iter()
+        .filter(|(path, remote)| !same_content(Some(remote), last_synced.get(*path)))
+        .map(|(path, remote)| (path.clone(), remote.clone()))
         .collect();
-    let their_deleted: HashSet<String> = base_response.delete_local.into_iter().collect();
+    let their_deleted: HashSet<String> = last_synced
+        .iter()
+        .filter(|(path, base)| !base.deleted && !server_files.contains_key(*path))
+        .map(|(path, _)| path.clone())
+        .collect();
 
-    let candidates = conflict_candidate_paths(response, already_pending);
+    let candidates = conflict_candidate_paths(response, already_pending)
+        .into_iter()
+        .chain(their_changed.keys().cloned())
+        .chain(their_deleted.iter().cloned());
     let mut edits = detect_concurrent_edits(
         last_synced,
         local_files,
@@ -190,6 +221,10 @@ pub async fn resolve_conflict(
         .get_conflict_record(path)
         .await?
         .with_context(|| format!("no pending conflict for {path}"))?;
+    let before = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    crate::snapshot::SnapshotEngine::new(ctx)
+        .snapshot_local_view(&before, "you")
+        .await?;
     let conflict_dir = PathBuf::from(&record.conflict_dir);
 
     match keep {
@@ -246,14 +281,36 @@ pub async fn resolve_conflict(
                 })
                 .collect();
             let alt_path = format!("{safe_path} (conflicted copy {hostname})");
+            let ours_path = ctx.base.join(path);
+            if ours_path.exists() {
+                let content = fs::read(&ours_path).await?;
+                upload_sealed(ctx, path, &content, file_mtime_ms(&ours_path).await?).await?;
+            }
             if theirs_file.exists() {
                 let content = fs::read(&theirs_file).await?;
                 if !is_sentinel_content(&content) {
                     atomic_write(ctx.base, &alt_path, &content).await?;
+                    upload_sealed(
+                        ctx,
+                        &alt_path,
+                        &content,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
                 }
             }
         }
     }
+
+    let resolved_files = if ctx.format_version() >= 3 {
+        crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?
+    } else {
+        load_server_view(ctx).await?
+    };
+    let resolver = std::env::var("FEANORFS_AGENT").unwrap_or_else(|_| "human".into());
+    crate::snapshot::SnapshotEngine::new(ctx)
+        .resolve_conflict(path, &resolved_files, &resolver)
+        .await?;
 
     ctx.db.resolve_conflict_path(path).await?;
     remove_path_artifacts(&conflict_dir, path).await?;
@@ -267,7 +324,6 @@ pub async fn resolve_conflict(
     let source_hash = file_source
         .and_then(|p| std::fs::read(p).ok())
         .map(|b| feanorfs_common::hash_bytes(&b));
-    let resolver = std::env::var("FEANORFS_AGENT").unwrap_or_else(|_| "human".into());
     ctx.db
         .record_conflict_resolution(path, method, source_hash.as_deref(), &resolver)
         .await?;
@@ -285,16 +341,21 @@ pub async fn resolve_conflict(
 
 async fn upload_sealed(ctx: &SyncCtx<'_>, path: &str, content: &[u8], mtime: i64) -> Result<()> {
     let (hash, packed) = seal(content, ctx.password_str(), path)?;
-    ctx.api
-        .upload_file(
-            ctx.workspace_id(),
-            path,
-            &hash,
-            content.len() as u64,
-            mtime,
-            packed,
-        )
-        .await
+    let file = FileState {
+        path: path.to_string(),
+        hash,
+        size: content.len() as u64,
+        mtime,
+        deleted: false,
+        mode: 0,
+    };
+    if ctx.format_version() >= 3 {
+        ctx.api
+            .upload_object(ctx.workspace_id(), &file.hash, packed)
+            .await
+    } else {
+        ctx.api.upload_file(ctx.workspace_id(), &file, packed).await
+    }
 }
 
 async fn upload_tombstone_for(ctx: &SyncCtx<'_>, path: &str) -> Result<()> {
@@ -304,6 +365,9 @@ async fn upload_tombstone_for(ctx: &SyncCtx<'_>, path: &str) -> Result<()> {
         .map(|c| c.encrypted_hash.clone())
         .unwrap_or_else(|| feanorfs_common::hash_bytes(b""));
     let mtime = chrono::Utc::now().timestamp_millis();
+    if ctx.format_version() >= 3 {
+        return Ok(());
+    }
     ctx.api
         .upload_tombstone(ctx.workspace_id(), path, &hash, mtime)
         .await
@@ -313,52 +377,22 @@ pub async fn seed_last_synced_from_server(
     ctx: &SyncCtx<'_>,
     local_files: &HashMap<String, FileState>,
 ) -> Result<u32> {
-    let peek = ctx
-        .api
-        .peek_sync(&SyncRequest {
-            workspace_id: ctx.workspace_id().to_string(),
-            files: local_files.values().cloned().collect(),
-        })
-        .await?;
-    let mut synced = load_last_synced(ctx.db).await?;
+    let mut synced = load_last_synced_snapshot(ctx).await?;
     let before = synced.len();
-    let server_peek = ctx
-        .api
-        .peek_sync(&SyncRequest {
-            workspace_id: ctx.workspace_id().to_string(),
-            files: Vec::new(),
-        })
+    let server_files = load_server_view(ctx).await?;
+    for (path, local) in local_files {
+        if !is_safe_rel_path(path) {
+            continue;
+        }
+        if let Some(remote) = server_files.get(path) {
+            if same_content(Some(local), Some(remote)) {
+                synced.insert(path.clone(), remote.clone());
+            }
+        }
+    }
+    crate::snapshot::SnapshotEngine::new(ctx)
+        .record_last_synced(&synced, "seed")
         .await?;
-    let server_files: HashMap<String, FileState> = server_peek
-        .download_required
-        .into_iter()
-        .map(|f| (f.path.clone(), f))
-        .collect();
-    let divergent: HashSet<String> = local_files
-        .iter()
-        .filter_map(|(path, local)| {
-            if local.deleted {
-                return None;
-            }
-            let remote = server_files.get(path)?;
-            if !remote.deleted && local.hash != remote.hash {
-                Some(path.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    for f in peek.download_required {
-        if is_safe_rel_path(&f.path) && !divergent.contains(&f.path) {
-            synced.insert(f.path.clone(), f);
-        }
-    }
-    for (path, file) in local_files {
-        if is_safe_rel_path(path) && !file.deleted && !divergent.contains(path) {
-            synced.insert(path.clone(), file.clone());
-        }
-    }
-    ctx.db.replace_last_synced_files(&synced).await?;
     Ok(u32::try_from(synced.len().saturating_sub(before)).unwrap_or(u32::MAX))
 }
 
@@ -476,7 +510,7 @@ pub fn detect_server_rollback(
             }
         }
     }
-    if regressed >= 3 {
+    if regressed > 0 {
         Some(format!(
             "Server looks older than this machine on {regressed} path(s); \
              run `feanorfs sync --up` to restore it instead of mass-downloading stale files."
@@ -495,17 +529,8 @@ pub async fn detect_post_upload_collisions(
     if uploaded_paths.is_empty() {
         return Ok(Vec::new());
     }
-    let last = load_last_synced(ctx.db).await?;
-    let request = SyncRequest {
-        workspace_id: ctx.workspace_id().to_string(),
-        files: local_files.values().cloned().collect(),
-    };
-    let response = ctx.api.peek_sync(&request).await?;
-    let server_map: HashMap<_, _> = response
-        .download_required
-        .into_iter()
-        .map(|f| (f.path.clone(), f))
-        .collect();
+    let last = load_last_synced_snapshot(ctx).await?;
+    let server_map = load_server_view(ctx).await?;
     let mut out = Vec::new();
     for path in uploaded_paths {
         let Some(local) = local_files.get(path) else {
@@ -537,13 +562,17 @@ pub async fn negotiate_sync_with_conflict_gate(
     register: bool,
 ) -> Result<(SyncResponse, HashSet<String>)> {
     let pending = pending_conflict_paths(ctx.db).await?;
-    let request = SyncRequest {
-        workspace_id: ctx.workspace_id().to_string(),
-        files: local_files.values().cloned().collect(),
-    };
-    let mut response = ctx.api.peek_sync(&request).await?;
-    let last = load_last_synced(ctx.db).await?;
-    let detected = detect_workspace_conflicts(ctx, &last, local_files, &response, &pending).await?;
+    let server_files = load_server_view(ctx).await?;
+    let reconciled = crate::tree_reconcile::reconcile(ctx, local_files, &server_files).await?;
+    let last = reconciled.base;
+    let mut response = reconciled.response;
+    let detected = detect_workspace_conflicts_with_server_view(
+        &last,
+        local_files,
+        &response,
+        &pending,
+        &server_files,
+    )?;
 
     let mut all_detected = detected;
     for remote_path in case_conflict_paths(&response.download_required, local_files) {
@@ -587,7 +616,7 @@ pub async fn negotiate_sync_with_conflict_gate(
         let Some(local) = local_files.get(&remote.path) else {
             continue;
         };
-        if local.deleted || remote.deleted || local.hash == remote.hash {
+        if same_content(Some(local), Some(remote)) {
             continue;
         }
         let we_changed = file_changed_since(last.get(&remote.path), local);
@@ -615,18 +644,6 @@ pub async fn negotiate_sync_with_conflict_gate(
         .iter()
         .any(|path| local_files.contains_key(path) && !last.contains_key(path));
     if needs_upload_collision_scan {
-        let server_peek = ctx
-            .api
-            .peek_sync(&SyncRequest {
-                workspace_id: ctx.workspace_id().to_string(),
-                files: Vec::new(),
-            })
-            .await?;
-        let server_files: HashMap<String, FileState> = server_peek
-            .download_required
-            .into_iter()
-            .map(|f| (f.path.clone(), f))
-            .collect();
         for path in &response.upload_required {
             if pending.contains(path) || !seen_paths.insert(path.clone()) {
                 continue;
@@ -637,7 +654,7 @@ pub async fn negotiate_sync_with_conflict_gate(
             let Some(remote) = server_files.get(path) else {
                 continue;
             };
-            if local.deleted || remote.deleted || local.hash == remote.hash {
+            if same_content(Some(local), Some(remote)) {
                 continue;
             }
             let we_changed = file_changed_since(last.get(path), local);
@@ -700,6 +717,7 @@ mod tests {
             size: 1,
             mtime: 1,
             deleted,
+            mode: 0,
         }
     }
 

@@ -15,6 +15,7 @@ pub struct SyncCtx<'a> {
     pub policy: LegacyPolicy,
     workspace_id: std::borrow::Cow<'a, str>,
     password: std::borrow::Cow<'a, str>,
+    format_version: u32,
 }
 
 impl<'a> SyncCtx<'a> {
@@ -44,6 +45,10 @@ impl<'a> SyncCtx<'a> {
         }
     }
 
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
     /// Build a context from an explicit policy.
     #[must_use]
     pub fn new(
@@ -61,6 +66,7 @@ impl<'a> SyncCtx<'a> {
             policy,
             workspace_id: std::borrow::Cow::Owned(workspace_id.to_string()),
             password: std::borrow::Cow::Owned(password.unwrap_or("").to_string()),
+            format_version: 2,
         }
     }
 
@@ -80,6 +86,7 @@ impl<'a> SyncCtx<'a> {
             password: std::borrow::Cow::Owned(
                 config.encryption_password.clone().unwrap_or_default(),
             ),
+            format_version: config.format_version,
         })
     }
 }

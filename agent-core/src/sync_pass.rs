@@ -2,7 +2,7 @@ use crate::api::ApiClient;
 use crate::conflicts;
 use crate::crypto::seal;
 use crate::ctx::SyncCtx;
-use crate::fs_util::{atomic_write, file_mtime_ms, set_readonly};
+use crate::fs_util::{apply_executable_mode, atomic_write, file_mtime_ms, set_readonly};
 use crate::local::{load_config, CacheEntry, ClientDb};
 use crate::lock::SyncLock;
 use anyhow::{Context, Result};
@@ -37,16 +37,119 @@ pub fn build_ctx_or_fallback<'a>(
 
 async fn finish_sync_pass(
     ctx: &SyncCtx<'_>,
-    local_files: &HashMap<String, FileState>,
+    local_files_before: &HashMap<String, FileState>,
     conflict_paths: &HashSet<String>,
-    disk_mutated: bool,
 ) -> Result<()> {
-    let current_files = if disk_mutated {
-        crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?
-    } else {
-        local_files.clone()
-    };
-    conflicts::commit_last_synced(ctx.db, &current_files, conflict_paths).await
+    let current_files =
+        crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    if ctx.format_version() >= 3 {
+        let snapshots = crate::snapshot::SnapshotEngine::new(ctx);
+        let expected = ctx.api.get_head(ctx.workspace_id()).await?;
+        let (head_files, head_conflicts, current_root) = match &expected {
+            Some(id) => {
+                let snapshot = snapshots.load_snapshot(id).await?;
+                let state = snapshots.load_state(id).await?;
+                (state.files, state.conflicts, Some(snapshot.root))
+            }
+            None => (HashMap::new(), Vec::new(), None),
+        };
+        let mut candidate_files = current_files.clone();
+        for path in conflict_paths {
+            match head_files.get(path) {
+                Some(state) => {
+                    candidate_files.insert(path.clone(), state.clone());
+                }
+                None => {
+                    candidate_files.remove(path);
+                }
+            }
+        }
+        let root = snapshots.candidate_root(&candidate_files, &head_conflicts)?;
+        let committed = if current_root.as_deref() == Some(root.as_str()) {
+            expected.context("unchanged format v3 workspace has no head")?
+        } else {
+            let candidate = snapshots
+                .write(crate::snapshot::SnapshotInput {
+                    files: &candidate_files,
+                    conflicts: &head_conflicts,
+                    parents: expected.iter().cloned().collect(),
+                    author: "sync",
+                    message: None,
+                })
+                .await?;
+            match ctx
+                .api
+                .swap_head(ctx.workspace_id(), expected.as_deref(), &candidate)
+                .await?
+            {
+                crate::SwapHeadResult::Swapped => candidate,
+                crate::SwapHeadResult::Conflict(_) => {
+                    anyhow::bail!("workspace head changed during sync; retry")
+                }
+            }
+        };
+        ctx.api.set_workspace_format(ctx.workspace_id(), 3).await?;
+        if conflict_paths.is_empty() {
+            snapshots.record_committed_refs(&committed).await?;
+        } else {
+            snapshots.snapshot_local_view(&current_files, "you").await?;
+            snapshots.record_last_synced_ref(&committed).await?;
+        }
+        return Ok(());
+    }
+    let server_files = conflicts::load_server_view(ctx).await?;
+    let snapshots = crate::snapshot::SnapshotEngine::new(ctx);
+    let mut agreed = snapshots.load_last_synced().await?;
+    let paths: HashSet<String> = agreed
+        .keys()
+        .chain(local_files_before.keys())
+        .chain(current_files.keys())
+        .chain(server_files.keys())
+        .cloned()
+        .collect();
+
+    for path in paths {
+        if conflict_paths.contains(&path) {
+            continue;
+        }
+
+        let local = current_files.get(&path);
+        let remote = server_files.get(&path);
+        if !states_agree(local, remote) {
+            continue;
+        }
+
+        if let Some(remote) = remote.filter(|state| !state.deleted) {
+            agreed.insert(path, remote.clone());
+            continue;
+        }
+
+        let source = local
+            .or_else(|| local_files_before.get(&path))
+            .or_else(|| agreed.get(&path));
+        if let Some(source) = source {
+            let mut tombstone = source.clone();
+            tombstone.deleted = true;
+            tombstone.size = 0;
+            agreed.insert(path, tombstone);
+        }
+    }
+
+    snapshots.record_last_synced(&agreed, "sync").await?;
+    snapshots.snapshot_local_view(&current_files, "you").await?;
+    snapshots.publish_server_view(&server_files, "sync").await?;
+    Ok(())
+}
+
+fn states_agree(local: Option<&FileState>, remote: Option<&FileState>) -> bool {
+    match (
+        local.filter(|state| !state.deleted),
+        remote.filter(|state| !state.deleted),
+    ) {
+        (Some(local), Some(remote)) => local.hash == remote.hash,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +175,39 @@ pub async fn run_sync_pass(
     lazy: bool,
 ) -> Result<(SyncPassOutcome, HashSet<String>)> {
     let _lock = SyncLock::acquire(ctx.base)?;
+    run_sync_pass_locked(ctx, mode, lazy).await
+}
+
+fn promote_rollback_restores(
+    response: &mut SyncResponse,
+    local_files: &HashMap<String, FileState>,
+    last_synced: &HashMap<String, FileState>,
+) {
+    let mut restore_paths = Vec::new();
+    response.download_required.retain(|remote| {
+        let base = last_synced.get(&remote.path);
+        let local = local_files.get(&remote.path);
+        let is_rollback = base.is_some_and(|b| {
+            !b.deleted
+                && remote.mtime < b.mtime
+                && remote.hash != b.hash
+                && local.is_some_and(|l| !l.deleted && l.hash == b.hash)
+        });
+        if is_rollback {
+            restore_paths.push(remote.path.clone());
+        }
+        !is_rollback
+    });
+    response.upload_required.extend(restore_paths);
+    response.upload_required.sort_unstable();
+    response.upload_required.dedup();
+}
+
+pub(crate) async fn run_sync_pass_locked(
+    ctx: &SyncCtx<'_>,
+    mode: SyncMode,
+    lazy: bool,
+) -> Result<(SyncPassOutcome, HashSet<String>)> {
     let label = match mode {
         SyncMode::Push => "Push",
         SyncMode::Pull => "Pull",
@@ -80,9 +216,17 @@ pub async fn run_sync_pass(
     tracing::info!("{label} started (lazy={lazy})");
     let local_files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     tracing::debug!("Scanned {} entries", local_files.len());
+    crate::snapshot::SnapshotEngine::new(ctx)
+        .snapshot_local_view(&local_files, "you")
+        .await?;
 
-    let (response, mut blocked) =
+    let (mut response, mut blocked) =
         conflicts::negotiate_sync_with_conflict_gate(ctx, &local_files, true).await?;
+
+    if mode == SyncMode::Push {
+        let last_synced = conflicts::load_last_synced_snapshot(ctx).await?;
+        promote_rollback_restores(&mut response, &local_files, &last_synced);
+    }
 
     tracing::debug!(
         "Diff: upload={}, download={}, delete_local={}",
@@ -105,7 +249,7 @@ pub async fn run_sync_pass(
         outcome.uploads = process_uploads(ctx, &response, &local_files).await?;
         outcome.deletes_remote = cleanup_deleted_cache(&local_files, ctx.db).await?;
 
-        if !response.upload_required.is_empty() {
+        if ctx.format_version() < 3 && !response.upload_required.is_empty() {
             let post = conflicts::detect_post_upload_collisions(
                 ctx,
                 &local_files,
@@ -134,12 +278,7 @@ pub async fn run_sync_pass(
         outcome.deletes_remote
     );
 
-    let disk_mutated = outcome.uploads > 0
-        || outcome.downloads > 0
-        || outcome.placeholders > 0
-        || outcome.deletes_local > 0
-        || outcome.deletes_remote > 0;
-    finish_sync_pass(ctx, &local_files, &blocked, disk_mutated).await?;
+    finish_sync_pass(ctx, &local_files, &blocked).await?;
 
     Ok((outcome, blocked))
 }
@@ -188,6 +327,7 @@ pub(crate) async fn process_downloads(
                 size: replica_file.size,
                 mtime: replica_file.mtime,
                 server_mtime: replica_file.mtime,
+                mode: replica_file.mode,
                 hydrated: false,
                 deleted_at: None,
             };
@@ -231,6 +371,7 @@ pub(crate) async fn process_downloads(
             }
             set_readonly(&full_path, false).await?;
             atomic_write(ctx.base, path, &plain_content).await?;
+            apply_executable_mode(&full_path, replica_file.mode).await?;
 
             let actual_mtime = file_mtime_ms(&full_path).await.unwrap_or_else(|e| {
                 tracing::warn!(
@@ -247,6 +388,7 @@ pub(crate) async fn process_downloads(
                 size: replica_file.size,
                 mtime: actual_mtime,
                 server_mtime: replica_file.mtime,
+                mode: replica_file.mode,
                 hydrated: true,
                 deleted_at: None,
             };
@@ -298,6 +440,20 @@ pub(crate) async fn process_uploads(
         let Some(local_file) = local_files.get(path) else {
             continue;
         };
+        if ctx.format_version() >= 3 {
+            if !local_file.deleted {
+                let plain_content = fs::read(ctx.base.join(path)).await?;
+                let (hash, encrypted_content) = seal(&plain_content, password_str, path)?;
+                ctx.api
+                    .upload_object(ctx.workspace_id(), &hash, encrypted_content)
+                    .await?;
+                ctx.db
+                    .set_cache_server_mtime(path, local_file.mtime)
+                    .await?;
+                uploads += 1;
+            }
+            continue;
+        }
         if local_file.deleted {
             tracing::info!("Uploading tombstone for {}", path);
             ctx.api
@@ -309,15 +465,10 @@ pub(crate) async fn process_uploads(
             tracing::info!("Uploading {} ({} bytes)", path, local_file.size);
             let plain_content = fs::read(ctx.base.join(path)).await?;
             let (hash, encrypted_content) = seal(&plain_content, password_str, path)?;
+            let mut upload = local_file.clone();
+            upload.hash = hash;
             ctx.api
-                .upload_file(
-                    ctx.workspace_id(),
-                    path,
-                    &hash,
-                    local_file.size,
-                    local_file.mtime,
-                    encrypted_content,
-                )
+                .upload_file(ctx.workspace_id(), &upload, encrypted_content)
                 .await?;
             ctx.db
                 .set_cache_server_mtime(path, local_file.mtime)
