@@ -7,7 +7,7 @@ fn main() {
     let header_path = crate_dir.join("feanorfs.h");
     let config = cbindgen::Config::from_file(crate_dir.join("cbindgen.toml")).unwrap();
     let generated = cbindgen::Builder::new()
-        .with_crate(&crate_dir)
+        .with_src(crate_dir.join("src/lib.rs"))
         .with_config(config)
         .generate()
         .expect("cbindgen");
