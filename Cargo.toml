@@ -3,7 +3,7 @@ members = ["common", "server", "client", "agent-core", "feanorfs-ffi", "bindings
 resolver = "2"
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -15,7 +15,7 @@ keywords = ["sync", "filesystem", "e2ee", "blake3", "sqlite"]
 categories = ["command-line-utilities", "filesystem"]
 
 [workspace.dependencies]
-feanorfs-common = { version = "0.3.0", path = "common" }
+feanorfs-common = { version = "0.3.4", path = "common" }
 feanorfs-server = { version = "0.3.0", path = "server" }
 feanorfs-agent-core = { version = "0.3.0", path = "agent-core" }
 napi = { version = "2", default-features = false, features = ["napi4"] }
