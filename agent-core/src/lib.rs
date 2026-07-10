@@ -9,15 +9,27 @@ pub mod conflict_artifacts;
 pub mod conflicts;
 pub mod crypto;
 pub mod ctx;
+mod durable;
 pub mod fs_util;
+mod head;
+pub mod history;
 pub mod hub;
+mod hub_state;
 pub mod local;
 pub mod lock;
+mod object_gc;
+pub mod objects;
 pub mod paths;
+mod prepared_tree;
+pub mod snapshot;
+mod snapshot_diff;
+mod state;
 pub mod sync_pass;
+mod tree_reconcile;
 
 pub use agent::{
-    check_agent, clean_agent, commit_agent, land_agent, list_agents, refresh_agent, spawn_agent,
+    check_agent, clean_agent, commit_agent, land_agent, list_agents, refresh_agent,
+    refresh_agent_with_options, spawn_agent, RefreshOptions,
 };
 pub use api::ApiClient;
 pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
@@ -29,14 +41,32 @@ pub use feanorfs_common::{
     AgentRefreshResult, ConcurrentEdit, ConflictKind, ConflictRecord, FileState, SpawnResult,
     WorkspaceInvite, INVITE_PREFIX,
 };
+pub use head::SwapHeadResult;
+pub use history::{log, undo};
+pub use hub::LocalHub;
 pub use local::{
     load_config, load_global_config, save_config, save_global_config, validate_e2ee_key, ClientDb,
     Config, GlobalConfig, LOCAL_HUB_URL,
 };
+pub use objects::ObjectStore;
 pub use paths::legacy_policy_for_config;
 pub use paths::{agent_dir, agents_dir, conflicts_dir, validate_name};
+pub use snapshot::SnapshotEngine;
+pub use snapshot_diff::TreeDiffStats;
 
 use anyhow::{Context, Result};
+#[doc(hidden)]
+pub use hub_state::{
+    MigrationHubFence, MigrationHubFile, MigrationHubManifest, MigrationHubState,
+    MigrationHubWorkspace,
+};
+#[doc(hidden)]
+pub use local::ClientDb as _ClientDb;
+#[doc(hidden)]
+pub use state::{
+    MigrationAccessEntry, MigrationCacheEntry, MigrationConflictRecord,
+    MigrationConflictResolution, MigrationLocalState,
+};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -199,5 +229,17 @@ impl Workspace {
         let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
         self.rt
             .block_on(resolve_conflict(&ctx, path, keep, file_source))
+    }
+
+    /// Lists reachable workspace snapshots, newest first.
+    pub fn log(&self, limit: usize) -> Result<feanorfs_common::LogResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(history::log(&ctx, limit))
+    }
+
+    /// Restores a reachable snapshot as a new snapshot on current head.
+    pub fn undo(&self, snapshot_id: &str) -> Result<feanorfs_common::UndoResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(history::undo(&ctx, snapshot_id))
     }
 }

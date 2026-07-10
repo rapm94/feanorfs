@@ -18,16 +18,13 @@ path = "src/lib.rs"
 
 [dependencies]
 feanorfs-common = { workspace = true }
-feanorfs-server = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
-sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
-tower = { workspace = true }
 http = { workspace = true }
 urlencoding = { workspace = true }
 ignore = { workspace = true }
@@ -36,6 +33,10 @@ unicode-normalization = { workspace = true }
 diffy = { workspace = true }
 tracing = { workspace = true }
 libc = "0.2"
+fs2 = "0.4"
+atomic-write-file = "0.3"
+url = "2"
+constant_time_eq = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

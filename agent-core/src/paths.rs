@@ -15,6 +15,13 @@ pub fn agent_dir(base: &Path, name: &str) -> PathBuf {
 }
 
 #[must_use]
+pub fn agent_base_ref(base: &Path, name: &str) -> PathBuf {
+    agent_dir(base, name)
+        .join(".feanorfs")
+        .join("base-snapshot")
+}
+
+#[must_use]
 pub fn conflicts_dir(base: &Path) -> PathBuf {
     base.join(".feanorfs").join("conflicts")
 }

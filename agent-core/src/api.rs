@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use feanorfs_common::{SyncRequest, SyncResponse};
 use reqwest::Client;
+use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,6 +16,12 @@ enum Backend {
 pub struct ApiClient {
     backend: Backend,
     server_password: Option<String>,
+    migration_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceFormatResponse {
+    format_version: u32,
 }
 
 impl ApiClient {
@@ -25,6 +32,7 @@ impl ApiClient {
                 server_url: server_url.trim_end_matches('/').to_string(),
             },
             server_password: server_password.map(str::to_string),
+            migration_token: None,
         }
     }
 
@@ -32,6 +40,7 @@ impl ApiClient {
         Self {
             backend: Backend::Local(hub),
             server_password,
+            migration_token: None,
         }
     }
 
@@ -55,6 +64,12 @@ impl ApiClient {
 
     pub fn is_local(&self) -> bool {
         matches!(self.backend, Backend::Local(_))
+    }
+
+    #[must_use]
+    pub fn with_migration_token(mut self, token: String) -> Self {
+        self.migration_token = Some(token);
+        self
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str, query: &str) -> Result<T> {
@@ -118,7 +133,7 @@ impl ApiClient {
         Ok(())
     }
 
-    async fn raw_request(
+    pub(crate) async fn raw_request(
         &self,
         method: http::Method,
         path: &str,
@@ -134,8 +149,12 @@ impl ApiClient {
                     format!("{server_url}{path}?{query}")
                 };
                 let mut req = client.request(method, &url);
+                req = req.header("X-FeanorFS-Format", "3");
                 if let Some(pass) = &self.server_password {
                     req = req.bearer_auth(pass);
+                }
+                if let Some(token) = &self.migration_token {
+                    req = req.header("X-FeanorFS-Migration", token);
                 }
                 if let Some(ct) = content_type {
                     req = req.header("Content-Type", ct);
@@ -158,7 +177,10 @@ impl ApiClient {
                         path,
                         query,
                         body,
-                        self.server_password.as_deref(),
+                        (
+                            self.server_password.as_deref(),
+                            self.migration_token.as_deref(),
+                        ),
                         content_type,
                     )
                     .await?;
@@ -183,19 +205,17 @@ impl ApiClient {
     pub async fn upload_file(
         &self,
         workspace_id: &str,
-        path: &str,
-        hash: &str,
-        size: u64,
-        mtime: i64,
+        file: &feanorfs_common::FileState,
         content: Vec<u8>,
     ) -> Result<()> {
         let query = format!(
-            "workspace_id={}&path={}&hash={}&size={}&mtime={}&deleted=false",
+            "workspace_id={}&path={}&hash={}&size={}&mtime={}&mode={}&deleted=false",
             urlencoding_path(workspace_id),
-            urlencoding_path(path),
-            urlencoding_path(hash),
-            size,
-            mtime
+            urlencoding_path(&file.path),
+            urlencoding_path(&file.hash),
+            file.size,
+            file.mtime,
+            file.mode
         );
         self.post_bytes("/api/upload", &query, content).await
     }
@@ -215,6 +235,59 @@ impl ApiClient {
             mtime
         );
         self.post_bytes("/api/upload", &query, Vec::new()).await
+    }
+
+    pub async fn upload_object(
+        &self,
+        workspace_id: &str,
+        hash: &str,
+        content: Vec<u8>,
+    ) -> Result<()> {
+        let query = format!(
+            "workspace_id={}&path=object&hash={}&size={}&mtime=0&deleted=false&object=true",
+            urlencoding_path(workspace_id),
+            urlencoding_path(hash),
+            content.len()
+        );
+        self.post_bytes("/api/upload", &query, content).await
+    }
+
+    pub async fn upload_manifest(
+        &self,
+        workspace_id: &str,
+        snapshot_id: &str,
+        hashes: &[String],
+    ) -> Result<()> {
+        let query = format!(
+            "workspace_id={}&snapshot_id={}",
+            urlencoding_path(workspace_id),
+            urlencoding_path(snapshot_id)
+        );
+        let mut manifest = hashes.join("\n").into_bytes();
+        manifest.push(b'\n');
+        self.post_bytes("/api/manifest", &query, manifest).await
+    }
+
+    pub async fn set_workspace_format(&self, workspace_id: &str, version: u32) -> Result<()> {
+        let query = format!(
+            "workspace_id={}&format_version={version}",
+            urlencoding_path(workspace_id)
+        );
+        self.post_bytes("/api/workspace/format", &query, Vec::new())
+            .await
+    }
+
+    pub async fn workspace_format(&self, workspace_id: &str) -> Result<u32> {
+        let query = format!("workspace_id={}", urlencoding_path(workspace_id));
+        let response: WorkspaceFormatResponse =
+            self.get_json("/api/workspace/format", &query).await?;
+        Ok(response.format_version)
+    }
+
+    pub async fn begin_migration(&self, workspace_id: &str) -> Result<()> {
+        let query = format!("workspace_id={}", urlencoding_path(workspace_id));
+        self.post_bytes("/api/workspace/migration", &query, Vec::new())
+            .await
     }
 
     pub async fn download_file(&self, hash: &str) -> Result<Vec<u8>> {
