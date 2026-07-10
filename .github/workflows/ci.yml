@@ -185,6 +185,13 @@ jobs:
       # Debug FFI matches zig build.zig profile_dir (.Debug => target/debug).
       - name: Build FFI (debug for Zig)
         run: cargo build -p feanorfs-ffi --locked
+      - name: Verify embeddable dependency boundary
+        run: |
+          tree="$(cargo tree -p feanorfs-agent-core --prefix none)"
+          if grep -Eq '^(sqlx|feanorfs-server) v' <<<"$tree"; then
+            echo "::error::feanorfs-agent-core depends on SQLite or the server crate."
+            exit 1
+          fi
       - name: Verify feanorfs.h is committed
         run: git diff --exit-code -- feanorfs-ffi/feanorfs.h
       - name: SDK-2 CLI loop
@@ -203,6 +210,35 @@ jobs:
           npm ci --ignore-scripts
           npm run build
           FEANORFS_BIN="${{ github.workspace }}/target/release/feanorfs" node test/loop.mjs
+          npm run create-npm-dir
+          npm run assemble-metadata
+          npm run verify-metadata
+
+          case "$(uname -s)-$(uname -m)" in
+            Darwin-arm64) package_dir=darwin-arm64; artifact=feanorfs-agent-node.darwin-arm64.node ;;
+            Darwin-x86_64) package_dir=darwin-x64; artifact=feanorfs-agent-node.darwin-x64.node ;;
+            Linux-x86_64) package_dir=linux-x64-gnu; artifact=feanorfs-agent-node.linux-x64-gnu.node ;;
+            *) echo "::error::Unsupported SDK smoke host."; exit 1 ;;
+          esac
+          cp "$artifact" "npm/$package_dir/$artifact"
+
+          dist="$(mktemp -d)"
+          smoke="$(mktemp -d)"
+          trap 'rm -rf "$dist" "$smoke"' EXIT
+          version="$(node -p 'require("./package.json").version')"
+          npm pack --pack-destination "$dist" .
+          npm pack --pack-destination "$dist" "./npm/$package_dir"
+          cp test/loop.mjs "$smoke/loop.mjs"
+          printf '%s\n' '{"name":"packed-smoke","private":true,"type":"module"}' >"$smoke/package.json"
+          (
+            cd "$smoke"
+            npm install --offline --ignore-scripts --registry=http://127.0.0.1:9 \
+              "$dist/feanorfs-agent-$version.tgz" \
+              "$dist/feanorfs-agent-$package_dir-$version.tgz"
+            FEANORFS_AGENT_IMPORT=@feanorfs/agent \
+              FEANORFS_BIN="${{ github.workspace }}/target/release/feanorfs" \
+              node loop.mjs
+          )
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:

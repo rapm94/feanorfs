@@ -1,0 +1,27 @@
+{
+  "name": "@feanorfs/agent-darwin-arm64",
+  "version": "0.3.3",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "feanorfs-agent-node.darwin-arm64.node",
+  "files": [
+    "feanorfs-agent-node.darwin-arm64.node"
+  ],
+  "description": "Native Node bindings for FeanorFS agent workspaces",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rapm94/feanorfs.git",
+    "directory": "bindings/ts"
+  }
+}

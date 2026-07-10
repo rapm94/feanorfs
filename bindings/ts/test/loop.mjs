@@ -6,13 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  spawn,
-  land,
-  clean,
-  refresh,
-  conflictsKeep,
-} from '../api.mjs';
+const agentModule = process.env.FEANORFS_AGENT_IMPORT ?? '../api.mjs';
+const { spawn, land, clean, refresh, conflictsKeep } = await import(agentModule);
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const feanorfs =

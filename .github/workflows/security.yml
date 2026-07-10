@@ -65,6 +65,7 @@ jobs:
           inputs: |
             .github/dependabot.yml
             .github/workflows/ci.yml
+            .github/workflows/npm-release.yml
             .github/workflows/release-plz.yml
             .github/workflows/security.yml
             .github/workflows/tray-release.yml

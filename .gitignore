@@ -6,6 +6,10 @@
 /.sisyphus
 /bindings/ts/node_modules
 /bindings/ts/*.node
+/bindings/ts/artifacts
+/bindings/ts/npm/*/*.node
+/bindings/ts/npm/artifacts.json
+/bindings/ts/*.tgz
 /examples/zig-agent/zig-out
 /examples/zig-agent/.zig-cache
-
+/.omo/run-continuation/
