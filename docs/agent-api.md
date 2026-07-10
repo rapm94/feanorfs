@@ -14,10 +14,12 @@ Canonical fixtures live in `common/src/agent_contract.rs`. Snapshot tests in `cl
 | List agents (legacy) | hidden `agent list` | — | always `AgentListOfflineResult` (plain names, even when online) |
 | Spawn | `agent spawn <name>` | `spawn(name, opts)` | `SpawnResult` |
 | Preview | `agent status <name>` | `status(name)` | `AgentCheckResult` |
-| Refresh | `agent refresh <name>` | `refresh(name)` | `AgentRefreshResult` |
+| Refresh | `agent refresh <name> [--replace]` | `refresh(name)` | `AgentRefreshResult` |
 | Land | `agent land <name>` | `land(name, opts)` | `AgentLandResult` |
 | Clean | `agent clean <name>` | `clean(name)` | `AgentCleanResult` |
 | Resolve | `conflicts keep <path> …` | `resolve(path, keep, file?)` | exit 0 / FFI `-1` / TS throw |
+| History | `log [--limit N]` | `log(limit)` | `LogResult` |
+| Undo | `undo <snapshot_id>` | `undo(snapshot_id)` | `UndoResult` |
 
 ---
 
@@ -68,7 +70,8 @@ Primary land result type for `--json agent land` and all SDK embeddings.
   "their_changes": [],
   "conflicts": [],
   "landed": [{"path":"doc.txt","action":"applied"}],
-  "message": "Landed 1 path; 1 needs attention."
+  "message": "Landed 1 path; 1 needs attention.",
+  "snapshot_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }
 ```
 
@@ -88,10 +91,26 @@ Subset of `AgentLandResult` without `landed` / `message`. Still exported from `f
 {"cleaned":"ci1"}
 ```
 
+### `LogResult`
+
+`entries` starts at the current workspace head and walks reachable parents. `changed_paths` compares each snapshot with its first parent.
+
+```json
+{"entries":[{"snapshot_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","parents":[],"author":"you","created_at_ms":1719500000000,"message":"land","changed_paths":["src/main.rs"]}]}
+```
+
+### `UndoResult`
+
+Undo accepts a reachable full ID or an unambiguous prefix of at least eight hexadecimal characters. It appends a snapshot instead of moving or deleting history.
+
+```json
+{"snapshot_id":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","restored_snapshot_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","changed_paths":["src/main.rs"]}
+```
+
 ### `FileState`
 
 ```json
-{"path":"src/main.rs","hash":"<64 hex>","size":4096,"mtime":1719500000000,"deleted":false}
+{"path":"src/main.rs","hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":4096,"mtime":1719500000000,"deleted":false,"mode":1}
 ```
 
 ### `ConcurrentEdit`
@@ -158,6 +177,8 @@ Thread model:
 - Returned `char*` values (including from `ffs_last_error`) must be freed with `ffs_string_free`.
 - JSON-returning functions: **NULL = error** (read `ffs_last_error` on the same thread).
 - `ffs_conflicts_keep`: **0 = success**, **-1 = error**.
+- `ffs_log(root, limit)` returns `LogResult` JSON.
+- `ffs_undo(root, snapshot_id)` returns `UndoResult` JSON.
 
 `keep` values for `ffs_conflicts_keep(root, path, keep, file_path)`:
 

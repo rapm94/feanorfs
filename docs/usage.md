@@ -93,7 +93,7 @@ Log verbosity can be tuned via `RUST_LOG` (see [Environment](#environment) below
 | `config` | Inspect workspace config (`--key` for full key + invite) |
 | `doctor` | Troubleshoot connection and config |
 | `serve` | Run a blob hub |
-| `migrate` | Upgrade v1 workspaces to format v2 (AEAD) |
+| `migrate` | Upgrade legacy workspaces to format v3 encrypted snapshots |
 | `agent` | Isolated agent workspaces (`status`, `spawn`, `land`, …) |
 | `conflicts` | List and resolve sync conflicts (`keep`, `show`) |
 
@@ -200,13 +200,22 @@ feanorfs summary [--summarize] [--no-remember]
 
 `FEANORFS_SUMMARY_CMD` must be a path to an executable file (e.g. `/usr/local/bin/feanorfs-llm`). It is invoked directly — not interpreted by a shell — so arguments like `--model` must be wrapped in a shell script.
 
-### `migrate` — upgrade to format v2
+### Upgrade to format v3 with `migrate`
 
 ```bash
 feanorfs migrate [--rekey]
 ```
 
-Re-seals blobs as AEAD and bumps `format_version` to 2. `sync` nudges v1 workspaces to run this.
+Re-seals legacy blobs with authenticated encryption, creates the initial snapshot tree, sets the workspace head, and bumps `format_version` to 3. A durable migration journal and server fence make retries safe after interruption. Run the same command again to resume. Land or clean agent workspaces before using `--rekey`.
+
+### Inspect and restore snapshots with `log` and `undo`
+
+```bash
+feanorfs log [--limit 20]
+feanorfs undo snapshot_id
+```
+
+`log` prints the short ID, age, author, changed-path count, and message. Add `--json` for full IDs and structured paths. `undo` accepts a reachable full ID or an unambiguous prefix with at least eight characters, then records the restored tree as a new snapshot.
 
 ### Global flags
 
@@ -220,7 +229,7 @@ Re-seals blobs as AEAD and bumps `format_version` to 2. `sync` nudges v1 workspa
 feanorfs agent                    # list agents (one-line state when online)
 feanorfs agent status [NAME]      # list all, or preview one agent
 feanorfs agent spawn <NAME> [--no-sync] [--replace]
-feanorfs agent refresh <NAME>
+feanorfs agent refresh <NAME> [--replace]
 feanorfs agent land <NAME> [--clean] [--propose]
 feanorfs agent clean <NAME>
 feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
@@ -230,7 +239,7 @@ feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
 |---|---|
 | `status` | List all agents (enriched when server reachable; names-only offline). Hidden `agent list` returns legacy JSON `{"agents": ["name"]}`. |
 | `spawn` | APFS clonefile/copy snapshot with server base hashes |
-| `refresh` | Pull cloud changes the agent hasn't touched |
+| `refresh` | Pull cloud changes the agent hasn't touched. `--replace` discards agent-local edits after preserving them as a parent snapshot. |
 | `land` | Apply clean work, upload, register conflicts |
 | `clean` | Remove agent dir and snapshot rows |
 | `run` | Run a command in the agent dir — not a sandbox |
@@ -258,7 +267,7 @@ Version files use `.original`/`.local`/`.cloud` suffixes.
 
 ```bash
 feanorfs events    # NDJSON: sync_state, folder_changed, conflict_risk, …
-feanorfs mcp       # MCP protocol + tools (agent_*, conflicts_*, sync_status)
+feanorfs mcp       # MCP protocol + tools (agent_*, conflicts_*, sync_status, workspace_log, workspace_undo)
 ```
 
 File contents never leave the machine on either surface.

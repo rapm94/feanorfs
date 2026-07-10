@@ -6,13 +6,13 @@
 
 > **Dropbox for your uncommitted code** — end-to-end encrypted, self-host or managed.
 
-FeanorFS synchronizes your working directory to a lightweight blob server using content-addressed storage (CAS) and end-to-end encryption (E2EE). The server only ever sees encrypted hashes and scrambled bytes — your plaintext never leaves your machine.
+FeanorFS synchronizes your working directory through encrypted, content-addressed Merkle snapshots. The server sees opaque hashes, ciphertext sizes, object counts, and access timing, but format-v3 filenames and file contents never leave your machine in plaintext.
 
 It is designed for one specific situation: you write code on more than one machine and want your uncommitted work-in-progress to follow you without thinking about it — like Dropbox, but for the files you have not committed yet. Run `feanorfs start` once and it keeps your working files mirrored across machines. Self-host the server or use a managed instance — same open-source stack either way.
 
 ## Scope
 
-FeanorFS mirrors the **current contents** of a working directory to a blob server. It is **not version control**: no history, branches, tags, or merge UI. Use a VCS for that.
+FeanorFS mirrors the current contents of a working directory to a blob server. It is **not version control**: no staging, branches, tags, rebase, or merge UI. Its bounded snapshot log supports transport recovery and undo. Use a version control system for project history.
 
 It syncs files on disk (including gitignored/untracked paths — often the point), skips `.git/` and `.feanorfs/`, and blocks common artifact trees (`target/`, `node_modules/`, …) by default. It does not read `.gitignore`. See [docs/sync-scope.md](docs/sync-scope.md).
 
@@ -22,13 +22,15 @@ It syncs files on disk (including gitignored/untracked paths — often the point
 
 **Background sync (Dropbox-like):** your uncommitted work follows you between machines. Install, point at a folder, forget.
 
-- **Zero-knowledge E2EE** — ChaCha20-Poly1305 AEAD for new blobs; format v2 rejects legacy XOR. Run `feanorfs migrate` on older workspaces.
+- **Zero-knowledge E2EE** — ChaCha20-Poly1305 protects file bytes, filenames, tree layout, conflicts, and snapshots in format v3. Run `feanorfs migrate` on older workspaces.
 - **Content-addressed storage** — Blake3-hashed blobs with deduplication and upload integrity checks.
 - **Default ignores** — small built-in denylist for high-churn artifacts; optional `.feanorfsignore` for edge cases (does not honor `.gitignore`).
 - **One verb onboarding** — `feanorfs start` creates, joins (`fnr1-…`), or resumes; then syncs and watches.
 - **Single binary** — install `feanorfs` once; `feanorfs serve` runs the blob hub, `start --local` uses an in-process hub (no daemon).
 - **Agent loop** — `spawn` → `status` → `refresh` → `land` → `conflicts keep`. Data isolation, not process sandboxing.
 - **Conflict surfacing** — `.original`/`.local`/`.cloud` triples; bare `feanorfs conflicts` lists pending paths.
+- **Operational history** — `feanorfs log` inspects reachable snapshots and `feanorfs undo` records a restored tree without rewriting history.
+- **Crash-safe migration** — durable client journal and server write fence make format-v3 migration and rekey resumable.
 - **Lazy hydration**, **local cache**, **catch-up summary**, **library + `--json` API**.
 - **Orchestrator surfaces** — hidden `events` (NDJSON) and `mcp` (MCP protocol + tools).
 - **Server GC** — `feanorfs serve --gc-only`; periodic `--gc-interval` while serving.
@@ -41,12 +43,13 @@ One binary (`feanorfs`): sync client by default, blob hub via `feanorfs serve`. 
 ┌─────────────────────────────────────────────────────────────┐
 │  feanorfs (single install)                                  │
 │  ┌─────────────┐   feanorfs serve    ┌──────────────────┐  │
-│  │ sync client │ ── HTTP / local ──▶ │ Axum hub+SQLite  │  │
-│  │ start/sync  │                    │ server-data/     │  │
+│  │ sync client │ ───── HTTP ───────▶ │ Axum hub+SQLite │  │
+│  │ start/sync  │                    │ server-data/    │  │
 │  └─────────────┘                    └──────────────────┘  │
-│       │ .feanorfs/local_cache.db                            │
+│       │ .feanorfs/local_state.json                          │
+│       └── local mode: hub_state.json + blobs/               │
 └───────┼─────────────────────────────────────────────────────┘
-        │ encrypted blobs + /api/sync/diff
+        │ encrypted objects + compare-and-swap head
         ▼
    (remote hub or embedded LocalHub)
 ```
@@ -76,6 +79,14 @@ Linux and macOS are available on x86_64 and ARM64; Windows is available on
 x86_64.
 
 Release binaries are signed with [GitHub Artifact Attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds). To verify before running: `gh attestation verify <artifact> --repo rapm94/feanorfs`. See [SECURITY.md](SECURITY.md#verifying-release-artifacts) for checksum and build-from-source alternatives.
+
+### Node agent SDK
+
+`@feanorfs/agent` has release-ready packages for macOS x64/ARM64, Linux GNU
+x64/ARM64, and Windows x64. The trusted-tag workflow publishes those five
+native packages before the facade and verifies npm integrity on retries. Until
+the first registry release is completed, build from `bindings/ts/`; do not
+assume the package is available from npm yet.
 
 Per-app installer (client — recommended):
 
@@ -144,6 +155,8 @@ feanorfs sync --down --lazy        # lazy download
 feanorfs hydrate src/main.rs       # materialize a placeholder
 feanorfs cat src/main.rs           # print (auto-hydrates)
 feanorfs summary                   # what changed since last session
+feanorfs log                       # recent snapshot transitions
+feanorfs undo snapshot_id          # append a restored snapshot
 ```
 
 See [docs/usage.md](docs/usage.md) for the full CLI reference. Agent loop demo: [scripts/demo-agent-loop.sh](scripts/demo-agent-loop.sh).
@@ -158,8 +171,8 @@ FeanorFS provides end-to-end encryption using ChaCha20-Poly1305 (AEAD) with per-
 
 **Important limitations** (see [docs/threat-model.md](docs/threat-model.md) for the full analysis):
 
-- Format v2 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still accept legacy XOR on decrypt — run `feanorfs migrate`, then see [SEC-6](docs/roadmap.md) for removing the legacy path entirely. Until migrated, only sync against servers you trust.
-- The server can observe metadata: file paths, sizes, modification times, and encrypted hashes. Path confidentiality is NOT protected.
+- Format-v2 and format-v3 workspaces reject non-AEAD blobs. Unmigrated format-v1 workspaces still accept legacy XOR on decrypt. Run `feanorfs migrate`, then see [SEC-6](docs/roadmap.md).
+- Format-v3 servers do not store file paths. They can still observe ciphertext sizes, object counts, hash equality, retention, and access timing. Legacy formats expose path metadata.
 - The server password travels in cleartext over HTTP. For internet deployments, always use TLS (Caddy/nginx reverse proxy).
 - Passwords are stored in plaintext in `.feanorfs/config.json` and `~/.feanorfs/global.json`. Protect your workspace directory accordingly.
 
@@ -213,12 +226,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow.
 
 ## Roadmap
 
-Open backlog: [docs/roadmap.md](docs/roadmap.md). **Next up:** tray MVP (menu-bar client shelling `feanorfs --json`).
+Open backlog: [docs/roadmap.md](docs/roadmap.md). Snapshot engine and tray MVP are shipped.
 
 | Priority | Theme |
 |----------|-------|
-| P1 | Tray app (DX-26–28) |
-| P2 | Agent edge tests, sync polish, crypto cleanup (SEC-6), server history (GC-7) |
+| P2 | First npm registry release (external setup) and gated crypto cleanup |
 | P2 (blocked) | Account vault + NAT rendezvous (CONN-6/7) — needs hosted service |
 | P3 | OS dataless files (DX-12), block chunking (CHUNK) |
 
@@ -228,6 +240,8 @@ Open backlog: [docs/roadmap.md](docs/roadmap.md). **Next up:** tray MVP (menu-ba
 feanorfs/
 ├── common/     # Shared data models + crypto
 ├── server/     # Hub library (embedded in `feanorfs serve`; optional `feanorfs-server` binary)
+├── agent-core/ # SQLite-free embeddable agent SDK + JSON LocalHub
+├── bindings/ts/ # @feanorfs/agent napi-rs bindings and native package assembly
 ├── client/     # `feanorfs` binary: sync, agents, hub, MCP/events
 └── docs/       # Threat model, usage, roadmap
 ```

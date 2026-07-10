@@ -6,8 +6,8 @@ Thank you for your interest in improving FeanorFS. This document describes the d
 
 ### Prerequisites
 
-- Rust 1.75 or later (`rustup default stable`)
-- SQLite (bundled by `sqlx` via the `sqlite` feature — no system install required)
+- Rust 1.88 or later (`rustup default stable`)
+- No system SQLite install; the server and one-time legacy importer use bundled SQLx SQLite while the embeddable agent SDK uses JSON state.
 - `cargo-deny` (optional, for license/advisory audits): `cargo install cargo-deny`
 
 ### Getting started
@@ -41,8 +41,8 @@ cargo run --bin feanorfs -- sync --no-watch
 
 ### Conventions
 
-- **Paths**: All file paths are tracked and uploaded using forward slashes (`/`). Normalize with `feanorfs_common::normalize_path` before any DB operation.
-- **No redundant hashing**: Check disk files against `local_cache.db` first. Rehash only if `mtime` or `size` differs.
+- **Paths**: All file paths are tracked and uploaded using forward slashes (`/`). Normalize with `feanorfs_common::normalize_path` before cache or database operations.
+- **No redundant hashing**: Check `.feanorfs/local_state.json` first. Rehash only if `mtime` or `size` differs.
 - **Zero-knowledge encryption**: Always encrypt file contents with `crypt_bytes` before calling `api.upload_file`. Store the resulting `encrypted_hash` in the database.
 - **Error handling**: Use `anyhow::Result` for application code. Provide context with `.context()` or `.with_context()`. Avoid bare `.unwrap()` on fallible operations — use `.unwrap_or()` / `.unwrap_or_default()` only when the default is genuinely safe.
 - **Skip control directories**: `.feanorfs` and `.git` must be hardcoded as skipped in directory scanning. Do not rely on `.gitignore` for these. Sync scope and ignore policy: [docs/sync-scope.md](docs/sync-scope.md).
@@ -105,4 +105,3 @@ dist build --artifacts=all   # build locally (requires cross targets installed)
 ```
 
 Config lives in `dist-workspace.toml` and `release-plz.toml`. Regenerate CI after dist config changes: `dist init -y` or `dist generate`.
-
