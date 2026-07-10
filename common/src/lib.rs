@@ -3,9 +3,14 @@ pub mod invite;
 pub mod sync_delta;
 pub mod three_way;
 pub mod tray_contract;
+pub mod tree;
+mod tree_codec;
+mod tree_convert;
+mod tree_diff;
 
 pub use agent_contract::{
-    AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, SpawnResult,
+    AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, LogEntry, LogResult,
+    SpawnResult, UndoResult,
 };
 pub use invite::{decode_invite, encode_invite, looks_like_invite, WorkspaceInvite, INVITE_PREFIX};
 pub use tray_contract::{
@@ -15,6 +20,12 @@ pub use tray_contract::{
 
 pub use sync_delta::compute_sync_delta;
 pub use three_way::{classify_conflict_kind, conflict_candidate_paths, detect_concurrent_edits};
+pub use tree::{
+    Snapshot, Tree, TreeBundle, TreeChange, TreeChangeKind, TreeEntry, TreeEntryKind,
+    EXECUTABLE_MODE,
+};
+pub use tree_convert::{flat_to_tree, flat_to_tree_with_conflicts, tree_to_flat};
+pub use tree_diff::diff_trees;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -43,6 +54,13 @@ pub struct FileState {
     pub size: u64,     // File size in bytes
     pub mtime: i64,    // Modification time in milliseconds since Unix Epoch
     pub deleted: bool, // Whether the file has been deleted
+    /// Portable executable intent. `0` means non-executable; `1` means executable.
+    #[serde(default, skip_serializing_if = "is_zero_mode")]
+    pub mode: u32,
+}
+
+const fn is_zero_mode(mode: &u32) -> bool {
+    *mode == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +120,20 @@ pub struct SyncResponse {
     pub upload_required: Vec<String>, // Paths of files the client needs to upload
     pub download_required: Vec<FileState>, // Metadata of files the client needs to download
     pub delete_local: Vec<String>,    // Paths the client must delete locally
+}
+
+/// Opaque per-workspace snapshot head returned by the hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadResponse {
+    pub snapshot_id: Option<String>,
+}
+
+/// Compare-and-swap request for one opaque workspace head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapHeadRequest {
+    pub workspace_id: String,
+    pub expected: Option<String>,
+    pub new: String,
 }
 
 /// Snapshot row recorded when an agent workspace is spawned.
@@ -173,6 +205,8 @@ pub struct AgentLandResult {
     pub conflicts: Vec<ConcurrentEdit>,
     pub landed: Vec<LandedPath>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 /// Result of `agent refresh`.
@@ -576,6 +610,7 @@ mod tests {
             size: 4_096,
             mtime: 1_719_500_000_000,
             deleted: false,
+            mode: 0,
         };
         let json = serde_json::to_string(&state).unwrap();
         let decoded: FileState = serde_json::from_str(&json).unwrap();
@@ -590,6 +625,7 @@ mod tests {
             size: 0,
             mtime: 0,
             deleted: true,
+            mode: 0,
         };
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains("\"deleted\":true"), "json: {json}");

@@ -33,11 +33,23 @@ fn theirs_state(
                 size: 0,
                 mtime: 0,
                 deleted: true,
+                mode: 0,
             })
         } else {
             None
         }
     })
+}
+
+fn same_content(left: Option<&FileState>, right: Option<&FileState>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.deleted == right.deleted
+                && (left.deleted || (left.hash == right.hash && left.mode == right.mode))
+        }
+        (None, None) => true,
+        (Some(state), None) | (None, Some(state)) => state.deleted,
+    }
 }
 
 /// Detect concurrent edits given a base snapshot, current local view, and server
@@ -63,12 +75,13 @@ pub fn detect_concurrent_edits(
 
         if let Some(base_entry) = base_entry {
             let we_changed = ours
-                .map(|o| o.hash != base_entry.hash || o.deleted != base_entry.deleted)
+                .map(|ours| !same_content(Some(ours), Some(base_entry)))
                 .unwrap_or(false);
             let server_changed = their_changed.contains_key(&path) || their_deleted.contains(&path);
 
             if we_changed && server_changed {
-                if their_deleted.contains(&path) && ours.is_some_and(|o| o.deleted) {
+                let theirs = theirs_state(&path, their_changed, their_deleted.contains(&path));
+                if same_content(ours, theirs.as_ref()) {
                     continue;
                 }
                 let kind = classify_conflict_kind(
@@ -82,14 +95,14 @@ pub fn detect_concurrent_edits(
                         path.clone(),
                         Some(base_entry.clone()),
                         ours.cloned(),
-                        theirs_state(&path, their_changed, their_deleted.contains(&path)),
+                        theirs,
                     ),
                     kind,
                 ));
             }
         } else if already_pending.contains(&path) {
             if let (Some(o), Some(t)) = (ours, their_changed.get(&path)) {
-                if o.hash != t.hash {
+                if !same_content(Some(o), Some(t)) {
                     out.push((
                         ConcurrentEdit::new(path.clone(), None, Some(o.clone()), Some(t.clone())),
                         ConflictKind::EditEdit,
@@ -99,7 +112,7 @@ pub fn detect_concurrent_edits(
         } else if let (Some(our_state), Some(their_state)) = (ours, their_changed.get(&path)) {
             // No base snapshot — both sides independently created the same path.
             // Flag as conflict when their content or deletion status differs.
-            if our_state.hash != their_state.hash || our_state.deleted != their_state.deleted {
+            if !same_content(Some(our_state), Some(their_state)) {
                 let kind = if our_state.deleted && !their_state.deleted {
                     ConflictKind::DeleteEdit
                 } else if !our_state.deleted && their_state.deleted {
