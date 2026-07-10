@@ -2,22 +2,28 @@
 
 ## Purpose
 
-Content-addressed blob storage and sync metadata server. Axum HTTP server backed by SQLite (`server-data/db.sqlite`) and a flat blobs directory (`server-data/blobs/<hash>`). The server is dumb transport: it stores encrypted bytes and their Blake3 hashes, never decrypts, never inspects file content, and makes no semantic decisions. Optional Bearer auth, optional mDNS LAN advertisement, multi-instance via `--port` and `--data-dir`.
+Content-addressed encrypted object storage. Axum and SQLite store opaque blobs, workspace heads, reachability manifests, and format markers. The server never decrypts objects, inspects filenames, or merges content. Optional Bearer auth, optional mDNS LAN advertisement, and multi-instance flags remain transport concerns.
 
 ## Ownership
 
 - Crate: `feanorfs-server` (library + source-only compatibility binary
   `feanorfs-server`). The supported production and release path is embedded in
   the `feanorfs` binary via `feanorfs serve`.
-- Source layout: `src/main.rs`, `src/serve.rs` (HTTP + GC entry), `src/app.rs` (routes), `src/db.rs` (SQLite), `src/gc.rs`. Sync delta logic lives in `feanorfs_common::compute_sync_delta`.
+- Source layout: `src/main.rs`, `src/serve.rs` (HTTP + GC entry), `src/app.rs` + `src/app/` (router, guards, grouped routes, tests), `src/db.rs` (SQLite), `src/gc.rs`. Sync delta logic lives in `feanorfs_common::compute_sync_delta`.
 - Runtime data lives in `server-data/` which is git-ignored and MUST stay server-local — never include it in distributions.
 
 ## Local Contracts
 
 - Wire types come from `feanorfs-common`. Never redefine `FileState`/`SyncRequest`/`SyncResponse` here.
-- `/api/sync/peek` and `/api/sync/diff` (alias) are read-only; both call `feanorfs_common::compute_sync_delta`.
+- `/api/sync/peek` and `/api/sync/diff` remain format-v1/v2 compatibility paths. Format-v3 clients use encrypted snapshot heads.
+- `/api/head` is the single mutable snapshot commit point and uses SQLite `BEGIN IMMEDIATE` compare-and-swap.
+- `/api/manifest` stores validated newline-delimited opaque blob IDs. GC retains current heads plus the configured day/count manifest window.
+- Manifest upload rejects incomplete closures, and format-v3 head CAS requires a stored manifest.
+- Format-v3 stamping deletes that workspace's flat `files` rows. Legacy sync and non-object uploads receive HTTP 426 even when callers spoof a v3 header.
+- Migration fences persist in SQLite. Only the matching `X-FeanorFS-Migration` token may upload, publish manifests, swap heads, or stamp format until cutover completes.
+- HTTP publication handlers share an `RwLock` with periodic GC. GC takes the write side so it never sweeps from a stale live set while objects or manifests publish.
 - Bearer token comparison uses `constant_time_eq` to prevent timing side-channels. Any future auth changes MUST keep the timing equality property.
-- Request body is capped at 100 MiB via `DefaultBodyLimit` to mitigate memory-exhaustion DoS. Do not raise this without a matching blob-size policy.
+- Request bodies are capped at 100 MiB. Reachability manifests have an additional 8 MiB limit.
 - Upload flow: compute `hash_bytes(body)` server-side and reject mismatches with 400 BEFORE writing the blob. If the DB upsert fails after the blob is on disk, the orphan blob MUST be removed before returning an error so no partial state survives.
 - Download: a single `fs::read` covers both "missing" and "read error"; match `ErrorKind::NotFound` to 404 and everything else to 500. Do not reintroduce a separate `exists()` probe — the exists/read split is a TOCTOU window.
 - `--token` and `--password` are aliases. `FEANORFS_TOKEN` env var mirrors `--token`. `--port` and `--data-dir` env aliases are `FEANORFS_PORT` and `FEANORFS_DATA_DIR` respectively.
@@ -31,10 +37,12 @@ Content-addressed blob storage and sync metadata server. Axum HTTP server backed
 
 ## Verification
 
-- `cargo test -p feanorfs-server` — currently the crate has no dedicated tests; integration behavior is exercised via the workspace `cargo test --workspace` run and locally via manual E2E (start server + two client fixtures in `test-client-a/b`).
+- `cargo test -p feanorfs-server` — covers upload validation, head races, format rejection, and retained-manifest GC.
 - `cargo clippy -p feanorfs-server --all-targets -- -D warnings`.
 - `cargo fmt -p feanorfs-server -- --check`.
 
 ## Child DOX Index
 
-No child directories. `src/` is flat (`main.rs`, `serve.rs`, `app.rs`, `db.rs`, `gc.rs`, `lib.rs`).
+| Child | Purpose |
+| :--- | :--- |
+| [`src/app/`](src/app/AGENTS.md) | Axum format/migration guards, grouped route handlers, and route tests. |

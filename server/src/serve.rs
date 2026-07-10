@@ -13,6 +13,8 @@ pub struct ServeOptions {
     pub gc_interval_secs: u64,
     pub gc_grace_minutes: u64,
     pub tombstone_retention_days: u64,
+    pub snapshot_retention_days: u64,
+    pub snapshot_keep_last: usize,
 }
 
 impl Default for ServeOptions {
@@ -26,6 +28,8 @@ impl Default for ServeOptions {
             gc_interval_secs: 0,
             gc_grace_minutes: 10,
             tombstone_retention_days: 30,
+            snapshot_retention_days: 30,
+            snapshot_keep_last: 50,
         }
     }
 }
@@ -75,6 +79,8 @@ fn register_mdns(port: u16) -> Result<mdns_sd::ServiceDaemon> {
 pub async fn run_http_server(opts: ServeOptions) -> Result<()> {
     let token = resolve_auth_token(opts.token, opts.allow_open)?;
     let state = crate::init_app_state(opts.data_dir.clone(), token.clone()).await?;
+    let gc_db = state.db.clone();
+    let publication_lock = state.publication_lock.clone();
     let app = crate::build_router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], opts.port));
@@ -106,20 +112,27 @@ pub async fn run_http_server(opts: ServeOptions) -> Result<()> {
 
     if opts.gc_interval_secs > 0 {
         let data_dir = opts.data_dir.clone();
+        let db = gc_db.clone();
+        let publication_lock = publication_lock.clone();
         let grace = Duration::from_secs(opts.gc_grace_minutes * 60);
         let retention = Duration::from_secs(opts.tombstone_retention_days * 86400);
+        let snapshot_retention = Duration::from_secs(opts.snapshot_retention_days * 86400);
+        let snapshot_keep_last = opts.snapshot_keep_last;
         let interval = Duration::from_secs(opts.gc_interval_secs);
         tokio::spawn(async move {
-            let db = match crate::db::Db::new(data_dir.join("db.sqlite")).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!("GC task failed to open db: {e}");
-                    return;
-                }
-            };
             loop {
                 tokio::time::sleep(interval).await;
-                match crate::gc::run_gc(&db, &data_dir, grace, retention).await {
+                match crate::gc::run_gc(
+                    &db,
+                    &data_dir,
+                    grace,
+                    retention,
+                    snapshot_retention,
+                    snapshot_keep_last,
+                    &publication_lock,
+                )
+                .await
+                {
                     Ok(s) => tracing::info!(
                         "GC: deleted {} blobs ({} bytes), purged {} tombstones",
                         s.blobs_deleted,
@@ -139,11 +152,15 @@ pub async fn run_http_server(opts: ServeOptions) -> Result<()> {
 
 pub async fn run_gc(opts: &ServeOptions) -> Result<crate::gc::GcStats> {
     let db = crate::db::Db::new(opts.data_dir.join("db.sqlite")).await?;
+    let publication_lock = tokio::sync::RwLock::new(());
     crate::gc::run_gc(
         &db,
         &opts.data_dir,
         Duration::from_secs(opts.gc_grace_minutes * 60),
         Duration::from_secs(opts.tombstone_retention_days * 86400),
+        Duration::from_secs(opts.snapshot_retention_days * 86400),
+        opts.snapshot_keep_last,
+        &publication_lock,
     )
     .await
 }
