@@ -227,6 +227,55 @@ pub extern "C" fn ffs_agent_clean(root: *const c_char, name: *const c_char) -> *
     catch_ptr(|| agent_by_name(root, name, |ws, name| ws.clean(name)))
 }
 
+/// List reachable workspace history. JSON: `LogResult`. NULL on error.
+#[no_mangle]
+pub extern "C" fn ffs_log(root: *const c_char, limit: u32) -> *mut c_char {
+    catch_ptr(|| {
+        clear_error();
+        match workspace(root) {
+            Ok(ws) => match ws.log(usize::try_from(limit).unwrap_or(usize::MAX)) {
+                Ok(result) => ok_json(&result),
+                Err(error) => {
+                    set_error(error.to_string());
+                    ptr::null_mut()
+                }
+            },
+            Err(error) => {
+                set_error(error);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Restore a reachable snapshot as a new snapshot. JSON: `UndoResult`. NULL on error.
+#[no_mangle]
+pub extern "C" fn ffs_undo(root: *const c_char, snapshot_id: *const c_char) -> *mut c_char {
+    catch_ptr(|| {
+        clear_error();
+        let snapshot_id = match unsafe { CStr::from_ptr(snapshot_id) }.to_str() {
+            Ok(value) => value,
+            Err(error) => {
+                set_error(error.to_string());
+                return ptr::null_mut();
+            }
+        };
+        match workspace(root) {
+            Ok(ws) => match ws.undo(snapshot_id) {
+                Ok(result) => ok_json(&result),
+                Err(error) => {
+                    set_error(error.to_string());
+                    ptr::null_mut()
+                }
+            },
+            Err(error) => {
+                set_error(error);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// Resolve a pending conflict. Returns `0` on success, `-1` on error.
 /// `keep`: 0=local, 1=cloud, 2=both, 3=file (requires non-null `file_path`).
 #[no_mangle]
@@ -391,6 +440,16 @@ mod smoke {
         let land_json = ffs_agent_land(root.as_ptr(), name.as_ptr(), 0, 0);
         assert!(!land_json.is_null(), "land failed: {}", last_err());
         let _ = cstr(land_json);
+
+        let log_json = ffs_log(root.as_ptr(), 10);
+        assert!(!log_json.is_null(), "log failed: {}", last_err());
+        let log: feanorfs_common::LogResult = serde_json::from_str(&cstr(log_json)).unwrap();
+        let target = log.entries[0].parents.last().unwrap();
+        let target = CString::new(target.as_str()).unwrap();
+        let undo_json = ffs_undo(root.as_ptr(), target.as_ptr());
+        assert!(!undo_json.is_null(), "undo failed: {}", last_err());
+        let undo: feanorfs_common::UndoResult = serde_json::from_str(&cstr(undo_json)).unwrap();
+        assert_eq!(undo.restored_snapshot_id, target.to_str().unwrap());
 
         let clean_json = ffs_agent_clean(root.as_ptr(), name.as_ptr());
         assert!(!clean_json.is_null());

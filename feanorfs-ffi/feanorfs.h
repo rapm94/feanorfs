@@ -56,6 +56,16 @@ char *ffs_agent_land(const char *root, const char *name, int32_t clean, int32_t 
 char *ffs_agent_clean(const char *root, const char *name);
 
 /**
+ * List reachable workspace history. JSON: `LogResult`. NULL on error.
+ */
+char *ffs_log(const char *root, uint32_t limit);
+
+/**
+ * Restore a reachable snapshot as a new snapshot. JSON: `UndoResult`. NULL on error.
+ */
+char *ffs_undo(const char *root, const char *snapshot_id);
+
+/**
  * Resolve a pending conflict. Returns `0` on success, `-1` on error.
  * `keep`: 0=local, 1=cloud, 2=both, 3=file (requires non-null `file_path`).
  */

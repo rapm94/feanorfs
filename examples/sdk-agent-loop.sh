@@ -39,6 +39,17 @@ echo "== land (expect clean or conflicts JSON) =="
 LAND_JSON="$(json agent land worker)"
 echo "$LAND_JSON"
 echo "$LAND_JSON" | grep -qE '"landed"|"message"'
+LAND_ID="$(echo "$LAND_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['snapshot_id'])")"
+
+echo "== log landed snapshot =="
+LOG_JSON="$(json log --limit 10)"
+echo "$LOG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); target='$LAND_ID'; assert any(e['snapshot_id']==target for e in d['entries'])"
+PRE_LAND_ID="$(echo "$LOG_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); target='$LAND_ID'; e=next(e for e in d['entries'] if e['snapshot_id']==target); print(e['parents'][-1])")"
+
+echo "== undo landed snapshot =="
+UNDO_JSON="$(json undo "$PRE_LAND_ID")"
+UNDO_ID="$(echo "$UNDO_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['snapshot_id'])")"
+json log --limit 10 | python3 -c "import json,sys; d=json.load(sys.stdin); target='$UNDO_ID'; assert d['entries'][0]['snapshot_id']==target"
 
 if echo "$LAND_JSON" | grep -q '"conflicts":\[\]'; then
   echo "== clean land — done =="

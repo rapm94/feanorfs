@@ -35,6 +35,14 @@ export async function clean(root, name) {
   return JSON.parse(await native.agentClean(root, name))
 }
 
+export async function log(root, limit = 20) {
+  return JSON.parse(await native.historyLog(root, limit))
+}
+
+export async function undo(root, snapshotId) {
+  return JSON.parse(await native.undo(root, snapshotId))
+}
+
 export async function conflictsKeep(root, path, keep, filePath) {
   await native.conflictsKeep(root, path, keep, filePath ?? null)
 }
