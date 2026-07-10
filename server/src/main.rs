@@ -39,6 +39,10 @@ struct ServeArgs {
     gc_grace_minutes: u64,
     #[arg(long, default_value = "30")]
     tombstone_retention_days: u64,
+    #[arg(long, default_value = "30")]
+    snapshot_retention_days: u64,
+    #[arg(long, default_value = "50")]
+    snapshot_keep_last: usize,
 }
 
 #[derive(Parser)]
@@ -49,6 +53,10 @@ struct GcArgs {
     gc_grace_minutes: u64,
     #[arg(long, default_value = "30")]
     tombstone_retention_days: u64,
+    #[arg(long, default_value = "30")]
+    snapshot_retention_days: u64,
+    #[arg(long, default_value = "50")]
+    snapshot_keep_last: usize,
 }
 
 impl From<ServeArgs> for ServeOptions {
@@ -62,6 +70,8 @@ impl From<ServeArgs> for ServeOptions {
             gc_interval_secs: a.gc_interval,
             gc_grace_minutes: a.gc_grace_minutes,
             tombstone_retention_days: a.tombstone_retention_days,
+            snapshot_retention_days: a.snapshot_retention_days,
+            snapshot_keep_last: a.snapshot_keep_last,
         }
     }
 }
@@ -88,6 +98,8 @@ async fn run_gc_once(args: &GcArgs) -> anyhow::Result<()> {
         data_dir: args.data_dir.clone(),
         gc_grace_minutes: args.gc_grace_minutes,
         tombstone_retention_days: args.tombstone_retention_days,
+        snapshot_retention_days: args.snapshot_retention_days,
+        snapshot_keep_last: args.snapshot_keep_last,
         ..ServeOptions::default()
     };
     let stats = run_gc(&opts).await?;

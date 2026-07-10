@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Default, Serialize)]
 pub struct GcStats {
@@ -18,15 +19,24 @@ pub async fn run_gc(
     storage_dir: &Path,
     grace: Duration,
     tombstone_retention: Duration,
+    snapshot_retention: Duration,
+    snapshot_keep_last: usize,
+    publication_lock: &RwLock<()>,
 ) -> Result<GcStats> {
+    let _publication_guard = publication_lock.write().await;
     let live = db.get_referenced_hashes().await?;
-    let live_set: HashSet<String> = live.into_iter().collect();
+    let mut live_set: HashSet<String> = live.into_iter().collect();
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let tombstone_cutoff = now - tombstone_retention.as_millis() as i64;
+    let snapshot_cutoff = now - snapshot_retention.as_millis() as i64;
+    live_set.extend(
+        db.retained_manifest_hashes(snapshot_cutoff, snapshot_keep_last)
+            .await?,
+    );
     let tombstones_purged = db.purge_old_tombstones(tombstone_cutoff).await? as u64;
 
     let blobs_dir = storage_dir.join("blobs");
@@ -96,6 +106,7 @@ mod tests {
                 size: 1,
                 mtime: 1,
                 deleted: false,
+                mode: 0,
             },
         )
         .await
@@ -109,9 +120,17 @@ mod tests {
             .await
             .unwrap();
 
-        let stats = run_gc(&db, data.path(), Duration::ZERO, Duration::from_secs(3600))
-            .await
-            .unwrap();
+        let stats = run_gc(
+            &db,
+            data.path(),
+            Duration::ZERO,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            50,
+            &RwLock::new(()),
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.blobs_deleted, 1);
         assert!(blobs.join(&live_hash).exists());
         assert!(!blobs.join(&orphan_hash).exists());
@@ -134,10 +153,56 @@ mod tests {
             data.path(),
             Duration::from_secs(3600),
             Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            50,
+            &RwLock::new(()),
         )
         .await
         .unwrap();
         assert_eq!(stats.blobs_deleted, 0);
         assert!(blobs.join(&orphan_hash).exists());
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_complete_retained_manifest_closure() {
+        let data = TempDir::new().unwrap();
+        let db = Db::new(data.path().join("db.sqlite")).await.unwrap();
+        let blobs = data.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        let snapshot = "1".repeat(64);
+        let tree = "2".repeat(64);
+        let file = "3".repeat(64);
+        let orphan = "4".repeat(64);
+        for hash in [&snapshot, &tree, &file, &orphan] {
+            tokio::fs::write(blobs.join(hash), hash.as_bytes())
+                .await
+                .unwrap();
+        }
+        db.upsert_manifest(
+            "ws",
+            &snapshot,
+            format!("{snapshot}\n{tree}\n{file}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        db.swap_head("ws", None, &snapshot).await.unwrap();
+
+        let stats = run_gc(
+            &db,
+            data.path(),
+            Duration::ZERO,
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            0,
+            &RwLock::new(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.blobs_deleted, 1);
+        assert!(blobs.join(snapshot).exists());
+        assert!(blobs.join(tree).exists());
+        assert!(blobs.join(file).exists());
+        assert!(!blobs.join(orphan).exists());
     }
 }

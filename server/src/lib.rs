@@ -24,5 +24,6 @@ pub async fn init_app_state(
         db: Arc::new(db),
         storage_dir: data_dir,
         auth_token,
+        publication_lock: Arc::new(tokio::sync::RwLock::new(())),
     })
 }
