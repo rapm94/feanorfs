@@ -15,9 +15,9 @@ keywords = ["sync", "filesystem", "e2ee", "blake3", "sqlite"]
 categories = ["command-line-utilities", "filesystem"]
 
 [workspace.dependencies]
-feanorfs-common = { version = "0.3.0", path = "common" }
-feanorfs-server = { version = "0.3.0", path = "server" }
-feanorfs-agent-core = { version = "0.3.0", path = "agent-core" }
+feanorfs-common = { version = "0", path = "common" }
+feanorfs-server = { version = "0", path = "server" }
+feanorfs-agent-core = { version = "0", path = "agent-core" }
 napi = { version = "2", default-features = false, features = ["napi4"] }
 napi-derive = "2"
 serde = { version = "1.0", features = ["derive"] }
@@ -62,4 +62,3 @@ codegen-units = 1
 [profile.dist]
 inherits = "release"
 lto = "thin"
-

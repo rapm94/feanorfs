@@ -1,9 +1,10 @@
 [workspace]
 # FeanorFS is distributed as pre-built binaries, not via crates.io.
 publish = false
-# Cargo package verification cannot resolve unpublished internal workspace
-# crates from crates.io and provides no useful release gate for binary-only
-# distribution. API compatibility remains covered by workspace CI.
+# API compatibility checks provide no useful release gate for binary-only
+# distribution. Historical git-only package verification is disabled by the
+# release-plz workflow because old tags contain unpublished workspace crates.
+# Workspace CI remains the build and compatibility gate.
 semver_check = false
 publish_no_verify = true
 
@@ -11,9 +12,6 @@ publish_no_verify = true
 # `version.workspace = true`; release-plz must not `cargo package` crates with
 # unpublished path deps (feanorfs-ffi, feanorfs-client, …).
 release = false
-
-# Unpublished workspace: derive versions from git tags, not crates.io.
-git_only = true
 
 # Tag only when the release PR is merged, not on every push to main.
 release_always = false
@@ -31,6 +29,9 @@ git_tag_name = "v{{ version }}"
 [[package]]
 name = "feanorfs-common"
 release = true
+# Unpublished release package: derive versions from git tags, not crates.io.
+git_only = true
+features_always_increment_minor = true
 changelog_path = "./CHANGELOG.md"
 changelog_include = [
   "feanorfs-client",

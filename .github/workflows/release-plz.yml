@@ -138,6 +138,33 @@ jobs:
           node-version: "22"
           package-manager-cache: false
 
+      - name: Configure cargo for git-only release history
+        env:
+          CARGO_WRAPPER: ${{ runner.temp }}/release-plz-cargo
+        run: |
+          cat > "$CARGO_WRAPPER" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          real_cargo="$(rustup which cargo)"
+          historical_workspace=false
+          for arg in "$@"; do
+            if [ "$arg" = "--workspace" ]; then
+              historical_workspace=true
+              break
+            fi
+          done
+          if [ "${1:-}" = "package" ] && [ "$historical_workspace" = true ]; then
+            "$real_cargo" "$@" --no-verify
+            target_dir="$("$real_cargo" metadata --format-version 1 --no-deps | jq -r '.target_directory')"
+            for archive in "$target_dir"/package/*.crate; do
+              tar -xzf "$archive" -C "$target_dir/package"
+            done
+            exit 0
+          fi
+          exec "$real_cargo" "$@"
+          EOF
+          chmod +x "$CARGO_WRAPPER"
+
       - name: Run release-plz (release-pr)
         id: release-plz
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
@@ -145,6 +172,7 @@ jobs:
           command: release-pr
           forge: github
         env:
+          CARGO: ${{ runner.temp }}/release-plz-cargo
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Sync npm versions into release PR

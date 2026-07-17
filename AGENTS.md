@@ -153,6 +153,7 @@ To avoid unnecessary re-hashing, the client stores schema-versioned state in `.f
 8. **Sync scope**: mirror disk contents (including gitignored paths); hard skip `.feanorfs/`, `.git/`, symlinks, and nested valid `CACHEDIR.TAG` trees; small frozen `DEFAULT_IGNORES` only — see [docs/sync-scope.md](docs/sync-scope.md). Do not honor `.gitignore` or expand defaults into a framework-specific denylist.
 9. **CI/CD ownership**: Pin repository-owned actions to immutable SHAs, keep permissions least-privilege, and validate workflows with actionlint/zizmor. Never hand-edit cargo-dist's generated `.github/workflows/release.yml`; change `dist-workspace.toml` and regenerate it.
 10. **Release changelog ownership**: Root `CHANGELOG.md` is canonical. Release-plz must use `changelog_path = "./CHANGELOG.md"`; do not create crate-local changelogs.
+11. **Shared pre-1.0 versions**: Internal workspace path dependencies use a pre-1.0 range so release-plz can bump all `version.workspace` crates together. These crates remain unpublished; main CI validates their compatibility.
 
 ---
 
