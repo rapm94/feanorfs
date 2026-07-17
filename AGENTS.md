@@ -107,7 +107,7 @@ To avoid unnecessary re-hashing, the client stores schema-versioned state in `.f
 | Catch-up Summary | [summary.rs](client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
 | Predictive Hydration | [predictive.rs](client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
 | Change Watching | [watch.rs](client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes. |
-| CI, security, and releases | [ci.yml](.github/workflows/ci.yml), [npm-release.yml](.github/workflows/npm-release.yml), [security.yml](.github/workflows/security.yml), [release-plz.yml](.github/workflows/release-plz.yml), [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml) | Main CI verifies SDK dependency boundaries and packed Node tarballs. Trusted tags build five native packages; the facade publishes only after exact platform integrity verification. Cargo-dist owns its generated workflow. |
+| CI, security, and releases | [ci.yml](.github/workflows/ci.yml), [npm-release.yml](.github/workflows/npm-release.yml), [security.yml](.github/workflows/security.yml), [release-plz.yml](.github/workflows/release-plz.yml), [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml) | Main CI verifies SDK dependency boundaries and packed Node tarballs. App tags release the CLI and optional tray; npm package assembly is manual dry-run only. Cargo-dist owns its generated workflow. |
 
 ---
 
@@ -357,7 +357,7 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Planning
 
-Prioritized backlog: [docs/roadmap.md](docs/roadmap.md). **Shipped:** format-v3 snapshots, JSON-backed agent SDK, safe SQLite import, executable intent, history/undo, retained GC, tray, and P2 sync polish. **Release-ready:** five-target Node packages and trusted-tag npm workflow; registry setup/tag push remain external. **Gated:** SEC-6 waits for v1 migration evidence.
+Prioritized backlog: [docs/roadmap.md](docs/roadmap.md). **Shipped:** format-v3 snapshots, JSON-backed agent SDK, safe SQLite import, executable intent, history/undo, retained GC, tray, and P2 sync polish. **Release-ready:** five-target Node package assembly; registry publication is intentionally deferred while app tags ship only the CLI and tray. **Gated:** SEC-6 waits for v1 migration evidence.
 
 ## Child DOX Index
 
