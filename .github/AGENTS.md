@@ -45,7 +45,9 @@ contributor templates.
 - Privileged `workflow_run` jobs validate source repository, event, branch/tag,
   conclusion, and exact commit before using secrets or uploading artifacts.
   Tray release triggers on `v*` tag push and polls until cargo-dist publishes
-  the GitHub Release before building.
+  the GitHub Release before building. Manual retries accept an existing release
+  tag, verify the release and tag resolve to the same commit, then check out that
+  immutable tag before uploading tray artifacts.
 - `release.yml` is cargo-dist generated. Configure `dist-workspace.toml` and
   regenerate; never patch the workflow directly.
 
