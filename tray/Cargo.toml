@@ -21,7 +21,7 @@ feanorfs-common = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tao = "0.30"
-tray-icon = "0.19"
+tray-icon = "0.24"
 muda = "0.15"
 open = "5"
 libc = "0.2"
