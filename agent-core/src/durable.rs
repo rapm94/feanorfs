@@ -54,19 +54,21 @@ pub fn atomic_overwrite(path: &Path, data: &[u8]) -> Result<()> {
 
     awf.commit().context("commit atomic write")?;
 
+    #[cfg(test)]
+    {
+        let fail = TEST_ATOMIC_FAULTS.with(|f| f.borrow().fail_after_commit);
+        if fail {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            return Err(anyhow::anyhow!(
+                "committed-but-durability-uncertain: new state written but \
+                 directory sync failed for {}: injected fault",
+                parent.display()
+            ));
+        }
+    }
+
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
-            #[cfg(test)]
-            {
-                let fail = TEST_ATOMIC_FAULTS.with(|f| f.borrow().fail_after_commit);
-                if fail {
-                    return Err(anyhow::anyhow!(
-                        "committed-but-durability-uncertain: new state written but \
-                         directory sync failed for {}: injected fault",
-                        parent.display()
-                    ));
-                }
-            }
             if let Err(e) = dir.sync_all() {
                 return Err(anyhow::anyhow!(
                     "committed-but-durability-uncertain: new state written but \
