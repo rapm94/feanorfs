@@ -6,11 +6,17 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing application release tag to build tray artifacts for
+        required: true
+        type: string
 
 permissions: {}
 
 concurrency:
-  group: tray-release-${{ github.ref_name }}
+  group: tray-release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -24,10 +30,11 @@ jobs:
       - name: Wait for GitHub Release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           for attempt in $(seq 1 60); do
-            if gh release view "$RELEASE_TAG" --json assets --jq '.assets | length' 2>/dev/null | grep -qv '^0$'; then
+            if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json assets --jq '.assets | length' 2>/dev/null | grep -qv '^0$'; then
               echo "Release $RELEASE_TAG is ready."
               exit 0
             fi
@@ -55,9 +62,9 @@ jobs:
     steps:
       - name: Verify release tag
         env:
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
           TAG_OBJECT="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
@@ -66,14 +73,20 @@ jobs:
           if [ "$TAG_TYPE" = "tag" ]; then
             TAG_SHA="$(gh api "repos/$REPOSITORY/git/tags/$TAG_SHA" --jq '.object.sha')"
           fi
-          if [ "$TAG_SHA" != "$EXPECTED_SHA" ]; then
+          RELEASE_TARGET="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
+          RELEASE_SHA="$(gh api "repos/$REPOSITORY/commits/$RELEASE_TARGET" --jq '.sha')"
+          if [ "$TAG_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::Release $RELEASE_TAG targets $RELEASE_SHA, but its tag resolves to $TAG_SHA."
+            exit 1
+          fi
+          if [ -n "$EXPECTED_SHA" ] && [ "$TAG_SHA" != "$EXPECTED_SHA" ]; then
             echo "::error::Release tag resolves to $TAG_SHA, expected $EXPECTED_SHA."
             exit 1
           fi
       - name: Checkout release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ github.sha }}
+          ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
           persist-credentials: false
           submodules: recursive
       - name: Install Rust
@@ -105,7 +118,7 @@ jobs:
       - name: Upload artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           TARGET: ${{ matrix.target }}
         run: >-
           gh release upload "$RELEASE_TAG"
