@@ -82,11 +82,11 @@ Release binaries are signed with [GitHub Artifact Attestations](https://docs.git
 
 ### Node agent SDK
 
-`@feanorfs/agent` has release-ready packages for macOS x64/ARM64, Linux GNU
-x64/ARM64, and Windows x64. The trusted-tag workflow publishes those five
-native packages before the facade and verifies npm integrity on retries. Until
-the first registry release is completed, build from `bindings/ts/`; do not
-assume the package is available from npm yet.
+`@feanorfs/agent` has release-ready package assembly for macOS x64/ARM64,
+Linux GNU x64/ARM64, and Windows x64. npm publication is intentionally deferred;
+application release tags ship the CLI and optional tray only. Build the SDK from
+`bindings/ts/` or install local tarballs; do not assume the package is available
+from npm.
 
 Per-app installer (client — recommended):
 

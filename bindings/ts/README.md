@@ -2,9 +2,9 @@
 
 Native Node.js bindings for the FeanorFS agent SDK (`spawn` / `status` / `refresh` / `land` / `clean` / `conflicts keep`).
 
-**Status:** release-ready, not yet claimed as published. Trusted-tag CI builds and
-verifies five native packages before publishing the facade. Build from source or
-install local tarballs until the first npm registry release completes.
+**Status:** release-ready, not published. CI can manually build and verify five
+native packages as a dry run, but application release tags do not publish npm
+packages. Build from source or install local tarballs.
 
 Supported packages:
 
