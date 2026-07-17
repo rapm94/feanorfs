@@ -35,6 +35,11 @@ contributor templates.
 - Release PR automation updates Cargo versions first, then runs
   `assemble-metadata` on the release branch so npm facade, lockfile, and five
   native package manifests use the same version before merge.
+- Release PR automation limits `git_only` history to `feanorfs-common`, wraps
+  cargo package commands with `--no-verify`, and extracts generated archives
+  because immutable historical tags contain unpublished internal crates.
+  Pre-1.0 feature commits increment the app minor version. Main-branch CI
+  remains the build gate.
 - npm release automation is manual-dispatch and dry-run only. App release tags must not publish Node packages. Re-enable a tag trigger only after an explicit product decision and npm bootstrap authentication are in place.
 - The dormant npm publish job retains `id-token: write`, exact-integrity checks, and `NPM_TOKEN` bootstrap support so publication can be reactivated without weakening provenance controls.
 - Privileged `workflow_run` jobs validate source repository, event, branch/tag,
