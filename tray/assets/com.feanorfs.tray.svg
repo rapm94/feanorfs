@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="FeanorFS">
+  <defs>
+    <linearGradient id="background" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#17365d"/>
+      <stop offset="1" stop-color="#0b1f36"/>
+    </linearGradient>
+  </defs>
+  <rect x="28" y="28" width="456" height="456" rx="112" fill="url(#background)"/>
+  <path d="M142 220a126 126 0 0 1 210-55l26-31 14 104-104-9 30-27a78 78 0 0 0-128 35z" fill="#55b8ff"/>
+  <path d="M370 292a126 126 0 0 1-210 55l-26 31-14-104 104 9-30 27a78 78 0 0 0 128-35z" fill="#63db91"/>
+  <circle cx="256" cy="256" r="38" fill="#f7fbff"/>
+</svg>

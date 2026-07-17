@@ -22,7 +22,65 @@ Please do not disclose the vulnerability publicly until a fix has been released.
 
 ## Verifying release artifacts
 
-FeanorFS release binaries are built by [cargo-dist](https://github.com/axodotdev/cargo-dist) in GitHub Actions (`.github/workflows/release.yml`). The macOS tray archives are built by `.github/workflows/tray-release.yml` only after the cargo-dist release succeeds. Release archives and installer scripts are signed with a **GitHub Artifact Attestation** (SLSA build provenance via Sigstore). The attestation proves the file was produced by an official release workflow from a specific commit in this repository — a tampered artifact on the release page fails verification even if the download URL looks correct.
+FeanorFS release binaries are built by [cargo-dist](https://github.com/axodotdev/cargo-dist) in GitHub Actions (`.github/workflows/release.yml`). The universal macOS package is built by `.github/workflows/tray-release.yml`, while native Linux and signed Windows desktop products are built by `.github/workflows/desktop-release.yml`; both run only after the cargo-dist release succeeds and the requested tag resolves to the same commit.
+
+The macOS workflow builds arm64 and x86_64 without secrets, combines them into
+one universal CLI and `FeanorFS.app`, signs both with Developer ID Application
+using hardened runtime and trusted timestamps, and signs the package with
+Developer ID Installer. It submits `FeanorFS-macOS.pkg` to Apple, staples the
+accepted ticket for offline validation, requires Gatekeeper package acceptance,
+and publishes notarization and verification evidence. Missing credentials or
+any rejected assessment stops the release before upload; there is no unsigned
+fallback.
+
+Before packaging, the privileged workflow runs the Developer ID-signed CLI in
+an isolated workspace without credential-store overrides. It requires the
+workspace config to contain only a random `fsc1-…` reference, verifies the
+corresponding `com.feanorfs.credentials` item exists and is readable through
+macOS Keychain, deletes that test credential, and binds the public smoke record
+to the packaged CLI SHA-256. An unsigned or ad-hoc-signed binary must fail this
+gate.
+
+The primary Unix installer inspects the latest release assets. On macOS it uses
+the universal package only when both package and checksum are present, then
+requires checksum, Developer ID Installer, and Gatekeeper verification before
+installation. If an older release has no package it installs only the
+cargo-dist CLI and reports that limitation; a listed but incomplete or invalid
+package fails closed.
+
+On Linux x86-64 and ARM64, the same installer prefers a release `.deb` on
+Debian/Ubuntu or `.rpm` on Fedora/RHEL. It verifies the checksum, package name,
+native architecture, and absence of install scripts before invoking the system
+package manager with recommended/weak dependencies disabled. Package metadata
+declares the required desktop libraries, and a listed native package with a
+missing or invalid checksum fails closed. The exact-content tar product remains
+available for custom prefixes and is rejected when runtime linkage is missing.
+
+On Windows, the PowerShell installer accepts only the expected checksummed
+two-executable bundle and requires both files to carry valid Authenticode
+signatures before installing them. The release workflow requires Azure Artifact
+Signing and has no unsigned desktop fallback.
+
+**Current release status:** v0.4.0 predates this gate. Its tray ZIP binaries are
+ad-hoc signed (`TeamIdentifier` absent) and fail Gatekeeper assessment; no
+notarization or verification evidence was published with them. Treat those
+ZIPs as developer-preview artifacts, not authenticated consumer releases. The
+first consumer macOS release must include the universal package, accepted
+notarization JSON, signed-Keychain smoke record, and verification evidence
+described above.
+
+Release artifacts, evidence, and installer scripts also receive a **GitHub
+Artifact Attestation** (SLSA build provenance via Sigstore). An attestation is
+provenance, not a code signature: it proves the file was produced by an
+official workflow from a specific commit. A tampered artifact fails
+verification even if its download URL looks correct.
+
+Trusted tags additionally build the amd64/arm64 opaque relay OCI image from
+`Dockerfile.relay`, publish an SBOM and BuildKit provenance, and attach a GitHub
+attestation to its immutable digest. The image runs as UID/GID 10001, supports a
+read-only root filesystem, and generates authentication only inside its
+persistent data volume. Its HTTP port must stay behind a public-TLS reverse
+proxy; see [docs/deploy-relay.md](docs/deploy-relay.md).
 
 Attestations are not retroactive. Older releases that predate this pipeline must
 be built from source for equivalent provenance.
@@ -36,7 +94,19 @@ gh attestation verify feanorfs-client-x86_64-apple-darwin.tar.xz \
   --repo rapm94/feanorfs
 ```
 
-Use the filename you downloaded (`*.tar.xz`, `*.zip`, `feanorfs-client-installer.sh`, or `feanorfs-client-installer.ps1`). This includes `feanorfs-tray-*.zip`. Success prints the linked workflow run and commit; failure means do not run the binary.
+For a relay image:
+
+```bash
+gh attestation verify \
+  oci://ghcr.io/rapm94/feanorfs-relay:<version> \
+  --repo rapm94/feanorfs
+```
+
+Use the filename you downloaded (`*.tar.xz`, `*.zip`, `*.pkg`, `*.deb`, `*.rpm`,
+`feanorfs-client-installer.sh`, or `feanorfs-client-installer.ps1`). This
+includes `FeanorFS-macOS.pkg` and its notarization/verification evidence.
+Success prints the linked workflow run and commit; failure means do not run the
+binary.
 
 List attestations for a release tag:
 
@@ -46,7 +116,7 @@ gh attestation download --repo rapm94/feanorfs <tag>
 
 ### Verify without piping the install script
 
-If you prefer not to `curl | sh`, download the archive for your platform from [GitHub Releases](https://github.com/rapm94/feanorfs/releases), verify the attestation (above), unpack, and place the `feanorfs` binary on your `PATH`. The install scripts are convenience wrappers around the same attested archives.
+If you prefer not to `curl | sh`, download the artifact for your platform from [GitHub Releases](https://github.com/rapm94/feanorfs/releases) and verify the attestation above. On macOS, open the universal `FeanorFS-macOS.pkg`. On Linux, install the matching `.deb`/`.rpm` with your package manager or inspect the portable tar product. On Windows, verify and unpack the signed desktop ZIP. The install scripts are convenience wrappers around the same attested artifacts.
 
 ### Verify with checksums
 
@@ -58,23 +128,76 @@ shasum -a 256 -c feanorfs-client-x86_64-apple-darwin.tar.xz.sha256
 
 Checksums detect accidental corruption; attestations additionally bind the file to the CI build that produced it.
 
+### Verify native Linux packages
+
+For a Debian-family x86-64 package (use the matching architecture filename):
+
+```bash
+sha256sum -c FeanorFS-linux-x86_64.deb.sha256
+gh attestation verify FeanorFS-linux-x86_64.deb --repo rapm94/feanorfs
+dpkg-deb -f FeanorFS-linux-x86_64.deb Package Architecture Depends
+```
+
+`Package` must be `feanorfs`, the architecture must match the machine, and the
+dependencies must include GTK 3, Ayatana AppIndicator 3, libxdo, and the XDG
+desktop portal. For an RPM-family system:
+
+```bash
+sha256sum -c FeanorFS-linux-x86_64.rpm.sha256
+gh attestation verify FeanorFS-linux-x86_64.rpm --repo rapm94/feanorfs
+rpm -qp --queryformat '%{NAME} %{ARCH}\n' FeanorFS-linux-x86_64.rpm
+rpm -qp --scripts FeanorFS-linux-x86_64.rpm
+```
+
+The identity must be `feanorfs` with the matching native architecture, and the
+script query must be empty.
+
+### Verify Apple signatures and notarization on macOS
+
+Before installation, verify the universal package:
+
+```bash
+shasum -a 256 -c FeanorFS-macOS.pkg.sha256
+gh attestation verify FeanorFS-macOS.pkg --repo rapm94/feanorfs
+pkgutil --check-signature FeanorFS-macOS.pkg
+spctl --assess --type install --verbose=4 FeanorFS-macOS.pkg
+xcrun stapler validate -v FeanorFS-macOS.pkg  # when Xcode tools are installed
+```
+
+`pkgutil` must show a `Developer ID Installer` authority. `spctl` must report
+`source=Notarized Developer ID`, and `stapler` must validate the embedded
+ticket. After installation, `codesign --display --verbose=4 /usr/local/bin/feanorfs`
+and the equivalent command for
+`/Applications/FeanorFS.app` must show a `Developer ID Application` authority,
+a TeamIdentifier, hardened runtime flags, and a trusted timestamp. Compare this
+with `FeanorFS-macOS.verification.txt`; the corresponding notarization JSON
+must have status `Accepted`.
+
 ## CI and supply-chain controls
 
-- CI tests the core workspace on Linux, macOS, and Windows; the macOS-only tray
-  has a separate native build, Clippy, test, and smoke-test gate.
+- CI tests the core workspace on Linux, macOS, and Windows. The cross-platform
+  tray has native build, Clippy, test, and product/payload gates on all three;
+  Linux also builds verified `.deb` and `.rpm` packages.
 - Rust 1.88 is the declared and continuously tested minimum supported version.
 - `cargo-deny` blocks known advisories, yanked crates, unapproved licenses, and
   untrusted dependency sources. A scheduled run catches newly published
   advisories even when the repository is idle.
+- Main-branch CI builds the hardened relay image, exercises its actual runtime,
+  and uses Trivy to block fixed high/critical vulnerabilities in the complete
+  Linux image before a trusted tag can publish it.
 - CodeQL scans Rust and GitHub Actions. `actionlint` validates workflow syntax
   and embedded shell, while `zizmor` audits repository-owned workflows.
 - Repository-owned actions are pinned to immutable commit SHAs. Cargo-dist's
   generated `release.yml` remains generator-owned and is never patched by hand.
-- Dependabot covers Cargo, npm, and GitHub Actions. Version updates use a
+- Dependabot covers Cargo, npm, Docker base images, and GitHub Actions. Version updates use a
   cooldown; security updates are not intentionally delayed.
 - `release-plz` runs only after CI succeeds on a trusted `main` push. Cargo-dist
-  then builds and attests the tag, and the tray workflow verifies that the tag
-  resolves to the exact release commit before uploading its artifacts.
+  then builds and attests the tag, and both desktop workflows verify that the
+  tag resolves to the exact release commit before uploading their artifacts.
+- Apple signing and notarization secrets are available only to their dedicated
+  steps. Decoded keys live under the ephemeral runner directory, private keys
+  are imported into a temporary keychain, and an unconditional cleanup step
+  deletes both files and keychain.
 
 ### Build from source
 
@@ -91,29 +214,78 @@ No binary from GitHub Releases is involved.
 
 ## Threat model
 
-Full analysis: [docs/threat-model.md](docs/threat-model.md). Open backlog: [docs/roadmap.md](docs/roadmap.md) (SEC-6, etc.).
+Full analysis: [docs/threat-model.md](docs/threat-model.md). Open security work is owned and gated in [TODO.md](TODO.md).
 
 ### What FeanorFS protects
 
-- **File contents at rest on the server** — New blobs are sealed with ChaCha20-Poly1305 AEAD (`pack_bytes`) before upload. Keys are derived per path from the workspace encryption key. The server stores only ciphertext and encrypted Blake3 hashes. Without the key, the server cannot recover plaintext.
+- **File contents and names at rest on a format-v3 hub** — File blobs, trees,
+  and snapshot objects are sealed with ChaCha20-Poly1305 AEAD before upload.
+  The hub stores opaque ciphertext objects, heads, and reachability manifests;
+  it cannot recover plaintext or format-v3 filenames without the workspace key.
 - **Ciphertext integrity (AEAD blobs)** — Tampered ciphertext fails authentication on decrypt. The client also re-hashes downloaded ciphertext against the expected `encrypted_hash` before decrypting.
-- **Optional server auth** — Run `feanorfs serve --token <TOKEN>` to require Bearer auth on all API routes.
+- **Authenticated transport** — `feanorfs serve` enables Rustls HTTPS and a
+  generated persistent bearer token by default. Private hubs deliver only their
+  public CA through authenticated `fnh1`/`fnr1` capabilities; clients retain
+  normal certificate and hostname verification.
+- **LAN invite delivery** — Single-use pairing uses SPAKE2, then
+  ChaCha20-Poly1305 with explicit key confirmation. mDNS carries only public
+  rendezvous data, never the pairing secret, server token, or E2EE key.
+- **Off-LAN invite delivery** — `fnp2` retains the same SPAKE2/AEAD/key-confirmation
+  exchange over an outbound-only WSS rendezvous. The relay receives a random
+  128-bit public session ID and bounded opaque frames, never the 80-bit secret,
+  invite, hub token, workspace ID, or E2EE key. It is disabled by default.
+- **Opaque private-hub relay** — `start --relay` gives an owned private hub a
+  random 256-bit route stored in atomic private hub-local state and outbound WSS workers. Remote clients relay the
+  existing Rustls byte stream while retaining the CA-bound hostname for SNI.
+  The relay sees route and traffic metadata but not the bearer token, workspace
+  ID, API paths, object names, or tunneled bytes. Inner TLS and bearer auth fail
+  closed under substitution; queues, concurrency, frames, bytes, and duration
+  are bounded.
+- **Private-hub identity recovery** — `feanorfs serve recovery export` seals the
+  hub CA and bearer token with Argon2id and XChaCha20-Poly1305. Offline import
+  validates the CA/key pair and uses a durable fence so partial restores cannot
+  start the hub.
+- **Private-hub identity rotation** — `feanorfs serve recovery rotate` requires
+  the hub to be stopped, writes an encrypted backup outside the data directory,
+  replaces both CA and token behind the same durable fence, and preserves opaque
+  storage. Every client must authenticate the replacement `fnh1` capability;
+  old trust and credentials fail closed.
+- **Workspace capability recovery** — `feanorfs recovery export` seals the full
+  portable workspace capability with Argon2id and XChaCha20-Poly1305 in an
+  atomic private file. Import authenticates and validates the capability before
+  creating workspace/global state, then delegates to the ordinary `start`
+  lifecycle. CLI prompts and the tray's bounded stdin pipe keep passphrases and
+  decrypted capabilities out of argv, environment variables, and logs. The kit
+  does not contain file blobs and cannot recover an unavailable or erased hub.
 
 ### What FeanorFS does NOT protect
 
-- **Metadata leakage** — The server sees file paths, sizes, modification times, and encrypted hashes. Paths are not encrypted.
+- **Traffic metadata** — A format-v3 hub still observes ciphertext sizes,
+  object counts, hash equality, retention, and request timing. Legacy formats
+  expose flat path metadata until migration.
 - **Legacy XOR blobs (v1 workspaces)** — Unmigrated workspaces still decrypt pre-AEAD blobs via an unauthenticated XOR stream. Run `feanorfs migrate` to format v3, which rejects non-AEAD blobs and encrypts workspace structure. Do not sync unmigrated workspaces against untrusted servers.
-- **No TLS by default** — HTTP on port 3030. Use a reverse proxy or VPN for internet deployments.
-- **Password storage** — Encryption keys and server tokens are stored in plaintext in `.feanorfs/config.json` and `~/.feanorfs/global.json`. Protect directory permissions.
-- **Brute-force resistance** — Key derivation is a single Blake3 pass with no KDF stretching. v2 workspaces require 64-hex generated keys (256-bit CSPRNG). Human passphrases remain weak if used manually.
-- **Replay of old blob versions** — Content-addressed storage allows the server to serve an older valid blob for a path.
+- **Historical weak workspace keys** — New format-v2/v3 create and link paths accept only canonical 256-bit recovery keys and reject human passphrases before writing configuration. A legacy format-v1 workspace may still contain a human-chosen key so it can be read for migration; use `feanorfs migrate --rekey` to replace it while resealing the workspace.
+- **Local account compromise** — Unattended sync resolves the workspace key and
+  server token from macOS Keychain for signed releases, Windows Credential
+  Manager, or Linux Secret Service. Config JSON contains only a random
+  reference. Unsigned macOS/source builds and unavailable stores fall back to
+  atomic Unix `0700`/`0600` files.
+  Malware running as the logged-in user may still use that user's credential
+  APIs, read the working tree, or capture decrypted data.
+- **No process sandbox** — Agent workspaces isolate files, not processes.
+  Commands run by an agent retain the logged-in user's operating-system access.
+- **Rollback availability** — Immutable history preserves recovery paths, but a
+  malicious or corrupted hub can withhold objects, deny service, or attempt to
+  present an older reachable head. Clients warn on observed regressions; this is
+  not an external transparency log.
+- **Pairing assurance** — SPAKE2 usage has focused protocol tests but has not
+  received an independent cryptographic audit.
 
-### Security goals for future versions
+### Open security work
 
-1. **Remove legacy XOR decrypt** (SEC-6) — after all workspaces migrate to format v3.
-2. **Native TLS** on the Axum server (or document reverse-proxy as the only supported internet path).
-3. **Path obfuscation** — encrypt paths in server metadata.
-4. **OS keychain** for stored keys/tokens.
+Ownership, dependencies, and release evidence for legacy-crypto retirement,
+hosted identity/default relay work, and independent review are tracked only in
+[TODO.md](TODO.md).
 
 ## Cryptographic primitives
 
@@ -123,6 +295,11 @@ Full analysis: [docs/threat-model.md](docs/threat-model.md). Open backlog: [docs
 | Encryption (new blobs) | ChaCha20-Poly1305 AEAD | `pack_bytes` / `unpack_bytes`; deterministic SIV-style nonce for CAS stability |
 | Encryption (legacy, decrypt-only) | Blake3 XOF XOR stream | Pre-AEAD blobs until `feanorfs migrate` |
 | Key derivation | Blake3 with length-prefix domain separation | `blake3(domain ‖ len ‖ key ‖ len ‖ path)` — no salt, no KDF stretching |
+| Hub transport | Rustls TLS 1.2/1.3 + bearer token | Public PKI or capability-pinned private hub CA; token generated by default |
+| Pairing | SPAKE2 (Ed25519 group) + ChaCha20-Poly1305 | PAKE-authenticated invite transfer with AEAD and key confirmation over secret-free mDNS (`fnp1`) or bounded WSS rendezvous (`fnp2`) |
+| Opaque relay | WebSocket carrying an inner Rustls stream | Random 256-bit route provides reachability; the existing private CA and bearer token still authenticate the hub end to end |
+| Hub recovery/rotation | Argon2id + XChaCha20-Poly1305 | Passphrase-hardened authenticated backup, restore, and crash-safe replacement of the private CA and bearer token |
+| Workspace recovery kit | Argon2id + XChaCha20-Poly1305 | Passphrase-hardened authenticated encryption of the complete portable workspace capability; restore enters the normal `start` path |
 
 ## Responsible disclosure
 

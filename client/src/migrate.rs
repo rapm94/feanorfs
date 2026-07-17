@@ -40,6 +40,9 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
     }
     let db = crate::open_client_db(base).await?;
     let api = crate::open_api_client(base, &config).await?;
+    // Preserve a CA-verified endpoint migration performed while opening the
+    // client before later format/key updates write this configuration.
+    config = load_config(base)?;
     let existing = load_journal(base).await?;
     if existing.is_none() && api.workspace_format(&config.workspace_id).await? >= 3 {
         let mut resumed = config.clone();

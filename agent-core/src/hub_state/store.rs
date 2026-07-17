@@ -111,10 +111,7 @@ impl HubDb {
                     .as_ref()
                     .is_some_and(|head| workspace.manifests.contains_key(head))
             {
-                bail!(
-                    "format v3 requires a manifested snapshot head in workspace {}",
-                    workspace_id
-                );
+                bail!("format v3 requires a manifested snapshot head in workspace {workspace_id}");
             }
             workspace.format_version = version;
             if version >= 3 {

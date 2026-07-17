@@ -44,7 +44,7 @@ async fn auth_wrong_token_returns_401() {
         .await
         .err()
         .unwrap();
-    assert!(err.to_string().contains("requires a password"));
+    assert!(err.to_string().contains("requires a valid access token"));
 }
 
 #[tokio::test]
@@ -58,7 +58,7 @@ async fn auth_missing_token_returns_401() {
         .await
         .err()
         .unwrap();
-    assert!(err.to_string().contains("requires a password"));
+    assert!(err.to_string().contains("requires a valid access token"));
 }
 
 #[tokio::test]

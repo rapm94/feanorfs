@@ -16,8 +16,10 @@ pub fn write_test_config(workspace: &Path, server_url: &str) {
         workspace_id: WORKSPACE_ID.to_string(),
         encryption_password: Some(TEST_PASSWORD.to_string()),
         server_password: None,
+        tls_ca_pem: None,
         format_version: 2,
         hub_local: false,
+        relay: None,
     };
     let json = serde_json::to_string_pretty(&cfg).unwrap();
     std::fs::write(feanorfs.join("config.json"), json).unwrap();

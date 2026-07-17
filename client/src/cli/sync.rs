@@ -8,6 +8,8 @@ use std::path::Path;
 
 use super::util::output_json;
 
+const MAX_SYMLINK_EXAMPLES: usize = 5;
+
 #[derive(Subcommand)]
 pub enum SyncAction {
     /// Show local and remote differences
@@ -99,12 +101,12 @@ async fn run_status(current_dir: &Path, json: bool) -> anyhow::Result<()> {
         for path in &result.upload_required {
             if let Some(f) = result.local_files.get(path) {
                 if f.deleted {
-                    println!("  [delete]     {}", path);
+                    println!("  [delete]     {path}");
                 } else {
-                    println!("  [modify/add] {}", path);
+                    println!("  [modify/add] {path}");
                 }
             } else {
-                println!("  [modify/add] {}", path);
+                println!("  [modify/add] {path}");
             }
         }
     }
@@ -123,7 +125,7 @@ async fn run_status(current_dir: &Path, json: bool) -> anyhow::Result<()> {
         has_changes = true;
         println!("\nFiles removed on other machines (run 'feanorfs sync --down'):");
         for path in &result.delete_local {
-            println!("  [delete]     {}", path);
+            println!("  [delete]     {path}");
         }
     }
     if !has_changes {
@@ -141,13 +143,30 @@ async fn run_status(current_dir: &Path, json: bool) -> anyhow::Result<()> {
         println!("  Warning: {warn}");
     }
     if !result.skipped_symlinks.is_empty() {
-        println!(
-            "  Skipped {} symlink(s) (not synced): {}",
-            result.skipped_symlinks.len(),
-            result.skipped_symlinks.join(", ")
-        );
+        println!("  {}", skipped_symlink_summary(&result.skipped_symlinks));
     }
     Ok(())
+}
+
+fn skipped_symlink_summary(paths: &[String]) -> String {
+    let examples = paths
+        .iter()
+        .take(MAX_SYMLINK_EXAMPLES)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() <= MAX_SYMLINK_EXAMPLES {
+        format!(
+            "Skipped {} symlink(s) (not synced): {examples}",
+            paths.len()
+        )
+    } else {
+        format!(
+            "Skipped {} symlink(s) (not synced). Examples: {examples} (+{} more)",
+            paths.len(),
+            paths.len() - MAX_SYMLINK_EXAMPLES
+        )
+    }
 }
 
 async fn run_push(current_dir: &Path, json: bool) -> anyhow::Result<()> {
@@ -320,4 +339,31 @@ async fn run_prune(current_dir: &Path, json: bool, dry_run: bool) -> anyhow::Res
         println!("Pruned {} path(s).", result.pruned.len());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_symlink_summary_lists_every_path() {
+        let paths = vec!["a".into(), "b".into()];
+        assert_eq!(
+            skipped_symlink_summary(&paths),
+            "Skipped 2 symlink(s) (not synced): a, b"
+        );
+    }
+
+    #[test]
+    fn large_symlink_summary_is_bounded() {
+        let paths = (0..10)
+            .map(|index| format!("link-{index}"))
+            .collect::<Vec<_>>();
+        let summary = skipped_symlink_summary(&paths);
+        assert_eq!(
+            summary,
+            "Skipped 10 symlink(s) (not synced). Examples: link-0, link-1, link-2, link-3, link-4 (+5 more)"
+        );
+        assert!(!summary.contains("link-5"));
+    }
 }

@@ -22,7 +22,7 @@ cargo build -q --manifest-path "$ROOT/Cargo.toml" -p feanorfs-client
 mkdir -p "$WORKSPACE"
 cd "$WORKSPACE"
 
-"$ROOT/target/debug/feanorfs" serve --data-dir "$SERVER_DATA" --port 3030 --allow-open &
+"$ROOT/target/debug/feanorfs" serve --allow-http --data-dir "$SERVER_DATA" --port 3030 --allow-open &
 SERVER_PID=$!
 for _ in $(seq 1 30); do
   if curl -sf "http://127.0.0.1:3030/api/workspaces" >/dev/null 2>&1; then

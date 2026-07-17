@@ -1,0 +1,55 @@
+name: feanorfs
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${NFPM_VERSION}
+version_schema: semver
+release: 1
+section: utils
+priority: optional
+maintainer: Raul Puigbó <raulapuigbo@gmail.com>
+description: End-to-end encrypted working-directory synchronization for developers
+vendor: FeanorFS
+homepage: https://github.com/rapm94/feanorfs
+license: MIT
+contents:
+  - src: ${NFPM_FEANORFS_BIN}
+    dst: /usr/bin/feanorfs
+    expand: true
+    file_info:
+      mode: 0755
+  - src: ${NFPM_TRAY_BIN}
+    dst: /usr/bin/feanorfs-tray
+    expand: true
+    file_info:
+      mode: 0755
+  - src: tray/assets/com.feanorfs.tray.desktop
+    dst: /usr/share/applications/com.feanorfs.tray.desktop
+    file_info:
+      mode: 0644
+  - src: tray/assets/com.feanorfs.tray.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/com.feanorfs.tray.svg
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/feanorfs/LICENSE
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/feanorfs/README.md
+    file_info:
+      mode: 0644
+overrides:
+  deb:
+    depends:
+      - libgtk-3-0t64 | libgtk-3-0
+      - libayatana-appindicator3-1
+      - libxdo3
+      - xdg-desktop-portal
+      - zenity
+  rpm:
+    depends:
+      - gtk3
+      - libayatana-appindicator-gtk3
+      - libxdo
+      - xdg-desktop-portal
+      - zenity

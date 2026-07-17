@@ -1,0 +1,12 @@
+.git
+.jj
+.feanorfs
+.github
+docs
+scripts
+target
+server-data
+**/.DS_Store
+**/node_modules
+**/target
+*.log

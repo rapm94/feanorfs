@@ -12,7 +12,11 @@ pub use agent_contract::{
     AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, LogEntry, LogResult,
     SpawnResult, UndoResult,
 };
-pub use invite::{decode_invite, encode_invite, looks_like_invite, WorkspaceInvite, INVITE_PREFIX};
+pub use invite::{
+    decode_hub_invite, decode_invite, encode_hub_invite, encode_invite, hub_ca_fingerprint,
+    hub_mdns_hostname, looks_like_hub_invite, looks_like_invite, HubInvite, RelayConfig,
+    WorkspaceInvite, HUB_INVITE_PREFIX, HUB_MDNS_SERVICE, INVITE_PREFIX,
+};
 pub use tray_contract::{
     ConflictKeepResult, ConflictShowResult, RecentWorkspaceEntry, RecentWorkspacesResult,
     TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayPauseResult, TrayStatusResult,
@@ -42,8 +46,8 @@ pub const LEGACY_DEFAULT_PASSWORD: &str = "default-secret-key";
 /// to produce a stable-length hex string suitable as an E2EE key.
 pub fn generate_password() -> Result<String> {
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed)
-        .map_err(|e| anyhow::anyhow!("Failed to generate random bytes: {}", e))?;
+    getrandom::fill(&mut seed)
+        .map_err(|e| anyhow::anyhow!("Failed to generate random bytes: {e}"))?;
     Ok(blake3::hash(&seed).to_hex().to_string())
 }
 
@@ -398,8 +402,9 @@ pub fn pack_bytes(data: &[u8], password: &str, path: &str) -> Result<Vec<u8>> {
     let digest = nonce_hasher.finalize();
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&digest.as_bytes()[..12]);
+    let nonce_ref: &Nonce = (&nonce).into();
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), data)
+        .encrypt(nonce_ref, data)
         .map_err(|e| anyhow::anyhow!("AEAD encrypt failed: {e}"))?;
     let mut out = Vec::with_capacity(1 + 12 + ciphertext.len());
     out.push(AEAD_PREFIX_BYTE);
@@ -426,7 +431,7 @@ pub fn unpack_bytes_with_policy(
 
         let key = derive_crypto_key(password, path);
         let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
-        let nonce = Nonce::from_slice(&data[1..13]);
+        let nonce: &Nonce = data[1..13].try_into().expect("12-byte nonce");
         let plain = cipher.decrypt(nonce, &data[13..]).map_err(|_| {
             anyhow::anyhow!("wrong encryption key for this workspace (decryption failed)")
         })?;

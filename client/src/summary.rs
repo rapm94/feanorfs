@@ -108,19 +108,19 @@ fn render_plain(s: &SummaryResult) -> String {
     if !s.files_added.is_empty() {
         lines.push("Added:".to_string());
         for p in &s.files_added {
-            lines.push(format!("  + {}", p));
+            lines.push(format!("  + {p}"));
         }
     }
     if !s.files_modified.is_empty() {
         lines.push("Modified:".to_string());
         for p in &s.files_modified {
-            lines.push(format!("  ~ {}", p));
+            lines.push(format!("  ~ {p}"));
         }
     }
     if !s.files_deleted.is_empty() {
         lines.push("Deleted:".to_string());
         for p in &s.files_deleted {
-            lines.push(format!("  - {}", p));
+            lines.push(format!("  - {p}"));
         }
     }
     lines.join("\n")

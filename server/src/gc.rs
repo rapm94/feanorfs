@@ -37,7 +37,7 @@ pub async fn run_gc(
         db.retained_manifest_hashes(snapshot_cutoff, snapshot_keep_last)
             .await?,
     );
-    let tombstones_purged = db.purge_old_tombstones(tombstone_cutoff).await? as u64;
+    let tombstones_purged = db.purge_old_tombstones(tombstone_cutoff).await?;
 
     let blobs_dir = storage_dir.join("blobs");
     let mut stats = GcStats {

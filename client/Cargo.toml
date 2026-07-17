@@ -32,6 +32,7 @@ ignore = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
@@ -51,6 +52,16 @@ libc = "0.2"
 fs2 = "0.4"
 atomic-write-file = "0.3"
 blake3 = { workspace = true }
+service-manager = { workspace = true }
+spake2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+if-addrs = { workspace = true }
+zeroize = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 feanorfs-server = { workspace = true }
@@ -66,4 +77,3 @@ bin-dir = "{ bin }{ binary-ext }"
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/feanorfs-client-{ target }.zip"
 pkg-fmt = "zip"
-

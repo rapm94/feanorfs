@@ -290,7 +290,7 @@ async fn do_hydrate_with_ctx(
         match &target_path {
             Some(t) => (
                 true,
-                format!("File '{}' is already hydrated or not found.", t),
+                format!("File '{t}' is already hydrated or not found."),
             ),
             None => (true, "All files are already hydrated.".to_string()),
         }

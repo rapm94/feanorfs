@@ -56,7 +56,7 @@ step "Start feanorfs serve"
 mkdir -p "$SMOKE_HOME" "$SERVER_DATA" "$CLIENT_A" "$CLIENT_B"
 export HOME="$SMOKE_HOME"
 FEANORFS_PORT=$PORT FEANORFS_TOKEN=$TOKEN FEANORFS_DATA_DIR="$SERVER_DATA" \
-  "$FEANORFS" serve --port "$PORT" --data-dir "$SERVER_DATA" --token "$TOKEN" \
+  "$FEANORFS" serve --allow-http --port "$PORT" --data-dir "$SERVER_DATA" --token "$TOKEN" \
   >"$SMOKE_ROOT/server.log" 2>&1 &
 SERVER_PID=$!
 sleep 1

@@ -16,7 +16,11 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "0BSD",
+    # Windows clipboard support (`clipboard-win`, `error-code`); OSI-approved.
+    "BSL-1.0",
     "MPL-2.0",
+    # Mozilla's public WebPKI root-certificate dataset, used by Rustls.
+    "CDLA-Permissive-2.0",
 ]
 # Fail build on unapproved licenses
 confidence-threshold = 0.93
@@ -37,6 +41,14 @@ highlight = "all"
 # (0.19 removed severity levels like "warn"; workspace flags direct deps only)
 unmaintained = "workspace"
 yanked = "deny"
+# wayland-scanner 0.31.10 pins quick-xml 0.39 and uses it only as a proc macro
+# over trusted, vendored Wayland protocol XML at build time. The vulnerable
+# untrusted-runtime XML paths are not present in the shipped tray. Remove these
+# exceptions when wayland-scanner accepts quick-xml >= 0.41.
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [sources]
 # Only allow crates from crates.io by default

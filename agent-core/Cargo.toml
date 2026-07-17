@@ -37,6 +37,11 @@ fs2 = "0.4"
 atomic-write-file = "0.3"
 url = "2"
 constant_time_eq = { workspace = true }
+keyring = { workspace = true }
+zeroize = { workspace = true }
+getrandom = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -94,7 +94,7 @@ pub async fn run_watch(
         {
             consecutive_errors = consecutive_errors.saturating_add(1);
             tracing::error!("Initial sync failed: {:?}", e);
-            eprintln!("Initial sync failed: {:?}", e);
+            eprintln!("Initial sync failed: {e:?}");
             eprintln!("Offline — changes will sync when the server is reachable.");
         }
     } else {
@@ -132,7 +132,7 @@ pub async fn run_watch(
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
                         tracing::error!("Auto-sync failed: {:?}", e);
-                        eprintln!("Auto-sync failed: {:?}", e);
+                        eprintln!("Auto-sync failed: {e:?}");
                     }
                 }
             }
@@ -178,7 +178,7 @@ async fn sync_once(
 ) -> Result<()> {
     tracing::info!("{label}");
     if announce {
-        println!("{}...", label);
+        println!("{label}...");
     }
     let result = do_sync(api, db, current_dir, workspace_id, password, false).await?;
     println!(

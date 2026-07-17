@@ -1,0 +1,382 @@
+# Build platform-native desktop bundles after cargo-dist publishes the core CLI.
+# Linux bundles are checksummed and attested. Windows binaries additionally
+# require Azure Artifact Signing and fail closed when signing is unavailable.
+name: Linux and Windows desktop release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing application release tag to package for desktop
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: desktop-package-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  wait-for-release:
+    name: Wait for cargo-dist release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Wait for GitHub Release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          for attempt in $(seq 1 60); do
+            if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" --json assets --jq '.assets | length' 2>/dev/null | grep -qv '^0$'; then
+              echo "Release $RELEASE_TAG is ready."
+              exit 0
+            fi
+            echo "Waiting for cargo-dist to publish $RELEASE_TAG ($attempt/60)..."
+            sleep 30
+          done
+          echo "::error::Timed out waiting for GitHub Release $RELEASE_TAG."
+          exit 1
+
+  build-linux:
+    needs: wait-for-release
+    name: Build Linux ${{ matrix.asset_arch }} desktop bundle
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            rust_arch: x86_64
+            asset_arch: x86_64
+            nfpm_archive_arch: x86_64
+            nfpm_sha256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+          - runner: ubuntu-24.04-arm
+            rust_arch: aarch64
+            asset_arch: aarch64
+            nfpm_archive_arch: arm64
+            nfpm_sha256: 1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
+          persist-credentials: false
+      - name: Install Linux desktop dependencies
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y --no-install-recommends
+          cpio libgtk-3-dev libxdo-dev libayatana-appindicator3-dev rpm
+      - name: Install pinned nFPM
+        env:
+          NFPM_ARCHIVE_ARCH: ${{ matrix.nfpm_archive_arch }}
+          NFPM_SHA256: ${{ matrix.nfpm_sha256 }}
+          NFPM_VERSION: 2.47.0
+        run: |
+          archive="nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCHIVE_ARCH}.tar.gz"
+          url="https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/${archive}"
+          mkdir -p "$RUNNER_TEMP/nfpm"
+          curl --proto '=https' --tlsv1.2 -fLsS "$url" -o "$RUNNER_TEMP/$archive"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/nfpm" nfpm
+          "$RUNNER_TEMP/nfpm/nfpm" --version | grep -F "${NFPM_VERSION}"
+          echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: Build CLI and tray
+        run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
+      - name: Verify and package desktop bundle
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          EXPECTED_ARCH: ${{ matrix.rust_arch }}
+        run: |
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          test -x target/release/feanorfs
+          test -x target/release/feanorfs-tray
+          if ldd target/release/feanorfs-tray | tee "FeanorFS-linux-$ASSET_ARCH.linkage.txt" | grep -F 'not found'; then
+            echo "::error::Linux tray has unresolved shared libraries."
+            exit 1
+          fi
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          install -m 755 target/release/feanorfs "$root/feanorfs"
+          install -m 755 target/release/feanorfs-tray "$root/feanorfs-tray"
+          install -m 644 tray/assets/com.feanorfs.tray.desktop "$root/com.feanorfs.tray.desktop"
+          install -m 644 tray/assets/com.feanorfs.tray.svg "$root/com.feanorfs.tray.svg"
+          asset="FeanorFS-linux-$ASSET_ARCH.tar.xz"
+          tar -C "$root" -cJf "$asset" \
+            feanorfs feanorfs-tray com.feanorfs.tray.desktop com.feanorfs.tray.svg
+          tar -tJf "$asset" | sort | diff -u - <(printf '%s\n' \
+            com.feanorfs.tray.desktop com.feanorfs.tray.svg feanorfs feanorfs-tray)
+
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          scripts/package-linux.sh .
+          sha256sum "$asset" > "$asset.sha256"
+      - name: Smoke clean Debian and Fedora installs
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: >-
+          scripts/smoke-linux-packages.sh
+          "FeanorFS-linux-$ASSET_ARCH.deb"
+          "FeanorFS-linux-$ASSET_ARCH.rpm"
+      - name: Upload unsigned Linux bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: feanorfs-linux-${{ matrix.asset_arch }}
+          path: |
+            FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz
+            FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz.sha256
+            FeanorFS-linux-${{ matrix.asset_arch }}.deb
+            FeanorFS-linux-${{ matrix.asset_arch }}.deb.sha256
+            FeanorFS-linux-${{ matrix.asset_arch }}.rpm
+            FeanorFS-linux-${{ matrix.asset_arch }}.rpm.sha256
+            FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-linux:
+    needs:
+      - wait-for-release
+      - build-linux
+    name: Attest and publish Linux ${{ matrix.asset_arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        asset_arch: [x86_64, aarch64]
+    steps:
+      - name: Verify immutable release tag
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            tag_sha="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
+          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
+          test "$tag_sha" = "$release_sha"
+          if [ -n "$EXPECTED_SHA" ]; then test "$tag_sha" = "$EXPECTED_SHA"; fi
+      - name: Download Linux bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: feanorfs-linux-${{ matrix.asset_arch }}
+          path: release
+      - name: Verify checksums
+        working-directory: release
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          sha256sum -c "FeanorFS-linux-$ASSET_ARCH.tar.xz.sha256"
+          sha256sum -c "FeanorFS-linux-$ASSET_ARCH.deb.sha256"
+          sha256sum -c "FeanorFS-linux-$ASSET_ARCH.rpm.sha256"
+      - name: Attest Linux release assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz.sha256
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.deb
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.deb.sha256
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm.sha256
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
+      - name: Upload Linux release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz.sha256
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.deb
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.deb.sha256
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm.sha256
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
+          --clobber
+
+  build-windows:
+    needs: wait-for-release
+    name: Build Windows x86_64 desktop binaries
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: Build CLI and tray
+        run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
+      - name: Smoke unsigned Windows product lifecycle
+        shell: pwsh
+        run: >-
+          scripts/smoke-windows-product.ps1
+          target/release/feanorfs.exe
+          target/release/feanorfs-tray.exe
+      - name: Upload unsigned Windows binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: feanorfs-windows-x86_64-unsigned
+          path: |
+            target/release/feanorfs.exe
+            target/release/feanorfs-tray.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-publish-windows:
+    needs:
+      - wait-for-release
+      - build-windows
+    name: Sign and publish Windows x86_64 desktop bundle
+    runs-on: windows-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Verify immutable release tag
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            tag_sha="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
+          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
+          test "$tag_sha" = "$release_sha"
+          if [ -n "$EXPECTED_SHA" ]; then test "$tag_sha" = "$EXPECTED_SHA"; fi
+      - name: Checkout release commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
+          persist-credentials: false
+      - name: Download unsigned Windows binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: feanorfs-windows-x86_64-unsigned
+          path: native
+      - name: Require Azure Artifact Signing configuration
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          SIGNING_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+        run: |
+          $required = @(
+            $env:AZURE_CLIENT_ID,
+            $env:AZURE_SUBSCRIPTION_ID,
+            $env:AZURE_TENANT_ID,
+            $env:SIGNING_ACCOUNT,
+            $env:SIGNING_ENDPOINT,
+            $env:SIGNING_PROFILE
+          )
+          if ($required.Where({ [string]::IsNullOrWhiteSpace($_) }).Count -ne 0) {
+            throw "Configure Azure OIDC and Artifact Signing before releasing Windows."
+          }
+      - name: Azure login with OIDC
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign Windows binaries
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files: |
+            ${{ github.workspace }}\native\feanorfs.exe
+            ${{ github.workspace }}\native\feanorfs-tray.exe
+          file-digest: SHA256
+          timestamp-digest: SHA256
+      - name: Verify signatures and package Windows bundle
+        shell: pwsh
+        run: |
+          $files = @("native/feanorfs.exe", "native/feanorfs-tray.exe")
+          $evidence = @()
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file
+            if ($signature.Status -ne "Valid") {
+              throw "$file does not have a valid Authenticode signature: $($signature.Status)"
+            }
+            $evidence += "$file status=$($signature.Status) subject=$($signature.SignerCertificate.Subject)"
+          }
+          $evidence | Set-Content -Encoding utf8NoBOM FeanorFS-windows-x86_64.verification.txt
+          Compress-Archive -Path $files -DestinationPath FeanorFS-windows-x86_64.zip
+          $hash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64.zip).Hash.ToLowerInvariant()
+          "$hash  FeanorFS-windows-x86_64.zip" | Set-Content -Encoding ascii FeanorFS-windows-x86_64.zip.sha256
+          Copy-Item scripts/install.ps1 feanorfs-windows-installer.ps1
+      - name: Smoke signed Windows product lifecycle
+        shell: pwsh
+        run: >-
+          scripts/smoke-windows-product.ps1
+          native/feanorfs.exe
+          native/feanorfs-tray.exe
+          -RequireAuthenticode
+      - name: Attest Windows release assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            FeanorFS-windows-x86_64.zip
+            FeanorFS-windows-x86_64.zip.sha256
+            FeanorFS-windows-x86_64.verification.txt
+            feanorfs-windows-installer.ps1
+      - name: Upload Windows release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          FeanorFS-windows-x86_64.zip
+          FeanorFS-windows-x86_64.zip.sha256
+          FeanorFS-windows-x86_64.verification.txt
+          feanorfs-windows-installer.ps1
+          --clobber
+      - name: Remove Azure credentials
+        if: always()
+        shell: pwsh
+        run: az logout

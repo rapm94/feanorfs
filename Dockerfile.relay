@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+
+# Build with the project's tested MSRV so the container cannot accidentally
+# depend on a newer compiler than the downloadable desktop product.
+FROM docker.io/library/rust:1.88.0-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
+
+WORKDIR /src
+COPY . .
+RUN cargo build --locked --release -p feanorfs-client --bin feanorfs
+
+FROM docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 feanorfs \
+    && useradd --uid 10001 --gid 10001 --home-dir /var/lib/feanorfs \
+        --create-home --shell /usr/sbin/nologin feanorfs
+
+COPY --from=builder /src/target/release/feanorfs /usr/local/bin/feanorfs
+
+ENV FEANORFS_DATA_DIR=/var/lib/feanorfs \
+    FEANORFS_PORT=3030 \
+    RUST_LOG=feanorfs_server=info,tower_http=warn
+
+VOLUME ["/var/lib/feanorfs"]
+EXPOSE 3030
+
+# A protected bearer token is generated in the persistent data directory.
+# HTTP is intentional only between this container and a TLS reverse proxy.
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/feanorfs"]
+CMD ["serve", "--allow-http", "--relay", "--gc-interval", "3600"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:${FEANORFS_PORT}/api/workspaces)" = "401"

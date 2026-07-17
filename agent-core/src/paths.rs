@@ -31,10 +31,10 @@ pub fn validate_name(name: &str) -> Result<()> {
         bail!("Agent name must not be empty");
     }
     if name.chars().any(|c| c.is_control()) {
-        bail!("Agent name must not contain control characters: '{}'", name);
+        bail!("Agent name must not contain control characters: '{name}'");
     }
     if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
-        bail!("Agent name must be a single path segment: '{}'", name);
+        bail!("Agent name must be a single path segment: '{name}'");
     }
     Ok(())
 }

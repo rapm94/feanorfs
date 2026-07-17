@@ -145,7 +145,7 @@ async fn land_agent_with_ctx(
             "Landed {} path(s){}.",
             applied,
             if registered_count > 0 {
-                format!(", {} need attention", registered_count)
+                format!(", {registered_count} need attention")
             } else {
                 String::new()
             }

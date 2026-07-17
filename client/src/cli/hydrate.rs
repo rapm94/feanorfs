@@ -93,13 +93,13 @@ async fn run_cat(current_dir: &Path, json: bool, path: String) -> anyhow::Result
         output_json(&result)?;
     } else {
         if result.untracked {
-            println!("Warning: file '{}' is not tracked. Reading directly.", path);
+            println!("Warning: file '{path}' is not tracked. Reading directly.");
         }
         if result.hydrated_first {
-            eprintln!("Hydrated {} from server.", path);
+            eprintln!("Hydrated {path} from server.");
         }
         if result.not_found {
-            println!("Error: file '{}' does not exist.", path);
+            println!("Error: file '{path}' does not exist.");
         } else {
             std::io::stdout().write_all(&result.content)?;
         }

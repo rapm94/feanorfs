@@ -282,6 +282,40 @@ jobs:
         run: cargo test -p feanorfs-tray --locked
       - name: Build feanorfs + tray
         run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
+      - name: Test unified installer routing
+        run: |
+          bash scripts/test-install-routing.sh
+          if bash scripts/smoke-macos-keychain.sh target/release/feanorfs; then
+            echo "::error::Unsigned development binary unexpectedly passed signed-release credential smoke."
+            exit 1
+          fi
+      - name: Assemble and smoke macOS package
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "feanorfs-client") | .version')"
+          ROOT="$(mktemp -d)"
+          sh scripts/package-macos.sh assemble \
+            "$VERSION" \
+            target/release/feanorfs \
+            target/release/feanorfs-tray \
+            "$ROOT/build"
+          sh scripts/package-macos.sh build \
+            "$VERSION" \
+            "$ROOT/build" \
+            "$ROOT/FeanorFS-macOS-unsigned.pkg"
+          pkgutil --expand-full \
+            "$ROOT/FeanorFS-macOS-unsigned.pkg" \
+            "$ROOT/expanded"
+          CLI="$ROOT/expanded/Payload/usr/local/bin/feanorfs"
+          APP="$ROOT/expanded/Payload/Applications/FeanorFS.app"
+          cmp target/release/feanorfs "$CLI"
+          cmp target/release/feanorfs-tray "$APP/Contents/MacOS/feanorfs-tray"
+          plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" | grep -Fx com.feanorfs.tray
+          plutil -extract LSUIElement raw -o - "$APP/Contents/Info.plist" | grep -Fx true
+          lipo "$CLI" -verify_arch "$(uname -m)"
+          lipo "$APP/Contents/MacOS/feanorfs-tray" -verify_arch "$(uname -m)"
+          bash scripts/smoke-macos-product.sh \
+            "$CLI" \
+            "$APP/Contents/MacOS/feanorfs-tray"
       - name: Tray CLI smoke
         run: |
           WS="$(mktemp -d)/ws"
@@ -302,6 +336,127 @@ jobs:
             exit 1
           fi
           "$FNR" --json conflicts list | jq -e 'length == 0'
+
+  desktop-tray:
+    name: Tray (${{ matrix.os }})
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Linux desktop dependencies
+        if: ${{ runner.os == 'Linux' }}
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y --no-install-recommends
+          cpio libgtk-3-dev libxdo-dev libayatana-appindicator3-dev rpm
+      - name: Install pinned nFPM
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+          NFPM_VERSION: 2.47.0
+        run: |
+          archive="nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          url="https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/${archive}"
+          mkdir -p "$RUNNER_TEMP/nfpm"
+          curl --proto '=https' --tlsv1.2 -fLsS "$url" -o "$RUNNER_TEMP/$archive"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/nfpm" nfpm
+          "$RUNNER_TEMP/nfpm/nfpm" --version | grep -F "${NFPM_VERSION}"
+          echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
+      - name: Parse Windows product installer
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          [void][scriptblock]::Create((Get-Content -Raw scripts/install.ps1))
+          [void][scriptblock]::Create((Get-Content -Raw scripts/test-install-routing.ps1))
+          scripts/test-install-routing.ps1
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Install MSRV Rust
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Check tray MSRV
+        run: cargo +1.88.0 check -p feanorfs-tray --all-targets --locked
+      - name: Run tray Clippy
+        run: cargo clippy -p feanorfs-tray --all-targets --locked -- -D warnings
+      - name: Run tray tests
+        run: cargo test -p feanorfs-tray --locked
+      - name: Build colocated desktop product
+        run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
+      - name: Verify colocated CLI and tray payload
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              test -x target/release/feanorfs
+              test -x target/release/feanorfs-tray
+              if ldd target/release/feanorfs-tray | grep -F 'not found'; then
+                echo "::error::Linux tray has unresolved shared libraries."
+                exit 1
+              fi
+              ;;
+            Windows)
+              test -f target/release/feanorfs.exe
+              test -f target/release/feanorfs-tray.exe
+              ;;
+            *)
+              echo "::error::Unexpected desktop runner $RUNNER_OS."
+              exit 1
+              ;;
+          esac
+      - name: Smoke Windows product lifecycle
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: >-
+          scripts/smoke-windows-product.ps1
+          target/release/feanorfs.exe
+          target/release/feanorfs-tray.exe
+      - name: Build and verify native Linux packages
+        if: ${{ runner.os == 'Linux' }}
+        run: scripts/package-linux.sh "$RUNNER_TEMP/linux-packages"
+      - name: Smoke clean Debian and Fedora installs
+        if: ${{ runner.os == 'Linux' }}
+        run: >-
+          scripts/smoke-linux-packages.sh
+          "$RUNNER_TEMP/linux-packages/FeanorFS-linux-x86_64.deb"
+          "$RUNNER_TEMP/linux-packages/FeanorFS-linux-x86_64.rpm"
+
+  relay-container:
+    name: Relay container
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build and smoke hardened relay image
+        run: sh scripts/smoke-relay-container.sh
+        env:
+          FEANORFS_RELAY_SMOKE_IMAGE: feanorfs-relay-ci:scan
+          KEEP_FEANORFS_RELAY_SMOKE_IMAGE: "1"
+      - name: Scan relay runtime image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          image-ref: feanorfs-relay-ci:scan
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          scanners: vuln
 
   dependencies:
     name: Dependencies
@@ -343,6 +498,8 @@ jobs:
       - build
       - sdk
       - tray
+      - desktop-tray
+      - relay-container
       - dependencies
       - workflow-lint
     runs-on: ubuntu-latest
@@ -365,7 +522,9 @@ jobs:
             needs.docs.result != 'success' ||
             needs.build.result != 'success' ||
             needs.sdk.result != 'success' ||
-            needs.tray.result != 'success'
+            needs.tray.result != 'success' ||
+            needs.desktop-tray.result != 'success' ||
+            needs.relay-container.result != 'success'
           )
         run: exit 1
       - name: Confirm CI success

@@ -12,7 +12,7 @@ Shared data models, canonical Merkle tree/snapshot objects, sync delta (`compute
 
 ## Local Contracts
 
-- `pack_bytes` / `unpack_bytes` — ChaCha20-Poly1305 for new blobs; format v2 and v3 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to legacy `crypt_bytes` XOR on decrypt — removal tracked as [SEC-6](../docs/roadmap.md).
+- `pack_bytes` / `unpack_bytes` — ChaCha20-Poly1305 for new blobs; format v2 and v3 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to legacy `crypt_bytes` XOR on decrypt — removal is gated by [AI-5](../TODO.md#ai-5-retire-legacy-xor-only-after-field-evidence).
 - Deterministic SIV-style nonce (`blake3(key ‖ len ‖ plaintext)[..12]`) is LOAD-BEARING: CAS keys and change detection require identical `(key, path, plaintext)` → identical ciphertext. Do NOT switch to random nonces. Known accepted leak: the server can observe a file reverting to a previous state.
 - `compute_sync_delta` — pure LWW read-only transport hint used by server peek/diff handlers. Clients reconcile the complete server view against their last agreed state by hash; cross-machine mtime is not conflict identity.
 - `detect_concurrent_edits` / `classify_conflict_kind` — shared three-way logic for agent and workspace conflicts. When ours and theirs independently reach identical hash/deletion state, they have converged and do not conflict even when mtimes differ.
@@ -22,6 +22,8 @@ Shared data models, canonical Merkle tree/snapshot objects, sync delta (`compute
 - `tree.rs` owns public snapshot types; `tree_codec.rs` owns versioned canonical bytes; `tree_convert.rs` and `tree_diff.rs` keep flat conversion and hash-pruned traversal I/O-free.
 - Canonical tree ids hash sorted, length-prefixed bytes. Snapshot identity excludes mtimes. `FileState.mode` is portable executable intent (`0` or `EXECUTABLE_MODE`) and zero stays absent from legacy JSON.
 - Conflict entry `hash` identifies the leg visible in the working copy: `theirs`, then `ours`, then `base`. Tree decoding rejects any other value.
+- `fnh1` hub invites carry URL, optional bearer token, optional public CA, and optional opaque-relay metadata; `fnr1` workspace invites additionally carry workspace ID and E2EE key. `RelayConfig` contains a public relay URL plus random 256-bit reachability route, never the bearer token. TLS CA fields are public certificates only—private keys never enter common wire types.
+- `hub_ca_fingerprint` and `hub_mdns_hostname` derive public discovery identity from the exact serialized CA certificate. The hostname is reachability metadata only; clients still pin the full public CA from an authenticated capability.
 
 ## Work Guidance
 

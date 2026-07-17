@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FeanorFS
+Comment=End-to-end encrypted working-directory sync
+Exec=feanorfs-tray
+Icon=com.feanorfs.tray
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=false

@@ -38,6 +38,20 @@ updates:
       - rust
       - dependencies
 
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:25"
+      timezone: Europe/Madrid
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - ci
+      - dependencies
+
   - package-ecosystem: npm
     directory: /bindings/ts
     schedule:

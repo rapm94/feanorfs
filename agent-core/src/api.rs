@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
-use feanorfs_common::{SyncRequest, SyncResponse};
-use reqwest::Client;
+use feanorfs_common::{RelayConfig, SyncRequest, SyncResponse};
+use reqwest::{Certificate, Client};
 use serde::Deserialize;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,7 +10,11 @@ use crate::hub::LocalHub;
 use crate::local::{load_config, Config};
 
 enum Backend {
-    Http { client: Client, server_url: String },
+    Http {
+        client: Client,
+        server_url: String,
+        _tunnel: Option<crate::tunnel::ClientTunnel>,
+    },
     Local(Arc<LocalHub>),
 }
 
@@ -30,10 +35,64 @@ impl ApiClient {
             backend: Backend::Http {
                 client: Client::new(),
                 server_url: server_url.trim_end_matches('/').to_string(),
+                _tunnel: None,
             },
             server_password: server_password.map(str::to_string),
             migration_token: None,
         }
+    }
+
+    pub fn new_with_tls(
+        server_url: &str,
+        server_password: Option<&str>,
+        tls_ca_pem: Option<&str>,
+    ) -> Result<Self> {
+        Self::new_with_tls_resolution(server_url, server_password, tls_ca_pem, None)
+    }
+
+    /// Builds a normally verified TLS client while overriding address lookup
+    /// for the URL hostname. The URL hostname remains the TLS SNI/name check;
+    /// this is safe for mDNS-discovered addresses only when the CA is pinned.
+    pub fn new_with_tls_resolved(
+        server_url: &str,
+        server_password: Option<&str>,
+        tls_ca_pem: Option<&str>,
+        hostname: &str,
+        addresses: &[SocketAddr],
+    ) -> Result<Self> {
+        Self::new_with_tls_resolution(
+            server_url,
+            server_password,
+            tls_ca_pem,
+            Some((hostname, addresses)),
+        )
+    }
+
+    fn new_with_tls_resolution(
+        server_url: &str,
+        server_password: Option<&str>,
+        tls_ca_pem: Option<&str>,
+        resolution: Option<(&str, &[SocketAddr])>,
+    ) -> Result<Self> {
+        let mut builder = Client::builder();
+        if let Some(pem) = tls_ca_pem {
+            let certificate = Certificate::from_pem(pem.as_bytes())
+                .context("parse FeanorFS hub CA certificate")?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        if let Some((hostname, addresses)) = resolution {
+            builder = builder.resolve_to_addrs(hostname, addresses);
+        }
+        let client = builder.build().context("build FeanorFS HTTP client")?;
+        Ok(Self {
+            backend: Backend::Http {
+                client,
+                server_url: server_url.trim_end_matches('/').to_string(),
+                _tunnel: None,
+            },
+            server_password: server_password.map(str::to_string),
+            migration_token: None,
+        })
     }
 
     pub fn local(hub: Arc<LocalHub>, server_password: Option<String>) -> Self {
@@ -54,12 +113,56 @@ impl ApiClient {
             let hub_dir = config.hub_data_dir(workspace);
             let hub = LocalHub::open(hub_dir, config.server_password.clone()).await?;
             Ok(Self::local(hub, config.server_password.clone()))
-        } else {
-            Ok(Self::new(
+        } else if let Some(relay) = config
+            .relay
+            .as_ref()
+            .filter(|_| !url_is_loopback(&config.server_url))
+        {
+            Self::new_with_relay(
                 &config.server_url,
                 config.server_password.as_deref(),
-            ))
+                config.tls_ca_pem.as_deref(),
+                relay,
+            )
+            .await
+        } else {
+            Self::from_config_direct(workspace, config).await
         }
+    }
+
+    pub async fn from_config_direct(workspace: &Path, config: &Config) -> Result<Self> {
+        if config.is_local_hub() {
+            let hub_dir = config.hub_data_dir(workspace);
+            let hub = LocalHub::open(hub_dir, config.server_password.clone()).await?;
+            Ok(Self::local(hub, config.server_password.clone()))
+        } else {
+            Self::new_with_tls(
+                &config.server_url,
+                config.server_password.as_deref(),
+                config.tls_ca_pem.as_deref(),
+            )
+        }
+    }
+
+    async fn new_with_relay(
+        server_url: &str,
+        server_password: Option<&str>,
+        tls_ca_pem: Option<&str>,
+        relay: &RelayConfig,
+    ) -> Result<Self> {
+        let tunnel = crate::tunnel::ClientTunnel::start(relay, server_url).await?;
+        let address = tunnel.address();
+        let mut api = Self::new_with_tls_resolved(
+            tunnel.server_url(),
+            server_password,
+            tls_ca_pem,
+            tunnel.hostname(),
+            &[address],
+        )?;
+        if let Backend::Http { _tunnel, .. } = &mut api.backend {
+            *_tunnel = Some(tunnel);
+        }
+        Ok(api)
     }
 
     pub fn is_local(&self) -> bool {
@@ -77,7 +180,7 @@ impl ApiClient {
             .raw_request(http::Method::GET, path, query, Vec::new(), None)
             .await?;
         if status == http::StatusCode::UNAUTHORIZED {
-            bail!("Server requires a password. Run 'feanorfs connect <URL> --token <PASS>'");
+            bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
         }
         if !status.is_success() {
             bail!(
@@ -105,7 +208,7 @@ impl ApiClient {
             )
             .await?;
         if status == http::StatusCode::UNAUTHORIZED {
-            bail!("Server requires a password. Run 'feanorfs connect <URL> --token <PASS>'");
+            bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
         }
         if !status.is_success() {
             bail!(
@@ -122,7 +225,7 @@ impl ApiClient {
             .raw_request(http::Method::POST, path, query, body, None)
             .await?;
         if status == http::StatusCode::UNAUTHORIZED {
-            bail!("Server requires a password. Run 'feanorfs connect <URL> --token <PASS>'");
+            bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
         }
         if !status.is_success() {
             bail!(
@@ -142,7 +245,9 @@ impl ApiClient {
         content_type: Option<&str>,
     ) -> Result<(http::StatusCode, Vec<u8>)> {
         match &self.backend {
-            Backend::Http { client, server_url } => {
+            Backend::Http {
+                client, server_url, ..
+            } => {
                 let url = if query.is_empty() {
                     format!("{server_url}{path}")
                 } else {
@@ -301,7 +406,7 @@ impl ApiClient {
             )
             .await?;
         if status == http::StatusCode::UNAUTHORIZED {
-            bail!("Server requires a password. Run 'feanorfs connect <URL> --token <PASS>'");
+            bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
         }
         if !status.is_success() {
             bail!(
@@ -319,4 +424,16 @@ impl ApiClient {
 
 fn urlencoding_path(s: &str) -> String {
     urlencoding::encode(s).into_owned()
+}
+
+fn url_is_loopback(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
 }

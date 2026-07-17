@@ -657,6 +657,55 @@ async fn agent_greenfield_spawn_land_new_file() {
 }
 
 #[tokio::test]
+async fn agent_spawn_replace_restores_original_workspace_on_failure() {
+    let server = spawn_test_server().await;
+    let main = spawn_test_client_with_server(&server).await;
+    let base = main.workspace.path();
+
+    spawn_agent(
+        base,
+        &main.db,
+        &server.api,
+        WORKSPACE_ID,
+        "replace",
+        Some(TEST_PASSWORD),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    write_workspace_file(&base.join(".feanorfs/agents/replace"), "task.txt", b"old").await;
+    tokio::fs::write(
+        base.join(".feanorfs/test-spawn-failpoint-replace"),
+        b"after-stage",
+    )
+    .await
+    .unwrap();
+
+    let error = spawn_agent(
+        base,
+        &main.db,
+        &server.api,
+        WORKSPACE_ID,
+        "replace",
+        Some(TEST_PASSWORD),
+        false,
+        true,
+    )
+    .await
+    .expect_err("replace spawn should fail at the injected failpoint");
+
+    assert!(error.to_string().contains("injected agent spawn failure"));
+    let agent_dir = base.join(".feanorfs/agents/replace");
+    assert!(
+        tokio::fs::try_exists(&agent_dir).await.unwrap(),
+        "restored agent directory missing"
+    );
+    assert_eq!(read_workspace_file(&agent_dir, "task.txt").await, b"old");
+}
+
+#[tokio::test]
 async fn agent_land_pre_sync_detects_no_base_add_add() {
     let server = spawn_test_server().await;
     let main = spawn_test_client_with_server(&server).await;
@@ -2339,8 +2388,10 @@ async fn join_nonempty_folder_unions_without_silent_overwrite() {
         workspace_id: WORKSPACE_ID.to_string(),
         encryption_password: Some(TEST_PASSWORD.to_string()),
         server_password: None,
+        tls_ca_pem: None,
         format_version: 2,
         hub_local: false,
+        relay: None,
     };
     save_config(join_base, &config).unwrap();
     let db = feanorfs_client::ClientDb::new(join_base.join(".feanorfs"))
@@ -2404,8 +2455,10 @@ async fn local_hub_in_process_sync() {
         workspace_id: "local-ws".into(),
         encryption_password: Some(key.clone()),
         server_password: None,
+        tls_ca_pem: None,
         format_version: 2,
         hub_local: true,
+        relay: None,
     };
     save_config(base, &config).unwrap();
     std::fs::create_dir_all(base.join(".feanorfs")).unwrap();

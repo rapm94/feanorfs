@@ -58,11 +58,7 @@ pub(super) async fn compute_agent_diff(ctx: &SyncCtx<'_>, name: &str) -> Result<
     validate_name(name)?;
     let agent_path = agent_dir(ctx.base, name);
     if !agent_path.exists() {
-        bail!(
-            "Agent workspace '{}' does not exist. Run `feanorfs agent spawn {}` first.",
-            name,
-            name
-        );
+        bail!("Agent workspace '{name}' does not exist. Run `feanorfs agent spawn {name}` first.");
     }
     let snapshots = SnapshotEngine::new(ctx);
     let base_id = snapshots.read_agent_base(name).await?;

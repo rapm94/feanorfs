@@ -1,6 +1,7 @@
-# Build the macOS tray after cargo-dist has created the GitHub Release.
-# Keeping this separate leaves cargo-dist's generated release.yml reproducible.
-name: Tray release
+# Build one universal, signed, notarized, and stapled macOS package after
+# cargo-dist has created the application release. Keep this separate from the
+# generated release.yml so cargo-dist remains reproducible.
+name: macOS package release
 
 on:
   push:
@@ -9,14 +10,14 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing application release tag to build tray artifacts for
+        description: Existing application release tag to package for macOS
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: tray-release-${{ inputs.release_tag || github.ref_name }}
+  group: macos-package-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -44,15 +45,13 @@ jobs:
           echo "::error::Timed out waiting for GitHub Release $RELEASE_TAG."
           exit 1
 
-  build-tray:
+  build-native:
     needs: wait-for-release
-    name: feanorfs-tray (${{ matrix.target }})
+    name: Build macOS ${{ matrix.target }}
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
-      contents: write
-      attestations: write
-      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -60,7 +59,56 @@ jobs:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
     steps:
-      - name: Verify release tag
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build CLI and tray
+        run: >-
+          cargo build --release -p feanorfs-client -p feanorfs-tray
+          --target ${{ matrix.target }} --locked
+      - name: Verify native architecture
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "$TARGET" in
+            aarch64-apple-darwin) expected=arm64 ;;
+            x86_64-apple-darwin) expected=x86_64 ;;
+            *) echo "::error::Unexpected target $TARGET"; exit 1 ;;
+          esac
+          for binary in feanorfs feanorfs-tray; do
+            lipo "target/$TARGET/release/$binary" -verify_arch "$expected"
+          done
+      - name: Upload native binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: feanorfs-macos-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/feanorfs
+            target/${{ matrix.target }}/release/feanorfs-tray
+          if-no-files-found: error
+          retention-days: 1
+
+  package-macos:
+    needs:
+      - wait-for-release
+      - build-native
+    name: Sign and package universal macOS app
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Verify immutable release tag
         env:
           EXPECTED_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -89,39 +137,219 @@ jobs:
           ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
           persist-credentials: false
           submodules: recursive
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      - name: Download arm64 binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-      - name: Build feanorfs + tray
-        run: >-
-          cargo build --release -p feanorfs-client -p feanorfs-tray
-          --target ${{ matrix.target }} --locked
-      - name: Package
-        env:
-          TARGET: ${{ matrix.target }}
+          name: feanorfs-macos-aarch64-apple-darwin
+          path: native/arm64
+      - name: Download x86_64 binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: feanorfs-macos-x86_64-apple-darwin
+          path: native/x86_64
+      - name: Assemble universal binaries
         run: |
-          mkdir -p tray-dist
-          cp "target/$TARGET/release/feanorfs" tray-dist/
-          cp "target/$TARGET/release/feanorfs-tray" tray-dist/
-          cd tray-dist
-          zip -9 "../feanorfs-tray-$TARGET.zip" feanorfs feanorfs-tray
-          cd ..
-          shasum -a 256 "feanorfs-tray-$TARGET.zip" > "feanorfs-tray-$TARGET.zip.sha256"
-      - name: Attest artifacts
+          chmod 755 native/arm64/feanorfs native/arm64/feanorfs-tray
+          chmod 755 native/x86_64/feanorfs native/x86_64/feanorfs-tray
+          mkdir -p universal
+          for binary in feanorfs feanorfs-tray; do
+            lipo -create \
+              "native/arm64/$binary" \
+              "native/x86_64/$binary" \
+              -output "universal/$binary"
+            chmod 755 "universal/$binary"
+            lipo "universal/$binary" -verify_arch arm64 x86_64
+          done
+      - name: Import Apple identities and build signed package
+        env:
+          APP_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APP_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          INSTALLER_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          if [ -z "$APP_CERTIFICATE_BASE64" ] || [ -z "$APP_CERTIFICATE_PASSWORD" ]; then
+            echo "::error::Configure the Developer ID Application certificate secrets before releasing macOS."
+            exit 1
+          fi
+          if [ -z "$INSTALLER_CERTIFICATE_BASE64" ] || [ -z "$INSTALLER_CERTIFICATE_PASSWORD" ]; then
+            echo "::error::Configure the Developer ID Installer certificate secrets before releasing macOS."
+            exit 1
+          fi
+
+          app_certificate="$RUNNER_TEMP/feanorfs-application.p12"
+          installer_certificate="$RUNNER_TEMP/feanorfs-installer.p12"
+          keychain_path="$RUNNER_TEMP/feanorfs-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          printf '%s' "$APP_CERTIFICATE_BASE64" | openssl base64 -d -A -out "$app_certificate"
+          printf '%s' "$INSTALLER_CERTIFICATE_BASE64" | openssl base64 -d -A -out "$installer_certificate"
+          chmod 600 "$app_certificate" "$installer_certificate"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$app_certificate" \
+            -k "$keychain_path" \
+            -P "$APP_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security \
+            -t cert \
+            -f pkcs12
+          security import "$installer_certificate" \
+            -k "$keychain_path" \
+            -P "$INSTALLER_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/productsign \
+            -T /usr/bin/security \
+            -t cert \
+            -f pkcs12
+          rm -f "$app_certificate" "$installer_certificate"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+
+          app_identity="$(security find-identity -v -p codesigning "$keychain_path" | awk '/Developer ID Application/ {print $2; exit}')"
+          installer_identity="$(security find-identity -v -p basic "$keychain_path" | awk '/Developer ID Installer/ {print $2; exit}')"
+          if [ -z "$app_identity" ]; then
+            echo "::error::No Developer ID Application identity was imported."
+            exit 1
+          fi
+          if [ -z "$installer_identity" ]; then
+            echo "::error::No Developer ID Installer identity was imported."
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          package_root="$RUNNER_TEMP/feanorfs-package"
+          sh scripts/package-macos.sh assemble \
+            "$version" universal/feanorfs universal/feanorfs-tray "$package_root"
+          cli="$package_root/payload/usr/local/bin/feanorfs"
+          app="$package_root/payload/Applications/FeanorFS.app"
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --keychain "$keychain_path" \
+            --sign "$app_identity" \
+            "$cli"
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --keychain "$keychain_path" \
+            --sign "$app_identity" \
+            "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --verify --strict --verbose=2 "$cli"
+          bash scripts/smoke-macos-keychain.sh "$cli" | tee FeanorFS-macOS.keychain-smoke.txt
+
+          unsigned="$RUNNER_TEMP/FeanorFS-macOS-unsigned.pkg"
+          sh scripts/package-macos.sh build "$version" "$package_root" "$unsigned"
+          productsign \
+            --sign "$installer_identity" \
+            --keychain "$keychain_path" \
+            --timestamp \
+            "$unsigned" \
+            FeanorFS-macOS.pkg
+          pkgutil --check-signature FeanorFS-macOS.pkg | grep -F "Developer ID Installer:"
+          rm -f "$unsigned"
+      - name: Notarize and staple package
+        env:
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        run: |
+          if [ -z "$NOTARY_KEY_P8_BASE64" ] || [ -z "$NOTARY_KEY_ID" ] || [ -z "$NOTARY_ISSUER_ID" ]; then
+            echo "::error::Configure the App Store Connect notarization secrets before releasing macOS."
+            exit 1
+          fi
+
+          key_path="$RUNNER_TEMP/feanorfs-notary-key.p8"
+          keychain_path="$RUNNER_TEMP/feanorfs-signing.keychain-db"
+          profile="feanorfs-notary"
+          printf '%s' "$NOTARY_KEY_P8_BASE64" | openssl base64 -d -A -out "$key_path"
+          chmod 600 "$key_path"
+          xcrun notarytool store-credentials "$profile" \
+            --key "$key_path" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --keychain "$keychain_path" \
+            --validate
+          rm -f "$key_path"
+          xcrun notarytool submit FeanorFS-macOS.pkg \
+            --keychain-profile "$profile" \
+            --keychain "$keychain_path" \
+            --wait \
+            --timeout 20m \
+            --output-format json > FeanorFS-macOS.notarization.json
+          jq -e '.status == "Accepted"' FeanorFS-macOS.notarization.json
+          xcrun stapler staple -v FeanorFS-macOS.pkg
+          xcrun stapler validate -v FeanorFS-macOS.pkg
+      - name: Verify package trust and contents
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          evidence="FeanorFS-macOS.verification.txt"
+          package_root="$RUNNER_TEMP/feanorfs-package"
+          app="$package_root/payload/Applications/FeanorFS.app"
+          cli="$package_root/payload/usr/local/bin/feanorfs"
+          : > "$evidence"
+          {
+            keychain_smoke_hash="$(sed -n 's/^cli_sha256=//p' FeanorFS-macOS.keychain-smoke.txt)"
+            test -n "$keychain_smoke_hash"
+            test "$keychain_smoke_hash" = "$(shasum -a 256 "$cli" | awk '{print $1}')"
+            cat FeanorFS-macOS.keychain-smoke.txt
+            pkgutil --check-signature FeanorFS-macOS.pkg
+            xcrun stapler validate -v FeanorFS-macOS.pkg
+            spctl --assess --type install --verbose=4 FeanorFS-macOS.pkg
+            codesign --verify --deep --strict --verbose=4 "$app"
+            codesign --display --verbose=4 "$app"
+            codesign --verify --strict --verbose=4 "$cli"
+            codesign --display --verbose=4 "$cli"
+            lipo "$app/Contents/MacOS/feanorfs-tray" -verify_arch arm64 x86_64
+            echo "tray architectures: arm64 x86_64"
+            lipo "$cli" -verify_arch arm64 x86_64
+            echo "cli architectures: arm64 x86_64"
+            pkgutil --payload-files FeanorFS-macOS.pkg
+          } >> "$evidence" 2>&1
+          grep -F "Developer ID Installer:" "$evidence"
+          grep -F "source=Notarized Developer ID" "$evidence"
+          grep -F "Authority=Developer ID Application:" "$evidence"
+          grep -F "Signed macOS credential smoke passed" "$evidence"
+          grep -F "arm64 x86_64" "$evidence"
+          shasum -a 256 FeanorFS-macOS.pkg > FeanorFS-macOS.pkg.sha256
+          cp scripts/install-macos.sh feanorfs-macos-installer.sh
+          chmod 755 feanorfs-macos-installer.sh
+          echo "Verified signed universal package for $RELEASE_TAG."
+      - name: Attest macOS release assets
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: |
-            feanorfs-tray-${{ matrix.target }}.zip
-            feanorfs-tray-${{ matrix.target }}.zip.sha256
-      - name: Upload artifacts
+            FeanorFS-macOS.pkg
+            FeanorFS-macOS.pkg.sha256
+            FeanorFS-macOS.notarization.json
+            FeanorFS-macOS.verification.txt
+            FeanorFS-macOS.keychain-smoke.txt
+            feanorfs-macos-installer.sh
+      - name: Upload macOS release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-          TARGET: ${{ matrix.target }}
-        run: >-
-          gh release upload "$RELEASE_TAG"
-          "feanorfs-tray-$TARGET.zip"
-          "feanorfs-tray-$TARGET.zip.sha256"
-          --clobber
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            FeanorFS-macOS.pkg \
+            FeanorFS-macOS.pkg.sha256 \
+            FeanorFS-macOS.notarization.json \
+            FeanorFS-macOS.verification.txt \
+            FeanorFS-macOS.keychain-smoke.txt \
+            feanorfs-macos-installer.sh \
+            --clobber
+      - name: Remove Apple credentials
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/feanorfs-signing.keychain-db" 2>/dev/null || true
+          rm -f \
+            "$RUNNER_TEMP/feanorfs-application.p12" \
+            "$RUNNER_TEMP/feanorfs-installer.p12" \
+            "$RUNNER_TEMP/feanorfs-notary-key.p8"

@@ -1,5 +1,6 @@
 mod access;
 mod cache;
+mod config;
 mod conflicts;
 mod durability;
 mod scanning;

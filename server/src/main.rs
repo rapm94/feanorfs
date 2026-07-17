@@ -15,7 +15,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the HTTP sync server (default).
+    /// Run the secure sync server (default).
     Serve(ServeArgs),
     /// Garbage-collect unreferenced blobs and old tombstones.
     Gc(GcArgs),
@@ -23,12 +23,23 @@ enum Commands {
 
 #[derive(Parser, Clone)]
 struct ServeArgs {
+    /// Bearer token (default: generate and persist one in the hub data directory)
     #[arg(long, env = "FEANORFS_TOKEN", visible_alias = "password")]
     token: Option<String>,
     #[arg(long)]
     allow_open: bool,
+    #[arg(long, conflicts_with_all = ["tls_cert", "tls_key", "tls_ca"])]
+    allow_http: bool,
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    #[arg(long, requires = "tls_cert")]
+    tls_ca: Option<PathBuf>,
     #[arg(long)]
     mdns: bool,
+    #[arg(long, visible_alias = "pair-relay")]
+    relay: bool,
     #[arg(long, default_value = "3030", env = "FEANORFS_PORT")]
     port: u16,
     #[arg(long, default_value = "server-data", env = "FEANORFS_DATA_DIR")]
@@ -66,7 +77,12 @@ impl From<ServeArgs> for ServeOptions {
             port: a.port,
             token: a.token,
             allow_open: a.allow_open,
+            allow_http: a.allow_http,
+            tls_cert: a.tls_cert,
+            tls_key: a.tls_key,
+            tls_ca: a.tls_ca,
             mdns: a.mdns,
+            relay: a.relay,
             gc_interval_secs: a.gc_interval,
             gc_grace_minutes: a.gc_grace_minutes,
             tombstone_retention_days: a.tombstone_retention_days,

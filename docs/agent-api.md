@@ -77,7 +77,10 @@ Primary land result type for `--json agent land` and all SDK embeddings.
 
 ### `AgentCommitResult` (legacy alias)
 
-Subset of `AgentLandResult` without `landed` / `message`. Still exported from `feanorfs_common` for older library callers; **not** emitted by `--json` or SDK bindings. Prefer `AgentLandResult` in new code. Removal planned at next major.
+Subset of `AgentLandResult` without `landed` / `message`. It remains exported
+from `feanorfs_common` for older library callers and is **not** emitted by
+`--json` or SDK bindings. Prefer `AgentLandResult` in new code; no removal is
+scheduled.
 
 ### `AgentRefreshResult`
 

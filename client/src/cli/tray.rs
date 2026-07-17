@@ -1,12 +1,18 @@
 use clap::Subcommand;
 use feanorfs_client::{
-    do_tray_status, list_recent_workspaces, load_config, register_workspace, set_active_workspace,
-    set_paused,
+    do_tray_status, forget_unavailable_workspaces, list_recent_workspaces, load_config,
+    register_workspace, set_active_workspace, set_paused,
 };
 use feanorfs_common::TrayPauseResult;
-use std::path::Path;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
+use super::pair::PairCode;
+use super::start::{run_start, StartOptions};
 use super::util::output_json;
+
+const MAX_PAIRING_STDIN_BYTES: u64 = 1024;
 
 #[derive(Subcommand)]
 pub enum TrayAction {
@@ -20,10 +26,17 @@ pub enum TrayAction {
     Register,
     /// List recent workspace folders.
     Recent,
+    /// Remove unavailable folders from the tray list without touching workspace data.
+    ForgetUnavailable,
     /// Set the active workspace for the tray switcher.
     Activate {
         /// Workspace folder path
         path: std::path::PathBuf,
+    },
+    /// Join another computer from the bundled tray's bounded stdin capability.
+    Join {
+        /// New or unconfigured workspace folder
+        folder: PathBuf,
     },
 }
 
@@ -92,6 +105,19 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                 }
             }
         }
+        TrayAction::ForgetUnavailable => {
+            let before = list_recent_workspaces()?.workspaces.len();
+            let recent = forget_unavailable_workspaces()?;
+            if json {
+                output_json(&recent)?;
+            } else {
+                let removed = before.saturating_sub(recent.workspaces.len());
+                println!(
+                    "Removed {removed} unavailable workspace entr{} from the tray. No workspace data was changed.",
+                    if removed == 1 { "y" } else { "ies" }
+                );
+            }
+        }
         TrayAction::Activate { path } => {
             set_active_workspace(&path)?;
             if json {
@@ -100,6 +126,76 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                 println!("Active workspace: {}", path.display());
             }
         }
+        TrayAction::Join { folder } => {
+            if json {
+                anyhow::bail!("tray pairing join is interactive and does not support --json");
+            }
+            if folder.join(".feanorfs").join("config.json").exists() {
+                anyhow::bail!(
+                    "{} is already a FeanorFS workspace; choose a new or unconfigured folder",
+                    folder.display()
+                );
+            }
+            let pair_code = read_pairing_code(std::io::stdin().lock())?;
+            run_start(
+                current_dir,
+                StartOptions {
+                    target: None,
+                    folder: Some(folder),
+                    workspace: None,
+                    encryption_key: None,
+                    server_token: None,
+                    lan: false,
+                    local: false,
+                    host: false,
+                    relay: None,
+                    no_watch: false,
+                    foreground: false,
+                    recovery_invite: None,
+                    pair_code: Some(pair_code),
+                },
+            )
+            .await?;
+        }
     }
     Ok(())
+}
+
+fn read_pairing_code<R: BufRead>(reader: R) -> anyhow::Result<PairCode> {
+    let mut limited = reader.take(MAX_PAIRING_STDIN_BYTES + 1);
+    let mut input = Zeroizing::new(String::new());
+    let bytes = limited
+        .read_line(&mut input)
+        .map_err(|error| anyhow::anyhow!("read pairing capability from tray: {error}"))?;
+    if bytes == 0 {
+        anyhow::bail!("bundled tray did not provide a pairing capability");
+    }
+    if bytes as u64 > MAX_PAIRING_STDIN_BYTES {
+        anyhow::bail!("pairing capability input is too large");
+    }
+    while input.ends_with(['\r', '\n']) {
+        input.pop();
+    }
+    if input.contains('\0') {
+        anyhow::bail!("pairing capability contains an unsupported NUL character");
+    }
+    PairCode::parse(input.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn bounded_stdin_pairing_code_is_validated_and_canonicalized() {
+        let code = read_pairing_code(Cursor::new(b"fnp1-2345-6789-abcd-efgh\n")).unwrap();
+        assert_eq!(code.as_str(), "fnp1-2345-6789-ABCD-EFGH");
+        assert!(read_pairing_code(Cursor::new(b"not-a-pairing-code\n")).is_err());
+        assert!(read_pairing_code(Cursor::new(vec![
+            b'x';
+            MAX_PAIRING_STDIN_BYTES as usize + 1
+        ]))
+        .is_err());
+    }
 }

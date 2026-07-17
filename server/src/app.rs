@@ -1,7 +1,9 @@
 mod guards;
 mod routes_legacy;
 mod routes_objects;
+pub(crate) mod routes_pair_relay;
 mod routes_publication;
+pub(crate) mod routes_tunnel_relay;
 
 #[cfg(test)]
 mod tests;
@@ -24,9 +26,11 @@ use tokio::sync::RwLock;
 use crate::db::Db;
 use routes_legacy::{handle_sync_peek, handle_upload};
 use routes_objects::{handle_download, handle_get_head, handle_get_workspaces, handle_swap_head};
+use routes_pair_relay::{handle_pair_relay, PairRelayState};
 use routes_publication::{
     handle_begin_migration, handle_get_format, handle_manifest, handle_set_format,
 };
+use routes_tunnel_relay::{handle_tunnel_relay, TunnelRelayState};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +38,8 @@ pub struct AppState {
     pub storage_dir: PathBuf,
     pub auth_token: Option<String>,
     pub publication_lock: Arc<RwLock<()>>,
+    pub(crate) pair_relay: PairRelayState,
+    pub(crate) tunnel_relay: TunnelRelayState,
 }
 
 #[derive(Deserialize)]
@@ -69,7 +75,15 @@ struct FormatQuery {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    build_router_inner(state, false)
+}
+
+pub(crate) fn build_router_with_relay(state: AppState) -> Router {
+    build_router_inner(state, true)
+}
+
+fn build_router_inner(state: AppState, relay: bool) -> Router {
+    let protected = Router::new()
         .route("/api/sync/peek", post(handle_sync_peek))
         .route("/api/sync/diff", post(handle_sync_peek))
         .route("/api/upload", post(handle_upload))
@@ -80,14 +94,27 @@ pub fn build_router(state: AppState) -> Router {
             "/api/workspace/format",
             get(handle_get_format).post(handle_set_format),
         )
-        .route("/api/download/:hash", get(handle_download))
+        .route("/api/download/{hash}", get(handle_download))
         .route("/api/workspaces", get(handle_get_workspaces))
         .layer(DefaultBodyLimit::max(crate::MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        ));
+    let mut router = Router::new().merge(protected);
+    if relay {
+        router = router
+            .route("/api/pair-relay/{session}/{role}", get(handle_pair_relay))
+            .route("/api/tunnel-relay/{route}/{role}", get(handle_tunnel_relay));
+    }
+    router
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                |request: &Request<axum::body::Body>| {
+                    tracing::info_span!("http_request", method = %request.method())
+                },
+            ),
+        )
         .with_state(state)
 }
 

@@ -29,6 +29,7 @@ path = "src/main.rs"
 feanorfs-common = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
+axum-server = { workspace = true }
 tower-http = { workspace = true }
 clap = { workspace = true }
 sqlx = { workspace = true }
@@ -44,6 +45,16 @@ constant_time_eq = { workspace = true }
 tokio-util = { workspace = true }
 if-addrs = { workspace = true }
 tower = { workspace = true }
+rcgen = { workspace = true }
+zeroize = { workspace = true }
+argon2 = { workspace = true }
+base64 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+getrandom = { workspace = true }
+atomic-write-file = "0.3"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
+reqwest = { workspace = true }

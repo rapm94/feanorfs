@@ -20,8 +20,26 @@ path = "src/main.rs"
 feanorfs-common = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tao = "0.30"
-tray-icon = "0.19"
-muda = "0.15"
-open = "5"
+tao = "0.35.3"
+tray-icon = { version = "0.24.1", default-features = false }
+muda = { version = "0.19.3", default-features = false }
+open = "5.4.0"
+rfd = { version = "0.17.2", default-features = false }
+arboard = { version = "3.6.1", default-features = false }
+zeroize = { workspace = true }
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.24.1", default-features = false, features = ["gtk", "libxdo"] }
+muda = { version = "0.19.3", default-features = false, features = ["gtk", "libxdo"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = { version = "0.24.1", default-features = false, features = ["common-controls-v6"] }
+muda = { version = "0.19.3", default-features = false, features = ["common-controls-v6"] }
+rfd = { version = "0.17.2", default-features = false, features = ["common-controls-v6"] }

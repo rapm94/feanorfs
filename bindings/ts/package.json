@@ -1,6 +1,6 @@
 {
   "name": "@feanorfs/agent",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Native Node bindings for FeanorFS agent workspaces",
   "main": "api.mjs",
   "types": "contract.d.ts",
@@ -31,22 +31,19 @@
     "access": "public"
   },
   "napi": {
-    "name": "feanorfs-agent-node",
-    "triples": {
-      "defaults": false,
-      "additional": [
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-pc-windows-msvc"
-      ]
-    }
+    "binaryName": "feanorfs-agent-node",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
+    ]
   },
   "scripts": {
     "build": "napi build --platform --release -p feanorfs-agent-node",
     "build:target": "napi build --release -p feanorfs-agent-node",
-    "create-npm-dir": "napi create-npm-dir -t .",
+    "create-npm-dir": "napi create-npm-dirs",
     "assemble-packages": "node scripts/assemble-packages.mjs",
     "assemble-metadata": "node scripts/assemble-packages.mjs --metadata-only",
     "verify-packages": "node scripts/assemble-packages.mjs --verify",
@@ -56,14 +53,14 @@
     "test": "node test/loop.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "2.18.4"
+    "@napi-rs/cli": "3.7.3"
   },
   "license": "MIT",
   "optionalDependencies": {
-    "@feanorfs/agent-darwin-x64": "0.4.0",
-    "@feanorfs/agent-darwin-arm64": "0.4.0",
-    "@feanorfs/agent-linux-x64-gnu": "0.4.0",
-    "@feanorfs/agent-linux-arm64-gnu": "0.4.0",
-    "@feanorfs/agent-win32-x64-msvc": "0.4.0"
+    "@feanorfs/agent-darwin-x64": "0.5.0",
+    "@feanorfs/agent-darwin-arm64": "0.5.0",
+    "@feanorfs/agent-linux-x64-gnu": "0.5.0",
+    "@feanorfs/agent-linux-arm64-gnu": "0.5.0",
+    "@feanorfs/agent-win32-x64-msvc": "0.5.0"
   }
 }

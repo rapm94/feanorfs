@@ -74,7 +74,7 @@ impl ApiClient {
 
 fn ensure_authorized(status: http::StatusCode) -> Result<()> {
     if status == http::StatusCode::UNAUTHORIZED {
-        bail!("Server requires a password. Run 'feanorfs connect <URL> --token <PASS>'");
+        bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
     }
     Ok(())
 }

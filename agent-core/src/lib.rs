@@ -26,6 +26,7 @@ mod snapshot_diff;
 mod state;
 pub mod sync_pass;
 mod tree_reconcile;
+pub mod tunnel;
 
 pub use agent::{
     check_agent, clean_agent, commit_agent, land_agent, list_agents, refresh_agent,
@@ -38,15 +39,16 @@ pub use ctx::SyncCtx;
 pub use feanorfs_common::{
     decode_invite, encode_invite, looks_like_invite, AgentCheckResult, AgentCleanResult,
     AgentCommitResult, AgentLandResult, AgentListEntry, AgentListOfflineResult, AgentListResult,
-    AgentRefreshResult, ConcurrentEdit, ConflictKind, ConflictRecord, FileState, SpawnResult,
-    WorkspaceInvite, INVITE_PREFIX,
+    AgentRefreshResult, ConcurrentEdit, ConflictKind, ConflictRecord, FileState, RelayConfig,
+    SpawnResult, WorkspaceInvite, INVITE_PREFIX,
 };
 pub use head::SwapHeadResult;
 pub use history::{log, undo};
 pub use hub::LocalHub;
 pub use local::{
-    load_config, load_global_config, save_config, save_global_config, validate_e2ee_key, ClientDb,
-    Config, GlobalConfig, LOCAL_HUB_URL,
+    load_config, load_global_config, save_config, save_config_secure, save_global_config,
+    save_global_config_secure, validate_e2ee_key, ClientDb, Config, CredentialProtection,
+    GlobalConfig, LOCAL_HUB_URL,
 };
 pub use objects::ObjectStore;
 pub use paths::legacy_policy_for_config;

@@ -1,10 +1,20 @@
 pub mod app;
 pub mod db;
 pub mod gc;
+mod private_file;
+pub mod recovery;
 pub mod serve;
+pub mod tls;
 
 pub use app::{build_router, AppState};
-pub use serve::{resolve_auth_token, run_gc, run_http_server, ServeOptions};
+pub use recovery::{
+    acquire_hub_runtime, ensure_recovery_complete, export_recovery_bundle, import_recovery_bundle,
+    rotate_hub_identity, HubRuntimeGuard, IdentityRotationResult, RecoveryExportResult,
+    RecoveryImportResult,
+};
+pub use serve::run_http_server_guarded;
+pub use serve::{resolve_or_create_auth_token, run_gc, run_http_server, ServeOptions};
+pub use tls::{prepare_tls, TlsIdentity};
 
 /// Maximum request/response body size for upload/download (100 MiB).
 pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
@@ -25,5 +35,7 @@ pub async fn init_app_state(
         storage_dir: data_dir,
         auth_token,
         publication_lock: Arc::new(tokio::sync::RwLock::new(())),
+        pair_relay: app::routes_pair_relay::PairRelayState::default(),
+        tunnel_relay: app::routes_tunnel_relay::TunnelRelayState::default(),
     })
 }

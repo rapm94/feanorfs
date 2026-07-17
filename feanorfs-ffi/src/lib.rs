@@ -413,8 +413,10 @@ mod smoke {
                 workspace_id: "ffi-test".into(),
                 encryption_password: Some(key),
                 server_password: None,
+                tls_ca_pem: None,
                 format_version: 2,
                 hub_local: true,
+                relay: None,
             },
         )
         .unwrap();

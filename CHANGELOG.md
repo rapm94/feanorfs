@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/rapm94/feanorfs/compare/v0.4.0...v0.5.0) - 2026-07-18
+
+### Added
+
+- Seamless first-machine hosting: with no saved connection, `feanorfs start [folder]` creates a native-TLS private hub under `~/.feanorfs/hub-data`, installs a credential-free per-user hub service, syncs, installs the workspace watcher, and registers the desktop tray. `start --host` explicitly selects that path; `serve` remains the advanced foreground/server surface.
+- Automatic per-workspace user services: `feanorfs start` now syncs, installs background sync at login, and returns; `service install|status|start|stop|uninstall` provides recovery controls.
+- Universal macOS Installer package containing `/usr/local/bin/feanorfs` and a proper `/Applications/FeanorFS.app`; the tray registers at login and coordinates exclusive actions with managed workspace services.
+- Cross-platform desktop tray for macOS, Linux, and Windows, with colocated CLI discovery, per-user login registration, native folder/dialog integration, and no duplicate sync or cryptography implementation.
+- Linux x86-64/ARM64 checksummed and attested `.deb`/`.rpm` desktop packages with declared GTK/AppIndicator/libxdo/portal dependencies, application-menu launchers, exact-payload verification, and a checked tar fallback; plus fail-closed Azure Authenticode signing for the Windows x86-64 CLI/tray bundle.
+- One recommended Unix installer that automatically selects the signed macOS package or verified native Linux package, delegates dependency resolution to `apt`/`dnf`/`yum`, and truthfully falls back to the tar or CLI-only path when appropriate; a PowerShell installer verifies Windows checksums, exact contents, and both executable signatures and creates a Start menu shortcut.
+- Tray-first onboarding: the system tray app now stays alive without a configured workspace and offers a native **Start Mirroring a Folder…** picker that delegates to the secure `feanorfs start` flow.
+- Tray-to-tray onboarding: the receiver's **Join Another Computer…** action accepts a pasted `fnp1`/`fnp2` in masked native UI, chooses a destination folder, and delegates through bounded stdin to the existing zeroizing `PairCode` and `run_start` path without Terminal.
+- Reversible folder offboarding: `feanorfs stop [folder]` and the tray's confirmed **Stop Mirroring This Folder…** action uninstall automatic sync and remove the recent-workspace entry while preserving files, encrypted setup, credentials, remote snapshots, and private hubs for later resume.
+- Comprehensive lifecycle diagnostics: `feanorfs doctor` now checks automatic workspace sync, tray registration, locally owned private-hub persistence, authenticated mirror reachability, E2EE, format-v3 trees, and local state; global `--json` returns stable secret-free check records for automation.
+- Native tray diagnostics and repair: **Check System Health…** reads only `doctor` check names/statuses, displays generic labels without workspace identifiers or endpoints, and offers explicit **Repair Mirroring** through the existing flag-safe `start -- <folder>` lifecycle instead of requiring Terminal.
+- Safe update awareness: `feanorfs update` performs a bounded HTTPS-only semantic-version check against the official stable GitHub release, rejects noncanonical metadata/URLs, and powers the tray's explicit **Check for Updates…** / **Open Release Page** flow without downloading, installing, or executing artifacts.
+- Privacy-safe migration evidence: `feanorfs doctor --migration-report` reads only local workspace format versions and emits deduplicated aggregate v1/v2/v3, unsupported, and unreadable counts. It never resolves credentials, contacts a hub, or reports paths, workspace IDs, labels, endpoints, credential references, relay routes, keys, tokens, or capabilities; legacy decryption remains gated on representative field evidence.
+- Recoverable tray history: unavailable workspace folders are labeled and disabled instead of failing when selected. A confirmed **Remove Unavailable Folders…** action warns about disconnected external drives and delegates one locked, atomic recent-list cleanup to the CLI without changing files, encrypted setup, credentials, services, hubs, or remote snapshots.
+- Tray-first installer handoff: after every checksum, signature, architecture, and payload check succeeds, interactive macOS, Linux, and Windows desktop installs open the exact installed tray with a non-secret `--first-run` hint. An unconfigured tray immediately offers custom **Start Mirroring a Folder…**, **Join Another Computer…**, and **Not Now** buttons, routing the first two into the existing secure menu actions without receiving a capability; existing workspaces never re-prompt, and **Not Now** leaves the tray available. Root/headless sessions and `FEANORFS_NO_LAUNCH=1` remain noninteractive; CLI-only fallbacks never launch a tray. The macOS app resolves its packaged CLI at `/usr/local/bin/feanorfs` without relying on LaunchServices `PATH`.
+- Opaque per-folder workspace IDs: implicit new mirrors use distinct random `fsw1-…` identifiers instead of sharing `default`; explicit `--workspace` remains available for manual linking.
+- Single-use LAN pairing: `feanorfs pair` and **Pair Another Computer…** produce an `fnp1-…` code that the receiver supplies through **Join Another Computer…** or the equivalent `start`; mDNS discovery, initial sync, and background setup are automatic.
+- Stable private-hub addressing: automatic hubs use a CA-derived `feanorfs-….local` hostname whose mDNS addresses follow interface and DHCP changes, removing the normal router-reservation step.
+- Native Rustls HTTPS: `feanorfs serve` now creates a durable private CA by default, refreshes interface certificates, and emits an `fnh1-…` secure hub invite; `--allow-http` is explicit.
+- Zero-flag hub authentication: generate and persist a private 64-hex bearer token, reuse it after restart, and rotate it with explicit `--token`.
+- Secure hub/workspace capabilities carry only public CA certificates so reqwest/Rustls can verify private hubs across LAN address changes.
+- Fail-closed macOS packaging: secret-free native builds are combined into universal binaries, then require Developer ID Application and Installer signatures, Apple notarization, a stapled ticket, Gatekeeper package acceptance, and published evidence before upload.
+- Signed-release Keychain gate: run the Developer ID CLI against an isolated workspace, require redacted config plus a readable native credential, delete the test item, bind the result to the packaged CLI hash, and publish the smoke record with the release.
+- Offline private-hub recovery: `serve recovery export|import` preserves the hub CA and bearer token in an encrypted, crash-safe bundle so restored hubs retain existing client trust.
+- Offline workspace recovery: `recovery export|import` and native tray actions protect the complete portable workspace capability with Argon2id + XChaCha20-Poly1305, fail before local writes on wrong-passphrase or tamper, use atomic `0600` files, and restore through the same initial-sync/service/tray `start` path.
+- Fail-closed hub trust refresh: `start fnh1-… <existing-folder>` authenticates a replacement HTTPS CA/token and existing opaque head before preserving the folder's workspace ID, E2EE key, refs, files, and encrypted history.
+- Crash-safe private-hub identity rotation: `serve recovery rotate` writes a mandatory encrypted backup, replaces the stopped hub's CA and bearer token behind a durable resume fence, removes stale leaf material, and preserves all opaque storage.
+- Off-LAN private-hub transport: `start --relay <URL>` persists a random 256-bit route for an owned automatic hub, whose credential-free service maintains outbound WebSocket offers. Remote clients tunnel the existing Rustls stream through a loopback bridge, preserving hub CA verification and bearer authentication end to end. `serve --relay` enables both this bounded tunnel and `fnp2` pairing; `--pair-relay` remains a compatibility alias.
+- Off-LAN pairing rendezvous: `fnp2` capabilities carry a public 128-bit session ID plus the relay URL and client-only 80-bit secret; the relay forwards bounded opaque WebSocket frames while SPAKE2, AEAD, and key confirmation remain end to end. Stored private-hub relay settings are reused automatically by the tray and CLI.
+- Standard `feanorfs --version` installation/support output.
+- Hardened opaque-relay OCI product: trusted tags publish the existing `feanorfs serve --relay` binary for amd64/arm64 as a non-root, read-only-capable image with protected persistent identity, authenticated health checks, SBOM, and digest-bound provenance.
+
+### Changed
+
+- Make fresh automatic private hubs survive a local port-3030 collision by scanning a bounded stable fallback range and atomically persisting the selection; existing hubs keep their endpoint, and service arguments remain limited to the protected hub-data path.
+- Make tray failure copy state the unavailable operation, reassure users when files or workspace access were preserved, and provide a concrete retry, reinstall, or `feanorfs doctor` path instead of exposing `FEANORFS_BIN`, “watcher,” or generic “feanorfs failed” messages.
+- Gate native Windows desktop artifacts on a full one-command host, redacted Credential Manager persistence/reload/cleanup, Task Scheduler hub/workspace/tray, TLS, doctor, MCP, and reversible stop/resume smoke; repeat it after Authenticode verification before signed publication.
+- Gate native Linux desktop publication on clean installs of the exact `.deb` and `.rpm` artifacts in digest-pinned Debian 13 and Fedora 44 containers, including an idle format-v3 encrypted one-shot workspace with private config and real snapshot objects plus tray startup against that workspace under isolated Xvfb/D-Bus sessions.
+- Keep MCP `sync_status` concise: return the mirror state, local file count, actionable pending paths, conflict/offline state, rollback warning, and skipped-symlink count without serializing the complete local file map.
+- Replace the low-adoption tray password-dialog dependency with a narrow platform adapter: built-in masked AppleScript and WinForms prompts on macOS/Windows, plus packaged `zenity` with `kdialog` fallback on Linux.
+
+### Security
+
+- Reject human passphrases, uppercase/non-hex values, and wrong-length manual E2EE keys before writing new format-v2/v3 workspace or global configuration. Generated 256-bit keys remain the canonical path; legacy format-v1 keys stay readable for migration and optional rekeying.
+- Keep the automatic hub's bearer token, CA private key, workspace E2EE key, and invites out of service argv, environment variables, logs, and discovery; its supervised command receives only the protected hub data-directory path.
+- Store unattended E2EE keys and server tokens in macOS Keychain for signed releases, Windows Credential Manager, or Linux Secret Service; config JSON keeps only a random reference. Unsigned macOS/source builds and unavailable stores retain the atomic private-file fallback, while migrated configs fail closed on credential-store errors.
+- Protect `~/.feanorfs/recent.json` updates with a private lock and atomic replacement; malformed state now fails explicitly instead of being silently overwritten during start/stop races.
+- Keep encryption keys and server tokens out of service-manager arguments, and create atomic Unix credential directories/files and their temporary replacements with `0700`/`0600` permissions.
+- Protect LAN invite delivery with SPAKE2, ChaCha20-Poly1305, explicit key confirmation, three-attempt rate limiting, expiry, secret zeroization, and secret-free mDNS metadata.
+- Keep mDNS outside the trust boundary: stable endpoint adoption requires normal TLS verification against the invite-pinned public CA plus a successful authenticated hub probe; forged advertisements can cause denial of service but cannot impersonate the hub.
+- Hide recovery keys and capability invites from redirected output unless explicitly requested; never disable TLS certificate verification.
+- Protect hub recovery bundles with Argon2id and XChaCha20-Poly1305; validate CA/key identity, require an offline runtime lock, and fence partial multi-file imports until resumed.
+- Protect workspace recovery kits with Argon2id and XChaCha20-Poly1305; expose no capability metadata, refuse implicit overwrite, and keep passphrases plus decrypted invites out of argv, environment variables, and logs while the tray supplies only a bounded stdin pipe.
+- Keep tray recovery passphrases confined to masked platform UI, capped captured output, zeroizing memory, and the CLI child's bounded stdin; dialog commands contain only static scripts and public labels.
+- Keep receiver-side pairing capabilities out of argv, environment variables, and logs; the tray sends one bounded stdin line, and the CLI validates it before folder creation or configuration writes.
+- Refuse plaintext or tokenless hub identity refreshes, and leave existing connection settings untouched when replacement TLS or authentication cannot be verified.
+- Rotate compromised hub CA/token material together, require offline exclusive access and a recoverable encrypted replacement identity, and force explicit capability re-pairing on every old client.
+- Keep off-LAN pairing secrets, invites, bearer tokens, and workspace metadata out of relay URLs/state/logs; require WSS outside loopback tests; bound pairing and tunnel queues, concurrency, frames, bytes, and lifetime; zeroize client pairing-capability copies; and preserve hub CA verification plus bearer authentication inside the relayed TLS stream.
+
+### Fixed
+
+- Treat Windows drive paths and ordinary colon-bearing names as folders in the merged `start [target] [folder]` flow instead of misclassifying them as scheme-free servers; bare endpoints remain available for unambiguous localhost, IP, and dotted-host values with an explicit port.
+- Prevent embedded local hubs from inheriting a bearer token cached for an unrelated remote hub.
+- Stop `doctor` from reporting a reachable but non-persistent workspace as healthy; failures now state what was preserved and provide a concrete recovery command instead of aborting on the first connection error.
+- Make macOS `service stop` unload and preserve its launchd job so `KeepAlive` cannot immediately respawn it; the tray no longer starts a shadow watcher for a stopped managed service.
+- Wait for the macOS watcher process to release its sync lock after launchd unloads it, preventing package upgrades and tray-exclusive actions from racing the terminating process.
+- Present tray pairing in a native, terminal-free one-time-code dialog. The CLI child retains mDNS and cryptography, emits only the expiring code and TTL through a captured pipe, keeps the code out of argv/logs, and is terminated when the dialog closes.
+- Refresh and restart an automatic host's TLS leaf before LAN pairing so laptops moved between networks advertise an address covered by the server certificate.
+- Replace fixed LAN-IP invites with the durable CA-bound hostname, auto-update advertised addresses, retain an IP fallback for custom loopback hubs, and recover existing numeric configurations without retrying ambiguous publication requests.
+- Detect same-path binary replacements with path-plus-Blake3 service identities, then restart the managed hub, workspace watcher, and tray onto the upgraded bytes. Background `start` now coordinates with an existing managed watcher, releases its workspace handles before launching the replacement, and restores the service if the initial sync fails.
+- Make an ordinary `start <existing-folder>` refresh its locally owned private-hub service after a same-path package upgrade; users do not need to rediscover or pass `--host` for lifecycle repair.
+- Read the stable Windows Task Scheduler state instead of localized status text so upgrades stop active managed watchers and do not relaunch an already-running tray.
+- Read the automatic private hub's actual Windows Task Scheduler state instead of treating every installed hub task as stopped, allowing `doctor` and restart decisions to distinguish running, stopped, and missing hubs correctly.
+- Register the Windows tray with Task Scheduler's interactive user token so the menu is visible in the logged-in desktop session instead of allowing a background-only tray process.
+- Upgrade Axum to 0.8.9, reqwest to 0.13.4, tower-http to 0.7, and add axum-server 0.8/Rustls 0.23 plus rcgen 0.14.8 for maintained native TLS.
+- Upgrade the tray stack to tray-icon 0.24.1, muda 0.19.3, and tao 0.35.3; move filesystem watching to notify 8.2, AEAD to ChaCha20-Poly1305 0.11, randomness to getrandom 0.4, and interface discovery to if-addrs 0.15 while preserving Rust 1.88 support.
+- Upgrade the Node SDK toolchain to napi-rs 3 (including its `create-npm-dirs` package workflow), diff rendering to diffy 0.5, and executable discovery to which 8; keep SQLx, notify, SPAKE2, Argon2, and constant-time comparison on their newest stable Rust-1.88-compatible lines, and retain tokio-tungstenite 0.29 while Axum 0.8.9 uses it so release binaries contain one WebSocket protocol stack instead of both 0.29 and 0.30.
+- Refresh the Rust-1.88-compatible Linux credential stack to zbus 5.18 and its current zvariant/zbus-name patch releases.
+- Exercise the expanded macOS package as a real product in CI: one-command private hosting, credential-free launchd arguments, tray startup, authenticated TLS, MCP discovery/status, and secret-protected LAN pairing readiness.
+- Keep human `status` output bounded when dependency trees contain thousands of skipped symlinks; `--json` still returns the complete sorted list.
+
 ## [0.4.0](https://github.com/rapm94/feanorfs/compare/v0.3.3...v0.4.0) - 2026-07-17
 
 ### Added
@@ -97,7 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
 - **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
-[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.5.0...HEAD
 [0.3.0]: https://github.com/rapm94/feanorfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rapm94/feanorfs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0

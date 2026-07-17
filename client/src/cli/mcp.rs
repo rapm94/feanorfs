@@ -1,6 +1,7 @@
 use anyhow::Context;
 use feanorfs_client::{
-    check_agent, land_agent, load_config, refresh_agent, spawn_agent, ResolveKeep, SyncCtx,
+    check_agent, land_agent, load_config, refresh_agent, spawn_agent, ResolveKeep, StatusResult,
+    SyncCtx,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -96,7 +97,7 @@ fn tool_list() -> Value {
                 },
                 "required": ["path", "keep"]
             })),
-            tool("sync_status", "Workspace sync status", json!({ "type": "object", "properties": {} })),
+            tool("sync_status", "Concise workspace sync status", json!({ "type": "object", "properties": {} })),
             tool("workspace_log", "List workspace snapshot history", json!({
                 "type": "object",
                 "properties": { "limit": { "type": "integer", "minimum": 0, "maximum": 1000 } }
@@ -217,7 +218,7 @@ async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Re
         "sync_status" => {
             let r = feanorfs_client::do_status(&api, &db, current_dir, &config.workspace_id, pw)
                 .await?;
-            Ok(serde_json::to_value(r)?)
+            Ok(compact_sync_status(r))
         }
         "workspace_log" => {
             let limit = params["limit"]
@@ -235,5 +236,73 @@ async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Re
             Ok(serde_json::to_value(result)?)
         }
         other => anyhow::bail!("unknown method: {other}"),
+    }
+}
+
+fn compact_sync_status(status: StatusResult) -> Value {
+    json!({
+        "mirror_state": status.mirror_state,
+        "local_file_count": status.local_files.len(),
+        "upload_required": status.upload_required,
+        "download_required": status
+            .download_required
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>(),
+        "delete_local": status.delete_local,
+        "pending_conflicts": status.pending_conflicts,
+        "offline_backlog": status.offline_backlog,
+        "server_rollback_warning": status.server_rollback_warning,
+        "skipped_symlink_count": status.skipped_symlinks.len(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_sync_status;
+    use feanorfs_client::{MirrorState, StatusResult};
+    use feanorfs_common::FileState;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn sync_status_is_compact_but_keeps_actionable_paths() {
+        let local_files = HashMap::from([(
+            "src/main.rs".to_string(),
+            FileState {
+                path: "src/main.rs".to_string(),
+                hash: "a".repeat(64),
+                size: 42,
+                mtime: 7,
+                deleted: false,
+                mode: 0,
+            },
+        )]);
+        let status = StatusResult {
+            mirror_state: MirrorState::OutOfSync,
+            upload_required: vec!["src/main.rs".to_string()],
+            download_required: vec![FileState {
+                path: "README.md".to_string(),
+                hash: "b".repeat(64),
+                size: 12,
+                mtime: 8,
+                deleted: false,
+                mode: 0,
+            }],
+            delete_local: Vec::new(),
+            local_files,
+            pending_conflicts: Vec::new(),
+            offline_backlog: 0,
+            server_rollback_warning: None,
+            skipped_symlinks: vec!["linked-cache".to_string()],
+        };
+
+        let value = compact_sync_status(status);
+        assert_eq!(value["mirror_state"], "out_of_sync");
+        assert_eq!(value["local_file_count"], 1);
+        assert_eq!(value["upload_required"], json!(["src/main.rs"]));
+        assert_eq!(value["download_required"], json!(["README.md"]));
+        assert_eq!(value["skipped_symlink_count"], 1);
+        assert!(value.get("local_files").is_none());
     }
 }

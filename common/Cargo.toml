@@ -10,7 +10,7 @@ homepage.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Shared data models and Blake3 XOF encryption primitives for FeanorFS"
+description = "Shared wire models, encrypted snapshot types, and AEAD primitives for FeanorFS"
 
 [dependencies]
 serde.workspace = true

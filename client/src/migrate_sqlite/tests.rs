@@ -782,6 +782,6 @@ fn no_raw_client_db_new_in_production_cli_modules() {
         let content = std::fs::read_to_string(src_dir.join(f)).unwrap();
         let has_raw =
             content.contains("ClientDb::new(") || content.contains("ApiClient::from_config(");
-        assert!(!has_raw, "raw constructor in production file: {}", f);
+        assert!(!has_raw, "raw constructor in production file: {f}");
     }
 }

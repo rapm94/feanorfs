@@ -90,10 +90,7 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                     files_copied: count,
                 })?;
             } else {
-                println!(
-                    "Agent '{}' spawned with {} files at .feanorfs/agents/{}/",
-                    name, count, name
-                );
+                println!("Agent '{name}' spawned with {count} files at .feanorfs/agents/{name}/");
             }
         }
         AgentAction::Land {
@@ -148,7 +145,7 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             if json {
                 output_json(&AgentCleanResult { cleaned: name })?;
             } else {
-                println!("Agent '{}' removed.", name);
+                println!("Agent '{name}' removed.");
             }
         }
         AgentAction::Run { name, command } => {
@@ -159,9 +156,7 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             let agent_path = feanorfs_client::agent::agent_dir(current_dir, &name);
             if !agent_path.exists() {
                 anyhow::bail!(
-                    "Agent workspace '{}' not found. Run `feanorfs agent spawn {}` first.",
-                    name,
-                    name
+                    "Agent workspace '{name}' not found. Run `feanorfs agent spawn {name}` first."
                 );
             }
             let agent_dir_abs = agent_path.canonicalize().unwrap_or(agent_path.clone());
