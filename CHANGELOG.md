@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/rapm94/feanorfs/compare/v0.3.3...v0.4.0) - 2026-07-17
+
+### Added
+
+- *(common)* add encrypted snapshot models
+
+### Fixed
+
+- *(release)* focus distribution on FeanorFS
+
+### Other
+
+- *(release)* defer npm publication
+- document format v3 release
+- harden quality and release gates ([#6](https://github.com/rapm94/feanorfs/pull/6))
+
 ## [0.3.0] - 2026-07-09
 
 ### Added
