@@ -203,10 +203,13 @@ function Assert-HealthyProduct {
             throw "Windows doctor checks did not all pass."
         }
 
-        $trayStatus = (& $cli --json tray status) | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0 -or $trayStatus.mirror_state -ne "idle" -or -not $trayStatus.watching -or $trayStatus.paused) {
-            throw "Windows tray status is not idle and watched."
-        }
+        Wait-For {
+            $trayStatus = (& $cli --json tray status) | ConvertFrom-Json
+            $LASTEXITCODE -eq 0 -and
+                $trayStatus.mirror_state -eq "idle" -and
+                $trayStatus.watching -and
+                -not $trayStatus.paused
+        } "Windows tray status to become idle and watched"
 
         $mcpInput = @(
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
