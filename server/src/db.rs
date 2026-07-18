@@ -6,7 +6,6 @@ use sqlx::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 pub struct Db {
@@ -21,11 +20,6 @@ pub enum HeadSwap {
 
 impl Db {
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let db_url = format!(
-            "sqlite:{}",
-            db_path.as_ref().to_str().context("Invalid database path")?
-        );
-
         // Ensure database file exists
         if !db_path.as_ref().exists() {
             if let Some(parent) = db_path.as_ref().parent() {
@@ -34,7 +28,9 @@ impl Db {
             std::fs::File::create(&db_path)?;
         }
 
-        let options = SqliteConnectOptions::from_str(&db_url)?.busy_timeout(Duration::from_secs(5));
+        let options = SqliteConnectOptions::new()
+            .filename(db_path.as_ref())
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)

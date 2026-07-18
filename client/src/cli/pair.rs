@@ -997,6 +997,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    #[ignore = "requires a multicast-capable LAN host"]
     async fn announced_mdns_pairing_is_discoverable() {
         let code = PairCode::generate().unwrap();
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
