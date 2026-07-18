@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 umask 077
+trap 'echo "macOS product smoke stopped at line $LINENO (status $?)." >&2' ERR
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This product smoke test requires macOS." >&2
