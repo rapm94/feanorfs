@@ -149,7 +149,7 @@ function Assert-HealthyProduct {
     Wait-For {
         $tasks = @(Get-SmokeTasks)
         $tasks.Count -eq 3 -and @($tasks | Where-Object State -ne "Running").Count -eq 0
-    } "hub, workspace, and tray tasks to run"
+    } "hub, workspace, and tray tasks to run" 30
 
     $tasks = @(Get-SmokeTasks)
     $hubTask = $tasks | Where-Object TaskName -eq "com.feanorfs.hub"

@@ -23,8 +23,11 @@ async fn native_tls_requires_and_accepts_hub_ca() {
     let trusted = ApiClient::new_with_tls(&url, Some("tls-test-token"), Some(&ca)).unwrap();
 
     let mut connected = false;
-    for _ in 0..100 {
-        if trusted.get_workspaces().await.is_ok() {
+    for _ in 0..20 {
+        if tokio::time::timeout(Duration::from_secs(1), trusted.get_workspaces())
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
             connected = true;
             break;
         }
@@ -95,8 +98,11 @@ async fn opaque_relay_preserves_inner_tls_ca_and_bearer_auth() {
         .await
     });
     let mut connected = false;
-    for _ in 0..100 {
-        if trusted.get_workspaces().await.is_ok() {
+    for _ in 0..20 {
+        if tokio::time::timeout(Duration::from_secs(1), trusted.get_workspaces())
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
             connected = true;
             break;
         }
@@ -109,14 +115,22 @@ async fn opaque_relay_preserves_inner_tls_ca_and_bearer_auth() {
     let unauthorized = ApiClient::from_config(workspace.path(), &wrong_token)
         .await
         .unwrap();
-    assert!(unauthorized.get_workspaces().await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), unauthorized.get_workspaces())
+            .await
+            .is_ok_and(|result| result.is_err())
+    );
 
     let mut wrong_ca = config;
     wrong_ca.tls_ca_pem = Some("not a certificate".into());
     let untrusted = ApiClient::from_config(workspace.path(), &wrong_ca)
         .await
         .unwrap();
-    assert!(untrusted.get_workspaces().await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), untrusted.get_workspaces())
+            .await
+            .is_ok_and(|result| result.is_err())
+    );
 
     host_tunnel.abort();
     relay.abort();

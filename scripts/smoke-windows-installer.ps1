@@ -34,9 +34,15 @@ try {
         Assert-ValidSignature $TrayBin
     }
 
-    & $Installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$installDir"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Windows installer exited with status $LASTEXITCODE."
+    $installProcess = Start-Process -FilePath $Installer -ArgumentList @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/SP-",
+        "/DIR=$installDir"
+    ) -Wait -PassThru
+    if ($installProcess.ExitCode -ne 0) {
+        throw "Windows installer exited with status $($installProcess.ExitCode)."
     }
 
     $installedCli = Join-Path $installDir "feanorfs.exe"
@@ -61,9 +67,13 @@ try {
         throw "Installer did not add the FeanorFS CLI directory to the user PATH."
     }
 
-    & $uninstaller /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-    if ($LASTEXITCODE -ne 0) {
-        throw "Windows uninstaller exited with status $LASTEXITCODE."
+    $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART"
+    ) -Wait -PassThru
+    if ($uninstallProcess.ExitCode -ne 0) {
+        throw "Windows uninstaller exited with status $($uninstallProcess.ExitCode)."
     }
     if ((Test-Path $installedCli) -or (Test-Path $installedTray)) {
         throw "Windows uninstaller left product binaries behind."
