@@ -29,15 +29,7 @@ pub fn set_paused(base: &Path, paused: bool) -> std::io::Result<()> {
 }
 
 fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, 0) == 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    feanorfs_agent_core::lock::pid_alive(pid)
 }
 
 fn now_secs() -> u64 {
@@ -88,4 +80,18 @@ pub fn is_watching(base: &Path) -> bool {
 
 pub fn is_syncing(base: &Path) -> bool {
     feanorfs_agent_core::lock::is_sync_lock_active(base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clear_watch_pid, is_watching, write_watch_pid};
+
+    #[test]
+    fn current_process_watch_marker_is_live() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_watch_pid(workspace.path());
+        assert!(is_watching(workspace.path()));
+        clear_watch_pid(workspace.path());
+        assert!(!is_watching(workspace.path()));
+    }
 }

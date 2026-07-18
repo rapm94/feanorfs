@@ -69,6 +69,7 @@ spake2 = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 rcgen = { version = "0.14.8", features = ["x509-parser", "zeroize"] }
 keyring = "4.1.5"
+windows-sys = "0.61"
 
 [profile.release]
 strip = true

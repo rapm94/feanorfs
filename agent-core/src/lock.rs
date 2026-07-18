@@ -11,12 +11,28 @@ fn lock_path(base: &Path, name: &str) -> PathBuf {
     base.join(".feanorfs").join(name)
 }
 
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     unsafe {
         libc::kill(pid as i32, 0) == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let queried = GetExitCodeProcess(handle, &mut exit_code) != 0;
+        let _ = CloseHandle(handle);
+        queried && exit_code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -178,5 +194,15 @@ pub async fn try_acquire_sync_lock(base: &Path, wait: Duration) -> Result<SyncLo
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pid_alive;
+
+    #[test]
+    fn current_process_is_alive() {
+        assert!(pid_alive(std::process::id()));
     }
 }

@@ -37,6 +37,7 @@ Wire types and semver JSON contract live in `feanorfs_common::agent_contract` â€
 - Land uploads immutable blobs and objects before compare-and-swap. The head swap is the commit point; worktree and legacy projections happen afterward.
 - Format-v3 conflict identity and last-synced state come from trees and refs, never `last_synced_files` rows.
 - `undo` acquires the sync lock and appends a two-parent snapshot that retains both previous head and pre-operation worktree state.
+- Sync-lock stale detection uses native process-liveness checks on Unix and Windows. Never treat every Windows PID as dead: that can break a live worker's lock and misreport tray watcher state.
 - Server-published snapshots must upload every referenced file blob before their reachability manifest. Working-copy refs may use local-only manifests until they become publishable state.
 - Rekey publishes a parentless root because old-key snapshot parents are intentionally unreadable under the new key.
 - Sync and agent conflict identity is hash/deletion based. Cross-machine mtime can indicate a possible server rollback, but never decides whether content changed.
