@@ -264,6 +264,63 @@ pub(crate) fn windows_task_running(
     Ok(Some(output.stdout == b"4"))
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_register_task(
+    task_path: &str,
+    task_name: &str,
+    program: &str,
+    arguments: &str,
+    interactive: bool,
+) -> anyhow::Result<()> {
+    // schtasks.exe flattens the executable and arguments into /TR, which has
+    // a 261-character limit even though Task Scheduler stores them as separate
+    // fields. Register-ScheduledTask keeps those fields separate so ordinary
+    // long install/workspace paths remain valid.
+    const SCRIPT: &str = concat!(
+        "$ErrorActionPreference='Stop';",
+        "$taskPath=$args[0];$taskName=$args[1];$program=$args[2];$arguments=$args[3];",
+        "$interactive=($args[4] -eq 'true');",
+        "$scheduler=New-Object -ComObject Schedule.Service;$scheduler.Connect();",
+        "$folderName=$taskPath.Trim('\\');",
+        "try{$null=$scheduler.GetFolder('\\'+$folderName)}catch{",
+        "$null=$scheduler.GetFolder('\\').CreateFolder($folderName)};",
+        "$user=[Security.Principal.WindowsIdentity]::GetCurrent().Name;",
+        "if([string]::IsNullOrEmpty($arguments)){",
+        "$action=New-ScheduledTaskAction -Execute $program}else{",
+        "$action=New-ScheduledTaskAction -Execute $program -Argument $arguments};",
+        "$trigger=New-ScheduledTaskTrigger -AtLogOn -User $user;",
+        "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries ",
+        "-DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero);",
+        "$params=@{TaskPath=$taskPath;TaskName=$taskName;Action=$action;",
+        "Trigger=$trigger;Settings=$settings;Force=$true};",
+        "if($interactive){$params.Principal=New-ScheduledTaskPrincipal ",
+        "-UserId $user -LogonType Interactive -RunLevel Limited};",
+        "Register-ScheduledTask @params | Out-Null"
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+            task_path,
+            task_name,
+            program,
+            arguments,
+            if interactive { "true" } else { "false" },
+        ])
+        .output()
+        .context("register Windows scheduled task")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "register Windows scheduled task: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 pub fn invite_from_config(config: &Config) -> Option<WorkspaceInvite> {
     Some(WorkspaceInvite {
         server_url: config.server_url.clone(),

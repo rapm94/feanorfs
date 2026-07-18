@@ -379,29 +379,12 @@ fn tray_service_configuration_matches(_tray_program: &Path, _feanorfs_program: &
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_tray_task_command(spec: &TrayServiceSpec) -> anyhow::Result<String> {
+fn windows_tray_task_action(spec: &TrayServiceSpec) -> anyhow::Result<(String, String)> {
     let program = spec.program.display().to_string();
     if program.contains('"') {
         anyhow::bail!("Windows paths containing double quotes cannot be installed as tasks");
     }
-    Ok(format!("\"{program}\""))
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_tray_create_args(command: &str) -> Vec<&str> {
-    vec![
-        "/Create",
-        "/TN",
-        "FeanorFS\\Tray",
-        "/SC",
-        "ONLOGON",
-        "/RL",
-        "LIMITED",
-        "/IT",
-        "/TR",
-        command,
-        "/F",
-    ]
+    Ok((program, String::new()))
 }
 
 #[cfg(target_os = "windows")]
@@ -413,14 +396,9 @@ fn install_tray_service(spec: &TrayServiceSpec) -> anyhow::Result<BackgroundStat
     let install_required =
         status == BackgroundStatus::NotInstalled || !spec.installed_programs_match();
     if install_required {
-        let command = windows_tray_task_command(spec)?;
-        let output = schtasks(&windows_tray_create_args(&command))?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "install FeanorFS tray: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        let (program, arguments) = windows_tray_task_action(spec)?;
+        super::util::windows_register_task(TASK_PATH, TASK_NAME, &program, &arguments, true)
+            .context("install FeanorFS tray")?;
         spec.record_installed_programs()?;
     }
     if install_required || status != BackgroundStatus::Running {
@@ -664,13 +642,13 @@ fn windows_task_status(
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_task_command(spec: &ServiceSpec) -> anyhow::Result<String> {
+fn windows_task_action(spec: &ServiceSpec) -> anyhow::Result<(String, String)> {
     let program = spec.program.display().to_string();
     let workspace = spec.workspace.display().to_string();
     if program.contains('"') || workspace.contains('"') {
         anyhow::bail!("Windows paths containing double quotes cannot be installed as tasks");
     }
-    Ok(format!("\"{program}\" service run \"{workspace}\""))
+    Ok((program, format!("service run \"{workspace}\"")))
 }
 
 #[cfg(target_os = "windows")]
@@ -689,19 +667,17 @@ fn platform_status(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
 
 #[cfg(target_os = "windows")]
 fn platform_install_and_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    let name = task_name(spec);
     if platform_status(spec)? == BackgroundStatus::NotInstalled || !spec.installed_program_matches()
     {
-        let command = windows_task_command(spec)?;
-        let output = schtasks(&[
-            "/Create", "/TN", &name, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", &command, "/F",
-        ])?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "install automatic sync: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        let (program, arguments) = windows_task_action(spec)?;
+        super::util::windows_register_task(
+            "\\FeanorFS\\",
+            &spec.label,
+            &program,
+            &arguments,
+            false,
+        )
+        .context("install automatic sync")?;
         spec.record_installed_program()?;
     }
     platform_start(spec)
@@ -765,34 +741,25 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
-            windows_task_command(&spec).unwrap(),
-            "\"/usr/local/bin/feanorfs\" service run \"/tmp/feanor workspace\""
-        );
+        let (program, arguments) = windows_task_action(&spec).unwrap();
+        assert_eq!(program, "/usr/local/bin/feanorfs");
+        assert_eq!(arguments, "service run \"/tmp/feanor workspace\"");
 
         let tray = TrayServiceSpec {
             program: PathBuf::from("C:\\Program Files\\FeanorFS\\feanorfs-tray.exe"),
             feanorfs_program: PathBuf::from("C:\\Program Files\\FeanorFS\\feanorfs.exe"),
             marker: PathBuf::from("C:\\Users\\test\\.feanorfs\\tray-service-program"),
         };
-        let tray_command = windows_tray_task_command(&tray).unwrap();
+        let (tray_program, tray_arguments) = windows_tray_task_action(&tray).unwrap();
         assert_eq!(
-            tray_command,
-            "\"C:\\Program Files\\FeanorFS\\feanorfs-tray.exe\""
+            tray_program,
+            "C:\\Program Files\\FeanorFS\\feanorfs-tray.exe"
         );
-        assert!(!tray_command.contains("token"));
-        assert!(!tray_command.contains("key"));
-        assert!(!tray_command.contains("invite"));
-
-        let tray_args = windows_tray_create_args(&tray_command);
-        assert!(tray_args.windows(2).any(|pair| pair == ["/SC", "ONLOGON"]));
-        assert!(tray_args.windows(2).any(|pair| pair == ["/RL", "LIMITED"]));
-        assert!(tray_args.contains(&"/IT"));
-        let joined = tray_args.join(" ");
-        assert!(!joined.contains("--token"));
-        assert!(!joined.contains("--password"));
-        assert!(!joined.contains("fnp"));
-        assert!(!joined.contains("fnr"));
+        assert!(tray_arguments.is_empty());
+        let tray_action = format!("{tray_program} {tray_arguments}");
+        assert!(!tray_action.contains("token"));
+        assert!(!tray_action.contains("key"));
+        assert!(!tray_action.contains("invite"));
     }
 
     #[cfg(target_os = "macos")]

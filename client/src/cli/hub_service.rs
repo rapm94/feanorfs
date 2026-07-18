@@ -617,13 +617,13 @@ fn task_name() -> String {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_task_command(spec: &HubServiceSpec) -> anyhow::Result<String> {
+fn windows_task_action(spec: &HubServiceSpec) -> anyhow::Result<(String, String)> {
     let program = spec.program.display().to_string();
     let data_dir = spec.data_dir.display().to_string();
     if program.contains('"') || data_dir.contains('"') {
         anyhow::bail!("Windows paths containing double quotes cannot be installed as tasks");
     }
-    Ok(format!("\"{program}\" service hub-run \"{data_dir}\""))
+    Ok((program, format!("service hub-run \"{data_dir}\"")))
 }
 
 #[cfg(target_os = "windows")]
@@ -654,16 +654,9 @@ fn hub_status_from_windows_task(running: Option<bool>) -> HubStatus {
 fn platform_install_and_start(spec: &HubServiceSpec, status: HubStatus) -> anyhow::Result<()> {
     let name = task_name();
     if status == HubStatus::NotInstalled || !spec.installed_program_matches() {
-        let command = windows_task_command(spec)?;
-        let output = schtasks(&[
-            "/Create", "/TN", &name, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", &command, "/F",
-        ])?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "install automatic private hub: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        let (program, arguments) = windows_task_action(spec)?;
+        super::util::windows_register_task("\\FeanorFS\\", LABEL, &program, &arguments, false)
+            .context("install automatic private hub")?;
         spec.record_installed_program()?;
     }
     let output = schtasks(&["/Run", "/TN", &name])?;
@@ -693,14 +686,13 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
-            windows_task_command(&spec).unwrap(),
-            "\"/usr/local/bin/feanorfs\" service hub-run \"/tmp/private hub\""
-        );
-        let command = windows_task_command(&spec).unwrap();
-        assert!(!command.contains("token"));
-        assert!(!command.contains("key"));
-        assert!(!command.contains("invite"));
+        let (program, arguments) = windows_task_action(&spec).unwrap();
+        assert_eq!(program, "/usr/local/bin/feanorfs");
+        assert_eq!(arguments, "service hub-run \"/tmp/private hub\"");
+        let action = format!("{program} {arguments}");
+        assert!(!action.contains("token"));
+        assert!(!action.contains("key"));
+        assert!(!action.contains("invite"));
     }
 
     #[test]
