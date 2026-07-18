@@ -214,6 +214,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
         run: >-
           gh release upload "$RELEASE_TAG"
           release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz
@@ -225,6 +226,7 @@ jobs:
           release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst
           release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst.sha256
           release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
+          --repo "$REPOSITORY"
           --clobber
 
   build-windows:
@@ -433,6 +435,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
         run: >-
           gh release upload "$RELEASE_TAG"
           FeanorFS-windows-x86_64.zip
@@ -441,6 +444,7 @@ jobs:
           FeanorFS-windows-x86_64-setup.exe
           FeanorFS-windows-x86_64-setup.exe.sha256
           feanorfs-windows-installer.ps1
+          --repo "$REPOSITORY"
           --clobber
       - name: Remove Azure credentials
         if: always()
