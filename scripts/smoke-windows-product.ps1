@@ -77,7 +77,15 @@ function Invoke-Start {
     try {
         & $cli start $workspace *> $startLog
         if ($LASTEXITCODE -ne 0) {
-            throw "feanorfs start failed with exit code $LASTEXITCODE."
+            $details = if (Test-Path -LiteralPath $startLog -PathType Leaf) {
+                Get-Content -LiteralPath $startLog -Raw
+            }
+            else {
+                "No start log was written."
+            }
+            $details = $details -replace 'fn[hrp][12]-[A-Za-z0-9-]+', '[capability redacted]'
+            $details = $details -replace '(?i)\b[0-9a-f]{64}\b', '[64-hex secret redacted]'
+            throw "feanorfs start failed with exit code $LASTEXITCODE.`n$details"
         }
     }
     finally {
