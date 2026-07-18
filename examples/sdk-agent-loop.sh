@@ -30,7 +30,9 @@ echo "seed" > seed.txt
 "$FEANORFS" sync --no-watch
 
 echo "== spawn agent =="
-json agent spawn worker | tee /dev/stderr | grep -q '"files_copied"'
+SPAWN_JSON="$(json agent spawn worker)"
+printf '%s\n' "$SPAWN_JSON" >&2
+grep -q '"files_copied"' <<<"$SPAWN_JSON"
 
 AGENT_DIR=".feanorfs/agents/worker"
 echo "agent edit" > "$AGENT_DIR/task.txt"
