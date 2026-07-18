@@ -94,6 +94,29 @@ pub(crate) fn validate_auth_token(token: &str) -> Result<()> {
 }
 
 fn mdns_service_info(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<mdns_sd::ServiceInfo> {
+    let mut addresses: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|interface| match interface.ip() {
+            IpAddr::V4(address) if !address.is_loopback() => Some(address),
+            _ => None,
+        })
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let addresses = addresses
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    mdns_service_info_with_addresses(port, tls, &addresses)
+}
+
+fn mdns_service_info_with_addresses(
+    port: u16,
+    tls: Option<&crate::TlsIdentity>,
+    addresses: &str,
+) -> Result<mdns_sd::ServiceInfo> {
     use mdns_sd::ServiceInfo;
 
     let scheme = if tls.is_some() { "https" } else { "http" };
@@ -109,20 +132,59 @@ fn mdns_service_info(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<mdns
         feanorfs_common::HUB_MDNS_SERVICE,
         instance,
         &format!("{hostname}."),
-        "",
+        addresses,
         port,
         &props[..],
     )
-    .map(mdns_sd::ServiceInfo::enable_addr_auto)
     .map_err(Into::into)
 }
 
-fn register_mdns(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<mdns_sd::ServiceDaemon> {
-    use mdns_sd::ServiceDaemon;
+struct MdnsRegistration {
+    daemon: mdns_sd::ServiceDaemon,
+    refresh_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MdnsRegistration {
+    fn drop(&mut self) {
+        self.refresh_task.abort();
+        let _ = self.daemon.shutdown();
+    }
+}
+
+fn register_mdns(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<MdnsRegistration> {
+    use mdns_sd::{DaemonEvent, ServiceDaemon};
 
     let daemon = ServiceDaemon::new()?;
+    let monitor = daemon.monitor()?;
     daemon.register(mdns_service_info(port, tls)?)?;
-    Ok(daemon)
+    let update_daemon = daemon.clone();
+    let update_tls = tls.cloned();
+    let refresh_task = tokio::spawn(async move {
+        while let Ok(event) = monitor.recv_async().await {
+            match event {
+                DaemonEvent::IpAdd(IpAddr::V4(_)) | DaemonEvent::IpDel(IpAddr::V4(_)) => {
+                    match mdns_service_info(port, update_tls.as_ref())
+                        .and_then(|info| update_daemon.register(info).map_err(Into::into))
+                    {
+                        Ok(()) => {
+                            tracing::info!("mDNS service refreshed after a network address change")
+                        }
+                        Err(error) => tracing::warn!(
+                            "Failed to refresh mDNS service after a network address change: {error}"
+                        ),
+                    }
+                }
+                DaemonEvent::Error(error) => {
+                    tracing::warn!("mDNS service error: {error}");
+                }
+                _ => {}
+            }
+        }
+    });
+    Ok(MdnsRegistration {
+        daemon,
+        refresh_task,
+    })
 }
 
 pub async fn run_http_server(opts: ServeOptions) -> Result<()> {
@@ -308,9 +370,15 @@ mod tests {
             fingerprint: Some("0123456789abcdef".into()),
             mdns_hostname: Some("feanorfs-0123456789abcdef.local".into()),
         };
-        let info = mdns_service_info(3030, Some(&identity)).unwrap();
+        let info =
+            mdns_service_info_with_addresses(3030, Some(&identity), "192.0.2.10,198.51.100.20")
+                .unwrap();
 
-        assert!(info.is_addr_auto());
+        assert!(!info.is_addr_auto());
+        assert_eq!(info.get_addresses().len(), 2);
+        assert!(info
+            .get_addresses_v4()
+            .contains(&Ipv4Addr::new(192, 0, 2, 10)));
         assert_eq!(info.get_hostname(), "feanorfs-0123456789abcdef.local.");
         assert_eq!(info.get_property_val_str("v"), Some("1"));
         assert_eq!(info.get_property_val_str("scheme"), Some("https"));

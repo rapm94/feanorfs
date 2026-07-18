@@ -260,6 +260,7 @@ cargo run --bin feanorfs -- agent run ci1 -- cargo test
 ```bash
 cargo run --bin feanorfs -- conflicts
 cargo run --bin feanorfs -- conflicts keep src/main.rs --local
+cargo run --bin feanorfs -- conflicts keep --all --local
 cargo run --bin feanorfs -- conflicts show src/main.rs --open
 ```
 

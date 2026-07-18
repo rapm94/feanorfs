@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use feanorfs_common::{
     flat_to_tree_with_conflicts, is_valid_hash, ConcurrentEdit, FileState, Snapshot,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 
 const MAX_HEAD_RETRIES: usize = 8;
@@ -171,20 +171,41 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         files: &HashMap<String, FileState>,
         author: &str,
     ) -> Result<String> {
+        self.resolve_conflicts(&[path.to_string()], files, author)
+            .await
+    }
+
+    pub(crate) async fn resolve_conflicts(
+        &self,
+        paths: &[String],
+        files: &HashMap<String, FileState>,
+        author: &str,
+    ) -> Result<String> {
+        if paths.is_empty() {
+            bail!("at least one conflict path is required");
+        }
+        let resolved: HashSet<&str> = paths.iter().map(String::as_str).collect();
         let Some(mut expected) = self.ctx.api.get_head(self.ctx.workspace_id()).await? else {
             return self.publish_server_view(files, author).await;
         };
         for _ in 0..MAX_HEAD_RETRIES {
             let snapshot = self.load_snapshot(&expected).await?;
             let mut state = self.objects.get_tree_state(&snapshot.root).await?;
-            state.conflicts.retain(|conflict| conflict.path != path);
+            state
+                .conflicts
+                .retain(|conflict| !resolved.contains(conflict.path.as_str()));
+            let message = if paths.len() == 1 {
+                format!("resolve {}", paths[0])
+            } else {
+                format!("resolve {} conflicts", paths.len())
+            };
             let candidate = self
                 .write(SnapshotInput {
                     files,
                     conflicts: &state.conflicts,
                     parents: vec![expected.clone()],
                     author,
-                    message: Some(format!("resolve {path}")),
+                    message: Some(message),
                 })
                 .await?;
             match self

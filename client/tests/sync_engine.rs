@@ -1637,6 +1637,140 @@ async fn sync_detects_concurrent_workspace_edit_without_silent_overwrite() {
 }
 
 #[tokio::test]
+async fn bulk_keep_local_resolves_and_publishes_all_workspace_conflicts() {
+    use feanorfs_client::{conflicts, SyncCtx};
+
+    let server = spawn_test_server().await;
+    let local = spawn_test_client_with_server(&server).await;
+    let remote = spawn_test_client_with_server(&server).await;
+    for workspace in [local.workspace.path(), remote.workspace.path()] {
+        let mut config = feanorfs_client::load_config(workspace).unwrap();
+        config.format_version = 3;
+        feanorfs_client::save_config(workspace, &config).unwrap();
+    }
+
+    for path in ["first.txt", "nested/second.txt"] {
+        write_workspace_file(local.workspace.path(), path, b"base").await;
+    }
+    do_sync(
+        &server.api,
+        &local.db,
+        local.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &remote.db,
+        remote.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    write_workspace_file(
+        local.workspace.path(),
+        "first.txt",
+        b"authoritative local first",
+    )
+    .await;
+    write_workspace_file(
+        local.workspace.path(),
+        "nested/second.txt",
+        b"authoritative local second",
+    )
+    .await;
+    write_workspace_file(remote.workspace.path(), "first.txt", b"remote first").await;
+    write_workspace_file(
+        remote.workspace.path(),
+        "nested/second.txt",
+        b"remote second",
+    )
+    .await;
+    do_sync(
+        &server.api,
+        &remote.db,
+        remote.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &local.db,
+        local.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let records = local.db.list_conflict_records().await.unwrap();
+    assert_eq!(records.len(), 2);
+    let conflict_dirs: std::collections::HashSet<_> = records
+        .iter()
+        .map(|record| record.conflict_dir.clone())
+        .collect();
+    let config = feanorfs_client::load_config(local.workspace.path()).unwrap();
+    let ctx =
+        SyncCtx::from_config(&server.api, &local.db, local.workspace.path(), &config).unwrap();
+    let mut resolved = conflicts::resolve_all_local_conflicts(&ctx).await.unwrap();
+    resolved.sort();
+    assert_eq!(resolved, vec!["first.txt", "nested/second.txt"]);
+    assert!(local.db.list_conflict_records().await.unwrap().is_empty());
+    assert!(conflict_dirs
+        .iter()
+        .all(|path| !std::path::Path::new(path).exists()));
+    let history = local.db.list_conflict_resolutions().await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|entry| entry.method == "local"));
+
+    let verifier = spawn_test_client_with_server(&server).await;
+    let mut verifier_config = feanorfs_client::load_config(verifier.workspace.path()).unwrap();
+    verifier_config.format_version = 3;
+    feanorfs_client::save_config(verifier.workspace.path(), &verifier_config).unwrap();
+    do_pull_only(
+        &server.api,
+        &verifier.db,
+        verifier.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_workspace_file(verifier.workspace.path(), "first.txt").await,
+        b"authoritative local first"
+    );
+    assert_eq!(
+        read_workspace_file(verifier.workspace.path(), "nested/second.txt").await,
+        b"authoritative local second"
+    );
+
+    let after = do_sync(
+        &server.api,
+        &local.db,
+        local.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(after.uploads, 0);
+    assert_eq!(after.downloads, 0);
+}
+
+#[tokio::test]
 async fn concurrent_delete_is_not_a_workspace_conflict() {
     use feanorfs_client::conflicts;
 

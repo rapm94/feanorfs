@@ -339,6 +339,64 @@ pub async fn resolve_conflict(
     Ok(())
 }
 
+pub async fn resolve_all_local_conflicts(ctx: &SyncCtx<'_>) -> Result<Vec<String>> {
+    let records = ctx.db.list_conflict_records().await?;
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+    for record in &records {
+        if !is_safe_rel_path(&record.path) {
+            bail!("unsafe path: {}", record.path);
+        }
+    }
+
+    let before = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    crate::snapshot::SnapshotEngine::new(ctx)
+        .snapshot_local_view(&before, "you")
+        .await?;
+
+    for record in &records {
+        let ours_path = ctx.base.join(&record.path);
+        if ours_path.exists() {
+            let plain = fs::read(&ours_path).await?;
+            let mtime = file_mtime_ms(&ours_path).await?;
+            upload_sealed(ctx, &record.path, &plain, mtime).await?;
+        } else {
+            upload_tombstone_for(ctx, &record.path).await?;
+        }
+    }
+
+    let resolved_files = if ctx.format_version() >= 3 {
+        crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?
+    } else {
+        load_server_view(ctx).await?
+    };
+    let resolver = std::env::var("FEANORFS_AGENT").unwrap_or_else(|_| "human".into());
+    let paths: Vec<String> = records.iter().map(|record| record.path.clone()).collect();
+    crate::snapshot::SnapshotEngine::new(ctx)
+        .resolve_conflicts(&paths, &resolved_files, &resolver)
+        .await?;
+    ctx.db
+        .resolve_conflict_paths_with_history(&paths, "local", &resolver)
+        .await?;
+
+    let conflict_dirs: HashSet<PathBuf> = records
+        .iter()
+        .map(|record| PathBuf::from(&record.conflict_dir))
+        .collect();
+    for conflict_dir in conflict_dirs {
+        if conflict_dir.is_dir() {
+            if let Err(error) = fs::remove_dir_all(&conflict_dir).await {
+                tracing::warn!(
+                    "failed to clean conflict dir {}: {error}",
+                    conflict_dir.display()
+                );
+            }
+        }
+    }
+    Ok(paths)
+}
+
 async fn upload_sealed(ctx: &SyncCtx<'_>, path: &str, content: &[u8], mtime: i64) -> Result<()> {
     let (hash, packed) = seal(content, ctx.password_str(), path)?;
     let file = FileState {

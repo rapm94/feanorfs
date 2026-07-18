@@ -36,6 +36,11 @@ Wire types and semver JSON contract live in `feanorfs_common::agent_contract` â€
 - Each agent base is one atomic `.feanorfs/base-snapshot` ref. Per-path `agent_snapshots` rows are forbidden.
 - Land uploads immutable blobs and objects before compare-and-swap. The head swap is the commit point; worktree and legacy projections happen afterward.
 - Format-v3 conflict identity and last-synced state come from trees and refs, never `last_synced_files` rows.
+- Bulk local conflict resolution validates every path before mutation, uploads
+  the selected working-copy versions, publishes one resolution snapshot, and
+  updates the registry plus resolution history in one durable-state commit.
+  Format-v2 retains the same flat-server-view projection as single-path
+  resolution.
 - `undo` acquires the sync lock and appends a two-parent snapshot that retains both previous head and pre-operation worktree state.
 - Sync-lock stale detection uses native process-liveness checks on Unix and Windows. Never treat every Windows PID as dead: that can break a live worker's lock and misreport tray watcher state.
 - Server-published snapshots must upload every referenced file blob before their reachability manifest. Working-copy refs may use local-only manifests until they become publishable state.

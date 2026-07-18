@@ -96,6 +96,36 @@ async fn conflict_resolution_history() {
 }
 
 #[tokio::test]
+async fn bulk_local_resolution_updates_registry_and_history_atomically() {
+    let (_dir, db) = new_db().await;
+    let paths = vec!["a.txt".to_string(), "b.txt".to_string()];
+    for path in &paths {
+        db.upsert_conflict(
+            path,
+            &feanorfs_common::ConflictKind::EditEdit,
+            "/tmp/bulk",
+            100,
+            "pending",
+        )
+        .await
+        .expect("upsert");
+    }
+
+    db.resolve_conflict_paths_with_history(&paths, "local", "human")
+        .await
+        .expect("bulk resolve");
+
+    assert!(db
+        .list_pending_conflict_paths()
+        .await
+        .expect("pending")
+        .is_empty());
+    let history = db.list_conflict_resolutions().await.expect("history");
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|entry| entry.method == "local"));
+}
+
+#[tokio::test]
 async fn session_keys_persist_and_overwrite() {
     let (_dir, db) = new_db().await;
     db.set_session_key("last_scan", r#"{"files":[]}"#)

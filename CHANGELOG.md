@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/rapm94/feanorfs/compare/v0.6.2...v0.6.3) - 2026-07-18
+
+### Added
+
+- `feanorfs conflicts keep --all --local` resolves every pending workspace
+  conflict with the current folder's versions in one bounded operation,
+  records each choice, and publishes one resolution snapshot.
+
+### Fixed
+
+- Private hubs now publish their actual non-loopback IPv4 addresses explicitly
+  and re-announce them when interfaces change. This restores discovery from
+  Linux hosts while retaining DHCP resilience and CA-bound TLS names; no LAN
+  address is embedded in FeanorFS configuration or release code.
+- Bulk local conflict resolution preserves legacy format-v2 behavior while
+  format-v3 workspaces keep encrypted snapshot publication and history.
+
 ## [0.6.2](https://github.com/rapm94/feanorfs/compare/v0.6.1...v0.6.2) - 2026-07-18
 
 ### Added
@@ -255,7 +272,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
 - **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
-[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.6.3...HEAD
 [0.3.0]: https://github.com/rapm94/feanorfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rapm94/feanorfs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0

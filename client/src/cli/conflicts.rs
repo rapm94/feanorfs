@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use clap::Subcommand;
 use feanorfs_client::{
     build_conflict_show,
@@ -16,7 +17,11 @@ pub enum ConflictsAction {
     List,
     /// Keep a version to resolve a conflict.
     Keep {
-        path: String,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        path: Option<String>,
+        /// Apply the selected choice to every pending conflict.
+        #[arg(long, conflicts_with = "path")]
+        all: bool,
         /// Keep the local version present in this folder.
         #[arg(long, group = "keep_choice")]
         local: bool,
@@ -91,18 +96,40 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
         }
         ConflictsAction::Keep {
             path,
+            all,
             local,
             cloud,
             both,
             file,
         } => {
             let (keep, file_path) = parse_keep_flags(local, cloud, both, file)?;
-            conflicts::resolve_conflict(&ctx, &path, keep, file_path.as_deref()).await?;
-            invalidate_agent_cache(current_dir);
-            if json {
-                output_json(&ConflictKeepResult { resolved: path })?;
+            if all {
+                if keep != ResolveKeep::Local {
+                    anyhow::bail!("--all currently requires --local");
+                }
+                let paths = conflicts::resolve_all_local_conflicts(&ctx).await?;
+                invalidate_agent_cache(current_dir);
+                if json {
+                    let results: Vec<ConflictKeepResult> = paths
+                        .into_iter()
+                        .map(|resolved| ConflictKeepResult { resolved })
+                        .collect();
+                    output_json(&results)?;
+                } else {
+                    println!(
+                        "Resolved {} conflict(s) with this folder's versions. Run 'feanorfs sync' to continue.",
+                        paths.len()
+                    );
+                }
             } else {
-                println!("Resolved '{path}'. Run 'feanorfs sync' to continue.");
+                let path = path.context("conflict path is required unless --all is used")?;
+                conflicts::resolve_conflict(&ctx, &path, keep, file_path.as_deref()).await?;
+                invalidate_agent_cache(current_dir);
+                if json {
+                    output_json(&ConflictKeepResult { resolved: path })?;
+                } else {
+                    println!("Resolved '{path}'. Run 'feanorfs sync' to continue.");
+                }
             }
         }
         ConflictsAction::Show { path, open } => {

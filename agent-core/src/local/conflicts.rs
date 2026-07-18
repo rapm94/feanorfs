@@ -70,6 +70,31 @@ impl ClientDb {
         })
     }
 
+    pub async fn resolve_conflict_paths_with_history(
+        &self,
+        paths: &[String],
+        method: &str,
+        resolver: &str,
+    ) -> Result<()> {
+        let paths = paths.to_vec();
+        let method = method.to_string();
+        let resolver = resolver.to_string();
+        let resolved_at = chrono::Utc::now().timestamp_millis();
+        self.state.with_write(|state| {
+            for path in paths {
+                state.conflict_registry.remove(&path);
+                state.conflict_resolutions.push(ConflictResolutionV1 {
+                    path,
+                    method: method.clone(),
+                    source_file_hash: None,
+                    resolved_at,
+                    resolver: resolver.clone(),
+                });
+            }
+            Ok(())
+        })
+    }
+
     pub async fn count_pending_in_dir(&self, conflict_dir: &str) -> Result<u32> {
         let conflict_dir = conflict_dir.to_string();
         self.state.with_read(|state| {
