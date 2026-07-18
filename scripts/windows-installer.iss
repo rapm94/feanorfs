@@ -46,11 +46,11 @@ Source: "{#SourceDir}\feanorfs-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\FeanorFS"; Filename: "{app}\feanorfs-tray.exe"; WorkingDir: "{userprofile}"
+Name: "{group}\FeanorFS"; Filename: "{app}\feanorfs-tray.exe"; WorkingDir: "{%USERPROFILE}"
 Name: "{group}\Uninstall FeanorFS"; Filename: "{uninstallexe}"
 
 [Run]
-Filename: "{app}\feanorfs-tray.exe"; Parameters: "--first-run"; WorkingDir: "{userprofile}"; Description: "Open FeanorFS in the system tray"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\feanorfs-tray.exe"; Parameters: "--first-run"; WorkingDir: "{%USERPROFILE}"; Description: "Open FeanorFS in the system tray"; Flags: nowait postinstall skipifsilent
 
 [Code]
 const
