@@ -170,7 +170,9 @@ function Assert-HealthyProduct {
     Assert-TaskAction $hubTask $cli '^service hub-run ".+"$'
     Assert-TaskAction $workspaceTasks[0] $cli '^service run ".+"$'
     Assert-TaskAction $trayTask $tray '^$'
-    if ([string]$trayTask.Principal.LogonType -ne "InteractiveToken") {
+    $trayTaskXml = [xml](Export-ScheduledTask -TaskPath $trayTask.TaskPath -TaskName $trayTask.TaskName)
+    $trayLogonType = [string]$trayTaskXml.Task.Principals.Principal.LogonType
+    if ($trayLogonType -ne "InteractiveToken") {
         throw "Windows tray task is not registered in the interactive user session."
     }
 
