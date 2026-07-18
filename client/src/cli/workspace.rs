@@ -1,8 +1,9 @@
 use anyhow::Context as _;
 use clap::Subcommand;
 use feanorfs_client::{
-    list_recent_workspaces, load_config, load_global_config, save_global_config_secure, summary,
-    unregister_workspace, ApiClient, GlobalConfig,
+    list_recent_workspaces, load_config, load_global_config, register_workspace,
+    save_global_config_secure, summary, transfer_hub, unregister_workspace, ApiClient,
+    GlobalConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -107,6 +108,15 @@ pub enum WorkspaceAction {
     Migrate {
         #[arg(long)]
         rekey: bool,
+    },
+    /// Move this encrypted workspace history to another configured hub.
+    #[command(hide = true)]
+    TransferHub {
+        /// Temporary source hub URL; plaintext is restricted to loopback
+        #[arg(long)]
+        source_url: String,
+        /// A workspace already connected to the destination hub
+        destination: PathBuf,
     },
     /// Mirror this folder (legacy — prefer `feanorfs start`)
     #[command(alias = "init", hide = true)]
@@ -323,6 +333,39 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
         } => run_summary(current_dir, json, summarize, no_remember).await,
         WorkspaceAction::Migrate { rekey } => {
             feanorfs_client::migrate_workspace(current_dir, rekey).await
+        }
+        WorkspaceAction::TransferHub {
+            source_url,
+            destination,
+        } => {
+            if json {
+                anyhow::bail!("`feanorfs transfer-hub` does not support --json");
+            }
+            let was_running = super::service::stop_for_start(current_dir)?;
+            let result = match transfer_hub(current_dir, &source_url, &destination).await {
+                Ok(result) => result,
+                Err(error) => {
+                    if was_running {
+                        let _ = super::service::restore_after_failed_start(current_dir);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = register_workspace(current_dir) {
+                eprintln!("Warning: transfer succeeded, but tray registration failed: {error}");
+            }
+            super::service::install_and_start(current_dir)?;
+            println!(
+                "Transferred {} encrypted objects across {} snapshots.",
+                result.objects, result.snapshots
+            );
+            println!(
+                "Prepared {} current local file objects for conflict-safe continuation.",
+                result.local_objects_seeded
+            );
+            println!("This folder now uses {}.", result.destination_url);
+            println!("The previous hub data was preserved as a rollback copy.");
+            Ok(())
         }
         WorkspaceAction::Events => super::events::run_events(current_dir).await,
         WorkspaceAction::Mcp => super::mcp::run_mcp(current_dir).await,

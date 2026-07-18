@@ -190,7 +190,8 @@ async fn reseal_files(api: &ApiClient, db: &ClientDb, base: &Path, config: &Conf
         let packed = feanorfs_common::pack_bytes(&content, password, &state.path)?;
         anyhow::ensure!(
             feanorfs_common::hash_bytes(&packed) == state.hash,
-            "worktree changed during migration"
+            "worktree changed during migration: {}",
+            state.path
         );
         api.upload_file(&config.workspace_id, state, packed).await?;
     }

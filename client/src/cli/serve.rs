@@ -46,6 +46,14 @@ pub struct ServeCli {
     pub relay: bool,
     #[arg(long, default_value = "3030", env = "FEANORFS_PORT")]
     pub port: u16,
+    /// Address to listen on (use 127.0.0.1 for local maintenance)
+    #[arg(
+        long,
+        default_value = "0.0.0.0",
+        env = "FEANORFS_BIND",
+        value_parser = parse_bind_ip
+    )]
+    pub bind: Box<std::net::IpAddr>,
     #[arg(long, default_value = "server-data", env = "FEANORFS_DATA_DIR")]
     pub data_dir: PathBuf,
     #[arg(long, env = "FEANORFS_GC_INTERVAL", default_value = "0")]
@@ -61,6 +69,10 @@ pub struct ServeCli {
     /// Run blob GC once and exit (no HTTP server)
     #[arg(long)]
     pub gc_only: bool,
+}
+
+fn parse_bind_ip(value: &str) -> Result<Box<std::net::IpAddr>, std::net::AddrParseError> {
+    value.parse().map(Box::new)
 }
 
 #[derive(Subcommand)]
@@ -110,6 +122,7 @@ impl From<ServeCli> for ServeOptions {
     fn from(c: ServeCli) -> Self {
         ServeOptions {
             data_dir: c.data_dir,
+            bind_ip: *c.bind,
             port: c.port,
             token: c.token,
             allow_open: c.allow_open,

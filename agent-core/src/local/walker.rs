@@ -87,9 +87,6 @@ pub fn build_workspace_walker(base_path: &Path, no_default_ignores: bool) -> Wal
         if file_type.is_dir() && entry.path() != base && has_valid_cachedir_tag(entry.path()) {
             return false;
         }
-        if !file_type.is_file() {
-            return true;
-        }
         let Some(ignores) = &ignores else {
             return true;
         };
@@ -99,7 +96,7 @@ pub fn build_workspace_walker(base_path: &Path, no_default_ignores: bool) -> Wal
         let Some(path) = relative.to_str() else {
             return true;
         };
-        !ignores.matched(path, false).is_ignore()
+        !ignores.matched(path, file_type.is_dir()).is_ignore()
     });
     builder
 }

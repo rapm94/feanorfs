@@ -42,6 +42,13 @@ struct ServeArgs {
     relay: bool,
     #[arg(long, default_value = "3030", env = "FEANORFS_PORT")]
     port: u16,
+    #[arg(
+        long,
+        default_value = "0.0.0.0",
+        env = "FEANORFS_BIND",
+        value_parser = parse_bind_ip
+    )]
+    bind: Box<std::net::IpAddr>,
     #[arg(long, default_value = "server-data", env = "FEANORFS_DATA_DIR")]
     data_dir: PathBuf,
     #[arg(long, env = "FEANORFS_GC_INTERVAL", default_value = "0")]
@@ -54,6 +61,10 @@ struct ServeArgs {
     snapshot_retention_days: u64,
     #[arg(long, default_value = "50")]
     snapshot_keep_last: usize,
+}
+
+fn parse_bind_ip(value: &str) -> Result<Box<std::net::IpAddr>, std::net::AddrParseError> {
+    value.parse().map(Box::new)
 }
 
 #[derive(Parser)]
@@ -74,6 +85,7 @@ impl From<ServeArgs> for ServeOptions {
     fn from(a: ServeArgs) -> Self {
         ServeOptions {
             data_dir: a.data_dir,
+            bind_ip: *a.bind,
             port: a.port,
             token: a.token,
             allow_open: a.allow_open,

@@ -84,21 +84,23 @@ FEANORFS_WORKSPACE=~/projects/my-app feanorfs-tray
 | Needs attention | Orange dot |
 | Paused | Yellow dot |
 
-- **Open Folder** — reveals the active workspace in the platform file manager
-- **Start Mirroring a Folder… / Add Another Folder…** — keeps the tray alive on first launch, opens the native folder picker, and delegates setup to `feanorfs start`; every implicit folder receives a distinct opaque workspace ID
+- **Mirrored Folders** — always-visible folder selector backed by `~/.feanorfs/recent.json`; it lists every followed folder, marks the active folder with a native check, keeps unavailable folders visible but disabled, and immediately scopes status and actions to a new selection
+- **Open Selected Folder** — reveals the active folder in the platform file manager
+- **Add Folder…** — opens the native folder picker, shows immediate setup activity, delegates to `feanorfs start`, and always ends with a native success or actionable failure dialog; every new folder receives a distinct opaque workspace ID, while existing encrypted setup is preserved and resumed rather than silently replaced
 - **Stop Mirroring This Folder…** — asks for confirmation, delegates to `feanorfs stop`, removes automatic sync and the tray entry, and preserves files, encrypted setup, credentials, remote snapshots, and private hubs for a later resume
-- **Pair Another Computer…** — shows and copies the short LAN `fnp1` code, or automatically reuses a relay stored by `feanorfs start --relay` and keeps the long off-LAN `fnp2` capability in the clipboard, with no Terminal window; the CLI child retains discovery, tunnel configuration, rendezvous, and cryptography, the copied value is cleared when the dialog closes if it is still on the clipboard, and the tray never receives encryption keys, tokens, routes, or the full invite
-- **Join Another Computer…** — receiver-side masked paste plus native folder picker; sends `fnp1`/`fnp2` only through bounded stdin to hidden `feanorfs tray join`, which validates and delegates to the ordinary `start` engine without capability argv/environment/logs
+- **Other Computers → Share Selected Folder…** — shows and copies a one-time sharing code without terminal instructions; the CLI child retains discovery, tunnel configuration, rendezvous, and cryptography, the copied value is cleared when the dialog closes if it is still on the clipboard, and the tray never receives encryption keys, tokens, routes, or the full invite
+- **Other Computers → Join a Shared Folder…** — receiver-side masked paste plus native folder picker; sends the one-time code only through bounded stdin to hidden `feanorfs tray join`, which validates and delegates to the ordinary `start` engine without secret argv/environment/logs
 - **Recovery → Export Encrypted Recovery Kit… / Restore From Recovery Kit…** — uses native file dialogs plus the operating system's masked password UI (AppleScript, WinForms, or packaged `zenity`/`kdialog`), sends the passphrase only through a bounded stdin pipe, and delegates encryption, validation, initial sync, protected credentials, and service setup to `feanorfs recovery`; the tray never receives the decrypted workspace capability
 - **Check System Health…** — runs `feanorfs --json doctor`, retains only check names/statuses, shows generic native results, and offers explicit **Repair Mirroring** through `feanorfs start -- <folder>`; diagnostic details, sync, credentials, encryption, and conflict policy stay in the CLI
 - **Check for Updates…** — delegates the HTTPS/semantic/canonical-release validation to `feanorfs --json update`, repeats the exact official tag-page check, and opens that page only after an explicit click; the tray never downloads, installs, or executes update code
 - **Pause / Resume** — writes `.feanorfs/paused`; the background `feanorfs sync` watcher skips uploads/downloads while paused
 - **Needs attention** — per-conflict submenu with plain-language labels and Keep local / cloud / both actions
 - **Agents** — `N working · M need attention` with Land shortcuts
-- **Switch Workspace** — recent folders from `~/.feanorfs/recent.json`
 
 Status refreshes every 10 seconds; menu actions run on worker threads so the
-menu never blocks. Normally the OS-managed per-workspace service owns sync.
+menu never blocks, and unchanged refreshes do not replace or close an open
+native menu. Normally the OS-managed per-workspace service owns sync and is
+not described as a terminal process.
 The tray stops and restarts that service around exclusive actions. For legacy
 workspaces without a service it can still supervise one `feanorfs sync` child;
 unmanaged terminal watchers are left untouched.

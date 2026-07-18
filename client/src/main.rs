@@ -99,6 +99,14 @@ mod cli_tests {
         Cli::try_parse_from(["feanorfs", "stop", "--", "/tmp/workspace"]).unwrap();
         Cli::try_parse_from([
             "feanorfs",
+            "transfer-hub",
+            "--source-url",
+            "http://127.0.0.1:3031",
+            "/tmp/destination",
+        ])
+        .unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
             "start",
             "--workspace",
             "team-app",

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/rapm94/feanorfs/compare/v0.6.1...v0.6.2) - 2026-07-18
+
+### Added
+
+- A stable multi-folder tray switcher that shows every followed folder, keeps
+  actions scoped to the selected workspace, and gives immediate native
+  feedback when a folder is added.
+- A fail-closed encrypted hub-transfer maintenance path that copies and
+  verifies complete reachable format-v3 history, accepts only loopback HTTP,
+  preserves rollback data, and resumes safely when the destination has already
+  advanced from the transferred head.
+
+### Changed
+
+- Tray menus now stay open reliably during pointer movement, avoid unnecessary
+  native menu replacement, and describe managed background sync without the
+  confusing “another terminal” wording.
+
+### Fixed
+
+- Directory entries in `.feanorfsignore` now prune before traversal, preventing
+  ignored trees such as legacy hub storage from entering snapshots.
+- New-folder setup, recent-workspace selection, and migration diagnostics now
+  report actionable results without hiding successful additions or naming a
+  background service as an external sync owner.
+- Hub transfer seeds current encrypted local objects before conflict
+  continuation, tolerates bounded live-filesystem races, and never publishes a
+  partial or unrelated destination history.
+
+### Security
+
+- Temporary compatibility hubs can bind explicitly to loopback, keeping
+  plaintext maintenance endpoints off the LAN; destination objects are
+  Blake3-verified before authenticated head publication and configuration
+  cutover.
+
 ## [0.6.1](https://github.com/rapm94/feanorfs/compare/v0.6.0...v0.6.1) - 2026-07-18
 
 ### Fixed
@@ -219,7 +255,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
 - **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
-[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.6.2...HEAD
 [0.3.0]: https://github.com/rapm94/feanorfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rapm94/feanorfs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0

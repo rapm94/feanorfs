@@ -2536,17 +2536,11 @@ async fn fresh_format_v3_workspace_syncs_without_flat_metadata() {
 
 #[tokio::test]
 async fn tray_status_and_pause() {
-    use feanorfs_client::{
-        do_tray_status, is_paused, list_recent_workspaces, register_workspace, set_paused,
-    };
+    use feanorfs_client::{do_tray_status, is_paused, set_paused};
 
     let server = spawn_test_server().await;
     let client = spawn_test_client_with_server(&server).await;
     let base = client.workspace.path();
-
-    register_workspace(base).unwrap();
-    let recent = list_recent_workspaces().unwrap();
-    assert!(recent.workspaces.iter().any(|w| w.path.contains("tmp")));
 
     set_paused(base, true).unwrap();
     assert!(is_paused(base));

@@ -13,8 +13,11 @@ use feanorfs::{
 };
 use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
 use icons::{icon_for, visual_from_state, TrayVisual};
-use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -27,6 +30,13 @@ const REFRESH_SECS: u64 = 10;
 const RECENT_CACHE_SECS: u64 = 30;
 const MAX_WATCH_FAILURES: u32 = 3;
 const FAST_EXIT_SECS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SetupKind {
+    AddFolder,
+    JoinFolder,
+    Repair,
+}
 
 #[derive(Clone)]
 enum Action {
@@ -63,6 +73,7 @@ enum Action {
     SetupDone {
         generation: u64,
         path: PathBuf,
+        kind: SetupKind,
         error: Option<String>,
     },
     StopDone {
@@ -105,6 +116,7 @@ struct AppState {
     recent_fetched_at: Option<Instant>,
     managed_service: Option<bool>,
     setup_inflight: bool,
+    setup_kind: Option<SetupKind>,
     stop_inflight: bool,
     switch_inflight: bool,
     pair_inflight: bool,
@@ -113,6 +125,7 @@ struct AppState {
     update_inflight: bool,
     pair_cancel: Option<std::sync::mpsc::Sender<()>>,
     quit_pending: bool,
+    last_menu_revision: Cell<Option<u64>>,
 }
 
 impl AppState {
@@ -134,6 +147,7 @@ impl AppState {
             recent_fetched_at: None,
             managed_service: None,
             setup_inflight: false,
+            setup_kind: None,
             stop_inflight: false,
             switch_inflight: false,
             pair_inflight: false,
@@ -142,6 +156,7 @@ impl AppState {
             update_inflight: false,
             pair_cancel: None,
             quit_pending: false,
+            last_menu_revision: Cell::new(None),
         }
     }
 
@@ -250,7 +265,12 @@ impl AppState {
                     self.start_watch();
                 }
             }
-        } else if !self.external_watcher_active() {
+        } else if self.external_watcher_active() {
+            // Distinguish the normal OS-managed watcher from a sync command
+            // the user really started in a terminal. The menu should never
+            // describe automatic background syncing as a terminal process.
+            let _ = self.has_managed_service();
+        } else {
             self.start_watch();
         }
     }
@@ -332,18 +352,133 @@ fn unavailable_workspace_count(recent: &RecentWorkspacesResult) -> usize {
         .count()
 }
 
-fn workspace_switch_item(label: &str, path: &str, active: Option<&str>) -> (String, bool) {
-    let available = workspace_has_config(Path::new(path));
-    let selected = if active == Some(path) {
-        format!("✓ {label}")
-    } else {
-        label.to_string()
-    };
-    if available {
-        (selected, true)
-    } else {
-        (format!("{selected} — unavailable"), false)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirroredFolderMenuItem {
+    id: String,
+    label: String,
+    available: bool,
+    selected: bool,
+}
+
+fn canonical_path_string(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn same_workspace_path(left: &str, right: &str) -> bool {
+    canonical_path_string(Path::new(left)) == canonical_path_string(Path::new(right))
+}
+
+fn compact_workspace_path(path: &Path) -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(PathBuf::from);
+    if let Some(relative) = home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        if relative.as_os_str().is_empty() {
+            return "~".into();
+        }
+        return format!("~/{}", relative.display());
     }
+    path.display().to_string()
+}
+
+fn workspace_switch_item(label: &str, path: &str, active: Option<&str>) -> MirroredFolderMenuItem {
+    let available = workspace_has_config(Path::new(path));
+    let selected = active.is_some_and(|active| same_workspace_path(active, path));
+    let mut menu_label = format!("{label} — {}", compact_workspace_path(Path::new(path)));
+    if !available {
+        menu_label.push_str(" — unavailable");
+    }
+    MirroredFolderMenuItem {
+        id: format!("switch:{path}"),
+        label: menu_label,
+        available,
+        selected,
+    }
+}
+
+fn mirrored_folder_menu_items(state: &AppState) -> Vec<MirroredFolderMenuItem> {
+    let mut workspaces = state
+        .recent
+        .as_ref()
+        .map(|recent| {
+            recent
+                .workspaces
+                .iter()
+                .map(|workspace| (workspace.path.clone(), workspace.label.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(workspace) = state.workspace.as_deref() {
+        let path = canonical_path_string(workspace);
+        if !workspaces
+            .iter()
+            .any(|(candidate, _)| same_workspace_path(candidate, &path))
+        {
+            let label = workspace
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("folder")
+                .to_string();
+            workspaces.insert(0, (path, label));
+        }
+    }
+
+    let active = state
+        .workspace
+        .as_deref()
+        .map(canonical_path_string)
+        .or_else(|| {
+            state
+                .recent
+                .as_ref()
+                .and_then(|recent| recent.active.clone())
+        });
+    workspaces
+        .iter()
+        .map(|(path, label)| workspace_switch_item(label, path, active.as_deref()))
+        .collect()
+}
+
+fn append_mirrored_folders(menu: &Menu, state: &AppState, actions_enabled: bool) {
+    let entries = mirrored_folder_menu_items(state);
+    if entries.is_empty() {
+        return;
+    }
+    let folders = Submenu::with_id(
+        muda::MenuId::new("mirrored-folders"),
+        "Mirrored Folders",
+        true,
+    );
+    for entry in entries {
+        let _ = folders.append(&CheckMenuItem::with_id(
+            muda::MenuId::new(entry.id),
+            entry.label,
+            actions_enabled && entry.available,
+            entry.selected,
+            None,
+        ));
+    }
+    if state
+        .recent
+        .as_ref()
+        .is_some_and(|recent| unavailable_workspace_count(recent) > 0)
+    {
+        let _ = folders.append(&PredefinedMenuItem::separator());
+        let _ = folders.append(&MenuItem::with_id(
+            muda::MenuId::new("forget-unavailable"),
+            "Remove Unavailable Folders…",
+            actions_enabled,
+            None,
+        ));
+    }
+    let _ = menu.append(&folders);
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -387,7 +522,7 @@ fn should_prompt_first_run(requested: bool, workspace: Option<&Path>) -> bool {
 }
 
 const FIRST_RUN_START: &str = "Start Mirroring a Folder…";
-const FIRST_RUN_JOIN: &str = "Join Another Computer…";
+const FIRST_RUN_JOIN: &str = "Join a Shared Folder…";
 const FIRST_RUN_LATER: &str = "Not Now";
 const HEALTH_REPAIR: &str = "Repair Mirroring";
 const HEALTH_CLOSE: &str = "Close";
@@ -419,7 +554,7 @@ fn show_first_run_choice() -> FirstRunChoice {
         rfd::MessageDialog::new()
             .set_title("Welcome to FeanorFS")
             .set_description(
-                "Mirror a folder from this computer, or securely join a workspace from another computer. You can do either later from the FeanorFS tray.",
+                "Add a folder from this computer, or securely join one shared from another computer. FeanorFS will keep it synced automatically.",
             )
             .set_level(rfd::MessageLevel::Info)
             .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
@@ -589,17 +724,13 @@ fn pairing_dialog_description(code: &str, expires_in_seconds: u64) -> String {
     let expiry = format_duration(expires_in_seconds);
     if code.starts_with("fnp2-") {
         return format!(
-            "A secure off-LAN pairing capability was copied to your clipboard.\n\n\
-             On the other computer, open FeanorFS, choose Join Another Computer…, and paste it.\n\n\
-             Terminal equivalent:\n\n\
-             feanorfs start <paste capability> /path/to/project\n\n\
-             It expires in {expiry} and works once. Keep this window open while the other computer connects."
+            "A secure one-time sharing code was copied to your clipboard.\n\n\
+             On the other computer, open FeanorFS, choose Join a Shared Folder…, and paste it.\n\n\
+             The code expires in {expiry} and works once. Keep this window open while the other computer connects."
         );
     }
     format!(
-        "On the other computer, open FeanorFS, choose Join Another Computer…, and paste this one-time code:\n\n{code}\n\n\
-         Terminal equivalent:\n\n\
-         feanorfs start {code} /path/to/project\n\n\
+        "On the other computer, open FeanorFS, choose Join a Shared Folder…, and paste this one-time code:\n\n{code}\n\n\
          The code was copied to your clipboard and expires in {expiry}. \
          Keep this window open while the other computer connects."
     )
@@ -647,9 +778,176 @@ fn native_password_input(title: &str, message: &str) -> Option<zeroize::Zeroizin
     }
 }
 
+fn menu_actions_enabled(state: &AppState) -> bool {
+    !state.setup_inflight
+        && !state.stop_inflight
+        && !state.switch_inflight
+        && !state.pair_inflight
+        && !state.recovery_inflight
+}
+
+fn unmanaged_terminal_watcher_active(state: &AppState, status: &TrayStatusResult) -> bool {
+    status.watching && !state.owns_watch && state.managed_service == Some(false)
+}
+
+fn append_other_computers(menu: &Menu, state: &AppState, actions_enabled: bool) {
+    let computers = Submenu::with_id(
+        muda::MenuId::new("other-computers"),
+        "Other Computers",
+        true,
+    );
+    let _ = computers.append(&MenuItem::with_id(
+        muda::MenuId::new("pair"),
+        if state.pair_inflight {
+            "Preparing Secure Share…"
+        } else {
+            "Share Selected Folder…"
+        },
+        actions_enabled && state.workspace.is_some(),
+        None,
+    ));
+    let _ = computers.append(&MenuItem::with_id(
+        muda::MenuId::new("join-computer"),
+        "Join a Shared Folder…",
+        actions_enabled,
+        None,
+    ));
+    let _ = menu.append(&computers);
+}
+
+fn append_recovery_menu(menu: &Menu, state: &AppState, actions_enabled: bool) {
+    let recovery = Submenu::with_id(
+        muda::MenuId::new("recovery"),
+        if state.recovery_inflight {
+            "Recovery in progress…"
+        } else {
+            "Recovery"
+        },
+        true,
+    );
+    let _ = recovery.append(&MenuItem::with_id(
+        muda::MenuId::new("recovery-export"),
+        "Export Encrypted Recovery Kit…",
+        actions_enabled && state.workspace.is_some(),
+        None,
+    ));
+    let _ = recovery.append(&MenuItem::with_id(
+        muda::MenuId::new("recovery-import"),
+        "Restore From Recovery Kit…",
+        actions_enabled,
+        None,
+    ));
+    let _ = menu.append(&recovery);
+}
+
+fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("the selected folder")
+        .to_string()
+}
+
+fn setup_success_copy(kind: SetupKind, path: &Path) -> (&'static str, String) {
+    let name = folder_name(path);
+    match kind {
+        SetupKind::AddFolder => (
+            "Folder ready",
+            format!(
+                "FeanorFS is now mirroring “{name}”. It will sync automatically, including after you log in again."
+            ),
+        ),
+        SetupKind::JoinFolder => (
+            "Shared folder ready",
+            format!(
+                "“{name}” is connected securely and will sync automatically, including after you log in again."
+            ),
+        ),
+        SetupKind::Repair => (
+            "Mirroring repaired",
+            format!("FeanorFS repaired automatic syncing for “{name}”."),
+        ),
+    }
+}
+
+fn setup_failure_copy(
+    kind: SetupKind,
+    path: &Path,
+    configured: bool,
+    error: &str,
+) -> (&'static str, String) {
+    let name = folder_name(path);
+    let (title, outcome) = match kind {
+        SetupKind::AddFolder => ("Folder wasn’t added", format!("“{name}” was not added.")),
+        SetupKind::JoinFolder => (
+            "Shared folder wasn’t joined",
+            format!("“{name}” was not connected."),
+        ),
+        SetupKind::Repair => (
+            "Mirroring wasn’t repaired",
+            format!("Automatic syncing for “{name}” was not repaired."),
+        ),
+    };
+    let cause = if configured && kind == SetupKind::AddFolder {
+        "This folder already has FeanorFS setup, but its saved mirror could not be reached."
+    } else {
+        "FeanorFS could not finish the secure connection and initial sync."
+    };
+    let next_step = if configured && kind == SetupKind::AddFolder {
+        "Make sure the computer or service that hosts its existing mirror is available, then choose Add Folder again."
+    } else {
+        "Check the connection and try again. If it keeps failing, reopen FeanorFS and retry."
+    };
+    let detail = error.trim().strip_prefix("Error:").unwrap_or(error.trim());
+    (
+        title,
+        format!(
+            "{outcome} {cause}\n\nYour files and encrypted setup were not changed. {next_step}\n\nDetails: {detail}"
+        ),
+    )
+}
+
+fn show_setup_result_dialog(title: &str, description: String, success: bool) {
+    activate_for_native_dialog();
+    let _ = rfd::MessageDialog::new()
+        .set_title(title)
+        .set_description(description)
+        .set_level(if success {
+            rfd::MessageLevel::Info
+        } else {
+            rfd::MessageLevel::Error
+        })
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+fn activity_header(state: &AppState) -> Option<&'static str> {
+    if state.setup_inflight {
+        return Some(match state.setup_kind {
+            Some(SetupKind::AddFolder) => "FeanorFS — adding folder…",
+            Some(SetupKind::JoinFolder) => "FeanorFS — joining shared folder…",
+            Some(SetupKind::Repair) => "FeanorFS — repairing mirroring…",
+            None => "FeanorFS — setting up folder…",
+        });
+    }
+    if state.stop_inflight {
+        return Some("FeanorFS — stopping mirroring…");
+    }
+    if state.switch_inflight {
+        return Some("FeanorFS — switching folders…");
+    }
+    if state.pair_inflight {
+        return Some("FeanorFS — sharing securely…");
+    }
+    if state.recovery_inflight {
+        return Some("FeanorFS — recovery in progress…");
+    }
+    None
+}
+
 fn build_menu(state: &AppState) -> Menu {
     let menu = Menu::new();
     let status = state.last_status.as_ref();
+    let actions_enabled = menu_actions_enabled(state);
 
     if state.health_inflight || state.update_inflight {
         let _ = menu.append(&MenuItem::with_id(
@@ -662,10 +960,12 @@ fn build_menu(state: &AppState) -> Menu {
             false,
             None,
         ));
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        append_mirrored_folders(&menu, state, false);
         if state.workspace.is_some() {
             let _ = menu.append(&MenuItem::with_id(
                 muda::MenuId::new("open"),
-                "Open Folder",
+                "Open Selected Folder",
                 true,
                 None,
             ));
@@ -683,11 +983,13 @@ fn build_menu(state: &AppState) -> Menu {
     if let Some(s) = status {
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("header"),
-            header_label(s),
+            activity_header(state)
+                .map(str::to_string)
+                .unwrap_or_else(|| header_label(s)),
             false,
             None,
         ));
-        if s.watching && !state.owns_watch {
+        if unmanaged_terminal_watcher_active(state, s) {
             let _ = menu.append(&MenuItem::with_id(
                 muda::MenuId::new("external-watch"),
                 "Syncing in another terminal",
@@ -705,97 +1007,26 @@ fn build_menu(state: &AppState) -> Menu {
         }
         let _ = menu.append(&PredefinedMenuItem::separator());
 
+        append_mirrored_folders(&menu, state, actions_enabled);
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("open"),
-            "Open Folder",
+            "Open Selected Folder",
             true,
             None,
         ));
 
         let add_label = if state.setup_inflight {
-            "Setting Up Folder…"
+            "Adding Folder…"
         } else {
-            "Add Another Folder…"
+            "Add Folder…"
         };
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("add-folder"),
             add_label,
-            !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.pair_inflight
-                && !state.recovery_inflight,
+            actions_enabled,
             None,
         ));
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("join-computer"),
-            "Join Another Computer…",
-            !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.pair_inflight
-                && !state.recovery_inflight,
-            None,
-        ));
-
-        let stop_label = if state.stop_inflight {
-            "Stopping Mirroring…"
-        } else {
-            "Stop Mirroring This Folder…"
-        };
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("stop-mirroring"),
-            stop_label,
-            !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.pair_inflight
-                && !state.recovery_inflight,
-            None,
-        ));
-
-        let pair_label = if state.pair_inflight {
-            "Pairing Another Computer…"
-        } else {
-            "Pair Another Computer…"
-        };
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("pair"),
-            pair_label,
-            !state.pair_inflight
-                && !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.recovery_inflight,
-            None,
-        ));
-
-        let recovery = Submenu::with_id(
-            muda::MenuId::new("recovery"),
-            if state.recovery_inflight {
-                "Recovery in progress…"
-            } else {
-                "Recovery"
-            },
-            !state.recovery_inflight
-                && !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.pair_inflight,
-        );
-        let _ = recovery.append(&MenuItem::with_id(
-            muda::MenuId::new("recovery-export"),
-            "Export Encrypted Recovery Kit…",
-            true,
-            None,
-        ));
-        let _ = recovery.append(&MenuItem::with_id(
-            muda::MenuId::new("recovery-import"),
-            "Restore From Recovery Kit…",
-            true,
-            None,
-        ));
-        let _ = menu.append(&recovery);
+        let _ = menu.append(&PredefinedMenuItem::separator());
 
         let pause_label = if s.paused {
             "Resume Syncing"
@@ -805,19 +1036,19 @@ fn build_menu(state: &AppState) -> Menu {
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("pause"),
             pause_label,
-            !state.pair_inflight && !state.stop_inflight && !state.recovery_inflight,
+            actions_enabled,
             None,
         ));
 
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("sync-now"),
             "Sync Now",
-            !state.pair_inflight && !state.stop_inflight && !state.recovery_inflight,
+            actions_enabled,
             None,
         ));
-        let _ = menu.append(&PredefinedMenuItem::separator());
 
         if !s.pending_conflicts.is_empty() {
+            let _ = menu.append(&PredefinedMenuItem::separator());
             let title = format!("Needs attention ({})", s.pending_conflicts.len());
             let conflict_menu = Submenu::with_id(muda::MenuId::new("conflicts"), title, true);
             for c in &s.pending_conflicts {
@@ -831,7 +1062,7 @@ fn build_menu(state: &AppState) -> Menu {
                     let _ = conflict_menu.append(&MenuItem::with_id(
                         muda::MenuId::new(format!("keep-{choice}:{}", c.path)),
                         format!("  {}", choice_label(choice)),
-                        !state.pair_inflight && !state.stop_inflight,
+                        actions_enabled,
                         None,
                     ));
                 }
@@ -841,6 +1072,9 @@ fn build_menu(state: &AppState) -> Menu {
         }
 
         if !s.agents.entries.is_empty() {
+            if s.pending_conflicts.is_empty() {
+                let _ = menu.append(&PredefinedMenuItem::separator());
+            }
             let title = if s.agents.working > 0 {
                 format!(
                     "Agents — {} working · {} need attention",
@@ -861,7 +1095,7 @@ fn build_menu(state: &AppState) -> Menu {
                     let _ = agent_menu.append(&MenuItem::with_id(
                         muda::MenuId::new(format!("land:{}", a.name)),
                         format!("  Land {label}"),
-                        !state.pair_inflight && !state.stop_inflight,
+                        actions_enabled,
                         None,
                     ));
                 } else {
@@ -877,12 +1111,24 @@ fn build_menu(state: &AppState) -> Menu {
         }
 
         let _ = menu.append(&PredefinedMenuItem::separator());
+        append_other_computers(&menu, state, actions_enabled);
+        append_recovery_menu(&menu, state, actions_enabled);
+        let _ = menu.append(&MenuItem::with_id(
+            muda::MenuId::new("stop-mirroring"),
+            if state.stop_inflight {
+                "Stopping Mirroring…"
+            } else {
+                "Stop Mirroring This Folder…"
+            },
+            actions_enabled,
+            None,
+        ));
     } else {
-        let header = if state.workspace.is_some() {
-            "FeanorFS — checking workspace…"
+        let header = activity_header(state).unwrap_or(if state.workspace.is_some() {
+            "FeanorFS — checking folder…"
         } else {
-            "FeanorFS — no workspace"
-        };
+            "FeanorFS — no folders yet"
+        });
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("header"),
             header,
@@ -898,47 +1144,29 @@ fn build_menu(state: &AppState) -> Menu {
             ));
         }
         let _ = menu.append(&PredefinedMenuItem::separator());
+        append_mirrored_folders(&menu, state, actions_enabled);
+        if state.workspace.is_some() {
+            let _ = menu.append(&MenuItem::with_id(
+                muda::MenuId::new("open"),
+                "Open Selected Folder",
+                true,
+                None,
+            ));
+        }
         let add_label = if state.setup_inflight {
-            "Setting Up Folder…"
-        } else if state.workspace.is_some() {
-            "Add Another Folder…"
+            "Adding Folder…"
         } else {
-            "Start Mirroring a Folder…"
+            "Add Folder…"
         };
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("add-folder"),
             add_label,
-            !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.pair_inflight
-                && !state.recovery_inflight,
+            actions_enabled,
             None,
         ));
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("join-computer"),
-            "Join Another Computer…",
-            !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.pair_inflight
-                && !state.recovery_inflight,
-            None,
-        ));
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("recovery-import"),
-            if state.recovery_inflight {
-                "Restoring From Recovery Kit…"
-            } else {
-                "Restore From Recovery Kit…"
-            },
-            !state.recovery_inflight
-                && !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.pair_inflight,
-            None,
-        ));
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        append_other_computers(&menu, state, actions_enabled);
+        append_recovery_menu(&menu, state, actions_enabled);
         if state.workspace.is_some() {
             let stop_label = if state.stop_inflight {
                 "Stopping Mirroring…"
@@ -948,50 +1176,13 @@ fn build_menu(state: &AppState) -> Menu {
             let _ = menu.append(&MenuItem::with_id(
                 muda::MenuId::new("stop-mirroring"),
                 stop_label,
-                !state.setup_inflight
-                    && !state.stop_inflight
-                    && !state.switch_inflight
-                    && !state.pair_inflight
-                    && !state.recovery_inflight,
+                actions_enabled,
                 None,
             ));
         }
     }
 
-    if let Some(ref recent) = state.recent {
-        if !recent.workspaces.is_empty() {
-            let switch = Submenu::with_id(
-                muda::MenuId::new("switch"),
-                "Switch Workspace",
-                !state.setup_inflight
-                    && !state.stop_inflight
-                    && !state.switch_inflight
-                    && !state.pair_inflight
-                    && !state.recovery_inflight,
-            );
-            for w in &recent.workspaces {
-                let (label, available) =
-                    workspace_switch_item(&w.label, &w.path, recent.active.as_deref());
-                let _ = switch.append(&MenuItem::with_id(
-                    muda::MenuId::new(format!("switch:{}", w.path)),
-                    label,
-                    available,
-                    None,
-                ));
-            }
-            if unavailable_workspace_count(recent) > 0 {
-                let _ = switch.append(&PredefinedMenuItem::separator());
-                let _ = switch.append(&MenuItem::with_id(
-                    muda::MenuId::new("forget-unavailable"),
-                    "Remove Unavailable Folders…",
-                    true,
-                    None,
-                ));
-            }
-            let _ = menu.append(&switch);
-        }
-    }
-
+    let _ = menu.append(&PredefinedMenuItem::separator());
     if state.workspace.is_some() {
         let label = if state.health_inflight {
             "Checking System Health…"
@@ -1001,12 +1192,7 @@ fn build_menu(state: &AppState) -> Menu {
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("health"),
             label,
-            !state.health_inflight
-                && !state.setup_inflight
-                && !state.stop_inflight
-                && !state.switch_inflight
-                && !state.pair_inflight
-                && !state.recovery_inflight,
+            actions_enabled && !state.health_inflight,
             None,
         ));
     }
@@ -1019,12 +1205,7 @@ fn build_menu(state: &AppState) -> Menu {
     let _ = menu.append(&MenuItem::with_id(
         muda::MenuId::new("update"),
         update_label,
-        !state.update_inflight
-            && !state.setup_inflight
-            && !state.stop_inflight
-            && !state.switch_inflight
-            && !state.pair_inflight
-            && !state.recovery_inflight,
+        actions_enabled && !state.update_inflight,
         None,
     ));
 
@@ -1032,7 +1213,10 @@ fn build_menu(state: &AppState) -> Menu {
     let _ = menu.append(&MenuItem::with_id(
         muda::MenuId::new("quit"),
         "Quit FeanorFS Tray",
-        !state.stop_inflight && !state.recovery_inflight,
+        !state.setup_inflight
+            && !state.stop_inflight
+            && !state.switch_inflight
+            && !state.recovery_inflight,
         None,
     ));
     menu
@@ -1121,8 +1305,36 @@ fn action_allowed_while_background_check_runs(action: &MenuAction) -> bool {
     matches!(action, MenuAction::OpenFolder | MenuAction::Quit)
 }
 
+fn menu_revision(state: &AppState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    state.workspace.hash(&mut hasher);
+    state.owns_watch.hash(&mut hasher);
+    state.error_message.hash(&mut hasher);
+    state.setup_inflight.hash(&mut hasher);
+    state.setup_kind.hash(&mut hasher);
+    state.stop_inflight.hash(&mut hasher);
+    state.switch_inflight.hash(&mut hasher);
+    state.pair_inflight.hash(&mut hasher);
+    state.recovery_inflight.hash(&mut hasher);
+    state.health_inflight.hash(&mut hasher);
+    state.update_inflight.hash(&mut hasher);
+    if let Some(status) = state.last_status.as_ref() {
+        serde_json::to_vec(status)
+            .expect("tray status is serializable")
+            .hash(&mut hasher);
+    }
+    if let Some(recent) = state.recent.as_ref() {
+        serde_json::to_vec(recent)
+            .expect("recent workspace state is serializable")
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn apply_ui(state: &AppState, tray: &TrayIcon, visual: &mut TrayVisual) {
-    let v = if state.workspace.is_none() {
+    let v = if state.setup_inflight || state.switch_inflight {
+        TrayVisual::Syncing
+    } else if state.workspace.is_none() {
         TrayVisual::Idle
     } else if state.last_status.is_none() || state.status_failed {
         TrayVisual::Error
@@ -1136,8 +1348,13 @@ fn apply_ui(state: &AppState, tray: &TrayIcon, visual: &mut TrayVisual) {
         let _ = tray.set_icon(Some(icon_for(v)));
         *visual = v;
     }
+    let revision = menu_revision(state);
+    if state.last_menu_revision.get() == Some(revision) {
+        return;
+    }
     let menu = build_menu(state);
     tray.set_menu(Some(Box::new(menu)));
+    state.last_menu_revision.set(Some(revision));
 }
 
 fn request_status_fetch(state: &mut AppState, proxy: &tao::event_loop::EventLoopProxy<Action>) {
@@ -1197,6 +1414,7 @@ fn begin_workspace_repair(
     state.task_generation = state.task_generation.saturating_add(1);
     let generation = state.task_generation;
     state.setup_inflight = true;
+    state.setup_kind = Some(SetupKind::Repair);
     state.error_message = Some("Repairing encrypted mirroring…".into());
     let proxy = proxy.clone();
     std::thread::spawn(move || {
@@ -1204,6 +1422,7 @@ fn begin_workspace_repair(
         let _ = proxy.send_event(Action::SetupDone {
             generation,
             path: workspace,
+            kind: SetupKind::Repair,
             error,
         });
     });
@@ -1214,6 +1433,10 @@ fn handle_menu_action(
     action: MenuAction,
     proxy: &tao::event_loop::EventLoopProxy<Action>,
 ) {
+    if (state.setup_inflight || state.switch_inflight) && !matches!(&action, MenuAction::OpenFolder)
+    {
+        return;
+    }
     if (state.health_inflight || state.update_inflight)
         && !action_allowed_while_background_check_runs(&action)
     {
@@ -1258,6 +1481,7 @@ fn handle_menu_action(
             state.task_generation = state.task_generation.saturating_add(1);
             let generation = state.task_generation;
             state.setup_inflight = true;
+            state.setup_kind = Some(SetupKind::AddFolder);
             state.error_message = Some("Setting up encrypted mirroring…".into());
             let proxy = proxy.clone();
             std::thread::spawn(move || {
@@ -1265,6 +1489,7 @@ fn handle_menu_action(
                 let _ = proxy.send_event(Action::SetupDone {
                     generation,
                     path,
+                    kind: SetupKind::AddFolder,
                     error,
                 });
             });
@@ -1279,13 +1504,13 @@ fn handle_menu_action(
                 return;
             }
             let Some(pairing_code) = native_password_input(
-                "Join another computer",
-                "Paste the one-time FeanorFS pairing code or capability",
+                "Join a shared folder",
+                "Paste the one-time code from the other computer",
             ) else {
                 return;
             };
             let mut dialog =
-                rfd::FileDialog::new().set_title("Choose a folder for the joined workspace");
+                rfd::FileDialog::new().set_title("Choose where to keep the shared folder");
             if let Some(directory) = state.workspace.as_deref().and_then(Path::parent) {
                 dialog = dialog.set_directory(directory);
             }
@@ -1295,13 +1520,15 @@ fn handle_menu_action(
             state.task_generation = state.task_generation.saturating_add(1);
             let generation = state.task_generation;
             state.setup_inflight = true;
-            state.error_message = Some("Joining encrypted workspace…".into());
+            state.setup_kind = Some(SetupKind::JoinFolder);
+            state.error_message = Some("Connecting shared folder securely…".into());
             let proxy = proxy.clone();
             std::thread::spawn(move || {
                 let error = join_workspace(&path, pairing_code).err();
                 let _ = proxy.send_event(Action::SetupDone {
                     generation,
                     path,
+                    kind: SetupKind::JoinFolder,
                     error,
                 });
             });
@@ -1357,15 +1584,14 @@ fn handle_menu_action(
                 return;
             }
             let Some(workspace) = state.workspace.clone() else {
-                state.error_message =
-                    Some("Choose a folder before pairing another computer.".into());
+                state.error_message = Some("Select a folder before sharing it.".into());
                 return;
             };
             let generation = state.task_generation;
             let (cancel, cancel_rx) = std::sync::mpsc::channel();
             state.pair_inflight = true;
             state.pair_cancel = Some(cancel);
-            state.error_message = Some("Preparing secure pairing…".into());
+            state.error_message = Some("Preparing a secure one-time sharing code…".into());
             let proxy = proxy.clone();
             std::thread::spawn(move || {
                 run_pairing_session(&workspace, cancel_rx, |event| match event {
@@ -1561,7 +1787,7 @@ fn handle_menu_action(
             let confirmed = rfd::MessageDialog::new()
                 .set_title("Remove unavailable folders from this list?")
                 .set_description(format!(
-                    "{before} workspace {noun} cannot be opened right now. This can happen when a folder was moved or deleted, or when an external drive is disconnected.\n\nFeanorFS will remove only these entries from the tray. It will not delete files, encrypted setup, credentials, services, hub data, or remote snapshots. Reconnect external drives and cancel if you want to keep them listed."
+                    "{before} {noun} cannot be opened right now. This can happen when a folder was moved or deleted, or when an external drive is disconnected.\n\nFeanorFS will remove only these entries from the tray. It will not delete files, encrypted setup, credentials, services, hub data, or remote snapshots. Reconnect external drives and cancel if you want to keep them listed."
                 ))
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::OkCancel)
@@ -1632,7 +1858,7 @@ fn handle_menu_action(
             }
             if !workspace_has_config(&path) {
                 state.error_message = Some(format!(
-                    "Not a FeanorFS workspace (missing .feanorfs/config.json): {}",
+                    "This folder is no longer available to FeanorFS: {}",
                     path.display()
                 ));
                 return;
@@ -1740,6 +1966,11 @@ fn main() {
                 apply_ui(&st, &tray, &mut visual);
             }
             Action::Refresh => {
+                // Other CLI processes can add or stop folders while the tray is
+                // open. Refresh the shared registry on every UI refresh so a
+                // new mirrored folder appears within one polling interval.
+                st.invalidate_recent();
+                st.cached_recent();
                 if st.adopt_recent_if_unconfigured() {
                     st.last_status = None;
                 }
@@ -1963,6 +2194,7 @@ fn main() {
                     st.stop_watch();
                     st.workspace = Some(path);
                     st.invalidate_recent();
+                    st.cached_recent();
                     st.reset_watch_policy();
                     st.last_status = None;
                 }
@@ -1991,7 +2223,7 @@ fn main() {
                         }
                         let noun = if removed == 1 { "folder" } else { "folders" };
                         let _ = rfd::MessageDialog::new()
-                            .set_title("Workspace list cleaned up")
+                            .set_title("Folder list cleaned up")
                             .set_description(format!(
                                 "Removed {removed} unavailable {noun} from the tray. No files, encrypted setup, credentials, services, hub data, or remote snapshots were changed."
                             ))
@@ -2007,28 +2239,47 @@ fn main() {
             Action::SetupDone {
                 generation,
                 path,
+                kind,
                 error,
             } => {
                 if generation != st.task_generation {
                     return;
                 }
                 st.setup_inflight = false;
-                if let Some(error) = error {
-                    st.error_message = Some(error);
+                st.setup_kind = None;
+                let dialog = if let Some(error) = error {
+                    let configured = workspace_has_config(&path);
+                    let (title, description) =
+                        setup_failure_copy(kind, &path, configured, &error);
+                    st.error_message = Some(format!(
+                        "{} Your files were not changed.",
+                        title.trim_end_matches('.')
+                    ));
+                    Some((title, description, false))
                 } else if !workspace_has_config(&path) {
-                    st.error_message = Some(
-                        "Mirroring could not be enabled because setup did not finish. The folder was preserved. Try Start Mirroring again; if this continues, reinstall FeanorFS."
-                            .into(),
-                    );
+                    let error = "Setup ended before FeanorFS could save the encrypted folder configuration.";
+                    let (title, description) =
+                        setup_failure_copy(kind, &path, false, error);
+                    st.error_message = Some(format!(
+                        "{} Your files were not changed.",
+                        title.trim_end_matches('.')
+                    ));
+                    Some((title, description, false))
                 } else {
                     st.stop_watch();
-                    st.workspace = Some(path);
+                    st.workspace = Some(path.clone());
                     st.invalidate_recent();
+                    st.cached_recent();
                     st.reset_watch_policy();
                     st.last_status = None;
-                }
+                    let (title, description) = setup_success_copy(kind, &path);
+                    Some((title, description, true))
+                };
                 request_status_fetch(&mut st, &proxy);
                 apply_ui(&st, &tray, &mut visual);
+                if let Some((title, description, success)) = dialog {
+                    show_setup_result_dialog(title, description, success);
+                }
             }
             Action::StopDone {
                 generation,
@@ -2066,7 +2317,7 @@ fn main() {
                 let description = pairing_dialog_description(&code, expires_in_seconds);
                 copy_pairing_clipboard(&code);
                 let _ = rfd::MessageDialog::new()
-                    .set_title("Pair another computer")
+                    .set_title("Share selected folder")
                     .set_description(description)
                     .set_level(rfd::MessageLevel::Info)
                     .set_buttons(rfd::MessageButtons::OkCancel)
@@ -2090,12 +2341,12 @@ fn main() {
                 st.error_message = if let Some(error) = error {
                     Some(error)
                 } else if paired {
-                    Some("Computer paired successfully.".into())
+                    Some("Folder shared successfully.".into())
                 } else if canceled {
                     None
                 } else {
                     Some(
-                        "The computers were not paired. No workspace access was shared. Try Pair Another Computer again."
+                        "The folder wasn’t shared. No access was granted. Try Share Selected Folder again."
                             .into(),
                     )
                 };
@@ -2122,6 +2373,7 @@ fn main() {
                         st.stop_watch();
                         st.workspace = Some(path);
                         st.invalidate_recent();
+                        st.cached_recent();
                         st.reset_watch_policy();
                         st.last_status = None;
                         let _ = rfd::MessageDialog::new()
@@ -2187,6 +2439,7 @@ mod tests {
         assert!(state.workspace.is_none());
         assert!(state.watch_child.is_none());
         assert!(!state.setup_inflight);
+        assert_eq!(state.setup_kind, None);
         assert!(!state.stop_inflight);
         assert!(!state.switch_inflight);
         assert!(!state.pair_inflight);
@@ -2194,7 +2447,55 @@ mod tests {
         assert!(!state.health_inflight);
         assert!(!state.update_inflight);
         assert!(state.pair_cancel.is_none());
+        assert_eq!(state.last_menu_revision.get(), None);
         assert!(!state.has_managed_service());
+    }
+
+    #[test]
+    fn normal_background_sync_is_never_labeled_as_a_terminal_process() {
+        let status = make_status("idle", false);
+        let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
+        state.managed_service = Some(true);
+        assert!(!unmanaged_terminal_watcher_active(&state, &status));
+
+        state.managed_service = Some(false);
+        assert!(unmanaged_terminal_watcher_active(&state, &status));
+    }
+
+    #[test]
+    fn folder_setup_has_immediate_activity_and_clear_completion_copy() {
+        let path = Path::new("/Users/test/project");
+        let mut state = AppState::new(Some(path.to_path_buf()));
+        state.setup_inflight = true;
+        state.setup_kind = Some(SetupKind::AddFolder);
+        assert_eq!(activity_header(&state), Some("FeanorFS — adding folder…"));
+
+        let (title, success) = setup_success_copy(SetupKind::AddFolder, path);
+        assert_eq!(title, "Folder ready");
+        assert!(success.contains("sync automatically"));
+
+        let (title, failure) =
+            setup_failure_copy(SetupKind::AddFolder, path, true, "mirror offline");
+        assert_eq!(title, "Folder wasn’t added");
+        assert!(failure.contains("already has FeanorFS setup"));
+        assert!(failure.contains("files and encrypted setup were not changed"));
+        assert!(failure.contains("choose Add Folder again"));
+        assert!(failure.contains("mirror offline"));
+    }
+
+    #[test]
+    fn unchanged_refresh_does_not_replace_the_native_menu() {
+        let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
+        state.last_status = Some(make_status("idle", false));
+        let initial = menu_revision(&state);
+
+        // Cache bookkeeping changes every refresh but has no visible menu
+        // effect, so it must not close an open macOS status menu.
+        state.recent_fetched_at = Some(Instant::now());
+        assert_eq!(menu_revision(&state), initial);
+
+        state.last_status.as_mut().unwrap().paused = true;
+        assert_ne!(menu_revision(&state), initial);
     }
 
     #[test]
@@ -2346,8 +2647,9 @@ mod tests {
     fn off_lan_pairing_dialog_keeps_long_capability_in_clipboard() {
         let capability = format!("fnp2-{}", "ab".repeat(300));
         let description = pairing_dialog_description(&capability, 300);
-        assert!(description.contains("off-LAN"));
-        assert!(description.contains("<paste capability>"));
+        assert!(description.contains("one-time sharing code"));
+        assert!(description.contains("Join a Shared Folder"));
+        assert!(!description.contains("Terminal"));
         assert!(!description.contains(&capability));
     }
 
@@ -2460,18 +2762,38 @@ mod tests {
         };
 
         assert_eq!(unavailable_workspace_count(&recent), 1);
-        assert_eq!(
-            workspace_switch_item(
-                "offline drive",
-                &unavailable.to_string_lossy(),
-                recent.active.as_deref()
-            ),
-            ("✓ offline drive — unavailable".into(), false)
+        let unavailable_item = workspace_switch_item(
+            "offline drive",
+            &unavailable.to_string_lossy(),
+            recent.active.as_deref(),
         );
+        assert!(!unavailable_item.available);
+        assert!(unavailable_item.selected);
+        assert!(unavailable_item.label.contains("offline drive"));
+        assert!(unavailable_item.label.ends_with("— unavailable"));
+
+        let available_item = workspace_switch_item("available", &available.to_string_lossy(), None);
+        assert!(available_item.available);
+        assert!(!available_item.selected);
+        assert!(available_item
+            .label
+            .contains(&available.display().to_string()));
+
+        // The tray's in-memory selection is authoritative for Open Folder and
+        // every other folder-scoped action, even before a cached registry is
+        // refreshed. Both followed folders remain present in the selector.
+        let mut state = AppState::new(Some(available.clone()));
+        state.recent = Some(recent);
+        let items = mirrored_folder_menu_items(&state);
+        assert_eq!(items.len(), 2);
         assert_eq!(
-            workspace_switch_item("available", &available.to_string_lossy(), None),
-            ("available".into(), true)
+            items.iter().filter(|item| item.selected).count(),
+            1,
+            "exactly one folder must be visibly selected"
         );
+        let selected = items.iter().find(|item| item.selected).unwrap();
+        assert_eq!(selected.id, format!("switch:{}", available.display()));
+        assert!(selected.available);
 
         std::fs::remove_dir_all(root).unwrap();
     }

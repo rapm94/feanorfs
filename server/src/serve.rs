@@ -1,12 +1,13 @@
 use anyhow::{Context as _, Result};
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub data_dir: PathBuf,
+    pub bind_ip: IpAddr,
     pub port: u16,
     pub token: Option<String>,
     pub allow_open: bool,
@@ -27,6 +28,7 @@ impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("server-data"),
+            bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: 3030,
             token: None,
             allow_open: false,
@@ -144,7 +146,7 @@ pub async fn run_http_server_guarded(
         crate::build_router(state)
     };
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], opts.port));
+    let addr = SocketAddr::new(opts.bind_ip, opts.port);
     let scheme = if tls.is_some() { "https" } else { "http" };
     tracing::info!(
         "FeanorFS Sync Server starting on {}://{} (data: {})",

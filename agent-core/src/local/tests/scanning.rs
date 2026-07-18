@@ -84,6 +84,27 @@ async fn valid_cachedir_tag_at_workspace_root_does_not_prune_workspace() {
     assert!(files.contains("keep.txt"));
 }
 
+#[tokio::test]
+async fn custom_directory_ignore_prunes_the_directory_before_descending() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    fs::write(workspace.path().join(".feanorfsignore"), b"server-data/\n")
+        .expect("write custom ignore");
+    fs::create_dir_all(workspace.path().join("server-data/blobs"))
+        .expect("create ignored directory");
+    fs::write(
+        workspace.path().join("server-data/blobs/changing"),
+        b"runtime data",
+    )
+    .expect("write ignored runtime file");
+    fs::write(workspace.path().join("keep.txt"), b"workspace content")
+        .expect("write retained file");
+
+    let files = scanned_files(workspace.path()).await;
+    assert!(files.contains(".feanorfsignore"));
+    assert!(files.contains("keep.txt"));
+    assert!(!files.contains("server-data/blobs/changing"));
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_warnings_are_sorted_and_links_are_never_followed() {
