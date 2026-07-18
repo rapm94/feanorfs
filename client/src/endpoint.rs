@@ -48,7 +48,9 @@ pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<Ap
                 &[address],
             )?;
             if probe(&resolved).await {
-                persist_stable_url(workspace, config, &stable.url);
+                // This is a local transport fallback, not proof that the
+                // CA-bound name resolves on the network. Preserve the
+                // configured endpoint until a direct or mDNS probe succeeds.
                 return Ok(resolved);
             }
         }
