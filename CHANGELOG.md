@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address is embedded in FeanorFS configuration or release code.
 - Bulk local conflict resolution preserves legacy format-v2 behavior while
   format-v3 workspaces keep encrypted snapshot publication and history.
+- Workspace recovery can reach its own managed private hub when same-host mDNS
+  is unavailable, but only after the local hub CA and persisted port match the
+  pinned capability; TLS hostname verification and bearer authentication stay
+  enabled over the loopback route.
 
 ## [0.6.2](https://github.com/rapm94/feanorfs/compare/v0.6.1...v0.6.2) - 2026-07-18
 

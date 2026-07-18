@@ -2,8 +2,8 @@ use anyhow::Context as _;
 use feanorfs_agent_core::ApiClient;
 use feanorfs_common::{hub_ca_fingerprint, hub_mdns_hostname, HUB_MDNS_SERVICE};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::local::{load_global_config, save_config, save_global_config, Config};
@@ -38,6 +38,22 @@ pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<Ap
         return Ok(direct);
     }
 
+    if let Some(pinned_ca) = config.tls_ca_pem.as_deref() {
+        if let Some(address) = same_machine_address(&stable, pinned_ca) {
+            let resolved = ApiClient::new_with_tls_resolved(
+                &stable.url,
+                config.server_password.as_deref(),
+                config.tls_ca_pem.as_deref(),
+                &stable.hostname,
+                &[address],
+            )?;
+            if probe(&resolved).await {
+                persist_stable_url(workspace, config, &stable.url);
+                return Ok(resolved);
+            }
+        }
+    }
+
     let fingerprint = stable.fingerprint.clone();
     let hostname = stable.hostname.clone();
     let port = stable.port;
@@ -67,6 +83,33 @@ pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<Ap
     } else {
         Ok(original)
     }
+}
+
+fn same_machine_address(stable: &StableEndpoint, pinned_ca: &str) -> Option<SocketAddr> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    same_machine_address_in(
+        stable,
+        pinned_ca,
+        &PathBuf::from(home).join(".feanorfs").join("hub-data"),
+    )
+}
+
+fn same_machine_address_in(
+    stable: &StableEndpoint,
+    pinned_ca: &str,
+    data_dir: &Path,
+) -> Option<SocketAddr> {
+    let managed_ca = std::fs::read_to_string(data_dir.join("tls").join("ca-cert.pem")).ok()?;
+    if managed_ca != pinned_ca || stable.hostname != hub_mdns_hostname(&managed_ca) {
+        return None;
+    }
+    let port = std::fs::read_to_string(data_dir.join("listen-port"))
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0 && *port == stable.port)?;
+    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
 }
 
 async fn probe(client: &ApiClient) -> bool {
@@ -196,5 +239,30 @@ mod tests {
         assert!(stable_endpoint(&config("https://hub.example:3030", Some("ca"))).is_none());
         assert!(stable_endpoint(&config("https://192.168.1.13:3030", None)).is_none());
         assert!(stable_endpoint(&config("http://192.168.1.13:3030", Some("ca"))).is_none());
+    }
+
+    #[test]
+    fn same_machine_fallback_requires_exact_ca_and_port() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data.path().join("tls")).unwrap();
+        std::fs::write(data.path().join("tls/ca-cert.pem"), "managed-ca").unwrap();
+        std::fs::write(data.path().join("listen-port"), "3030\n").unwrap();
+        let stable =
+            stable_endpoint(&config("https://127.0.0.1:3030", Some("managed-ca"))).unwrap();
+
+        assert_eq!(
+            same_machine_address_in(&stable, "managed-ca", data.path()),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 3030)))
+        );
+        assert_eq!(
+            same_machine_address_in(&stable, "other-ca", data.path()),
+            None
+        );
+
+        std::fs::write(data.path().join("listen-port"), "3031\n").unwrap();
+        assert_eq!(
+            same_machine_address_in(&stable, "managed-ca", data.path()),
+            None
+        );
     }
 }
