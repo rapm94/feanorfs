@@ -195,7 +195,7 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
             no_watch,
             foreground,
         } => {
-            run_start(
+            Box::pin(run_start(
                 current_dir,
                 StartOptions {
                     target,
@@ -212,7 +212,7 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
                     recovery_invite: None,
                     pair_code: None,
                 },
-            )
+            ))
             .await
         }
         WorkspaceAction::Setup {

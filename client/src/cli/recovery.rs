@@ -94,7 +94,10 @@ pub async fn run(current_dir: &Path, action: RecoveryAction, json: bool) -> anyh
             let invite = feanorfs_client::open_recovery_kit(&source, passphrase.as_str())?;
             drop(passphrase);
             println!("Recovery kit authenticated. Restoring encrypted workspace…");
-            run_start(
+            // `run_start` composes the complete onboarding, sync, and service
+            // state machines. Keep that large future off the Windows main
+            // thread's smaller stack when recovery adds another async layer.
+            Box::pin(run_start(
                 current_dir,
                 StartOptions {
                     target: None,
@@ -111,7 +114,7 @@ pub async fn run(current_dir: &Path, action: RecoveryAction, json: bool) -> anyh
                     recovery_invite: Some(invite),
                     pair_code: None,
                 },
-            )
+            ))
             .await
         }
     }

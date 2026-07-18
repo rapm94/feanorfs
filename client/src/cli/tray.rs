@@ -137,7 +137,7 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                 );
             }
             let pair_code = read_pairing_code(std::io::stdin().lock())?;
-            run_start(
+            Box::pin(run_start(
                 current_dir,
                 StartOptions {
                     target: None,
@@ -154,7 +154,7 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                     recovery_invite: None,
                     pair_code: Some(pair_code),
                 },
-            )
+            ))
             .await?;
         }
     }
