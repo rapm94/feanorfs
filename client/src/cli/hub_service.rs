@@ -21,7 +21,8 @@ use super::util::{record_service_identity, service_identity_matches, HubConnecti
 const LABEL: &str = "com.feanorfs.hub";
 const DEFAULT_PORT: u16 = 3030;
 const FALLBACK_PORT_SPAN: u16 = 100;
-const READY_TIMEOUT: Duration = Duration::from_secs(8);
+const READY_TIMEOUT: Duration = Duration::from_secs(20);
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const RELAY_CONFIG_FILE: &str = "relay.json";
 const LISTEN_PORT_FILE: &str = "listen-port";
 
@@ -516,7 +517,10 @@ async fn endpoint_ready(connection: &HubConnection) -> bool {
     ) else {
         return false;
     };
-    api.get_workspaces().await.is_ok()
+    matches!(
+        tokio::time::timeout(READY_PROBE_TIMEOUT, api.get_workspaces()).await,
+        Ok(Ok(_))
+    )
 }
 
 async fn legacy_http_endpoint_ready(connection: &HubConnection) -> bool {
@@ -767,11 +771,18 @@ mod tests {
         let deadline = Instant::now() + READY_TIMEOUT;
         let mut ready = false;
         while Instant::now() < deadline {
+            if server.is_finished() {
+                let outcome = server.await;
+                panic!("supervised private hub stopped before readiness: {outcome:?}");
+            }
             let token = std::fs::read_to_string(data_dir.join("auth-token"));
             let ca = std::fs::read_to_string(data_dir.join("tls/ca-cert.pem"));
             if let (Ok(token), Ok(ca)) = (token, ca) {
                 let authenticated = ApiClient::new_with_tls(&url, Some(&token), Some(&ca)).unwrap();
-                if authenticated.get_workspaces().await.is_ok() {
+                if matches!(
+                    tokio::time::timeout(READY_PROBE_TIMEOUT, authenticated.get_workspaces()).await,
+                    Ok(Ok(_))
+                ) {
                     let unauthenticated = ApiClient::new_with_tls(&url, None, Some(&ca)).unwrap();
                     assert!(unauthenticated.get_workspaces().await.is_err());
                     ready = true;

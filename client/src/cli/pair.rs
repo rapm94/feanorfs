@@ -3,7 +3,7 @@ use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use feanorfs_client::{Config, WorkspaceInvite};
 use futures_util::{SinkExt as _, StreamExt as _};
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{DaemonEvent, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::io::Write as _;
@@ -32,6 +32,7 @@ const MAX_FRAME: usize = 16 * 1024;
 const MAX_ATTEMPTS: usize = 3;
 const MAX_RELAY_URL_BYTES: usize = 256;
 const MAX_RELAY_CODE_BYTES: usize = 900;
+const MDNS_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairPresentation {
@@ -388,7 +389,7 @@ pub async fn offer(
         .await
         .context("open LAN pairing listener")?;
     let port = listener.local_addr()?.port();
-    let _registration = advertise(&code, port)?;
+    let _registration = advertise(&code, port).await?;
 
     present_code(&code, timeout, presentation)?;
     copy_to_clipboard(code.as_str());
@@ -664,16 +665,40 @@ fn local_ipv4_addresses() -> anyhow::Result<Vec<Ipv4Addr>> {
     Ok(addresses)
 }
 
-fn advertise(code: &PairCode, port: u16) -> anyhow::Result<MdnsRegistration> {
+async fn advertise(code: &PairCode, port: u16) -> anyhow::Result<MdnsRegistration> {
     let addresses = local_ipv4_addresses()?
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
     let daemon = ServiceDaemon::new().context("start mDNS pairing discovery")?;
+    let monitor = daemon
+        .monitor()
+        .context("monitor mDNS pairing advertisement")?;
     let info = pairing_service_info(code, port, addresses)?;
     let fullname = info.get_fullname().to_string();
     daemon.register(info)?;
+    tokio::time::timeout(MDNS_ANNOUNCE_TIMEOUT, async {
+        loop {
+            match monitor.recv_async().await {
+                Ok(DaemonEvent::Announce(announced, _))
+                    if announced.eq_ignore_ascii_case(&fullname) =>
+                {
+                    return Ok(());
+                }
+                Ok(DaemonEvent::Error(error)) => {
+                    return Err(anyhow::anyhow!(error).context("announce LAN pairing session"));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!(error)
+                        .context("mDNS pairing monitor stopped before announcement"));
+                }
+            }
+        }
+    })
+    .await
+    .context("mDNS pairing session was not announced within 3 seconds")??;
     Ok(MdnsRegistration { daemon, fullname })
 }
 
@@ -968,6 +993,22 @@ mod tests {
         let rendered = format!("{info:?}");
         assert!(!rendered.contains("6789-ABCD-EFGH"));
         assert!(!rendered.contains("fnr1-"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn announced_mdns_pairing_is_discoverable() {
+        let code = PairCode::generate().unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _registration = advertise(&code, port).await.unwrap();
+        let discovered_code = code.clone();
+        let endpoints =
+            tokio::task::spawn_blocking(move || discover(&discovered_code, Duration::from_secs(3)))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(endpoints.iter().any(|endpoint| endpoint.port() == port));
     }
 
     #[tokio::test]

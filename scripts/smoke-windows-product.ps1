@@ -23,7 +23,7 @@ if ($RequireAuthenticode) {
 }
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ("feanorfs-windows-product-" + [Guid]::NewGuid())
-$home = Join-Path $root "home"
+$profileHome = Join-Path $root "home"
 $binDir = Join-Path $root "bin"
 $workspace = Join-Path $root "workspace"
 $startLog = Join-Path $root "start.log"
@@ -151,7 +151,7 @@ function Assert-HealthyProduct {
         throw "Windows product did not install exactly one hub, workspace, and tray task."
     }
 
-    $listenPortPath = Join-Path $home ".feanorfs\hub-data\listen-port"
+    $listenPortPath = Join-Path $profileHome ".feanorfs\hub-data\listen-port"
     $listenPort = 0
     if (-not (Test-Path -LiteralPath $listenPortPath -PathType Leaf) -or
         -not [int]::TryParse((Get-Content -LiteralPath $listenPortPath -Raw).Trim(), [ref]$listenPort) -or
@@ -166,7 +166,7 @@ function Assert-HealthyProduct {
         throw "Windows tray task is not registered in the interactive user session."
     }
 
-    Assert-RedactedCredentialConfig (Join-Path $home ".feanorfs\global.json")
+    Assert-RedactedCredentialConfig (Join-Path $profileHome ".feanorfs\global.json")
     Assert-RedactedCredentialConfig (Join-Path $workspace ".feanorfs\config.json")
 
     Push-Location $workspace
@@ -220,13 +220,13 @@ try {
     if (@(Get-SmokeTasks).Count -ne 0) {
         throw "Windows product smoke refuses to replace existing FeanorFS scheduled tasks."
     }
-    New-Item -ItemType Directory -Path $home, $binDir, $workspace | Out-Null
+    New-Item -ItemType Directory -Path $profileHome, $binDir, $workspace | Out-Null
     Copy-Item -LiteralPath $sourceCli -Destination $cli
     Copy-Item -LiteralPath $sourceTray -Destination $tray
     [IO.File]::WriteAllText((Join-Path $workspace "windows-smoke.txt"), "Windows product smoke`n")
 
-    $env:HOME = $home
-    $env:USERPROFILE = $home
+    $env:HOME = $profileHome
+    $env:USERPROFILE = $profileHome
     $env:FEANORFS_TRAY_BIN = $tray
     # Require the real native store; cleanup removes the exact random entries.
     $env:FEANORFS_CREDENTIAL_STORE = "os"
@@ -257,7 +257,7 @@ try {
 finally {
     $credentialCleanupFailed = $false
     foreach ($configPath in @(
-        (Join-Path $home ".feanorfs\global.json"),
+        (Join-Path $profileHome ".feanorfs\global.json"),
         (Join-Path $workspace ".feanorfs\config.json")
     )) {
         try {
