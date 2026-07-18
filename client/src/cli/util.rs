@@ -278,8 +278,9 @@ pub(crate) fn windows_register_task(
     // long install/workspace paths remain valid.
     const SCRIPT: &str = concat!(
         "$ErrorActionPreference='Stop';",
-        "$taskPath=$args[0];$taskName=$args[1];$program=$args[2];$arguments=$args[3];",
-        "$interactive=($args[4] -eq 'true');",
+        "$taskPath=$env:FEANORFS_TASK_PATH;$taskName=$env:FEANORFS_TASK_NAME;",
+        "$program=$env:FEANORFS_TASK_PROGRAM;$arguments=$env:FEANORFS_TASK_ARGUMENTS;",
+        "$interactive=($env:FEANORFS_TASK_INTERACTIVE -eq 'true');",
         "$scheduler=New-Object -ComObject Schedule.Service;$scheduler.Connect();",
         "$folderName=$taskPath.Trim('\\');",
         "try{$null=$scheduler.GetFolder('\\'+$folderName)}catch{",
@@ -304,12 +305,15 @@ pub(crate) fn windows_register_task(
             "-NonInteractive",
             "-Command",
             SCRIPT,
-            task_path,
-            task_name,
-            program,
-            arguments,
-            if interactive { "true" } else { "false" },
         ])
+        .env("FEANORFS_TASK_PATH", task_path)
+        .env("FEANORFS_TASK_NAME", task_name)
+        .env("FEANORFS_TASK_PROGRAM", program)
+        .env("FEANORFS_TASK_ARGUMENTS", arguments)
+        .env(
+            "FEANORFS_TASK_INTERACTIVE",
+            if interactive { "true" } else { "false" },
+        )
         .output()
         .context("register Windows scheduled task")?;
     if !output.status.success() {
