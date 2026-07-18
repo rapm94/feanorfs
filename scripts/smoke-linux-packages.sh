@@ -152,8 +152,10 @@ if [ "$status" -ne 124 ]; then
 fi
 FEDORA_SMOKE
 
-echo "Smoke: clean Arch Linux desktop package install"
-"$container_runtime" run --rm --pull=always \
+case "$(uname -m)" in
+x86_64|amd64)
+    echo "Smoke: clean Arch Linux desktop package install"
+    "$container_runtime" run --rm --pull=always \
     --mount "type=bind,source=$arch_package,target=/tmp/feanorfs.pkg.tar.zst,readonly" \
     "$archlinux_image" sh -s <<'ARCH_SMOKE'
 set -eu
@@ -204,5 +206,18 @@ if [ "$status" -ne 124 ]; then
     exit 1
 fi
 ARCH_SMOKE
+    ;;
+aarch64|arm64)
+    # Docker's official Arch Linux image is x86-64-only. The native ARM64
+    # binary has already executed above in Debian and Fedora; package-linux.sh
+    # independently verifies the Arch package's architecture, dependencies,
+    # and exact payload.
+    echo "Arch Linux has no official ARM64 container; verified ARM64 package metadata/payload and Debian/Fedora native execution."
+    ;;
+*)
+    echo "error: unsupported Linux smoke architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
 
 echo "Clean Debian, Fedora, and Arch package smoke passed."

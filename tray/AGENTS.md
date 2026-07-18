@@ -54,7 +54,7 @@ macOS, Linux, and Windows system-tray companion for FeanorFS. Shells `feanorfs -
   staples, Gatekeeper-checks, attests, and uploads one universal package plus
   public verification evidence.
 - Manual: `feanorfs-tray` with `FEANORFS_WORKSPACE` set
-- Linux release proof: build on native x86-64/ARM64 with GTK/AppIndicator/libxdo, verify exact `.deb`/`.rpm`/`.pkg.tar.zst`/tar payloads and dependency metadata, require `ldd` to report no missing libraries, and install/run the CLI plus tray in digest-pinned Debian 13, Fedora 44, and Arch containers.
+- Linux release proof: build on native x86-64/ARM64 with GTK/AppIndicator/libxdo, verify exact `.deb`/`.rpm`/`.pkg.tar.zst`/tar payloads and dependency metadata, require complete `ldd`, install/run both architectures in Debian/Fedora, and install/run x86-64 in official Arch. Arch ARM64 has metadata/payload proof plus native Debian/Fedora execution because the official Arch container is x86-64-only.
 - Windows release proof: native CI executes the complete Task Scheduler host/workspace/tray lifecycle, doctor, MCP, and stop/resume; the privileged release reruns that product smoke after Azure Authenticode verification. Unsigned binaries must never be published as the desktop product.
 
 ## Child DOX Index

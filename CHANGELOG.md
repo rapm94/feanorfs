@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/rapm94/feanorfs/compare/v0.6.0...v0.6.1) - 2026-07-18
+
+### Fixed
+
+- Keep the Arch clean-install smoke on the official x86-64 image while proving
+  ARM64 through exact Arch package metadata/payload checks and native
+  Debian/Fedora execution; Docker's official Arch image has no ARM64 manifest.
+
 ## [0.6.0](https://github.com/rapm94/feanorfs/compare/v0.5.0...v0.6.0) - 2026-07-18
 
 ### Added
@@ -211,7 +219,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
 - **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
-[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.6.1...HEAD
 [0.3.0]: https://github.com/rapm94/feanorfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rapm94/feanorfs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0
