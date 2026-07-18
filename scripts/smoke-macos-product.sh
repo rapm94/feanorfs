@@ -191,8 +191,21 @@ fi
   ])
   and all(.checks[]; .status == "ok")
 ' >/dev/null
-(cd "$WORKSPACE" && "$FEANORFS" --json tray status) | \
-  jq -e '.mirror_state == "idle" and .watching == true and .paused == false' >/dev/null
+TRAY_STATUS="$ROOT/tray-status.json"
+tray_ready=false
+for _ in {1..20}; do
+  if (cd "$WORKSPACE" && "$FEANORFS" --json tray status) >"$TRAY_STATUS" &&
+    jq -e '.mirror_state == "idle" and .watching == true and .paused == false' \
+      "$TRAY_STATUS" >/dev/null; then
+    tray_ready=true
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$tray_ready" != true ]]; then
+  echo "Tray did not reach idle, watching, and unpaused state within the bounded readiness window." >&2
+  exit 1
+fi
 /bin/launchctl print "gui/$(id -u)/com.feanorfs.tray" >/dev/null
 
 echo "Smoke: TLS, doctor, tray status, and MCP"
