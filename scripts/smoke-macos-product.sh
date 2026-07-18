@@ -84,7 +84,14 @@ kill "$EMPTY_TRAY_PID"
 wait "$EMPTY_TRAY_PID" 2>/dev/null || true
 EMPTY_TRAY_PID=""
 
-"$FEANORFS" start "$WORKSPACE" >/dev/null
+if ! "$FEANORFS" start "$WORKSPACE" >"$ROOT/initial-start.log" 2>&1; then
+  echo "Initial automatic-hub start failed:" >&2
+  sed -E \
+    -e 's/fn[hrp][12]-[A-Za-z0-9-]+/[capability redacted]/g' \
+    -e 's/[0-9a-f]{64}/[secret-or-hash redacted]/g' \
+    "$ROOT/initial-start.log" >&2
+  exit 1
+fi
 
 HUB_PORT="$(<"$HOME/.feanorfs/hub-data/listen-port")"
 if [[ ! "$HUB_PORT" =~ ^[0-9]+$ ]] || (( HUB_PORT < 1 || HUB_PORT > 65535 )); then
