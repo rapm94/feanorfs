@@ -120,8 +120,11 @@ fi
 
 jq -e '.workspace_id | startswith("fsw1-") and length == 37' \
   "$WORKSPACE/.feanorfs/config.json" >/dev/null
+# Same-host multicast is unavailable on GitHub-hosted runners. In that case
+# endpoint discovery deliberately retains the authenticated HTTPS loopback URL
+# until the CA-bound mDNS name can be probed successfully.
 jq -e --arg port "$HUB_PORT" \
-  '.server_url | test("^https://feanorfs-[0-9a-f]{16}\\.local:" + $port + "$")' \
+  '.server_url | test("^https://(127\\.0\\.0\\.1|feanorfs-[0-9a-f]{16}\\.local):" + $port + "$")' \
   "$WORKSPACE/.feanorfs/config.json" >/dev/null
 
 # Resume must hand off directly to the supervised watcher without a transient
@@ -165,8 +168,8 @@ jq -e 'length == 2 and all(.[][1]; length == 64)' \
 
 CA="$HOME/.feanorfs/hub-data/tls/ca-cert.pem"
 [[ "$(curl --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://127.0.0.1:$HUB_PORT/api/workspaces")" == "401" ]]
-STABLE_HOST="$(jq -r '.server_url | capture("^https://(?<host>[^:]+):[0-9]+$").host' "$WORKSPACE/.feanorfs/config.json")"
-[[ "$(curl --resolve "$STABLE_HOST:$HUB_PORT:127.0.0.1" --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://$STABLE_HOST:$HUB_PORT/api/workspaces")" == "401" ]]
+CONFIGURED_HOST="$(jq -r '.server_url | capture("^https://(?<host>[^:]+):[0-9]+$").host' "$WORKSPACE/.feanorfs/config.json")"
+[[ "$(curl --resolve "$CONFIGURED_HOST:$HUB_PORT:127.0.0.1" --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://$CONFIGURED_HOST:$HUB_PORT/api/workspaces")" == "401" ]]
 if curl -o /dev/null -fsS "http://127.0.0.1:$HUB_PORT/api/workspaces" 2>/dev/null; then
   echo "Private hub unexpectedly accepted plaintext HTTP." >&2
   exit 1
