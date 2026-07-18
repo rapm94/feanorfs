@@ -76,7 +76,7 @@ jobs:
         run: >-
           sudo apt-get update &&
           sudo apt-get install -y --no-install-recommends
-          cpio libgtk-3-dev libxdo-dev libayatana-appindicator3-dev rpm
+          cpio libgtk-3-dev libxdo-dev libayatana-appindicator3-dev rpm zstd
       - name: Install pinned nFPM
         env:
           NFPM_ARCHIVE_ARCH: ${{ matrix.nfpm_archive_arch }}
@@ -125,13 +125,14 @@ jobs:
           export SOURCE_DATE_EPOCH
           scripts/package-linux.sh .
           sha256sum "$asset" > "$asset.sha256"
-      - name: Smoke clean Debian and Fedora installs
+      - name: Smoke clean Debian, Fedora, and Arch installs
         env:
           ASSET_ARCH: ${{ matrix.asset_arch }}
         run: >-
           scripts/smoke-linux-packages.sh
           "FeanorFS-linux-$ASSET_ARCH.deb"
           "FeanorFS-linux-$ASSET_ARCH.rpm"
+          "FeanorFS-linux-$ASSET_ARCH.pkg.tar.zst"
       - name: Upload unsigned Linux bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -143,6 +144,8 @@ jobs:
             FeanorFS-linux-${{ matrix.asset_arch }}.deb.sha256
             FeanorFS-linux-${{ matrix.asset_arch }}.rpm
             FeanorFS-linux-${{ matrix.asset_arch }}.rpm.sha256
+            FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst
+            FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst.sha256
             FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
           if-no-files-found: error
           retention-days: 1
@@ -193,6 +196,7 @@ jobs:
           sha256sum -c "FeanorFS-linux-$ASSET_ARCH.tar.xz.sha256"
           sha256sum -c "FeanorFS-linux-$ASSET_ARCH.deb.sha256"
           sha256sum -c "FeanorFS-linux-$ASSET_ARCH.rpm.sha256"
+          sha256sum -c "FeanorFS-linux-$ASSET_ARCH.pkg.tar.zst.sha256"
       - name: Attest Linux release assets
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
@@ -203,6 +207,8 @@ jobs:
             release/FeanorFS-linux-${{ matrix.asset_arch }}.deb.sha256
             release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm
             release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm.sha256
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst.sha256
             release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
       - name: Upload Linux release assets
         env:
@@ -216,6 +222,8 @@ jobs:
           release/FeanorFS-linux-${{ matrix.asset_arch }}.deb.sha256
           release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm
           release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm.sha256
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst
+          release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst.sha256
           release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
           --clobber
 
@@ -238,6 +246,23 @@ jobs:
           toolchain: stable
       - name: Build CLI and tray
         run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
+      - name: Compile and smoke unsigned Windows installer
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            $candidate = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+            if (Test-Path -PathType Leaf $candidate) { $iscc = $candidate }
+          }
+          if (-not $iscc) { throw "GitHub's Windows runner does not provide Inno Setup 6." }
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          $output = Join-Path $env:RUNNER_TEMP "unsigned-installer"
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          & $iscc "/DAppVersion=$version" "/DSourceDir=$pwd\target\release" "/DRepoRoot=$pwd" "/DOutputDir=$output" scripts/windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with status $LASTEXITCODE." }
+          scripts/smoke-windows-installer.ps1 "$output/FeanorFS-windows-x86_64-setup.exe" target/release/feanorfs.exe target/release/feanorfs-tray.exe
       - name: Smoke unsigned Windows product lifecycle
         shell: pwsh
         run: >-
@@ -332,10 +357,36 @@ jobs:
             ${{ github.workspace }}\native\feanorfs-tray.exe
           file-digest: SHA256
           timestamp-digest: SHA256
+      - name: Compile installer from signed binaries
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            $candidate = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+            if (Test-Path -PathType Leaf $candidate) { $iscc = $candidate }
+          }
+          if (-not $iscc) { throw "GitHub's Windows runner does not provide Inno Setup 6." }
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          $output = Join-Path $pwd "windows-installer"
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          & $iscc "/DAppVersion=$version" "/DSourceDir=$pwd\native" "/DRepoRoot=$pwd" "/DOutputDir=$output" scripts/windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with status $LASTEXITCODE." }
+      - name: Sign Windows installer
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files: ${{ github.workspace }}\windows-installer\FeanorFS-windows-x86_64-setup.exe
+          file-digest: SHA256
+          timestamp-digest: SHA256
       - name: Verify signatures and package Windows bundle
         shell: pwsh
         run: |
-          $files = @("native/feanorfs.exe", "native/feanorfs-tray.exe")
+          $installer = "windows-installer/FeanorFS-windows-x86_64-setup.exe"
+          $files = @("native/feanorfs.exe", "native/feanorfs-tray.exe", $installer)
           $evidence = @()
           foreach ($file in $files) {
             $signature = Get-AuthenticodeSignature $file
@@ -345,10 +396,21 @@ jobs:
             $evidence += "$file status=$($signature.Status) subject=$($signature.SignerCertificate.Subject)"
           }
           $evidence | Set-Content -Encoding utf8NoBOM FeanorFS-windows-x86_64.verification.txt
-          Compress-Archive -Path $files -DestinationPath FeanorFS-windows-x86_64.zip
+          Compress-Archive -Path @("native/feanorfs.exe", "native/feanorfs-tray.exe") -DestinationPath FeanorFS-windows-x86_64.zip
           $hash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64.zip).Hash.ToLowerInvariant()
           "$hash  FeanorFS-windows-x86_64.zip" | Set-Content -Encoding ascii FeanorFS-windows-x86_64.zip.sha256
+          Copy-Item $installer FeanorFS-windows-x86_64-setup.exe
+          $installerHash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64-setup.exe).Hash.ToLowerInvariant()
+          "$installerHash  FeanorFS-windows-x86_64-setup.exe" | Set-Content -Encoding ascii FeanorFS-windows-x86_64-setup.exe.sha256
           Copy-Item scripts/install.ps1 feanorfs-windows-installer.ps1
+      - name: Smoke signed Windows installer
+        shell: pwsh
+        run: >-
+          scripts/smoke-windows-installer.ps1
+          FeanorFS-windows-x86_64-setup.exe
+          native/feanorfs.exe
+          native/feanorfs-tray.exe
+          -RequireAuthenticode
       - name: Smoke signed Windows product lifecycle
         shell: pwsh
         run: >-
@@ -363,6 +425,8 @@ jobs:
             FeanorFS-windows-x86_64.zip
             FeanorFS-windows-x86_64.zip.sha256
             FeanorFS-windows-x86_64.verification.txt
+            FeanorFS-windows-x86_64-setup.exe
+            FeanorFS-windows-x86_64-setup.exe.sha256
             feanorfs-windows-installer.ps1
       - name: Upload Windows release assets
         shell: bash
@@ -374,6 +438,8 @@ jobs:
           FeanorFS-windows-x86_64.zip
           FeanorFS-windows-x86_64.zip.sha256
           FeanorFS-windows-x86_64.verification.txt
+          FeanorFS-windows-x86_64-setup.exe
+          FeanorFS-windows-x86_64-setup.exe.sha256
           feanorfs-windows-installer.ps1
           --clobber
       - name: Remove Azure credentials

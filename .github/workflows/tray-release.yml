@@ -254,11 +254,12 @@ jobs:
             FeanorFS-macOS.pkg
           pkgutil --check-signature FeanorFS-macOS.pkg | grep -F "Developer ID Installer:"
           rm -f "$unsigned"
-      - name: Notarize and staple package
+      - name: Notarize and staple package and disk image
         env:
           NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
           NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           if [ -z "$NOTARY_KEY_P8_BASE64" ] || [ -z "$NOTARY_KEY_ID" ] || [ -z "$NOTARY_ISSUER_ID" ]; then
             echo "::error::Configure the App Store Connect notarization secrets before releasing macOS."
@@ -286,6 +287,19 @@ jobs:
           jq -e '.status == "Accepted"' FeanorFS-macOS.notarization.json
           xcrun stapler staple -v FeanorFS-macOS.pkg
           xcrun stapler validate -v FeanorFS-macOS.pkg
+
+          version="${RELEASE_TAG#v}"
+          sh scripts/package-macos.sh dmg \
+            "$version" FeanorFS-macOS.pkg FeanorFS-macOS.dmg
+          xcrun notarytool submit FeanorFS-macOS.dmg \
+            --keychain-profile "$profile" \
+            --keychain "$keychain_path" \
+            --wait \
+            --timeout 20m \
+            --output-format json > FeanorFS-macOS.dmg.notarization.json
+          jq -e '.status == "Accepted"' FeanorFS-macOS.dmg.notarization.json
+          xcrun stapler staple -v FeanorFS-macOS.dmg
+          xcrun stapler validate -v FeanorFS-macOS.dmg
       - name: Verify package trust and contents
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
@@ -303,6 +317,8 @@ jobs:
             pkgutil --check-signature FeanorFS-macOS.pkg
             xcrun stapler validate -v FeanorFS-macOS.pkg
             spctl --assess --type install --verbose=4 FeanorFS-macOS.pkg
+            xcrun stapler validate -v FeanorFS-macOS.dmg
+            spctl --assess --type open --context context:primary-signature --verbose=4 FeanorFS-macOS.dmg
             codesign --verify --deep --strict --verbose=4 "$app"
             codesign --display --verbose=4 "$app"
             codesign --verify --strict --verbose=4 "$cli"
@@ -312,6 +328,13 @@ jobs:
             lipo "$cli" -verify_arch arm64 x86_64
             echo "cli architectures: arm64 x86_64"
             pkgutil --payload-files FeanorFS-macOS.pkg
+            mount="$RUNNER_TEMP/feanorfs-dmg-mount"
+            mkdir -p "$mount"
+            hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mount" FeanorFS-macOS.dmg
+            test "$(find "$mount" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 1
+            cmp FeanorFS-macOS.pkg "$mount/FeanorFS-macOS.pkg"
+            hdiutil detach -quiet "$mount"
+            echo "disk image payload: exact signed FeanorFS-macOS.pkg"
           } >> "$evidence" 2>&1
           grep -F "Developer ID Installer:" "$evidence"
           grep -F "source=Notarized Developer ID" "$evidence"
@@ -319,6 +342,7 @@ jobs:
           grep -F "Signed macOS credential smoke passed" "$evidence"
           grep -F "arm64 x86_64" "$evidence"
           shasum -a 256 FeanorFS-macOS.pkg > FeanorFS-macOS.pkg.sha256
+          shasum -a 256 FeanorFS-macOS.dmg > FeanorFS-macOS.dmg.sha256
           cp scripts/install-macos.sh feanorfs-macos-installer.sh
           chmod 755 feanorfs-macos-installer.sh
           echo "Verified signed universal package for $RELEASE_TAG."
@@ -328,7 +352,10 @@ jobs:
           subject-path: |
             FeanorFS-macOS.pkg
             FeanorFS-macOS.pkg.sha256
+            FeanorFS-macOS.dmg
+            FeanorFS-macOS.dmg.sha256
             FeanorFS-macOS.notarization.json
+            FeanorFS-macOS.dmg.notarization.json
             FeanorFS-macOS.verification.txt
             FeanorFS-macOS.keychain-smoke.txt
             feanorfs-macos-installer.sh
@@ -340,7 +367,10 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             FeanorFS-macOS.pkg \
             FeanorFS-macOS.pkg.sha256 \
+            FeanorFS-macOS.dmg \
+            FeanorFS-macOS.dmg.sha256 \
             FeanorFS-macOS.notarization.json \
+            FeanorFS-macOS.dmg.notarization.json \
             FeanorFS-macOS.verification.txt \
             FeanorFS-macOS.keychain-smoke.txt \
             feanorfs-macos-installer.sh \

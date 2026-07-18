@@ -22,16 +22,16 @@ Please do not disclose the vulnerability publicly until a fix has been released.
 
 ## Verifying release artifacts
 
-FeanorFS release binaries are built by [cargo-dist](https://github.com/axodotdev/cargo-dist) in GitHub Actions (`.github/workflows/release.yml`). The universal macOS package is built by `.github/workflows/tray-release.yml`, while native Linux and signed Windows desktop products are built by `.github/workflows/desktop-release.yml`; both run only after the cargo-dist release succeeds and the requested tag resolves to the same commit.
+FeanorFS release binaries are built by [cargo-dist](https://github.com/axodotdev/cargo-dist) in GitHub Actions (`.github/workflows/release.yml`). The universal macOS package and DMG are built by `.github/workflows/tray-release.yml`, while native Linux and signed Windows installer products are built by `.github/workflows/desktop-release.yml`; both run only after the cargo-dist release succeeds and the requested tag resolves to the same commit.
 
 The macOS workflow builds arm64 and x86_64 without secrets, combines them into
 one universal CLI and `FeanorFS.app`, signs both with Developer ID Application
 using hardened runtime and trusted timestamps, and signs the package with
-Developer ID Installer. It submits `FeanorFS-macOS.pkg` to Apple, staples the
-accepted ticket for offline validation, requires Gatekeeper package acceptance,
-and publishes notarization and verification evidence. Missing credentials or
-any rejected assessment stops the release before upload; there is no unsigned
-fallback.
+Developer ID Installer. It notarizes and staples `FeanorFS-macOS.pkg`, wraps
+that exact package in `FeanorFS-macOS.dmg`, then notarizes and staples the disk
+image. Gatekeeper must accept both layers and the mounted package must match the
+published package byte-for-byte. Missing credentials or any rejected assessment
+stops the release before upload; there is no unsigned fallback.
 
 Before packaging, the privileged workflow runs the Developer ID-signed CLI in
 an isolated workspace without credential-store overrides. It requires the
@@ -49,25 +49,25 @@ cargo-dist CLI and reports that limitation; a listed but incomplete or invalid
 package fails closed.
 
 On Linux x86-64 and ARM64, the same installer prefers a release `.deb` on
-Debian/Ubuntu or `.rpm` on Fedora/RHEL. It verifies the checksum, package name,
-native architecture, and absence of install scripts before invoking the system
-package manager with recommended/weak dependencies disabled. Package metadata
-declares the required desktop libraries, and a listed native package with a
-missing or invalid checksum fails closed. The exact-content tar product remains
-available for custom prefixes and is rejected when runtime linkage is missing.
+Debian/Ubuntu, `.rpm` on Fedora/RHEL, or `.pkg.tar.zst` on Arch/Manjaro. It
+verifies the checksum, package name, native architecture, and absence of install
+scripts before invoking the system package manager. Package metadata declares
+the required desktop libraries, and a listed native package with a missing or
+invalid checksum fails closed. The exact-content tar product remains available
+for custom prefixes and is rejected when runtime linkage is missing.
 
-On Windows, the PowerShell installer accepts only the expected checksummed
-two-executable bundle and requires both files to carry valid Authenticode
-signatures before installing them. The release workflow requires Azure Artifact
-Signing and has no unsigned desktop fallback.
+On Windows, the normal Inno Setup EXE and both embedded executables must carry
+valid Authenticode signatures. CI proves exact installed hashes, per-user PATH
+integration, and uninstall before publication. The PowerShell fallback accepts
+only the expected checksummed two-executable bundle and verifies both
+signatures. Azure Artifact Signing is mandatory; there is no unsigned desktop
+fallback.
 
-**Current release status:** v0.4.0 predates this gate. Its tray ZIP binaries are
-ad-hoc signed (`TeamIdentifier` absent) and fail Gatekeeper assessment; no
-notarization or verification evidence was published with them. Treat those
-ZIPs as developer-preview artifacts, not authenticated consumer releases. The
-first consumer macOS release must include the universal package, accepted
-notarization JSON, signed-Keychain smoke record, and verification evidence
-described above.
+**Current release status:** v0.5.0 contains the attested CLI but no trusted
+desktop artifacts. The first consumer macOS release must include the universal
+DMG/package, accepted notarization JSON, signed-Keychain smoke record, and
+verification evidence described above. The first Windows desktop release must
+likewise include the Authenticode-signed setup EXE and verification evidence.
 
 Release artifacts, evidence, and installer scripts also receive a **GitHub
 Artifact Attestation** (SLSA build provenance via Sigstore). An attestation is
@@ -102,7 +102,8 @@ gh attestation verify \
   --repo rapm94/feanorfs
 ```
 
-Use the filename you downloaded (`*.tar.xz`, `*.zip`, `*.pkg`, `*.deb`, `*.rpm`,
+Use the filename you downloaded (`*.tar.xz`, `*.zip`, `*.dmg`, `*.pkg`,
+`*.deb`, `*.rpm`, `*.pkg.tar.zst`, `*.exe`,
 `feanorfs-client-installer.sh`, or `feanorfs-client-installer.ps1`). This
 includes `FeanorFS-macOS.pkg` and its notarization/verification evidence.
 Success prints the linked workflow run and commit; failure means do not run the
@@ -116,7 +117,7 @@ gh attestation download --repo rapm94/feanorfs <tag>
 
 ### Verify without piping the install script
 
-If you prefer not to `curl | sh`, download the artifact for your platform from [GitHub Releases](https://github.com/rapm94/feanorfs/releases) and verify the attestation above. On macOS, open the universal `FeanorFS-macOS.pkg`. On Linux, install the matching `.deb`/`.rpm` with your package manager or inspect the portable tar product. On Windows, verify and unpack the signed desktop ZIP. The install scripts are convenience wrappers around the same attested artifacts.
+If you prefer not to `curl | sh`, download the artifact for your platform from [GitHub Releases](https://github.com/rapm94/feanorfs/releases) and verify the attestation above. On macOS, open `FeanorFS-macOS.dmg` and its package. On Linux, install the matching `.deb`, `.rpm`, or `.pkg.tar.zst`. On Windows, run the signed setup EXE. The install scripts are convenience wrappers around the same attested artifacts.
 
 ### Verify with checksums
 
@@ -152,11 +153,41 @@ rpm -qp --scripts FeanorFS-linux-x86_64.rpm
 The identity must be `feanorfs` with the matching native architecture, and the
 script query must be empty.
 
-### Verify Apple signatures and notarization on macOS
-
-Before installation, verify the universal package:
+For Arch/Manjaro:
 
 ```bash
+sha256sum -c FeanorFS-linux-x86_64.pkg.tar.zst.sha256
+gh attestation verify FeanorFS-linux-x86_64.pkg.tar.zst --repo rapm94/feanorfs
+bsdtar -xOf FeanorFS-linux-x86_64.pkg.tar.zst .PKGINFO
+```
+
+`pkgname` must be `feanorfs`, `arch` must match the machine, and the
+dependencies must name GTK 3, Ayatana AppIndicator, xdotool, the XDG desktop
+portal, and zenity.
+
+### Verify the Windows installer
+
+In PowerShell:
+
+```powershell
+(Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64-setup.exe).Hash
+Get-AuthenticodeSignature FeanorFS-windows-x86_64-setup.exe | Format-List Status,StatusMessage
+gh attestation verify FeanorFS-windows-x86_64-setup.exe --repo rapm94/feanorfs
+```
+
+Compare the hash with `FeanorFS-windows-x86_64-setup.exe.sha256`. Signature
+status must be `Valid`; an absent, unknown, or untrusted signer is a hard
+failure.
+
+### Verify Apple signatures and notarization on macOS
+
+Before installation, verify the universal disk image and package:
+
+```bash
+shasum -a 256 -c FeanorFS-macOS.dmg.sha256
+gh attestation verify FeanorFS-macOS.dmg --repo rapm94/feanorfs
+xcrun stapler validate -v FeanorFS-macOS.dmg
+spctl --assess --type open --context context:primary-signature --verbose=4 FeanorFS-macOS.dmg
 shasum -a 256 -c FeanorFS-macOS.pkg.sha256
 gh attestation verify FeanorFS-macOS.pkg --repo rapm94/feanorfs
 pkgutil --check-signature FeanorFS-macOS.pkg
@@ -177,7 +208,7 @@ must have status `Accepted`.
 
 - CI tests the core workspace on Linux, macOS, and Windows. The cross-platform
   tray has native build, Clippy, test, and product/payload gates on all three;
-  Linux also builds verified `.deb` and `.rpm` packages.
+  Linux also builds verified `.deb`, `.rpm`, and `.pkg.tar.zst` packages.
 - Rust 1.88 is the declared and continuously tested minimum supported version.
 - `cargo-deny` blocks known advisories, yanked crates, unapproved licenses, and
   untrusted dependency sources. A scheduled run catches newly published

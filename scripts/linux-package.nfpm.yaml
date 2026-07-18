@@ -53,3 +53,10 @@ overrides:
       - libxdo
       - xdg-desktop-portal
       - zenity
+  archlinux:
+    depends:
+      - gtk3
+      - libayatana-appindicator
+      - xdotool
+      - xdg-desktop-portal
+      - zenity

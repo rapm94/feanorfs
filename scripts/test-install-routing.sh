@@ -67,6 +67,12 @@ case "$url" in
   */FeanorFS-linux-x86_64.rpm.sha256)
     cp "$FAKE_LINUX_RPM_CHECKSUM" "$output"
     ;;
+  */FeanorFS-linux-x86_64.pkg.tar.zst)
+    cp "$FAKE_LINUX_ARCH_PACKAGE" "$output"
+    ;;
+  */FeanorFS-linux-x86_64.pkg.tar.zst.sha256)
+    cp "$FAKE_LINUX_ARCH_CHECKSUM" "$output"
+    ;;
   *)
     echo "unexpected test URL: $url" >&2
     exit 1
@@ -151,6 +157,31 @@ case "$4" in */FeanorFS-linux-x86_64.rpm) ;; *) exit 1 ;; esac
 : > "$FAKE_DNF_MARKER"
 EOF
 chmod 755 "$STUBS/dnf"
+
+cat >"$STUBS/bsdtar" <<'EOF'
+#!/bin/sh
+set -eu
+case "$1" in
+  -xOf)
+    printf '%s\n' 'pkgname = feanorfs' 'arch = x86_64'
+    ;;
+  -tf)
+    printf '%s\n' '.PKGINFO' 'usr/bin/feanorfs' 'usr/bin/feanorfs-tray'
+    ;;
+  *) echo "unexpected bsdtar test arguments: $*" >&2; exit 1 ;;
+esac
+EOF
+chmod 755 "$STUBS/bsdtar"
+
+cat >"$STUBS/pacman" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$1" = -U ]
+[ "$2" = --noconfirm ]
+case "$3" in */FeanorFS-linux-x86_64.pkg.tar.zst) ;; *) exit 1 ;; esac
+: > "$FAKE_PACMAN_MARKER"
+EOF
+chmod 755 "$STUBS/pacman"
 
 export PATH="$STUBS:$PATH"
 export FEANORFS_RELEASE_API="https://example.invalid/releases/latest"
@@ -288,4 +319,30 @@ sh scripts/install.sh >"$ROOT/rpm.log"
 [[ ! -f "$FEANORFS_TEST_CLI_MARKER" ]]
 grep -Fq 'automatic desktop dependencies' "$ROOT/rpm.log"
 
-echo "Installer routing passed: legacy fallback, fail-closed macOS/Linux trust, headless opt-out, verified Linux tray launch, and deb/rpm routing."
+rm -f "$FAKE_DNF_MARKER"
+export FAKE_PACMAN_MARKER="$ROOT/pacman-installed"
+export FAKE_LINUX_ARCH_PACKAGE="$ROOT/FeanorFS-linux-x86_64.pkg.tar.zst"
+printf 'fake-arch-payload' >"$FAKE_LINUX_ARCH_PACKAGE"
+export FAKE_LINUX_ARCH_CHECKSUM="$ROOT/FeanorFS-linux-x86_64.pkg.tar.zst.sha256"
+(
+  cd "$ROOT"
+  sha256sum "$(basename "$FAKE_LINUX_ARCH_PACKAGE")" >"$FAKE_LINUX_ARCH_CHECKSUM"
+)
+
+export FAKE_RELEASE_JSON='{"tag_name":"v9.9.9","assets":[{"name":"FeanorFS-linux-x86_64.pkg.tar.zst"}]}'
+if sh scripts/install.sh >"$ROOT/incomplete-arch.log" 2>&1; then
+  echo "Linux Arch package without a checksum unexpectedly reached installation." >&2
+  exit 1
+fi
+grep -Fq 'has a Linux arch package but no checksum' "$ROOT/incomplete-arch.log"
+[[ ! -f "$FAKE_PACMAN_MARKER" ]]
+
+export FAKE_RELEASE_JSON='{"tag_name":"v9.9.9","assets":[{"name":"FeanorFS-linux-x86_64.pkg.tar.zst"},{"name":"FeanorFS-linux-x86_64.pkg.tar.zst.sha256"},{"name":"FeanorFS-linux-x86_64.tar.xz"},{"name":"FeanorFS-linux-x86_64.tar.xz.sha256"}]}'
+sh scripts/install.sh >"$ROOT/arch.log"
+[[ -f "$FAKE_PACMAN_MARKER" ]]
+[[ ! -f "$FAKE_DNF_MARKER" ]]
+[[ ! -f "$FAKE_APT_MARKER" ]]
+[[ ! -f "$FEANORFS_TEST_CLI_MARKER" ]]
+grep -Fq 'automatic desktop dependencies' "$ROOT/arch.log"
+
+echo "Installer routing passed: legacy fallback, fail-closed macOS/Linux trust, headless opt-out, verified Linux tray launch, and deb/rpm/Arch routing."

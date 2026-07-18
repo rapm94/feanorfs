@@ -19,6 +19,10 @@ command -v rpm >/dev/null 2>&1 || {
     echo "error: rpm is required" >&2
     exit 1
 }
+command -v tar >/dev/null 2>&1 || {
+    echo "error: tar is required" >&2
+    exit 1
+}
 [ -x "$feanorfs_bin" ] || { echo "error: missing $feanorfs_bin" >&2; exit 1; }
 [ -x "$tray_bin" ] || { echo "error: missing $tray_bin" >&2; exit 1; }
 
@@ -46,6 +50,7 @@ nfpm_version="$(cargo metadata --no-deps --format-version 1 | \
 mkdir -p "$output_dir"
 deb="$output_dir/FeanorFS-linux-$asset_arch.deb"
 rpm_package="$output_dir/FeanorFS-linux-$asset_arch.rpm"
+arch_package="$output_dir/FeanorFS-linux-$asset_arch.pkg.tar.zst"
 
 NFPM_ARCH="$nfpm_arch"
 NFPM_VERSION="$nfpm_version"
@@ -56,6 +61,7 @@ export NFPM_ARCH NFPM_VERSION NFPM_FEANORFS_BIN NFPM_TRAY_BIN SOURCE_DATE_EPOCH
 
 nfpm package --config scripts/linux-package.nfpm.yaml --packager deb --target "$deb"
 nfpm package --config scripts/linux-package.nfpm.yaml --packager rpm --target "$rpm_package"
+nfpm package --config scripts/linux-package.nfpm.yaml --packager archlinux --target "$arch_package"
 
 [ "$(dpkg-deb -f "$deb" Package)" = feanorfs ]
 [ "$(dpkg-deb -f "$deb" Architecture)" = "$nfpm_arch" ]
@@ -96,7 +102,28 @@ expected_rpm_contents="$(printf '%s\n' \
     exit 1
 }
 
-for asset in "$deb" "$rpm_package"; do
+arch_metadata="$(tar --zstd -xOf "$arch_package" .PKGINFO)"
+printf '%s\n' "$arch_metadata" | grep -Fx 'pkgname = feanorfs' >/dev/null
+printf '%s\n' "$arch_metadata" | grep -Fx "arch = $rpm_arch" >/dev/null
+for dependency in gtk3 libayatana-appindicator xdotool xdg-desktop-portal zenity; do
+    printf '%s\n' "$arch_metadata" | grep -Fx "depend = $dependency" >/dev/null
+done
+arch_contents="$(tar --zstd -tf "$arch_package" | \
+    sed -e '/\/$/d' -e '/^\.BUILDINFO$/d' -e '/^\.MTREE$/d' -e '/^\.PKGINFO$/d' | \
+    LC_ALL=C sort)"
+expected_arch_contents="$(printf '%s\n' \
+    usr/bin/feanorfs \
+    usr/bin/feanorfs-tray \
+    usr/share/applications/com.feanorfs.tray.desktop \
+    usr/share/doc/feanorfs/LICENSE \
+    usr/share/doc/feanorfs/README.md \
+    usr/share/icons/hicolor/scalable/apps/com.feanorfs.tray.svg | LC_ALL=C sort)"
+[ "$arch_contents" = "$expected_arch_contents" ] || {
+    echo "error: Arch package contains unexpected files" >&2
+    exit 1
+}
+
+for asset in "$deb" "$rpm_package" "$arch_package"; do
     sha256sum "$asset" > "$asset.sha256"
 done
 

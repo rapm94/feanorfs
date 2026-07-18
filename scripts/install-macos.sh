@@ -21,7 +21,7 @@ curl --proto '=https' --tlsv1.2 -fLsS "$BASE_URL/$PACKAGE.sha256" -o "$TEMP_DIR/
 /usr/sbin/spctl --assess --type install --verbose=2 "$TEMP_DIR/$PACKAGE"
 
 if [ "$(id -u)" -eq 0 ]; then
-  /usr/sbin/installer -pkg "$TEMP_DIR/$PACKAGE" -target /
+  FEANORFS_NO_LAUNCH=1 /usr/sbin/installer -pkg "$TEMP_DIR/$PACKAGE" -target /
 else
   command -v sudo >/dev/null 2>&1 || {
     echo "Administrator access is required to install FeanorFS.app and /usr/local/bin/feanorfs." >&2
@@ -32,7 +32,8 @@ else
     exit 1
   }
   sudo -v
-  sudo /usr/sbin/installer -pkg "$TEMP_DIR/$PACKAGE" -target /
+  sudo /usr/bin/env FEANORFS_NO_LAUNCH=1 \
+    /usr/sbin/installer -pkg "$TEMP_DIR/$PACKAGE" -target /
 fi
 
 hash -r 2>/dev/null || true

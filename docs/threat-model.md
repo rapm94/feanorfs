@@ -81,7 +81,7 @@ leaves the hub data directory.
 
 **Result:** **Partially defended against.**
 - **Ciphertext tampering (new blobs)**: New blobs are sealed with ChaCha20-Poly1305 AEAD (`pack_bytes`). Tampered ciphertext fails authentication on decrypt. Additionally, the client re-hashes downloaded ciphertext against the expected `encrypted_hash` before decrypting.
-- **Legacy downgrade (v1 workspaces only)**: Format-v2 and format-v3 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to the legacy XOR stream on decrypt. Run `feanorfs migrate`; removing XOR entirely remains gated by [representative field evidence](../TODO.md#ai-5-retire-legacy-xor-only-after-field-evidence).
+- **Legacy downgrade (v1 workspaces only)**: Format-v2 and format-v3 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to the legacy XOR stream on decrypt. Run `feanorfs migrate`; removing XOR entirely requires separately approved representative field evidence.
 - **Metadata lies**: a malicious server can still lie in `SyncResponse` (supply a hash matching substituted ciphertext); AEAD limits this to replaying validly-encrypted blobs for that same path.
 - **Replay attacks**: The server can replay an older valid snapshot head or blob. Compare-and-swap prevents honest concurrent writers from silently replacing each other, but it does not authenticate a malicious server's head response.
 - **Metadata manipulation**: A malicious server can hide snapshots, omit objects, or return an older head. Authenticated encryption detects modified ciphertext, not omission or rollback.
@@ -231,7 +231,7 @@ blob      = 0x01 ‖ nonce ‖ ChaCha20-Poly1305(key, nonce, plaintext)
 
 **Known properties / weaknesses:**
 1. **Determinism leaks reverts**: identical plaintext at the same path always yields identical ciphertext, so the server can observe "this file returned to a previous state." This is an accepted CAS-stability trade-off.
-2. **Legacy XOR fallback (v1 only)**: unmigrated workspaces still decrypt pre-AEAD blobs via XOR. Run `feanorfs migrate`; removal is gated by [AI-5](../TODO.md#ai-5-retire-legacy-xor-only-after-field-evidence).
+2. **Legacy XOR fallback (v1 only)**: unmigrated workspaces still decrypt pre-AEAD blobs via XOR. Run `feanorfs migrate`; removal requires separately approved representative field evidence.
 3. **Fast key derivation**: single Blake3 pass — v2 workspaces require 64-hex generated keys (256-bit CSPRNG).
 
 ### Legacy construction (pre-AEAD blobs, decrypt-only)
@@ -254,7 +254,7 @@ Unauthenticated and malleable — an attacker who knows plaintext at a position 
 | Risk | Severity | Mitigation | Status |
 |---|---|---|---|
 | Plaintext leakage via weak password | High | New format-v2/v3 setup accepts only generated-shape 256-bit keys before persistence; migrate legacy format-v1 workspaces with `--rekey` | Implemented for new setup; historical keys require migration |
-| Legacy XOR decrypt path (unmigrated v1 workspaces) | Medium | `feanorfs migrate` to format v3; remove XOR only after [representative evidence](../TODO.md#ai-5-retire-legacy-xor-only-after-field-evidence) | Open |
+| Legacy XOR decrypt path (unmigrated v1 workspaces) | Medium | `feanorfs migrate` to format v3; remove XOR only after separately approved representative evidence | Open |
 | Ciphertext tampering (AEAD blobs) | — | ChaCha20-Poly1305 authentication | Implemented |
 | Network MITM | — | Native Rustls HTTPS, private-CA pinning through capability invites, normal hostname verification | Implemented by default |
 | LAN pairing secret interception/substitution | Medium | SPAKE2, AEAD, key confirmation, three online attempts, expiry, secret-free mDNS | Implemented; upstream PAKE crate unaudited |

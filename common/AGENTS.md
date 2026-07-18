@@ -12,7 +12,7 @@ Shared data models, canonical Merkle tree/snapshot objects, sync delta (`compute
 
 ## Local Contracts
 
-- `pack_bytes` / `unpack_bytes` — ChaCha20-Poly1305 for new blobs; format v2 and v3 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to legacy `crypt_bytes` XOR on decrypt — removal is gated by [AI-5](../TODO.md#ai-5-retire-legacy-xor-only-after-field-evidence).
+- `pack_bytes` / `unpack_bytes` — ChaCha20-Poly1305 for new blobs; format v2 and v3 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to legacy `crypt_bytes` XOR on decrypt; removal requires separately approved representative field evidence.
 - Deterministic SIV-style nonce (`blake3(key ‖ len ‖ plaintext)[..12]`) is LOAD-BEARING: CAS keys and change detection require identical `(key, path, plaintext)` → identical ciphertext. Do NOT switch to random nonces. Known accepted leak: the server can observe a file reverting to a previous state.
 - `compute_sync_delta` — pure LWW read-only transport hint used by server peek/diff handlers. Clients reconcile the complete server view against their last agreed state by hash; cross-machine mtime is not conflict identity.
 - `detect_concurrent_edits` / `classify_conflict_kind` — shared three-way logic for agent and workspace conflicts. When ours and theirs independently reach identical hash/deletion state, they have converged and do not conflict even when mtimes differ.

@@ -544,8 +544,8 @@ command. `--json` returns `{ "ok": boolean, "checks": [...] }`; each check has
 a stable `name`, `status` (`ok`, `info`, `warning`, or `failure`), `message`, and
 optional `action`. No key, bearer token, invite, or recovery secret is emitted.
 
-`--migration-report` is a separate, offline evidence mode for the gated
-[legacy-format retirement task](../TODO.md#ai-5-retire-legacy-xor-only-after-field-evidence). It reads only
+`--migration-report` is a separate, offline evidence mode for any future,
+separately approved legacy-format retirement decision. It reads only
 `format_version` from the current and recent workspace config files,
 deduplicates folders, and reports aggregate v1/v2/v3, unsupported, and
 unreadable-or-missing counts. It does not open OS credentials, contact a hub,

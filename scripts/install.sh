@@ -84,14 +84,15 @@ install_macos_package() {
     /usr/sbin/spctl --assess --type install --verbose=2 "$temp_dir/$package"
 
     if [ "$(id -u)" -eq 0 ]; then
-        /usr/sbin/installer -pkg "$temp_dir/$package" -target /
+        FEANORFS_NO_LAUNCH=1 /usr/sbin/installer -pkg "$temp_dir/$package" -target /
     else
         command -v sudo >/dev/null 2>&1 || \
             err "administrator access is required to install FeanorFS.app and /usr/local/bin/feanorfs"
         [ -t 1 ] || \
             err "run this installer from an interactive terminal so macOS can request administrator access"
         sudo -v
-        sudo /usr/sbin/installer -pkg "$temp_dir/$package" -target /
+        sudo /usr/bin/env FEANORFS_NO_LAUNCH=1 \
+            /usr/sbin/installer -pkg "$temp_dir/$package" -target /
     fi
 
     hash -r 2>/dev/null || true
@@ -119,6 +120,8 @@ linux_package_arch() {
         deb:aarch64) printf '%s\n' arm64 ;;
         rpm:x86_64) printf '%s\n' x86_64 ;;
         rpm:aarch64) printf '%s\n' aarch64 ;;
+        arch:x86_64) printf '%s\n' x86_64 ;;
+        arch:aarch64) printf '%s\n' aarch64 ;;
         *) return 1 ;;
     esac
 }
@@ -139,7 +142,12 @@ install_linux_native_package() {
     arch="$1"
     format="$2"
     package_arch="$(linux_package_arch "$format" "$arch")"
-    asset="FeanorFS-linux-${arch}.${format}"
+    if [ "$format" = arch ]; then
+        extension=pkg.tar.zst
+    else
+        extension="$format"
+    fi
+    asset="FeanorFS-linux-${arch}.${extension}"
     has_release_asset "$asset.sha256" || \
         err "release ${VERSION} has a Linux ${format} package but no checksum"
     command -v sha256sum >/dev/null 2>&1 || err "sha256sum is required to verify FeanorFS"
@@ -164,7 +172,7 @@ install_linux_native_package() {
             err "Linux package unexpectedly contains maintainer scripts"
         fi
         run_as_root apt-get install -y --no-install-recommends "$temp_dir/$asset"
-    else
+    elif [ "$format" = rpm ]; then
         [ "$(rpm -qp --queryformat '%{NAME}' "$temp_dir/$asset")" = feanorfs ] || \
             err "Linux package has an unexpected package name"
         [ "$(rpm -qp --queryformat '%{ARCH}' "$temp_dir/$asset")" = "$package_arch" ] || \
@@ -176,6 +184,16 @@ install_linux_native_package() {
         else
             run_as_root yum install -y "$temp_dir/$asset"
         fi
+    else
+        metadata="$(bsdtar -xOf "$temp_dir/$asset" .PKGINFO)"
+        printf '%s\n' "$metadata" | grep -Fx 'pkgname = feanorfs' >/dev/null || \
+            err "Linux package has an unexpected package name"
+        printf '%s\n' "$metadata" | grep -Fx "arch = $package_arch" >/dev/null || \
+            err "Linux package architecture does not match this computer"
+        if bsdtar -tf "$temp_dir/$asset" | grep -Fxq .INSTALL; then
+            err "Linux package unexpectedly contains install scripts"
+        fi
+        run_as_root pacman -U --noconfirm "$temp_dir/$asset"
     fi
 
     hash -r 2>/dev/null || true
@@ -247,6 +265,13 @@ if [ "$(uname -s)" = "Linux" ]; then
         { command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; } && \
        has_release_asset "FeanorFS-linux-${arch}.rpm"; then
         install_linux_native_package "$arch" rpm
+        launch_desktop_tray linux /usr/bin/feanorfs-tray
+        exit 0
+    fi
+    if [ -n "$arch" ] && [ -z "${BINDIR:-}" ] && [ -z "${FEANORFS_CLIENT_INSTALL_DIR:-}" ] && \
+        command -v pacman >/dev/null 2>&1 && command -v bsdtar >/dev/null 2>&1 && \
+       has_release_asset "FeanorFS-linux-${arch}.pkg.tar.zst"; then
+        install_linux_native_package "$arch" arch
         launch_desktop_tray linux /usr/bin/feanorfs-tray
         exit 0
     fi

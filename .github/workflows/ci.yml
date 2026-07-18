@@ -302,17 +302,28 @@ jobs:
             "$VERSION" \
             "$ROOT/build" \
             "$ROOT/FeanorFS-macOS-unsigned.pkg"
+          sh scripts/package-macos.sh dmg \
+            "$VERSION" \
+            "$ROOT/FeanorFS-macOS-unsigned.pkg" \
+            "$ROOT/FeanorFS-macOS-unsigned.dmg"
           pkgutil --expand-full \
             "$ROOT/FeanorFS-macOS-unsigned.pkg" \
             "$ROOT/expanded"
           CLI="$ROOT/expanded/Payload/usr/local/bin/feanorfs"
           APP="$ROOT/expanded/Payload/Applications/FeanorFS.app"
+          test -x "$ROOT/expanded/Scripts/postinstall"
+          grep -F -- '--first-run' "$ROOT/expanded/Scripts/postinstall"
           cmp target/release/feanorfs "$CLI"
           cmp target/release/feanorfs-tray "$APP/Contents/MacOS/feanorfs-tray"
           plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" | grep -Fx com.feanorfs.tray
           plutil -extract LSUIElement raw -o - "$APP/Contents/Info.plist" | grep -Fx true
           lipo "$CLI" -verify_arch "$(uname -m)"
           lipo "$APP/Contents/MacOS/feanorfs-tray" -verify_arch "$(uname -m)"
+          mkdir "$ROOT/dmg"
+          hdiutil attach -quiet -readonly -nobrowse \
+            -mountpoint "$ROOT/dmg" "$ROOT/FeanorFS-macOS-unsigned.dmg"
+          cmp "$ROOT/FeanorFS-macOS-unsigned.pkg" "$ROOT/dmg/FeanorFS-macOS.pkg"
+          hdiutil detach -quiet "$ROOT/dmg"
           bash scripts/smoke-macos-product.sh \
             "$CLI" \
             "$APP/Contents/MacOS/feanorfs-tray"
@@ -356,7 +367,7 @@ jobs:
         run: >-
           sudo apt-get update &&
           sudo apt-get install -y --no-install-recommends
-          cpio libgtk-3-dev libxdo-dev libayatana-appindicator3-dev rpm
+          cpio libgtk-3-dev libxdo-dev libayatana-appindicator3-dev rpm zstd
       - name: Install pinned nFPM
         if: ${{ runner.os == 'Linux' }}
         env:
@@ -377,6 +388,7 @@ jobs:
         run: |
           [void][scriptblock]::Create((Get-Content -Raw scripts/install.ps1))
           [void][scriptblock]::Create((Get-Content -Raw scripts/test-install-routing.ps1))
+          [void][scriptblock]::Create((Get-Content -Raw scripts/smoke-windows-installer.ps1))
           scripts/test-install-routing.ps1
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -422,15 +434,33 @@ jobs:
           scripts/smoke-windows-product.ps1
           target/release/feanorfs.exe
           target/release/feanorfs-tray.exe
+      - name: Compile and smoke Windows installer
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            $candidate = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+            if (Test-Path -PathType Leaf $candidate) { $iscc = $candidate }
+          }
+          if (-not $iscc) { throw "GitHub's Windows runner does not provide Inno Setup 6." }
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = $metadata.packages | Where-Object name -eq feanorfs-client | Select-Object -ExpandProperty version
+          $output = Join-Path $env:RUNNER_TEMP "windows-installer"
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          & $iscc "/DAppVersion=$version" "/DSourceDir=$pwd\target\release" "/DRepoRoot=$pwd" "/DOutputDir=$output" scripts/windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with status $LASTEXITCODE." }
+          scripts/smoke-windows-installer.ps1 "$output/FeanorFS-windows-x86_64-setup.exe" target/release/feanorfs.exe target/release/feanorfs-tray.exe
       - name: Build and verify native Linux packages
         if: ${{ runner.os == 'Linux' }}
         run: scripts/package-linux.sh "$RUNNER_TEMP/linux-packages"
-      - name: Smoke clean Debian and Fedora installs
+      - name: Smoke clean Debian, Fedora, and Arch installs
         if: ${{ runner.os == 'Linux' }}
         run: >-
           scripts/smoke-linux-packages.sh
           "$RUNNER_TEMP/linux-packages/FeanorFS-linux-x86_64.deb"
           "$RUNNER_TEMP/linux-packages/FeanorFS-linux-x86_64.rpm"
+          "$RUNNER_TEMP/linux-packages/FeanorFS-linux-x86_64.pkg.tar.zst"
 
   relay-container:
     name: Relay container

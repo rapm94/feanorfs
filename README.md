@@ -83,21 +83,26 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 
 This is the single Unix install entry point. On macOS it selects the signed,
 notarized universal CLI/tray package. On Linux x86-64 and ARM64 it selects a
-verified native `.deb` on Debian/Ubuntu or `.rpm` on Fedora/RHEL so the system
-package manager installs the tray's desktop dependencies automatically. A
-checksummed tar bundle remains the custom-prefix fallback. Older or unsupported
-releases fall back to the attested cargo-dist CLI installer and say explicitly
-that the tray was not installed.
+verified native `.deb` on Debian/Ubuntu, `.rpm` on Fedora/RHEL, or
+`.pkg.tar.zst` on Arch/Manjaro so the system package manager installs the
+tray's desktop dependencies automatically. A checksummed tar bundle remains the
+custom-prefix fallback. Older or unsupported releases fall back to the attested
+cargo-dist CLI installer and say explicitly that the tray was not installed.
 
-Windows PowerShell:
+Windows users download the normal signed installer:
+
+[Download FeanorFS for Windows (.exe)](https://github.com/rapm94/feanorfs/releases/latest/download/FeanorFS-windows-x86_64-setup.exe)
+
+The PowerShell route remains a verified automation fallback:
 
 ```powershell
 irm https://github.com/rapm94/feanorfs/releases/latest/download/feanorfs-windows-installer.ps1 | iex
 ```
 
-The Windows installer accepts only the checksummed two-binary desktop bundle
-and requires valid Authenticode signatures on both executables. Windows release
-packaging fails closed unless Azure Artifact Signing is configured.
+The installer EXE, CLI, and tray all require valid Authenticode signatures.
+Installation is per-user, adds the CLI to the user PATH, creates a Start-menu
+entry, supports clean uninstall, and opens tray-first onboarding. Windows
+release packaging fails closed unless Azure Artifact Signing is configured.
 
 ### Pre-built binaries (cargo-binstall)
 
@@ -108,48 +113,48 @@ cargo binstall feanorfs-client   # installs `feanorfs`
 
 ### macOS with menu-bar app (recommended)
 
-The next credentialed release will publish one universal, Apple-signed
-installer at:
+The credentialed release publishes one universal, Apple-notarized disk image:
 
-[FeanorFS for macOS (.pkg)](https://github.com/rapm94/feanorfs/releases/latest/download/FeanorFS-macOS.pkg)
+[Download FeanorFS for macOS (.dmg)](https://github.com/rapm94/feanorfs/releases/latest/download/FeanorFS-macOS.dmg)
 
 The package workflow is implemented but its first real Developer ID release is
 still gated on Apple credentials. The v0.4.0 tray ZIPs are preview artifacts:
 they are ad-hoc signed and Gatekeeper rejects them. Build from source until a
-release includes `FeanorFS-macOS.pkg`, its notarization JSON, and verification
-evidence, including the signed-build Keychain smoke. Once published, the recommended installer above selects it
-automatically. The package-specific Terminal installer remains available and
-verifies that same artifact:
+release includes `FeanorFS-macOS.dmg`, the exact signed package inside it,
+both notarization results, and verification evidence including the signed-build
+Keychain smoke. Once published, the recommended installer above selects the
+same package automatically. The Terminal installer remains available:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/rapm94/feanorfs/releases/latest/download/feanorfs-macos-installer.sh | sh
 ```
 
-The universal package installs `/usr/local/bin/feanorfs` and
-`/Applications/FeanorFS.app`. It is Developer ID Application-signed, Developer
-ID Installer-signed, notarized, stapled for offline verification, checksummed,
-Keychain-smoked, and attested. When no workspace exists, the verified
-interactive installer opens the menu-bar app with equal native choices to
-start mirroring, join another computer, or continue later. Start/join delegate
-to the existing secure tray actions and ultimately `feanorfs start`, which
-registers the tray and workspace sync at login. Existing workspaces do not
-re-prompt. Root/headless installs and `FEANORFS_NO_LAUNCH=1` leave launch
+The DMG contains the exact universal package that installs
+`/usr/local/bin/feanorfs` and `/Applications/FeanorFS.app`. The binaries,
+package, and disk image pass their respective Developer ID, notarization,
+stapling, checksum, Keychain-smoke, and attestation gates. A normal Finder
+install opens the menu-bar app with equal native choices to start mirroring,
+join another computer, or continue later. Start/join delegate to the existing
+secure tray actions and ultimately `feanorfs start`. Existing workspaces do
+not re-prompt. Root/headless installs and `FEANORFS_NO_LAUNCH=1` leave launch
 explicit.
 
 ### Linux and Windows desktop tray
 
-Tagged releases build native Linux x86-64/ARM64 `.deb` and `.rpm` packages,
-portable tar fallbacks, and a Windows x86-64 desktop bundle. Linux packages are
+Tagged releases build native Linux x86-64/ARM64 `.deb`, `.rpm`, and
+`.pkg.tar.zst` packages, portable tar fallbacks, and a Windows x86-64
+installer EXE. Linux packages are
 checksummed and GitHub-attested; their metadata declares GTK 3, Ayatana
 AppIndicator 3, libxdo, and XDG desktop portal dependencies, and the installer
 rejects unexpected package names, architectures, or install scripts. Before
-publication, the exact packages must install cleanly on Debian 13 and Fedora 44,
+publication, the exact packages must install cleanly on Debian 13, Fedora 44,
+and Arch Linux,
 the CLI must create an idle format-v3 encrypted workspace with private config
 and real snapshot objects, and the tray must survive native GTK startup against
 that workspace under an isolated Xvfb/D-Bus session. Windows
-binaries are Azure Authenticode-signed, checksummed, attested, and
-signature-checked again by the installer. Native Windows CI runs the colocated
+installer and binaries are Azure Authenticode-signed, checksummed, attested,
+and signature-checked again after installation. Native Windows CI runs the
 CLI and tray through first-machine hosting, Task Scheduler persistence, TLS,
 redacted Credential Manager storage and unattended reload, doctor, MCP, cleanup,
 and reversible stop/resume; the signed release repeats that smoke after
@@ -167,10 +172,9 @@ and the required TLS/logging boundaries are in
 ### Node agent SDK
 
 `@feanorfs/agent` has release-ready package assembly for macOS x64/ARM64,
-Linux GNU x64/ARM64, and Windows x64. The first provenance-backed npm release is
-owned by [F4 and AI-4](TODO.md#f4-enable-the-first-public-node-sdk-release);
-application release tags currently ship the CLI and optional tray only. Build
-the SDK from `bindings/ts/` or install local tarballs until that gate closes.
+Linux GNU x64/ARM64, and Windows x64. Application release tags currently ship
+the app rather than publishing Node packages. Build the SDK from `bindings/ts/`
+or install local tarballs until public SDK distribution is separately approved.
 
 CLI-only release installer (advanced):
 
@@ -363,7 +367,10 @@ cannot replace the invite-pinned CA or bearer token.
 
 **Important limitations** (see [docs/threat-model.md](docs/threat-model.md) for the full analysis):
 
-- Format-v2 and format-v3 workspaces reject non-AEAD blobs. Unmigrated format-v1 workspaces still accept legacy XOR on decrypt. Run `feanorfs migrate`; removal remains gated by [representative field evidence](TODO.md#ai-5-retire-legacy-xor-only-after-field-evidence).
+- Format-v2 and format-v3 workspaces reject non-AEAD blobs. Unmigrated
+  format-v1 workspaces still accept legacy XOR on decrypt. Run `feanorfs
+  migrate`; compatibility will not be removed without separately approved,
+  representative field evidence.
 - New encrypted workspaces accept only the generated 64-character lowercase-hex recovery-key shape. Manual human passphrases are rejected before configuration is written because the content-key derivation is not a password-stretching KDF. Historical format-v1 workspaces remain readable for migration; use `feanorfs migrate --rekey` when their key was human-chosen.
 - Format-v3 servers do not store file paths. They can still observe ciphertext sizes, object counts, hash equality, retention, and access timing. Legacy formats expose path metadata.
 - `--allow-http` disables native TLS and exposes bearer tokens to the network unless a correctly configured TLS reverse proxy or VPN encloses that connection.

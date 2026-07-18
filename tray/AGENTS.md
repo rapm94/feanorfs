@@ -36,8 +36,8 @@ macOS, Linux, and Windows system-tray companion for FeanorFS. Shells `feanorfs -
 - Target-specific crate features are mandatory: GTK/AppIndicator/libxdo plus XDG portal/Wayland support on Linux, common-controls-v6 on Windows, and native AppKit on macOS. Clipboard access is text-only and clears a pairing code only when the clipboard still contains that exact code.
 - The Windows tray Task Scheduler job must use `InteractiveToken` so a running process belongs to the logged-in desktop session and can display its icon; never apply that UI-only logon mode to hub or workspace workers.
 - Masked recovery/passcode entry uses only platform facilities: AppleScript's hidden-answer dialog on macOS, hidden PowerShell/WinForms on Windows, and packaged `zenity` with `kdialog` fallback on Linux. File/folder/message dialogs remain on `rfd`. Dialog programs receive static script input and public copy only; secret values come back through bounded captured output and must never enter process arguments, environment variables, status strings, or logs.
-- `package.metadata.dist.dist = false` keeps this native UI crate out of cargo-dist. `tray-release.yml` owns the universal signed/notarized macOS package; `desktop-release.yml` owns checksummed/attested Linux x86-64/ARM64 `.deb`/`.rpm`/tar products and fail-closed Azure Authenticode-signed Windows x86-64 bundles.
-- `scripts/install.sh` is the primary Unix entry point and selects the trusted macOS package or verified native Linux `.deb`/`.rpm` when present, with a checked tar fallback. `scripts/install.ps1` verifies the Windows bundle checksum, exact two-file payload, and both Authenticode signatures. A listed desktop product must never fall back after failed verification.
+- `package.metadata.dist.dist = false` keeps this native UI crate out of cargo-dist. `tray-release.yml` owns the universal signed/notarized macOS package and DMG; `desktop-release.yml` owns checksummed/attested Linux x86-64/ARM64 `.deb`/`.rpm`/`.pkg.tar.zst`/tar products and fail-closed Azure Authenticode-signed Windows x86-64 installer EXEs and bundles.
+- `scripts/install.sh` is the primary Unix entry point and selects the trusted macOS package or verified native Linux `.deb`/`.rpm`/`.pkg.tar.zst` when present, with a checked tar fallback. `scripts/install.ps1` verifies the Windows bundle checksum, exact two-file payload, and both Authenticode signatures; the normal download is the signed installer EXE. A listed desktop product must never fall back after failed verification.
 
 ## Work Guidance
 
@@ -54,7 +54,7 @@ macOS, Linux, and Windows system-tray companion for FeanorFS. Shells `feanorfs -
   staples, Gatekeeper-checks, attests, and uploads one universal package plus
   public verification evidence.
 - Manual: `feanorfs-tray` with `FEANORFS_WORKSPACE` set
-- Linux release proof: build on native x86-64/ARM64 with GTK/AppIndicator/libxdo, verify exact `.deb`/`.rpm`/tar payloads and dependency metadata, require `ldd` to report no missing libraries, and install/run the CLI plus tray in digest-pinned Debian 13 and Fedora 44 containers.
+- Linux release proof: build on native x86-64/ARM64 with GTK/AppIndicator/libxdo, verify exact `.deb`/`.rpm`/`.pkg.tar.zst`/tar payloads and dependency metadata, require `ldd` to report no missing libraries, and install/run the CLI plus tray in digest-pinned Debian 13, Fedora 44, and Arch containers.
 - Windows release proof: native CI executes the complete Task Scheduler host/workspace/tray lifecycle, doctor, MCP, and stop/resume; the privileged release reruns that product smoke after Azure Authenticode verification. Unsigned binaries must never be published as the desktop product.
 
 ## Child DOX Index

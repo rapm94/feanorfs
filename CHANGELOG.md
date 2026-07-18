@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/rapm94/feanorfs/compare/v0.5.0...v0.6.0) - 2026-07-18
+
+### Added
+
+- Native tray-first installers for every supported desktop family: a universal
+  macOS DMG containing the exact signed package, an Inno Setup Windows EXE, and
+  Arch/Manjaro `.pkg.tar.zst` packages alongside Debian `.deb` and Fedora
+  `.rpm` products.
+- Clean-package smoke coverage for Arch Linux and install/PATH/uninstall smoke
+  coverage for the Windows installer.
+
+### Changed
+
+- Finder package installation and the Windows setup wizard now open the same
+  public `--first-run` tray chooser used by the verified script installers.
+  Start and join continue to delegate to the merged secure `feanorfs start`
+  engine; installers handle no tokens, pairing capabilities, or encryption
+  material.
+
+### Security
+
+- macOS publication now requires notarization and stapling for both the signed
+  package and its DMG container. Windows publication requires Authenticode on
+  the installer EXE as well as both embedded executables. Arch packages receive
+  exact-payload checks, SHA-256 files, clean-container execution, and GitHub
+  provenance attestations.
+
 ## [0.5.0](https://github.com/rapm94/feanorfs/compare/v0.4.0...v0.5.0) - 2026-07-18
 
 ### Added
@@ -184,7 +211,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Content-addressed storage**, **local cache**, **lazy hydration**, **real-time watch**.
 - **Agent workspaces**, **library API**, **`--json` output**, **catch-up summary**, **predictive hydration**.
 
-[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/rapm94/feanorfs/compare/v0.6.0...HEAD
 [0.3.0]: https://github.com/rapm94/feanorfs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rapm94/feanorfs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rapm94/feanorfs/releases/tag/v0.1.0
