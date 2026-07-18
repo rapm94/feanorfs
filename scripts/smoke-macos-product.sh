@@ -75,9 +75,27 @@ if ! kill -0 "$EMPTY_TRAY_PID" 2>/dev/null; then
   echo "Tray exited instead of presenting first-run folder setup." >&2
   exit 1
 fi
-/usr/bin/sample "$EMPTY_TRAY_PID" 1 -file "$ROOT/first-run-tray.sample" >/dev/null 2>&1
-if ! grep -Fq 'CFUserNotificationDisplayAlert' "$ROOT/first-run-tray.sample"; then
-  echo "Tray stayed alive but did not present the native first-run start-or-join choice." >&2
+sample_captured=false
+first_run_choice_visible=false
+for _ in {1..3}; do
+  kill -0 "$EMPTY_TRAY_PID" 2>/dev/null || break
+  rm -f "$ROOT/first-run-tray.sample"
+  if /usr/bin/sample "$EMPTY_TRAY_PID" 1 \
+    -file "$ROOT/first-run-tray.sample" >/dev/null 2>&1; then
+    sample_captured=true
+    if grep -Fq 'CFUserNotificationDisplayAlert' "$ROOT/first-run-tray.sample"; then
+      first_run_choice_visible=true
+      break
+    fi
+  fi
+  sleep 0.25
+done
+if [[ "$first_run_choice_visible" != true ]]; then
+  if [[ "$sample_captured" != true ]]; then
+    echo "Could not sample the running tray after three bounded attempts." >&2
+  else
+    echo "Tray stayed alive but did not present the native first-run start-or-join choice." >&2
+  fi
   exit 1
 fi
 kill "$EMPTY_TRAY_PID"
