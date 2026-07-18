@@ -249,10 +249,10 @@ pub(crate) fn windows_task_running(
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$task = Get-ScheduledTask -TaskPath $args[0] -TaskName $args[1] -ErrorAction Stop; [Console]::Out.Write([int]$task.State)",
-            task_path,
-            task_name,
+            "$task = Get-ScheduledTask -TaskPath $env:FEANORFS_TASK_PATH -TaskName $env:FEANORFS_TASK_NAME -ErrorAction Stop; [Console]::Out.Write([int]$task.State)",
         ])
+        .env("FEANORFS_TASK_PATH", task_path)
+        .env("FEANORFS_TASK_NAME", task_name)
         .output()
         .context("read Windows scheduled task state")?;
     if !output.status.success() {
