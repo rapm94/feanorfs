@@ -271,11 +271,14 @@ fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+    #[cfg(unix)]
     {
-        fs::File::open(parent)?.sync_all()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::File::open(parent)?.sync_all()?;
+        }
     }
     Ok(())
 }
@@ -347,7 +350,12 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), original);
 
         let mut envelope: RecoveryEnvelope = serde_json::from_slice(&original).unwrap();
-        envelope.nonce.replace_range(..1, "A");
+        let replacement = if envelope.nonce.starts_with('A') {
+            "B"
+        } else {
+            "A"
+        };
+        envelope.nonce.replace_range(..1, replacement);
         fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
         let tampered = open_recovery_kit(&path, PASSPHRASE).unwrap_err();
         assert!(tampered

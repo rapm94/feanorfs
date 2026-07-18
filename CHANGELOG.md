@@ -72,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve Unix parent-directory durability after atomic private writes while avoiding unsupported directory `sync_all` calls on Windows for recovery kits, automatic-hub endpoint/relay state, and private server identity files.
 - Treat Windows drive paths and ordinary colon-bearing names as folders in the merged `start [target] [folder]` flow instead of misclassifying them as scheme-free servers; bare endpoints remain available for unambiguous localhost, IP, and dotted-host values with an explicit port.
 - Prevent embedded local hubs from inheriting a bearer token cached for an unrelated remote hub.
 - Stop `doctor` from reporting a reachable but non-persistent workspace as healthy; failures now state what was preserved and provide a concrete recovery command instead of aborting on the first connection error.

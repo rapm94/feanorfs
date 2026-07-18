@@ -126,6 +126,7 @@ fn save_listen_port(data_dir: &Path, port: u16) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(unix)]
     std::fs::File::open(data_dir)?.sync_all()?;
     Ok(())
 }
@@ -377,6 +378,7 @@ fn save_hub_relay(data_dir: &Path, relay: &feanorfs_common::RelayConfig) -> anyh
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(unix)]
     std::fs::File::open(data_dir)?.sync_all()?;
     Ok(())
 }
@@ -389,7 +391,10 @@ fn restore_hub_relay(
         return save_hub_relay(data_dir, previous);
     }
     match std::fs::remove_file(relay_config_path(data_dir)) {
-        Ok(()) => std::fs::File::open(data_dir)?.sync_all()?,
+        Ok(()) => {
+            #[cfg(unix)]
+            std::fs::File::open(data_dir)?.sync_all()?;
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("restore private-hub relay configuration"),
     }

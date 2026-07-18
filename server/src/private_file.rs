@@ -37,11 +37,14 @@ pub(crate) fn atomic_private_write(path: &Path, content: &[u8]) -> Result<()> {
 
     file.write_all(content)?;
     file.commit()?;
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+    #[cfg(unix)]
     {
-        File::open(parent)?.sync_all()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)?.sync_all()?;
+        }
     }
     Ok(())
 }
@@ -52,11 +55,14 @@ pub(crate) fn durable_remove_if_exists(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+    #[cfg(unix)]
     {
-        File::open(parent)?.sync_all()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)?.sync_all()?;
+        }
     }
     Ok(())
 }
