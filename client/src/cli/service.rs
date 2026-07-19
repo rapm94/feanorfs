@@ -299,6 +299,19 @@ pub(crate) fn status_for_workspace(workspace: &Path) -> anyhow::Result<Backgroun
     platform_status(&spec)
 }
 
+fn wait_for_managed_service_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if platform_status(spec)? == BackgroundStatus::Running {
+            return Ok(BackgroundStatus::Running);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    anyhow::bail!(
+        "automatic sync did not reach the running state within 5 seconds; check `feanorfs service status` and retry `feanorfs start`"
+    );
+}
+
 /// Stop and uninstall automatic sync for the consumer-facing `feanorfs stop` flow.
 /// The workspace metadata stays in place so `feanorfs start` can resume later.
 pub(crate) fn uninstall_for_workspace_stop(workspace: &Path) -> anyhow::Result<()> {
@@ -665,7 +678,7 @@ fn platform_install_and_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundSt
     } else if status == BackgroundStatus::Stopped {
         start_managed_service(spec)?;
     }
-    Ok(BackgroundStatus::Running)
+    wait_for_managed_service_start(spec)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -674,7 +687,7 @@ fn platform_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
         anyhow::bail!("Automatic sync is not installed; run `feanorfs service install`");
     }
     start_managed_service(spec)?;
-    Ok(BackgroundStatus::Running)
+    wait_for_managed_service_start(spec)
 }
 
 #[cfg(target_os = "macos")]
@@ -809,7 +822,7 @@ fn platform_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(BackgroundStatus::Running)
+    wait_for_managed_service_start(spec)
 }
 
 #[cfg(target_os = "windows")]

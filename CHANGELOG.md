@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3](https://github.com/rapm94/feanorfs/compare/v0.7.2...v0.7.3) - 2026-07-19
+
+### Fixed
+
+- `start` and service restarts now wait for the managed workspace worker to
+  actually reach its running state before reporting success, with a bounded
+  actionable failure instead of a premature tray/CLI success message.
+
 ## [0.7.2](https://github.com/rapm94/feanorfs/compare/v0.7.1...v0.7.2) - 2026-07-19
 
 ### Fixed
