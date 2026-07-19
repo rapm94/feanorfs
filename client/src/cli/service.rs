@@ -68,6 +68,7 @@ struct ServiceResult {
 #[derive(Debug, Serialize)]
 struct InstallationRefreshResult {
     workspaces_restarted: usize,
+    unavailable_workspaces_skipped: usize,
     private_hub_restarted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tray: Option<BackgroundStatus>,
@@ -173,6 +174,12 @@ pub async fn run(current_dir: &Path, action: ServiceAction, json: bool) -> anyho
                     "Refreshed {} automatic workspace service(s) for this installation.",
                     result.workspaces_restarted
                 );
+                if result.unavailable_workspaces_skipped > 0 {
+                    println!(
+                        "Skipped {} unavailable workspace(s); reconnect them and run `feanorfs start` there to refresh their service.",
+                        result.unavailable_workspaces_skipped
+                    );
+                }
                 if result.private_hub_restarted {
                     println!("Refreshed the automatic private hub service.");
                 }
@@ -188,11 +195,16 @@ pub async fn run(current_dir: &Path, action: ServiceAction, json: bool) -> anyho
 async fn refresh_installation() -> anyhow::Result<InstallationRefreshResult> {
     let recent = feanorfs_client::list_recent_workspaces()?;
     let mut workspaces_restarted = 0;
+    let mut unavailable_workspaces_skipped = 0;
     let mut private_hub_restarted = false;
     let mut tray_spec = None;
 
     for entry in recent.workspaces {
         let workspace = PathBuf::from(entry.path);
+        if !workspace.is_dir() {
+            unavailable_workspaces_skipped += 1;
+            continue;
+        }
         if !feanorfs_agent_core::workspace_is_configured(&workspace) {
             continue;
         }
@@ -235,6 +247,7 @@ async fn refresh_installation() -> anyhow::Result<InstallationRefreshResult> {
         .context("refresh system tray executable")?;
     Ok(InstallationRefreshResult {
         workspaces_restarted,
+        unavailable_workspaces_skipped,
         private_hub_restarted,
         tray,
     })

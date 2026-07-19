@@ -313,6 +313,7 @@ jobs:
           APP="$ROOT/expanded/Payload/Applications/FeanorFS.app"
           test -x "$ROOT/expanded/Scripts/postinstall"
           grep -F -- '--first-run' "$ROOT/expanded/Scripts/postinstall"
+          grep -F -- 'service refresh-installation' "$ROOT/expanded/Scripts/postinstall"
           cmp target/release/feanorfs "$CLI"
           cmp target/release/feanorfs-tray "$APP/Contents/MacOS/feanorfs-tray"
           plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" | grep -Fx com.feanorfs.tray

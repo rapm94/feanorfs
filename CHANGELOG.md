@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8](https://github.com/rapm94/feanorfs/compare/v0.7.7...v0.7.8) - 2026-07-19
+
+### Fixed
+
+- macOS package upgrades now hand the installed CLI and tray to the existing
+  per-user service refresh path before opening the tray.
+- Installation refresh skips disconnected or stale recent folders without
+  deleting their encrypted state, while refreshing every available workspace,
+  the private hub, and the tray.
+
 ## [0.7.7](https://github.com/rapm94/feanorfs/compare/v0.7.6...v0.7.7) - 2026-07-19
 
 ### Fixed

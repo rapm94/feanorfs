@@ -90,6 +90,13 @@ case "$console_uid" in
 esac
 
 if /bin/launchctl print "gui/$console_uid" >/dev/null 2>&1; then
+  if ! /bin/launchctl asuser "$console_uid" \
+    /usr/bin/sudo -H -u "$console_user" \
+    /usr/bin/env FEANORFS_TRAY_BIN=/Applications/FeanorFS.app/Contents/MacOS/feanorfs-tray \
+    /usr/local/bin/feanorfs service refresh-installation \
+    >/dev/null 2>&1; then
+    echo "FeanorFS was installed, but existing login services could not be refreshed automatically." >&2
+  fi
   /bin/launchctl asuser "$console_uid" \
     /usr/bin/sudo -u "$console_user" \
     /usr/bin/open -g /Applications/FeanorFS.app --args --first-run \
