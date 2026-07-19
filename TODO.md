@@ -99,6 +99,11 @@ Blocked on F1 and F2.
 - [ ] Add a release dry-run gate that proves the shared Cargo and Node versions,
   changelog section, tag target, public installer entrypoint, and expected
   platform artifact set all agree before a tag can be pushed.
+- [ ] Build amd64 and arm64 relay images on native runners, or assemble them
+  from the already attested release binaries, then merge one immutable OCI
+  manifest. Do not compile the complete arm64 Rust workspace under QEMU: the
+  `v0.6.4` publish was cancelled at the 60-minute job timeout while compilation
+  was still making progress.
 
 Done when ordinary product fixes cannot require a manual version carrier edit
 or silently leave the latest release on the previous version.
