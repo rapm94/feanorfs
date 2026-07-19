@@ -15,6 +15,7 @@ mod head;
 pub mod history;
 pub mod hub;
 mod hub_state;
+pub mod large_file;
 pub mod local;
 pub mod lock;
 mod object_gc;

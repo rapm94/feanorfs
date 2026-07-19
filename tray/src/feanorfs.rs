@@ -324,7 +324,7 @@ struct JoinPreview {
     remote_only: JoinPathGroup,
     same: JoinPathGroup,
     conflicts: JoinPathGroup,
-    oversized: JoinPathGroup,
+    large_files: JoinPathGroup,
     ignore_policy_known: bool,
     ignore_policy_differs: bool,
 }
@@ -377,13 +377,6 @@ fn join_workspace_interactive(
     if event.event != "join_preview" {
         graceful_stop_child(&mut child);
         return Err("FeanorFS returned an unexpected secure join stage.".into());
-    }
-
-    if event.preview.oversized.count > 0 {
-        let _ = stdin.write_all(b"CANCEL\n");
-        drop(stdin);
-        graceful_stop_child(&mut child);
-        return Err(join_oversized_copy(&event.preview));
     }
 
     let needs_confirmation = event.preview.local_only.count > 0
@@ -460,6 +453,12 @@ fn join_confirmation_copy(preview: &JoinPreview) -> String {
         message
             .push_str("\n\nThis is an older invite, so this folder's ignore rules will be kept.");
     }
+    if preview.large_files.count > 0 {
+        message.push_str(&format!(
+            "\n\nLarge files: {}. They will use authenticated encrypted chunks; add disposable files to .feanorfsignore to avoid transferring them.",
+            preview.large_files.count
+        ));
+    }
     let examples = preview
         .conflicts
         .examples
@@ -475,20 +474,6 @@ fn join_confirmation_copy(preview: &JoinPreview) -> String {
     message.push_str(
         "\n\nChoose OK only if you want to continue. FeanorFS will not auto-merge different content; those paths remain visible for your choice.",
     );
-    message
-}
-
-fn join_oversized_copy(preview: &JoinPreview) -> String {
-    let mut message = format!(
-        "Join stopped before changing this folder. {} file(s) exceed the current 100 MiB transport limit.",
-        preview.oversized.count
-    );
-    if !preview.oversized.examples.is_empty() {
-        message.push_str(" Files: ");
-        message.push_str(&preview.oversized.examples.join(", "));
-    }
-    message
-        .push_str(" Add them to .feanorfsignore or move them out of this folder, then try again.");
     message
 }
 

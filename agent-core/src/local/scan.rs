@@ -231,6 +231,23 @@ fn hash_stable_file(
     encryption: EncryptionContext<'_>,
     expected: DiskMetadata,
 ) -> Result<Option<ObservedFile>> {
+    if crate::large_file::uses_chunk_transport(expected.size) {
+        let fingerprint =
+            crate::large_file::fingerprint(path, encryption.password, encryption.relative_path)?;
+        let observed = DiskMetadata::read(path)?;
+        if observed.size != expected.size || observed.mtime != expected.mtime {
+            return Ok(None);
+        }
+        return Ok(Some(ObservedFile {
+            plaintext_hash: fingerprint.plaintext_hash,
+            encrypted_hash: fingerprint.encrypted_hash,
+            size: expected.size,
+            mtime: expected.mtime,
+            server_mtime: expected.mtime,
+            mode: expected.mode,
+            hydrated: true,
+        }));
+    }
     let bytes = fs::read(path)?;
     let observed = DiskMetadata::read(path)?;
     if observed.size != expected.size || observed.mtime != expected.mtime {

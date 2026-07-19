@@ -1,11 +1,11 @@
 use crate::api::ApiClient;
 use crate::conflicts;
 use crate::ctx::SyncCtx;
-use crate::fs_util::{apply_executable_mode, atomic_write, file_mtime_ms, set_readonly};
+use crate::fs_util::{apply_executable_mode, file_mtime_ms, set_readonly};
 use crate::local::{load_config, CacheEntry, ClientDb, Config};
 use anyhow::Result;
 use feanorfs_agent_core::sync_pass::{self, SyncMode};
-use feanorfs_common::{unpack_bytes_with_policy, FileState, SyncResponse};
+use feanorfs_common::{FileState, SyncResponse};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -81,6 +81,8 @@ pub struct PushResult {
     pub uploads: u32,
     pub deletes: u32,
     pub remote_updates_available: bool,
+    pub large_file_count: usize,
+    pub large_file_examples: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -99,6 +101,8 @@ pub struct SyncResult {
     pub placeholders: u32,
     pub deletes_local: u32,
     pub deletes_remote: u32,
+    pub large_file_count: usize,
+    pub large_file_examples: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +151,8 @@ pub async fn do_push_only(
         uploads: outcome.uploads,
         deletes: outcome.deletes_remote,
         remote_updates_available: outcome.remote_still_pending,
+        large_file_count: outcome.large_file_count,
+        large_file_examples: outcome.large_file_examples,
     })
 }
 
@@ -202,6 +208,8 @@ pub async fn do_sync(
         placeholders: outcome.placeholders,
         deletes_local: outcome.deletes_local,
         deletes_remote: outcome.deletes_remote,
+        large_file_count: outcome.large_file_count,
+        large_file_examples: outcome.large_file_examples,
     })
 }
 
@@ -231,7 +239,6 @@ async fn do_hydrate_with_ctx(
     target_path: Option<String>,
 ) -> Result<HydrateResult> {
     tracing::info!("Hydrate (target={:?})", target_path);
-    let password_str = ctx.password_str();
     let cache_entries = ctx.db.get_cache_entries().await?;
 
     let mut hydrated = Vec::new();
@@ -245,36 +252,26 @@ async fn do_hydrate_with_ctx(
 
         if !entry.hydrated {
             tracing::info!("Hydrating {} (hash: {})", path, entry.encrypted_hash);
-            let encrypted_content = ctx.api.download_file(&entry.encrypted_hash).await?;
-            let computed_hash = feanorfs_common::hash_bytes(&encrypted_content);
-            if computed_hash != entry.encrypted_hash {
-                tracing::warn!(
-                    "Integrity check failed for {}: expected {}, computed {} (skipping)",
-                    path,
-                    entry.encrypted_hash,
-                    computed_hash
-                );
-                continue;
-            }
-            let plain_content =
-                unpack_bytes_with_policy(&encrypted_content, password_str, &path, ctx.policy)?;
-
             let full_path = ctx.base.join(&path);
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
             set_readonly(&full_path, false).await?;
-            atomic_write(ctx.base, &path, &plain_content).await?;
+            let materialized = feanorfs_agent_core::large_file::materialize(
+                ctx,
+                &path,
+                &entry.encrypted_hash,
+                entry.size,
+            )
+            .await?;
             apply_executable_mode(&full_path, entry.mode).await?;
 
             let actual_mtime = file_mtime_ms(&full_path).await.unwrap_or(entry.mtime);
-            let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
-
             let updated_entry = CacheEntry {
                 path: path.clone(),
-                plaintext_hash,
+                plaintext_hash: materialized.plaintext_hash,
                 encrypted_hash: entry.encrypted_hash.clone(),
-                size: plain_content.len() as u64,
+                size: materialized.size,
                 mtime: actual_mtime,
                 server_mtime: entry.server_mtime,
                 mode: entry.mode,

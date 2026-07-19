@@ -8,7 +8,7 @@ use crate::{ApiClient, ClientDb, Config, SyncCtx, WorkspaceInvite};
 
 pub const MAX_PREFLIGHT_EXAMPLES: usize = 5;
 pub const MAX_IGNORE_POLICY_BYTES: usize = 4 * 1024;
-pub const LEGACY_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+pub const LARGE_FILE_NOTICE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct JoinPathGroup {
@@ -22,7 +22,7 @@ pub struct JoinPreflight {
     pub remote_only: JoinPathGroup,
     pub same: JoinPathGroup,
     pub conflicts: JoinPathGroup,
-    pub oversized: JoinPathGroup,
+    pub large_files: JoinPathGroup,
     pub ignore_policy_known: bool,
     pub ignore_policy_differs: bool,
 }
@@ -36,11 +36,6 @@ impl JoinPreflight {
     #[must_use]
     pub fn needs_confirmation(&self) -> bool {
         self.local_only.count > 0 || self.conflicts.count > 0 || self.ignore_policy_differs
-    }
-
-    #[must_use]
-    pub fn is_blocked(&self) -> bool {
-        self.oversized.count > 0
     }
 }
 
@@ -127,18 +122,7 @@ pub async fn preview_join(workspace: &Path, invite: &WorkspaceInvite) -> Result<
         .as_deref()
         .is_some_and(|policy| policy != local_policy);
 
-    let oversized = oversized_paths(workspace, effective_policy);
-    if !oversized.is_empty() {
-        return Ok(JoinPreflight {
-            local_only: JoinPathGroup::default(),
-            remote_only: JoinPathGroup::default(),
-            same: JoinPathGroup::default(),
-            conflicts: JoinPathGroup::default(),
-            oversized: group(oversized),
-            ignore_policy_known: invited_policy.is_some(),
-            ignore_policy_differs,
-        });
-    }
+    let large_files = large_file_paths(workspace, effective_policy);
 
     let scratch = ScratchState::create()?;
     let db = ClientDb::new(scratch.0.join("state")).await?;
@@ -170,15 +154,17 @@ pub async fn preview_join(workspace: &Path, invite: &WorkspaceInvite) -> Result<
     let ctx = SyncCtx::from_config(&api, &db, workspace, &config)?;
     let remote = crate::conflicts::load_server_view(&ctx).await?;
 
-    Ok(classify(
+    let mut preview = classify(
         &local,
         &remote,
         invited_policy.is_some(),
         ignore_policy_differs,
-    ))
+    );
+    preview.large_files = group(large_files);
+    Ok(preview)
 }
 
-fn oversized_paths(workspace: &Path, ignore_policy: &str) -> Vec<String> {
+fn large_file_paths(workspace: &Path, ignore_policy: &str) -> Vec<String> {
     let mut paths = feanorfs_agent_core::local::build_workspace_walker_with_ignore_policy(
         workspace,
         false,
@@ -189,7 +175,7 @@ fn oversized_paths(workspace: &Path, ignore_policy: &str) -> Vec<String> {
     .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
     .filter_map(|entry| {
         let metadata = entry.metadata().ok()?;
-        if metadata.len() <= LEGACY_MAX_FILE_BYTES {
+        if metadata.len() <= LARGE_FILE_NOTICE_BYTES {
             return None;
         }
         let relative = entry.path().strip_prefix(workspace).ok()?.to_str()?;
@@ -238,7 +224,7 @@ fn classify(
         remote_only: group(remote_only),
         same: group(same),
         conflicts: group(conflicts),
-        oversized: JoinPathGroup::default(),
+        large_files: JoinPathGroup::default(),
         ignore_policy_known,
         ignore_policy_differs,
     }

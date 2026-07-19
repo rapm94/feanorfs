@@ -143,25 +143,58 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
             .with_context(|| format!("decode snapshot object {id}"))
     }
 
-    pub(crate) async fn snapshot_reachability(&self, id: &str) -> Result<Vec<String>> {
+    pub(crate) async fn snapshot_reachability(
+        &self,
+        id: &str,
+        expand_chunked_files: bool,
+    ) -> Result<Vec<String>> {
         let snapshot = self.get_snapshot(id).await?;
         let mut hashes = BTreeSet::from([id.to_string()]);
-        let mut pending = vec![snapshot.root];
-        while let Some(tree_id) = pending.pop() {
+        let mut pending = vec![(snapshot.root, String::new())];
+        while let Some((tree_id, prefix)) = pending.pop() {
             if !hashes.insert(tree_id.clone()) {
                 continue;
             }
             for entry in self.get_tree(&tree_id).await?.entries {
+                let path = if prefix.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{prefix}/{}", entry.name)
+                };
                 match entry.kind {
-                    TreeEntryKind::Dir => pending.push(entry.hash),
+                    TreeEntryKind::Dir => pending.push((entry.hash, path)),
                     TreeEntryKind::File => {
-                        hashes.insert(entry.hash);
+                        hashes.insert(entry.hash.clone());
+                        if expand_chunked_files {
+                            hashes.extend(
+                                crate::large_file::reachable_chunks(
+                                    self.ctx,
+                                    &path,
+                                    &entry.hash,
+                                    entry.size,
+                                )
+                                .await?,
+                            );
+                        }
                     }
                     TreeEntryKind::Conflict { base, ours, theirs } => {
-                        hashes.insert(entry.hash);
-                        hashes.extend(base);
-                        hashes.extend(ours);
-                        hashes.extend(theirs);
+                        let mut legs = vec![entry.hash];
+                        legs.extend(base);
+                        legs.extend(ours);
+                        legs.extend(theirs);
+                        legs.sort_unstable();
+                        legs.dedup();
+                        for leg in legs {
+                            hashes.insert(leg.clone());
+                            if expand_chunked_files {
+                                hashes.extend(
+                                    crate::large_file::reachable_chunks(
+                                        self.ctx, &path, &leg, entry.size,
+                                    )
+                                    .await?,
+                                );
+                            }
+                        }
                     }
                 }
             }

@@ -245,7 +245,10 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
                 message: input.message,
             })
             .await?;
-        let hashes = self.objects.snapshot_reachability(&id).await?;
+        let hashes = self
+            .objects
+            .snapshot_reachability(&id, upload_manifest)
+            .await?;
         if upload_manifest {
             self.ctx
                 .api

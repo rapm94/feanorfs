@@ -28,21 +28,37 @@ pub(super) async fn materialize_land(
         let main_path = input.ctx.base.join(&change.path);
         if main_path.exists() && !change.deleted {
             if let Some(gate) = input.gate_local.get(&change.path) {
-                let current = match fs::read(&main_path).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        tracing::warn!("failed to read {}: {error}", change.path);
-                        landed.push(LandedPath {
-                            path: change.path.clone(),
-                            action: "diverted: failed to read folder file".to_string(),
-                        });
-                        continue;
+                let current_hash = if crate::large_file::uses_chunk_transport(gate.size) {
+                    match crate::large_file::fingerprint(
+                        &main_path,
+                        input.ctx.password_str(),
+                        &change.path,
+                    ) {
+                        Ok(fingerprint) => fingerprint.encrypted_hash,
+                        Err(error) => {
+                            tracing::warn!("failed to fingerprint {}: {error}", change.path);
+                            landed.push(LandedPath {
+                                path: change.path.clone(),
+                                action: "diverted: failed to read folder file".to_string(),
+                            });
+                            continue;
+                        }
                     }
+                } else {
+                    let current = match fs::read(&main_path).await {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            tracing::warn!("failed to read {}: {error}", change.path);
+                            landed.push(LandedPath {
+                                path: change.path.clone(),
+                                action: "diverted: failed to read folder file".to_string(),
+                            });
+                            continue;
+                        }
+                    };
+                    seal(&current, input.ctx.password_str(), &change.path)?.0
                 };
-                let (current_hash, _) = seal(&current, input.ctx.password_str(), &change.path)?;
-                if current_hash != gate.hash
-                    || u64::try_from(current.len()).unwrap_or(u64::MAX) != gate.size
-                {
+                if current_hash != gate.hash || std::fs::metadata(&main_path)?.len() != gate.size {
                     landed.push(LandedPath {
                         path: change.path.clone(),
                         action: "diverted: folder changed during land".to_string(),

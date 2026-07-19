@@ -164,15 +164,30 @@ pub(crate) async fn finish_sync_watch(
         false,
     )
     .await;
-    if let Err(error) = sync_result {
-        if managed_was_running {
-            if let Err(restart_error) = super::service::restore_after_failed_start(work_dir) {
-                eprintln!(
-                    "Warning: automatic sync could not be restored after the failed start: {restart_error}"
-                );
+    let sync_result = match sync_result {
+        Ok(result) => result,
+        Err(error) => {
+            if managed_was_running {
+                if let Err(restart_error) = super::service::restore_after_failed_start(work_dir) {
+                    eprintln!(
+                        "Warning: automatic sync could not be restored after the failed start: {restart_error}"
+                    );
+                }
             }
+            return Err(error);
         }
-        return Err(error);
+    };
+    if sync_result.large_file_count > 0 {
+        println!(
+            "Large-file transport: {} file(s) used authenticated encrypted chunks.",
+            sync_result.large_file_count
+        );
+        for path in &sync_result.large_file_examples {
+            println!("  {path}");
+        }
+        println!(
+            "Keep legitimate large files normally; add disposable artifacts to .feanorfsignore."
+        );
     }
 
     // Migrate legacy protected-file credentials only after sync succeeds and before the

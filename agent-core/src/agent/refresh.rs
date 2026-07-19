@@ -41,9 +41,9 @@ pub async fn refresh_agent_with_options(
     base: &Path,
     db: &ClientDb,
     api: &ApiClient,
-    workspace_id: &str,
+    _workspace_id: &str,
     name: &str,
-    password: Option<&str>,
+    _password: Option<&str>,
     options: RefreshOptions,
 ) -> Result<AgentRefreshResult> {
     let config = crate::local::load_config(base)?;
@@ -57,15 +57,20 @@ pub async fn refresh_agent_with_options(
         let agent_db = ClientDb::new(agent_path.join(".feanorfs")).await?;
         let agent_scan =
             crate::local::scan_local_directory(&agent_path, &agent_db, ctx.password()).await?;
+        let agent_ctx = SyncCtx::from_config(api, &agent_db, &agent_path, &config)?;
         for state in agent_scan.values().filter(|state| !state.deleted) {
-            let bytes = fs::read(agent_path.join(&state.path)).await?;
-            let (hash, encrypted) = seal(&bytes, ctx.password_str(), &state.path)?;
-            if hash != state.hash {
-                bail!("agent file changed while preparing refresh: {}", state.path);
+            if crate::large_file::uses_chunk_transport(state.size) {
+                crate::large_file::upload(&agent_ctx, &state.path, &state.hash).await?;
+            } else {
+                let bytes = fs::read(agent_path.join(&state.path)).await?;
+                let (hash, encrypted) = seal(&bytes, ctx.password_str(), &state.path)?;
+                if hash != state.hash {
+                    bail!("agent file changed while preparing refresh: {}", state.path);
+                }
+                ctx.api
+                    .upload_object(ctx.workspace_id(), &hash, encrypted)
+                    .await?;
             }
-            ctx.api
-                .upload_object(ctx.workspace_id(), &hash, encrypted)
-                .await?;
         }
         let before_replace = snapshots
             .write(SnapshotInput {
@@ -86,14 +91,6 @@ pub async fn refresh_agent_with_options(
                 .cloned()
                 .collect(),
         };
-        let agent_ctx = SyncCtx::new(
-            api,
-            &agent_db,
-            &agent_path,
-            workspace_id,
-            password,
-            ctx.policy,
-        );
         crate::sync_pass::process_downloads(&agent_ctx, &response, &agent_scan, false).await?;
         crate::sync_pass::process_delete_local(&response, &agent_path, &agent_db).await?;
         let refreshed_snapshot = snapshots
@@ -125,14 +122,7 @@ pub async fn refresh_agent_with_options(
     let mut refreshed = Vec::new();
     let mut deferred = Vec::new();
     let agent_db = ClientDb::new(agent_path.join(".feanorfs")).await?;
-    let agent_ctx = SyncCtx::new(
-        api,
-        &agent_db,
-        &agent_path,
-        workspace_id,
-        password,
-        ctx.policy,
-    );
+    let agent_ctx = SyncCtx::from_config(api, &agent_db, &agent_path, &config)?;
     for theirs in &diff.their_changes {
         let response = if theirs.deleted {
             SyncResponse {

@@ -6,7 +6,7 @@ use crate::fs_util::{apply_executable_mode, atomic_write, file_mtime_ms, set_rea
 use crate::local::{load_config, CacheEntry, ClientDb};
 use crate::lock::SyncLock;
 use anyhow::{Context, Result};
-use feanorfs_common::{is_safe_rel_path, unpack_bytes_with_policy, FileState, SyncResponse};
+use feanorfs_common::{is_safe_rel_path, FileState, SyncResponse};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tokio::fs;
@@ -167,6 +167,8 @@ pub struct SyncPassOutcome {
     pub deletes_local: u32,
     pub deletes_remote: u32,
     pub remote_still_pending: bool,
+    pub large_file_count: usize,
+    pub large_file_examples: Vec<String>,
 }
 
 pub async fn run_sync_pass(
@@ -236,6 +238,34 @@ pub(crate) async fn run_sync_pass_locked(
     );
 
     let mut outcome = SyncPassOutcome::default();
+    let mut large_files = response
+        .upload_required
+        .iter()
+        .filter(|path| {
+            local_files.get(*path).is_some_and(|file| {
+                !file.deleted && crate::large_file::exceeds_legacy_single_blob_limit(file.size)
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    large_files.sort_unstable();
+    large_files.dedup();
+    outcome.large_file_count = large_files.len();
+    outcome.large_file_examples = large_files.into_iter().take(5).collect();
+    if ctx.format_version() < 3 && outcome.large_file_count > 0 {
+        let examples = outcome.large_file_examples.join(", ");
+        let remainder = outcome
+            .large_file_count
+            .saturating_sub(outcome.large_file_examples.len());
+        let remainder = if remainder == 0 {
+            String::new()
+        } else {
+            format!(" (and {remainder} more)")
+        };
+        anyhow::bail!(
+            "Large files cannot use the legacy single-blob transport: {examples}{remainder}. Run `feanorfs migrate` to enable authenticated encrypted chunks, or add disposable files to .feanorfsignore."
+        );
+    }
 
     if mode != SyncMode::Push {
         let (downloads, placeholders) =
@@ -303,8 +333,6 @@ pub(crate) async fn process_downloads(
 ) -> Result<(u32, u32)> {
     let mut downloads = 0u32;
     let mut placeholders = 0u32;
-    let password_str = ctx.password_str();
-
     for replica_file in &response.download_required {
         let path = &replica_file.path;
         if !is_safe_rel_path(path) {
@@ -353,24 +381,13 @@ pub(crate) async fn process_downloads(
             }
 
             tracing::info!("Downloading {} ({} bytes)", path, replica_file.size);
-            let encrypted_content = ctx.api.download_file(&replica_file.hash).await?;
-            let computed_hash = feanorfs_common::hash_bytes(&encrypted_content);
-            if computed_hash != replica_file.hash {
-                anyhow::bail!(
-                    "Integrity check failed for {}: expected hash {}, computed {} (server may be tampered or corrupt)",
-                    path,
-                    replica_file.hash,
-                    computed_hash
-                );
-            }
-            let plain_content =
-                unpack_bytes_with_policy(&encrypted_content, password_str, path, ctx.policy)?;
-
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).await?;
             }
             set_readonly(&full_path, false).await?;
-            atomic_write(ctx.base, path, &plain_content).await?;
+            let materialized =
+                crate::large_file::materialize(ctx, path, &replica_file.hash, replica_file.size)
+                    .await?;
             apply_executable_mode(&full_path, replica_file.mode).await?;
 
             let actual_mtime = file_mtime_ms(&full_path).await.unwrap_or_else(|e| {
@@ -379,11 +396,9 @@ pub(crate) async fn process_downloads(
                 );
                 replica_file.mtime
             });
-            let plaintext_hash = feanorfs_common::hash_bytes(&plain_content);
-
             let cache_entry = CacheEntry {
                 path: path.clone(),
-                plaintext_hash,
+                plaintext_hash: materialized.plaintext_hash,
                 encrypted_hash: replica_file.hash.clone(),
                 size: replica_file.size,
                 mtime: actual_mtime,
@@ -442,17 +457,26 @@ pub(crate) async fn process_uploads(
         };
         if ctx.format_version() >= 3 {
             if !local_file.deleted {
-                let plain_content = fs::read(ctx.base.join(path)).await?;
-                let (hash, encrypted_content) = seal(&plain_content, password_str, path)?;
-                ctx.api
-                    .upload_object(ctx.workspace_id(), &hash, encrypted_content)
-                    .await?;
+                if crate::large_file::uses_chunk_transport(local_file.size) {
+                    crate::large_file::upload(ctx, path, &local_file.hash).await?;
+                } else {
+                    let plain_content = fs::read(ctx.base.join(path)).await?;
+                    let (hash, encrypted_content) = seal(&plain_content, password_str, path)?;
+                    ctx.api
+                        .upload_object(ctx.workspace_id(), &hash, encrypted_content)
+                        .await?;
+                }
                 ctx.db
                     .set_cache_server_mtime(path, local_file.mtime)
                     .await?;
                 uploads += 1;
             }
             continue;
+        }
+        if !local_file.deleted && crate::large_file::uses_chunk_transport(local_file.size) {
+            anyhow::bail!(
+                "Cannot upload large file {path} from this legacy workspace. Run `feanorfs migrate` to enable authenticated encrypted chunks, or add disposable files to .feanorfsignore."
+            );
         }
         if local_file.deleted {
             tracing::info!("Uploading tombstone for {}", path);

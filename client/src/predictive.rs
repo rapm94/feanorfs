@@ -1,8 +1,7 @@
 use crate::api::ApiClient;
-use crate::fs_util::{apply_executable_mode, atomic_write, file_mtime_ms};
+use crate::fs_util::{apply_executable_mode, file_mtime_ms};
 use crate::local::{CacheEntry, ClientDb};
 use anyhow::Result;
-use feanorfs_common::unpack_bytes;
 use std::path::Path;
 
 const DEFAULT_NEIGHBORS: usize = 5;
@@ -69,6 +68,13 @@ pub async fn prefetch_related(
     }
     let mut report = PrefetchReport::default();
     let cache = db.get_cache_entries().await?;
+    let ctx = feanorfs_agent_core::sync_pass::build_ctx_or_fallback(
+        api,
+        db,
+        base,
+        "",
+        Some(password_str),
+    )?;
 
     for seed in seed_paths {
         report.inspected.push(seed.clone());
@@ -77,7 +83,7 @@ pub async fn prefetch_related(
                 report.skipped.push(seed.clone());
                 continue;
             }
-            if hydrate_one(base, api, db, password_str, seed_entry).await? {
+            if hydrate_one(&ctx, seed_entry).await? {
                 report.hydrated.push(seed.clone());
             }
         }
@@ -88,7 +94,7 @@ pub async fn prefetch_related(
                 if entry.hydrated {
                     continue;
                 }
-                if hydrate_one(base, api, db, password_str, entry).await? {
+                if hydrate_one(&ctx, entry).await? {
                     report.hydrated.push(sibling_path);
                 }
             }
@@ -99,48 +105,36 @@ pub async fn prefetch_related(
     Ok(report)
 }
 
-async fn hydrate_one(
-    base: &Path,
-    api: &ApiClient,
-    db: &ClientDb,
-    password: &str,
-    entry: &CacheEntry,
-) -> Result<bool> {
-    let Ok(encrypted) = api.download_file(&entry.encrypted_hash).await else {
+async fn hydrate_one(ctx: &crate::SyncCtx<'_>, entry: &CacheEntry) -> Result<bool> {
+    let Ok(materialized) = feanorfs_agent_core::large_file::materialize(
+        ctx,
+        &entry.path,
+        &entry.encrypted_hash,
+        entry.size,
+    )
+    .await
+    else {
         return Ok(false);
     };
-    let computed_hash = feanorfs_common::hash_bytes(&encrypted);
-    if computed_hash != entry.encrypted_hash {
-        tracing::warn!(
-            "Integrity check failed for predictive prefetch of {}: expected {}, computed {}",
-            entry.path,
-            entry.encrypted_hash,
-            computed_hash
-        );
-        return Ok(false);
-    }
-    let plain = unpack_bytes(&encrypted, password, &entry.path)?;
-    atomic_write(base, &entry.path, &plain).await?;
-    apply_executable_mode(&base.join(&entry.path), entry.mode).await?;
+    apply_executable_mode(&ctx.base.join(&entry.path), entry.mode).await?;
 
-    let actual_mtime = file_mtime_ms(&base.join(&entry.path))
+    let actual_mtime = file_mtime_ms(&ctx.base.join(&entry.path))
         .await
         .unwrap_or(entry.server_mtime);
 
-    let plaintext_hash = feanorfs_common::hash_bytes(&plain);
-
-    db.upsert_cache_entry(&CacheEntry {
-        path: entry.path.clone(),
-        plaintext_hash,
-        encrypted_hash: entry.encrypted_hash.clone(),
-        size: plain.len() as u64,
-        mtime: actual_mtime,
-        server_mtime: entry.server_mtime,
-        mode: entry.mode,
-        hydrated: true,
-        deleted_at: None,
-    })
-    .await?;
+    ctx.db
+        .upsert_cache_entry(&CacheEntry {
+            path: entry.path.clone(),
+            plaintext_hash: materialized.plaintext_hash,
+            encrypted_hash: entry.encrypted_hash.clone(),
+            size: materialized.size,
+            mtime: actual_mtime,
+            server_mtime: entry.server_mtime,
+            mode: entry.mode,
+            hydrated: true,
+            deleted_at: None,
+        })
+        .await?;
 
     Ok(true)
 }

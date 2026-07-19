@@ -143,21 +143,11 @@ pub async fn register_and_write_conflicts(
     let dir = conflicts_dir(ctx.base).join(ts.to_string());
     fs::create_dir_all(&dir).await?;
 
-    let password_str = ctx.password_str();
     let local_root = ours_base.unwrap_or(ctx.base);
     for (edit, kind) in items {
         let ours_src = edit.ours.as_ref().map(|o| local_root.join(&o.path));
         let ours_label = ours_missing_label(kind);
-        write_conflict_triple(
-            &dir,
-            edit,
-            ctx.api,
-            password_str,
-            ours_src.as_deref(),
-            ours_label,
-            ctx.policy,
-        )
-        .await?;
+        write_conflict_triple(&dir, edit, ctx, ours_src.as_deref(), ours_label).await?;
     }
 
     let paths: Vec<String> = items.iter().map(|(c, _)| c.path.clone()).collect();
@@ -398,6 +388,15 @@ pub async fn resolve_all_local_conflicts(ctx: &SyncCtx<'_>) -> Result<Vec<String
 }
 
 async fn upload_sealed(ctx: &SyncCtx<'_>, path: &str, content: &[u8], mtime: i64) -> Result<()> {
+    if crate::large_file::uses_chunk_transport(content.len() as u64) {
+        if ctx.format_version() < 3 {
+            bail!("large-file conflict resolution requires format v3; run `feanorfs migrate`");
+        }
+        let fingerprint =
+            crate::large_file::fingerprint(&ctx.base.join(path), ctx.password_str(), path)?;
+        crate::large_file::upload(ctx, path, &fingerprint.encrypted_hash).await?;
+        return Ok(());
+    }
     let (hash, packed) = seal(content, ctx.password_str(), path)?;
     let file = FileState {
         path: path.to_string(),

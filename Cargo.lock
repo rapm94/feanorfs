@@ -1396,6 +1396,7 @@ dependencies = [
  "anyhow",
  "atomic-write-file",
  "axum",
+ "blake3",
  "chrono",
  "constant_time_eq",
  "diffy",

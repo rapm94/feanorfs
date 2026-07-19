@@ -1,8 +1,6 @@
-use crate::api::ApiClient;
+use crate::ctx::SyncCtx;
 use anyhow::Result;
-use feanorfs_common::{
-    unpack_bytes_with_policy, ConcurrentEdit, ConflictKind, FileState, LegacyPolicy,
-};
+use feanorfs_common::{ConcurrentEdit, ConflictKind, FileState};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -77,10 +75,8 @@ pub enum ArtifactRole {
 pub async fn write_version_file(
     dest: &Path,
     state: Option<&FileState>,
-    api: &ApiClient,
-    password: &str,
+    ctx: &SyncCtx<'_>,
     path: &str,
-    policy: LegacyPolicy,
 ) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).await?;
@@ -89,29 +85,10 @@ pub async fn write_version_file(
         Some(f) if f.deleted => {
             fs::write(dest, sentinel("deleted")).await?;
         }
-        Some(f) => match api.download_file(&f.hash).await {
-            Ok(bytes) => {
-                let computed_hash = feanorfs_common::hash_bytes(&bytes);
-                if computed_hash != f.hash {
-                    fs::write(
-                        dest,
-                        sentinel(&format!(
-                            "integrity-mismatch expected={} computed={}",
-                            f.hash, computed_hash
-                        )),
-                    )
-                    .await?;
-                } else {
-                    match unpack_bytes_with_policy(&bytes, password, path, policy) {
-                        Ok(plain) => fs::write(dest, &plain).await?,
-                        Err(e) => {
-                            fs::write(dest, sentinel(&format!("decrypt-failed {e}"))).await?;
-                        }
-                    }
-                }
-            }
+        Some(f) => match crate::large_file::read_bytes(ctx, path, &f.hash, f.size).await {
+            Ok(plain) => fs::write(dest, &plain).await?,
             Err(e) => {
-                fs::write(dest, sentinel(&format!("download-failed {e}"))).await?;
+                fs::write(dest, sentinel(&format!("materialize-failed {e}"))).await?;
             }
         },
         None => {
@@ -124,25 +101,15 @@ pub async fn write_version_file(
 pub async fn write_conflict_triple(
     dir: &Path,
     edit: &ConcurrentEdit,
-    api: &ApiClient,
-    password: &str,
+    ctx: &SyncCtx<'_>,
     ours_from: Option<&Path>,
     ours_missing_label: &str,
-    policy: LegacyPolicy,
 ) -> Result<()> {
     let base_dest = artifact_path(dir, &edit.path, SUFFIX_ORIGINAL);
     let ours_dest = artifact_path(dir, &edit.path, SUFFIX_LOCAL);
     let theirs_dest = artifact_path(dir, &edit.path, SUFFIX_CLOUD);
 
-    write_version_file(
-        &base_dest,
-        edit.base.as_ref(),
-        api,
-        password,
-        &edit.path,
-        policy,
-    )
-    .await?;
+    write_version_file(&base_dest, edit.base.as_ref(), ctx, &edit.path).await?;
 
     if let Some(ref ours) = edit.ours {
         if let Some(src) = ours_from {
@@ -158,15 +125,7 @@ pub async fn write_conflict_triple(
         fs::write(&ours_dest, sentinel(ours_missing_label)).await?;
     }
 
-    write_version_file(
-        &theirs_dest,
-        edit.theirs.as_ref(),
-        api,
-        password,
-        &edit.path,
-        policy,
-    )
-    .await?;
+    write_version_file(&theirs_dest, edit.theirs.as_ref(), ctx, &edit.path).await?;
     Ok(())
 }
 

@@ -625,13 +625,11 @@ pub async fn join_from_workspace_invite(
     let preview = feanorfs_client::preview_join(current_dir, &invite)
         .await
         .context("preview this folder against the encrypted mirror")?;
-    if preview.destination_has_files() || preview.ignore_policy_differs || preview.is_blocked() {
+    if preview.destination_has_files()
+        || preview.ignore_policy_differs
+        || preview.large_files.count > 0
+    {
         print_join_preflight(&preview);
-    }
-    if preview.is_blocked() {
-        anyhow::bail!(
-            "Join stopped before changing this folder: files larger than 100 MiB require chunked transport. Move or ignore the listed files, then retry."
-        );
     }
     if preview.needs_confirmation() && !accept_join {
         confirm_join_preflight()?;
@@ -677,8 +675,11 @@ fn print_join_preflight(preview: &feanorfs_client::JoinPreflight) {
     } else {
         println!("  Ignore policy: older invite; keeping this folder's current policy");
     }
-    if preview.oversized.count > 0 {
-        print_preflight_group("Too large for current transport", &preview.oversized);
+    if preview.large_files.count > 0 {
+        print_preflight_group(
+            "Large files (authenticated encrypted chunks)",
+            &preview.large_files,
+        );
     }
     println!("No files or FeanorFS setup have been changed by this preview.");
 }

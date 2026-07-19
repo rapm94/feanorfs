@@ -192,6 +192,7 @@ async fn run_push(current_dir: &Path, json: bool) -> anyhow::Result<()> {
         if result.remote_updates_available {
             println!("Note: Remote updates available. Run 'feanorfs sync --down' to apply.");
         }
+        print_large_file_notice(result.large_file_count, &result.large_file_examples);
     }
     Ok(())
 }
@@ -257,6 +258,7 @@ async fn run_sync(
                 "Upload complete. {} file(s) uploaded, {} deletion(s).",
                 result.uploads, result.deletes
             );
+            print_large_file_notice(result.large_file_count, &result.large_file_examples);
         }
     } else if down {
         let result = commands::do_pull_only(
@@ -297,6 +299,7 @@ async fn run_sync(
                 result.deletes_local,
                 result.deletes_remote
             );
+            print_large_file_notice(result.large_file_count, &result.large_file_examples);
         }
         if !no_watch {
             watch::run_watch(
@@ -310,6 +313,22 @@ async fn run_sync(
         }
     }
     Ok(())
+}
+
+fn print_large_file_notice(count: usize, examples: &[String]) {
+    if count == 0 {
+        return;
+    }
+    println!("  Large-file transport: {count} file(s) used authenticated encrypted chunks.");
+    for path in examples {
+        println!("    {path}");
+    }
+    if count > examples.len() {
+        println!("    … and {} more", count - examples.len());
+    }
+    println!(
+        "  Keep legitimate large files normally; add disposable large artifacts to .feanorfsignore to avoid transferring them."
+    );
 }
 
 async fn run_watch(current_dir: &Path) -> anyhow::Result<()> {

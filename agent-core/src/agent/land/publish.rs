@@ -8,8 +8,6 @@ use crate::ctx::SyncCtx;
 use crate::snapshot::{SnapshotEngine, SnapshotInput};
 use crate::SwapHeadResult;
 
-const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024 - 28;
-
 pub(super) struct PublishInput<'a, 'ctx> {
     pub(super) ctx: &'a SyncCtx<'ctx>,
     pub(super) name: &'a str,
@@ -40,39 +38,52 @@ pub(super) async fn publish_land(
     let snapshots = SnapshotEngine::new(input.ctx);
     let mut committed_snapshot = None;
     for _ in 0..8 {
-        if let Some(change) = diff
-            .our_changes
-            .iter()
-            .find(|change| !change.deleted && change.size > MAX_UPLOAD_BYTES)
-        {
-            bail!("agent file exceeds 100 MiB land limit: {}", change.path);
-        }
         for change in diff.our_changes.iter().filter(|change| !change.deleted) {
-            let bytes = fs::read(input.agent_path.join(&change.path)).await?;
-            let (hash, encrypted) = seal(&bytes, input.ctx.password_str(), &change.path)?;
-            if hash != change.hash {
-                bail!("agent file changed while preparing land: {}", change.path);
+            if crate::large_file::uses_chunk_transport(change.size) {
+                let agent_ctx = SyncCtx::from_config(
+                    input.ctx.api,
+                    input.ctx.db,
+                    input.agent_path,
+                    &crate::local::load_config(input.ctx.base)?,
+                )?;
+                crate::large_file::upload(&agent_ctx, &change.path, &change.hash).await?;
+            } else {
+                let bytes = fs::read(input.agent_path.join(&change.path)).await?;
+                let (hash, encrypted) = seal(&bytes, input.ctx.password_str(), &change.path)?;
+                if hash != change.hash {
+                    bail!("agent file changed while preparing land: {}", change.path);
+                }
+                input
+                    .ctx
+                    .api
+                    .upload_object(input.ctx.workspace_id(), &hash, encrypted)
+                    .await?;
             }
-            input
-                .ctx
-                .api
-                .upload_object(input.ctx.workspace_id(), &hash, encrypted)
-                .await?;
         }
         for (conflict, _) in &diff.conflicts {
             let Some(ours) = conflict.ours.as_ref().filter(|state| !state.deleted) else {
                 continue;
             };
-            let bytes = fs::read(input.agent_path.join(&conflict.path)).await?;
-            let (hash, encrypted) = seal(&bytes, input.ctx.password_str(), &conflict.path)?;
-            if hash != ours.hash {
-                bail!("agent file changed while preparing land: {}", conflict.path);
+            if crate::large_file::uses_chunk_transport(ours.size) {
+                let agent_ctx = SyncCtx::from_config(
+                    input.ctx.api,
+                    input.ctx.db,
+                    input.agent_path,
+                    &crate::local::load_config(input.ctx.base)?,
+                )?;
+                crate::large_file::upload(&agent_ctx, &conflict.path, &ours.hash).await?;
+            } else {
+                let bytes = fs::read(input.agent_path.join(&conflict.path)).await?;
+                let (hash, encrypted) = seal(&bytes, input.ctx.password_str(), &conflict.path)?;
+                if hash != ours.hash {
+                    bail!("agent file changed while preparing land: {}", conflict.path);
+                }
+                input
+                    .ctx
+                    .api
+                    .upload_object(input.ctx.workspace_id(), &hash, encrypted)
+                    .await?;
             }
-            input
-                .ctx
-                .api
-                .upload_object(input.ctx.workspace_id(), &hash, encrypted)
-                .await?;
         }
         let current_root = snapshots.load_snapshot(&diff.current_head).await?.root;
         let candidate_state = build_land_candidate(&snapshots, &diff).await?;

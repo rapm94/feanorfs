@@ -32,6 +32,7 @@ reflink = { workspace = true }
 unicode-normalization = { workspace = true }
 diffy = { workspace = true }
 tracing = { workspace = true }
+blake3 = { workspace = true }
 libc = "0.2"
 fs2 = "0.4"
 atomic-write-file = "0.3"
