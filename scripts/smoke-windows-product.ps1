@@ -22,10 +22,16 @@ if ($RequireAuthenticode) {
     }
 }
 
+$profileHome = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+$profileState = Join-Path $profileHome ".feanorfs"
+if (Test-Path -LiteralPath $profileState) {
+    throw "The Windows product smoke requires a clean test account with no existing FeanorFS state."
+}
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ("feanorfs-windows-product-" + [Guid]::NewGuid())
-$profileHome = Join-Path $root "home"
 $binDir = Join-Path $root "bin"
 $workspace = Join-Path $root "workspace"
+$workspaceConfigPath = $null
 $startLog = Join-Path $root "start.log"
 $cli = Join-Path $binDir "feanorfs.exe"
 $tray = Join-Path $binDir "feanorfs-tray.exe"
@@ -99,6 +105,22 @@ function Normalize-WindowsPath([string]$Path) {
         $value = $value.Substring(4)
     }
     return [IO.Path]::GetFullPath($value).TrimEnd('\')
+}
+
+function Get-WorkspaceConfigPath([string]$Path) {
+    $canonical = Normalize-WindowsPath $Path
+    $workspacesRoot = Join-Path $profileState "workspaces"
+    foreach ($candidate in @(Get-ChildItem -LiteralPath $workspacesRoot -Directory -ErrorAction SilentlyContinue)) {
+        $locationPath = Join-Path $candidate.FullName "location"
+        if (-not (Test-Path -LiteralPath $locationPath -PathType Leaf)) {
+            continue
+        }
+        $savedLocation = [IO.File]::ReadAllText($locationPath).Trim()
+        if ((Normalize-WindowsPath $savedLocation) -ieq $canonical) {
+            return Join-Path $candidate.FullName "config.json"
+        }
+    }
+    throw "FeanorFS did not create private global state for the smoke workspace."
 }
 
 function Remember-CredentialTarget([string]$Path) {
@@ -176,8 +198,8 @@ function Assert-HealthyProduct {
         throw "Windows tray task is not registered in the interactive user session."
     }
 
-    Assert-RedactedCredentialConfig (Join-Path $profileHome ".feanorfs\global.json")
-    Assert-RedactedCredentialConfig (Join-Path $workspace ".feanorfs\config.json")
+    Assert-RedactedCredentialConfig (Join-Path $profileState "global.json")
+    Assert-RedactedCredentialConfig $workspaceConfigPath
 
     Push-Location $workspace
     try {
@@ -229,11 +251,12 @@ function Assert-HealthyProduct {
     }
 }
 
+if (@(Get-SmokeTasks).Count -ne 0) {
+    throw "The Windows product smoke requires a clean test account with no existing FeanorFS scheduled tasks."
+}
+
 try {
-    if (@(Get-SmokeTasks).Count -ne 0) {
-        throw "Windows product smoke refuses to replace existing FeanorFS scheduled tasks."
-    }
-    New-Item -ItemType Directory -Path $profileHome, $binDir, $workspace | Out-Null
+    New-Item -ItemType Directory -Path $binDir, $workspace | Out-Null
     Copy-Item -LiteralPath $sourceCli -Destination $cli
     Copy-Item -LiteralPath $sourceTray -Destination $tray
     [IO.File]::WriteAllText((Join-Path $workspace "windows-smoke.txt"), "Windows product smoke`n")
@@ -250,13 +273,21 @@ try {
     }
 
     Invoke-Start
+    $workspaceConfigPath = Get-WorkspaceConfigPath $workspace
+    if ((Test-Path -LiteralPath (Join-Path $workspace ".feanorfs")) -or
+        (Test-Path -LiteralPath (Join-Path $workspace ".feanorfsignore"))) {
+        throw "FeanorFS created project-local metadata."
+    }
     Assert-HealthyProduct
 
     & $cli stop $workspace *> (Join-Path $root "stop.log")
     if ($LASTEXITCODE -ne 0) {
         throw "feanorfs stop failed on Windows."
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $workspace "windows-smoke.txt")) -or -not (Test-Path -LiteralPath (Join-Path $workspace ".feanorfs\config.json"))) {
+    if (-not (Test-Path -LiteralPath (Join-Path $workspace "windows-smoke.txt")) -or
+        -not (Test-Path -LiteralPath $workspaceConfigPath) -or
+        (Test-Path -LiteralPath (Join-Path $workspace ".feanorfs")) -or
+        (Test-Path -LiteralPath (Join-Path $workspace ".feanorfsignore"))) {
         throw "Windows stop did not preserve the working file and encrypted setup."
     }
     Wait-For {
@@ -268,16 +299,17 @@ try {
     Write-Host "Windows product smoke passed: one-command host, Credential Manager, Task Scheduler services, interactive tray, TLS, doctor, MCP, and reversible stop/resume."
 }
 finally {
-    $credentialCleanupFailed = $false
-    foreach ($configPath in @(
-        (Join-Path $profileHome ".feanorfs\global.json"),
-        (Join-Path $workspace ".feanorfs\config.json")
-    )) {
+    $cleanupFailed = $false
+    $configPaths = @((Join-Path $profileState "global.json"))
+    if ($workspaceConfigPath) {
+        $configPaths += $workspaceConfigPath
+    }
+    foreach ($configPath in $configPaths) {
         try {
             $null = Remember-CredentialTarget $configPath
         }
         catch {
-            $credentialCleanupFailed = $true
+            $cleanupFailed = $true
         }
     }
     if (Test-Path -LiteralPath $cli) {
@@ -288,18 +320,23 @@ finally {
     foreach ($target in $credentialTargets) {
         & "$env:SystemRoot\System32\cmdkey.exe" "/delete:$target" *> $null
         if ($LASTEXITCODE -ne 0) {
-            $credentialCleanupFailed = $true
+            $cleanupFailed = $true
         }
     }
-    for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $root); $attempt++) {
-        try {
-            Remove-Item -LiteralPath $root -Recurse -Force
+    foreach ($cleanupPath in @($profileState, $root)) {
+        for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $cleanupPath); $attempt++) {
+            try {
+                Remove-Item -LiteralPath $cleanupPath -Recurse -Force
+            }
+            catch {
+                Start-Sleep -Milliseconds 250
+            }
         }
-        catch {
-            Start-Sleep -Milliseconds 250
+        if (Test-Path -LiteralPath $cleanupPath) {
+            $cleanupFailed = $true
         }
     }
-    if ($credentialCleanupFailed) {
-        throw "Windows product smoke could not remove its temporary Credential Manager entries."
+    if ($cleanupFailed) {
+        throw "Windows product smoke could not remove its temporary state or Credential Manager entries."
     }
 }

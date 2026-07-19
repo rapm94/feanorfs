@@ -7,10 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.5](https://github.com/rapm94/feanorfs/compare/v0.7.4...v0.7.5) - 2026-07-19
+## [0.7.6](https://github.com/rapm94/feanorfs/compare/v0.7.4...v0.7.6) - 2026-07-19
 
 ### Fixed
 
+- The Windows product smoke now uses a verified-clean login profile so Task
+  Scheduler workers resolve the same private global state as the foreground
+  client, validates that projects remain free of FeanorFS metadata, and removes
+  only state it proved absent before the test.
 - The cross-platform tray smoke now verifies pause state through the public CLI
   and explicitly proves that pause and resume never create project-local
   metadata.
