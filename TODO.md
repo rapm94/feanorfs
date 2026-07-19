@@ -36,19 +36,13 @@ Record only OS/version and secret-free acceptance or reproduction evidence.
 
 ## AI tasks
 
-### AI-1. Publish and validate the exact next release
+### AI-1. Complete released-product installation acceptance
 
-- [ ] Push the completed v0.7.8 product changes, create the immutable tag, and
-  validate every artifact, checksum, and attestation that can publish without
-  F1 credentials.
 - [ ] Install the exact published CLI archive on this Mac and the exact
   `.pkg.tar.zst` desktop product on CachyOS. Verify matching versions, tray
   visibility/folder switching, managed services, mDNS, `doctor`, and a bounded
   cross-machine sync while preserving the Mac workspaces as authoritative.
-- [ ] Confirm the release clean-package jobs pass on Debian and Fedora and that
-  no key, token, invite, route, passphrase, filename, or file content appears in
-  release evidence, service argv/environment, logs, or discovery.
 
-If signing credentials are unavailable, publish clearly labeled unsigned
-`.dmg`/`.pkg`/`.exe` artifacts only through the explicit no-signing release
-path requested by the founder; never label them trusted or notarized.
+The verified installers are open on both machines and await the local macOS
+administrator approval and the CachyOS `sudo` password. Never capture or relay
+either credential through logs, scripts, environment variables, or chat.
