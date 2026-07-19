@@ -339,13 +339,13 @@ jobs:
           "$FNR" --json tray status | jq -e '.mirror_state and .agents'
           "$FNR" --json tray recent | jq -e '.workspaces | length >= 1'
           "$FNR" tray pause
-          test -f .feanorfs/paused
+          test ! -e .feanorfs
+          test ! -e .feanorfsignore
           "$FNR" --json tray pause | jq -e '.paused == true'
           "$FNR" tray resume
-          if test -f .feanorfs/paused; then
-            echo "::error::Tray pause sentinel still exists after resume."
-            exit 1
-          fi
+          "$FNR" --json tray status | jq -e '.paused == false'
+          test ! -e .feanorfs
+          test ! -e .feanorfsignore
           "$FNR" --json conflicts list | jq -e 'length == 0'
 
   desktop-tray:

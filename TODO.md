@@ -38,7 +38,7 @@ Record only OS/version and secret-free acceptance or reproduction evidence.
 
 ### AI-1. Publish and validate the exact next release
 
-- [ ] Push the completed v0.7.4 product changes, create the immutable tag, and
+- [ ] Push the completed v0.7.5 product changes, create the immutable tag, and
   validate every artifact, checksum, and attestation that can publish without
   F1 credentials.
 - [ ] Install the exact published CLI archive on this Mac and the exact
