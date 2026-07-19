@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2](https://github.com/rapm94/feanorfs/compare/v0.7.1...v0.7.2) - 2026-07-19
+
+### Fixed
+
+- Workspace rename identity now includes the directory creation time, preventing
+  a deleted folder's reused filesystem inode from attaching an unrelated
+  workspace state or encryption key. Filesystems without a stable creation time
+  fail safe by disabling identity-based rename recovery.
+- Tray availability tests use an injected workspace probe instead of requiring
+  a separately installed CLI, keeping the release matrix deterministic without
+  changing the tray's production CLI-backed behavior.
+
 ## [0.7.1](https://github.com/rapm94/feanorfs/compare/v0.7.0...v0.7.1) - 2026-07-19
 
 ### Added

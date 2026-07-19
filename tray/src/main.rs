@@ -340,19 +340,33 @@ impl AppState {
 }
 
 fn configured_recent_workspace(recent: &RecentWorkspacesResult) -> Option<PathBuf> {
+    configured_recent_workspace_with(recent, workspace_has_config)
+}
+
+fn configured_recent_workspace_with(
+    recent: &RecentWorkspacesResult,
+    has_config: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     recent
         .active
         .iter()
         .chain(recent.workspaces.iter().map(|workspace| &workspace.path))
         .map(PathBuf::from)
-        .find(|path| workspace_has_config(path))
+        .find(|path| has_config(path))
 }
 
 fn unavailable_workspace_count(recent: &RecentWorkspacesResult) -> usize {
+    unavailable_workspace_count_with(recent, workspace_has_config)
+}
+
+fn unavailable_workspace_count_with(
+    recent: &RecentWorkspacesResult,
+    has_config: impl Fn(&Path) -> bool,
+) -> usize {
     recent
         .workspaces
         .iter()
-        .filter(|workspace| !workspace_has_config(Path::new(&workspace.path)))
+        .filter(|workspace| !has_config(Path::new(&workspace.path)))
         .count()
 }
 
@@ -392,8 +406,13 @@ fn compact_workspace_path(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn workspace_switch_item(label: &str, path: &str, active: Option<&str>) -> MirroredFolderMenuItem {
-    let available = workspace_has_config(Path::new(path));
+fn workspace_switch_item_with(
+    label: &str,
+    path: &str,
+    active: Option<&str>,
+    has_config: impl Fn(&Path) -> bool,
+) -> MirroredFolderMenuItem {
+    let available = has_config(Path::new(path));
     let selected = active.is_some_and(|active| same_workspace_path(active, path));
     let mut menu_label = format!("{label} — {}", compact_workspace_path(Path::new(path)));
     if !available {
@@ -408,6 +427,13 @@ fn workspace_switch_item(label: &str, path: &str, active: Option<&str>) -> Mirro
 }
 
 fn mirrored_folder_menu_items(state: &AppState) -> Vec<MirroredFolderMenuItem> {
+    mirrored_folder_menu_items_with(state, workspace_has_config)
+}
+
+fn mirrored_folder_menu_items_with(
+    state: &AppState,
+    has_config: impl Fn(&Path) -> bool + Copy,
+) -> Vec<MirroredFolderMenuItem> {
     let mut workspaces = state
         .recent
         .as_ref()
@@ -446,7 +472,7 @@ fn mirrored_folder_menu_items(state: &AppState) -> Vec<MirroredFolderMenuItem> {
         });
     workspaces
         .iter()
-        .map(|(path, label)| workspace_switch_item(label, path, active.as_deref()))
+        .map(|(path, label)| workspace_switch_item_with(label, path, active.as_deref(), has_config))
         .collect()
 }
 
@@ -2813,8 +2839,7 @@ mod tests {
         ));
         let stale = root.join("stale");
         let configured = root.join("configured");
-        std::fs::create_dir_all(configured.join(".feanorfs")).unwrap();
-        std::fs::write(configured.join(".feanorfs/config.json"), b"{}").unwrap();
+        std::fs::create_dir_all(&configured).unwrap();
 
         let recent = RecentWorkspacesResult {
             active: Some(stale.to_string_lossy().into_owned()),
@@ -2824,7 +2849,10 @@ mod tests {
                 label: "configured".into(),
             }],
         };
-        assert_eq!(configured_recent_workspace(&recent), Some(configured));
+        assert_eq!(
+            configured_recent_workspace_with(&recent, |path| path == configured),
+            Some(configured)
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2891,8 +2919,7 @@ mod tests {
         ));
         let available = root.join("available");
         let unavailable = root.join("unavailable");
-        std::fs::create_dir_all(available.join(".feanorfs")).unwrap();
-        std::fs::write(available.join(".feanorfs/config.json"), b"{}").unwrap();
+        std::fs::create_dir_all(&available).unwrap();
         let recent = RecentWorkspacesResult {
             active: Some(unavailable.to_string_lossy().into_owned()),
             workspaces: vec![
@@ -2909,18 +2936,21 @@ mod tests {
             ],
         };
 
-        assert_eq!(unavailable_workspace_count(&recent), 1);
-        let unavailable_item = workspace_switch_item(
+        let has_config = |path: &Path| path == available;
+        assert_eq!(unavailable_workspace_count_with(&recent, has_config), 1);
+        let unavailable_item = workspace_switch_item_with(
             "offline drive",
             &unavailable.to_string_lossy(),
             recent.active.as_deref(),
+            has_config,
         );
         assert!(!unavailable_item.available);
         assert!(unavailable_item.selected);
         assert!(unavailable_item.label.contains("offline drive"));
         assert!(unavailable_item.label.ends_with("— unavailable"));
 
-        let available_item = workspace_switch_item("available", &available.to_string_lossy(), None);
+        let available_item =
+            workspace_switch_item_with("available", &available.to_string_lossy(), None, has_config);
         assert!(available_item.available);
         assert!(!available_item.selected);
         assert!(available_item
@@ -2932,7 +2962,7 @@ mod tests {
         // refreshed. Both followed folders remain present in the selector.
         let mut state = AppState::new(Some(available.clone()));
         state.recent = Some(recent);
-        let items = mirrored_folder_menu_items(&state);
+        let items = mirrored_folder_menu_items_with(&state, has_config);
         assert_eq!(items.len(), 2);
         assert_eq!(
             items.iter().filter(|item| item.selected).count(),

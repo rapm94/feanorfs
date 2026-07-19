@@ -97,7 +97,19 @@ fn workspace_identity(workspace: &Path) -> Result<Option<String>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        Ok(Some(format!("unix:{}:{}", metadata.dev(), metadata.ino())))
+        let created = metadata
+            .created()
+            .ok()
+            .and_then(|created| created.duration_since(UNIX_EPOCH).ok());
+        Ok(created.map(|created| {
+            format!(
+                "unix:{}:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                created.as_secs(),
+                created.subsec_nanos()
+            )
+        }))
     }
     #[cfg(not(unix))]
     {
