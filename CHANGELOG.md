@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4](https://github.com/rapm94/feanorfs/compare/v0.7.3...v0.7.4) - 2026-07-19
+
+### Fixed
+
+- The macOS launchd product smoke now uses a verified-clean login account home,
+  matching how background services resolve global workspace state, and removes
+  only the state and launch agents it proved did not exist before the test.
+
 ## [0.7.3](https://github.com/rapm94/feanorfs/compare/v0.7.2...v0.7.3) - 2026-07-19
 
 ### Fixed

@@ -17,9 +17,16 @@ FEANORFS_TRAY="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 [[ -x "$FEANORFS" ]] || { echo "Missing feanorfs binary: $FEANORFS" >&2; exit 1; }
 [[ -x "$FEANORFS_TRAY" ]] || { echo "Missing tray binary: $FEANORFS_TRAY" >&2; exit 1; }
 
+ACCOUNT_HOME="$HOME"
+if [[ -e "$ACCOUNT_HOME/.feanorfs" ]] ||
+  compgen -G "$ACCOUNT_HOME/Library/LaunchAgents/com.feanorfs.*.plist" >/dev/null; then
+  echo "The macOS product smoke requires a clean test account with no existing FeanorFS state or launch agents." >&2
+  exit 2
+fi
+
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/feanorfs-product-smoke.XXXXXX")"
 ROOT="$(cd "$ROOT" && pwd -P)"
-export HOME="$ROOT/home"
+export HOME="$ACCOUNT_HOME"
 export FEANORFS_TRAY_BIN="$FEANORFS_TRAY"
 WORKSPACE="$ROOT/workspace"
 JOINED_WORKSPACE="$ROOT/joined-workspace"
@@ -27,7 +34,7 @@ PAIR_PID=""
 JOIN_PID=""
 EMPTY_TRAY_PID=""
 RELAY_PID=""
-mkdir -p "$HOME" "$WORKSPACE"
+mkdir -p "$WORKSPACE"
 printf 'workspace recovery smoke\n' >"$WORKSPACE/recovery-smoke.txt"
 
 workspace_state_dir() {
@@ -69,6 +76,11 @@ cleanup() {
       /bin/launchctl unload "$plist" >/dev/null 2>&1 || true
     fi
   done
+  rm -f \
+    "$HOME"/Library/LaunchAgents/com.feanorfs.sync-*.plist \
+    "$HOME/Library/LaunchAgents/com.feanorfs.tray.plist" \
+    "$HOME/Library/LaunchAgents/com.feanorfs.hub.plist"
+  rm -rf "$HOME/.feanorfs"
   rm -rf "$ROOT"
 }
 trap cleanup EXIT HUP INT TERM

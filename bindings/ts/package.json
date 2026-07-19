@@ -1,6 +1,6 @@
 {
   "name": "@feanorfs/agent",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Native Node bindings for FeanorFS agent workspaces",
   "main": "api.mjs",
   "types": "contract.d.ts",
@@ -57,10 +57,10 @@
   },
   "license": "MIT",
   "optionalDependencies": {
-    "@feanorfs/agent-darwin-x64": "0.7.3",
-    "@feanorfs/agent-darwin-arm64": "0.7.3",
-    "@feanorfs/agent-linux-x64-gnu": "0.7.3",
-    "@feanorfs/agent-linux-arm64-gnu": "0.7.3",
-    "@feanorfs/agent-win32-x64-msvc": "0.7.3"
+    "@feanorfs/agent-darwin-x64": "0.7.4",
+    "@feanorfs/agent-darwin-arm64": "0.7.4",
+    "@feanorfs/agent-linux-x64-gnu": "0.7.4",
+    "@feanorfs/agent-linux-arm64-gnu": "0.7.4",
+    "@feanorfs/agent-win32-x64-msvc": "0.7.4"
   }
 }

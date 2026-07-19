@@ -1,6 +1,6 @@
 {
   "name": "@feanorfs/agent-win32-x64-msvc",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "os": [
     "win32"
   ],
