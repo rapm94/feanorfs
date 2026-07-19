@@ -326,6 +326,13 @@ fn install_tray_service(spec: &TrayServiceSpec) -> anyhow::Result<BackgroundStat
         || !tray_service_configuration_matches(&spec.program, &spec.feanorfs_program)
         || !spec.installed_programs_match();
     if install_required {
+        if status == ServiceStatus::Running {
+            manager
+                .stop(service_manager::ServiceStopCtx {
+                    label: label.clone(),
+                })
+                .context("stop the previous FeanorFS tray during upgrade")?;
+        }
         manager
             .install(ServiceInstallCtx {
                 label: label.clone(),

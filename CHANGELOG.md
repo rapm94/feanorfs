@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Linux watchers ignore non-mutating access/open notifications, preventing a
+  scan from triggering an endless series of zero-change scans.
+- Reinstalling an updated tray service now stops the running old executable
+  before replacing and starting the service definition.
+
 ## [0.6.3](https://github.com/rapm94/feanorfs/compare/v0.6.2...v0.6.3) - 2026-07-18
 
 ### Added

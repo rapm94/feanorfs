@@ -1,7 +1,7 @@
 use feanorfs_client::commands::MirrorState;
 use feanorfs_client::conflicts::load_last_synced_snapshot;
 use feanorfs_client::lock::try_acquire_sync_lock;
-use feanorfs_client::watch::event_paths_warrant_sync;
+use feanorfs_client::watch::event_warrants_sync;
 use feanorfs_client::{do_status, load_config, SyncCtx};
 use notify::Watcher;
 use serde::Serialize;
@@ -39,7 +39,7 @@ pub async fn run_events(current_dir: &Path) -> anyhow::Result<()> {
     let mut watcher =
         notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                if event_paths_warrant_sync(&event.paths) {
+                if event_warrants_sync(&event) {
                     let _ = tx_clone.try_send(event.paths);
                 }
             }

@@ -31,7 +31,7 @@ CLI + library crate. Owns directory scanning, format-v3 snapshot sync orchestrat
   - `predictive.rs` — `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay). Local-only.
   - `recent.rs` — locked, atomic `~/.feanorfs/recent.json` registry shared by `start`, `stop`, and the tray. Removing an active workspace deterministically selects the next entry.
   - `summary.rs` — `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool`. Zero-knowledge — never ships file contents to a remote LLM.
-  - `watch.rs` — debounced (500 ms) filesystem watcher that drives `do_sync` on changes. Watcher path MUST be the workspace `current_dir`, never `"."`.
+  - `watch.rs` — debounced (500 ms) filesystem watcher that drives `do_sync` on mutating events and ignores non-mutating access/open events emitted by its own scan. Watcher path MUST be the workspace `current_dir`, never `"."`.
   - `tray.rs` — tray dashboard aggregation (`do_tray_status`, `build_conflict_show`). Agent summary cached on disk at `.feanorfs/tray-agent-cache.json` (30 s TTL); `invalidate_agent_cache` after land/keep.
 - Local runtime data lives in `.feanorfs/` (git-ignored by FeanorFS itself; never include in distributions). Live state files: `.feanorfs/local_state.json` (format version, server URL, auth) and embedded hub `hub_state.json` + `blobs/<hash>` at `.feanorfs/hub-data/`.
 

@@ -4,7 +4,7 @@ use crate::local::ClientDb;
 use crate::tray_state::{clear_watch_pid, is_paused, write_watch_pid};
 use anyhow::Result;
 use feanorfs_common::normalize_path;
-use notify::Watcher;
+use notify::{Event, EventKind, Watcher};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,6 +23,10 @@ pub fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
         }
     }
     false
+}
+
+pub fn event_warrants_sync(event: &Event) -> bool {
+    !matches!(event.kind, EventKind::Access(_)) && event_paths_warrant_sync(&event.paths)
 }
 
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(45);
@@ -57,7 +61,7 @@ pub async fn run_watch(
     let mut watcher =
         notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                if event_paths_warrant_sync(&event.paths) {
+                if event_warrants_sync(&event) {
                     tracing::debug!("FS event: {:?}", event);
                     let _ = tx_clone.try_send(());
                 }
@@ -194,7 +198,11 @@ async fn sync_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_duration, drain_event_burst, event_paths_warrant_sync};
+    use super::{
+        backoff_duration, drain_event_burst, event_paths_warrant_sync, event_warrants_sync,
+    };
+    use notify::event::{AccessKind, AccessMode, ModifyKind};
+    use notify::{Event, EventKind};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -203,6 +211,20 @@ mod tests {
         assert!(event_paths_warrant_sync(&[PathBuf::from(
             "/workspace/src/main.rs"
         )]));
+    }
+
+    #[test]
+    fn ignores_access_events_caused_by_the_scanner_itself() {
+        let event = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+            .add_path(PathBuf::from("/workspace/src"));
+        assert!(!event_warrants_sync(&event));
+    }
+
+    #[test]
+    fn accepts_mutating_events_for_workspace_files() {
+        let event = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(PathBuf::from("/workspace/src/main.rs"));
+        assert!(event_warrants_sync(&event));
     }
 
     #[test]
