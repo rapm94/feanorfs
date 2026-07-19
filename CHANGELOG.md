@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/rapm94/feanorfs/compare/v0.6.4...v0.7.0) - 2026-07-19
+
+### Added
+
+- make desktop releases product-aware
+- preview non-empty joins safely
+
+### Fixed
+
+- publish hub blobs atomically
+- make desktop recovery and folder listing reliable
+
 ## [0.6.4](https://github.com/rapm94/feanorfs/compare/v0.6.3...v0.6.4) - 2026-07-18
 
 ### Fixed
