@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4](https://github.com/rapm94/feanorfs/compare/v0.6.3...v0.6.4) - 2026-07-18
+
 ### Fixed
 
 - Linux watchers ignore non-mutating access/open notifications, preventing a
