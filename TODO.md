@@ -61,6 +61,19 @@ showing what will happen and how the local/cloud choices work.
 
 ### AI-4. Prove Linux desktop behavior outside CI containers
 
+- [ ] Replace the misleading cargo-dist `feanorfs-client-installer.sh`
+  entrypoint with one canonical desktop installer, or name it explicitly as
+  CLI-only. On Linux, the public install command must select the native
+  `.deb`, `.rpm`, or `.pkg.tar.zst` and include the tray; an unprivileged
+  fallback must install the complete checksummed desktop bundle.
+- [ ] Build or bundle Linux tray dependencies for the target package ABI
+  instead of putting an Ubuntu-linked `libxdo.so.3` binary in the Arch
+  package. Test current CachyOS/Arch `libxdo.so.4` resolution before
+  publication and reject unresolved native libraries before replacing a
+  working tray.
+- [ ] Migrate an existing `~/.local/bin` source/cargo-dist installation to a
+  native package without leaving an older CLI or tray first on `PATH`, and
+  restart both managed processes from the selected installation.
 - [ ] Diagnose missing native tray libraries before launch and provide the exact
   package-manager repair without requiring source-build knowledge.
 - [ ] Verify install, tray visibility, folder switching, pairing, background
@@ -77,3 +90,15 @@ Blocked on F1 and F2.
   installer.
 - [ ] Confirm secrets, capabilities, private routes, filenames, and file content
   never appear in argv, environment, logs, discovery, or release evidence.
+
+### AI-6. Make release automation product-aware
+
+- [ ] Make client, tray, installer, and workflow-only product changes create a
+  release PR even when `feanorfs-common` has no changed packaged files;
+  `changelog_include` alone does not trigger release-plz package selection.
+- [ ] Add a release dry-run gate that proves the shared Cargo and Node versions,
+  changelog section, tag target, public installer entrypoint, and expected
+  platform artifact set all agree before a tag can be pushed.
+
+Done when ordinary product fixes cannot require a manual version carrier edit
+or silently leave the latest release on the previous version.
