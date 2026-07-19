@@ -583,6 +583,11 @@ fn platform_stop(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
         BackgroundStatus::Running => {}
     }
     launchctl_plist("unload", spec).context("stop automatic sync")?;
+    wait_for_managed_service_stop(spec)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_managed_service_stop(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if platform_status(spec)? != BackgroundStatus::Running
@@ -610,7 +615,7 @@ fn platform_stop(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
             label: native_label(spec)?,
         })
         .context("stop automatic sync")?;
-    Ok(BackgroundStatus::Stopped)
+    wait_for_managed_service_stop(spec)
 }
 
 #[cfg(not(target_os = "windows"))]

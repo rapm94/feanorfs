@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan from triggering an endless series of zero-change scans.
 - Reinstalling an updated tray service now stops the running old executable
   before replacing and starting the service definition.
+- Linux service stops now wait for the watcher and sync lock to clear before
+  an upgrade sync begins, removing a first-run lock race.
 
 ## [0.6.3](https://github.com/rapm94/feanorfs/compare/v0.6.2...v0.6.3) - 2026-07-18
 
