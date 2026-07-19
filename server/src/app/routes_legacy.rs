@@ -98,9 +98,21 @@ pub(super) async fn handle_upload(
         return Err(StatusCode::BAD_REQUEST);
     }
     let blob_path = state.storage_dir.join("blobs").join(&params.hash);
-    if let Err(error) = tokio::fs::write(&blob_path, &body).await {
-        tracing::error!(?error, "failed to write blob");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    let write_path = blob_path.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        crate::private_file::atomic_private_write(&write_path, &body)
+    })
+    .await;
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(?error, "failed to write blob atomically");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Err(error) => {
+            tracing::error!(?error, "blob writer task failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
     if params.object {
         return Ok(StatusCode::OK);

@@ -1,12 +1,70 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     http::{Request, StatusCode},
 };
 use feanorfs_common::hash_bytes;
+use futures_util::future::join_all;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
 
 use super::{app_state, build_router};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_blob_uploads_never_expose_partial_ciphertext() {
+    let app = build_router(app_state().await);
+    let bytes = Bytes::from(vec![0x5a; 16 * 1024 * 1024]);
+    let hash = hash_bytes(&bytes);
+    let upload_uri = format!(
+        "/api/upload?workspace_id=ws&path=object&hash={hash}&size={}&mtime=0&object=true",
+        bytes.len()
+    );
+    let upload = || {
+        Request::post(&upload_uri)
+            .body(Body::from(bytes.clone()))
+            .expect("build object upload")
+    };
+
+    assert_eq!(
+        app.clone()
+            .oneshot(upload())
+            .await
+            .expect("seed object upload")
+            .status(),
+        StatusCode::OK
+    );
+
+    let uploads = async { join_all((0..16).map(|_| app.clone().oneshot(upload()))).await };
+    let downloads = async {
+        join_all((0..64).map(|_| {
+            let app = app.clone();
+            let hash = hash.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::get(format!("/api/download/{hash}"))
+                            .body(Body::empty())
+                            .expect("build object download"),
+                    )
+                    .await
+                    .expect("download object");
+                assert_eq!(response.status(), StatusCode::OK);
+                let downloaded = axum::body::to_bytes(response.into_body(), 17 * 1024 * 1024)
+                    .await
+                    .expect("read downloaded object");
+                assert_eq!(hash_bytes(&downloaded), hash);
+            }
+        }))
+        .await
+    };
+
+    let (upload_results, _) = tokio::join!(uploads, downloads);
+    for response in upload_results {
+        assert_eq!(
+            response.expect("concurrent object upload").status(),
+            StatusCode::OK
+        );
+    }
+}
 
 #[tokio::test]
 async fn concurrent_head_swap_has_one_winner_and_reports_current() {

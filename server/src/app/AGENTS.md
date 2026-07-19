@@ -18,6 +18,7 @@ Own Axum request guards, grouped route handlers, and route-level tests. `../app.
 
 - Publication handlers hold shared/read lock; format stamp and migration start hold write lock.
 - Validate hash/path/body before storage side effects.
+- Publish verified blob bytes atomically from a distinct same-directory temporary file; a download may observe the previous or replacement complete ciphertext, never a partial concurrent upload.
 - Keep download open/read atomic; no separate existence probe.
 - Return typed status codes without exposing database errors.
 - Pair relay paths accept only 128-bit lowercase-hex public session IDs. Forward bounded binary/Ping/Pong frames only, expire pending offers, and keep the relay route separate from the bearer-authenticated hub API router.
