@@ -93,7 +93,7 @@ FEANORFS_WORKSPACE=~/projects/my-app feanorfs-tray
 - **Recovery → Export Encrypted Recovery Kit… / Restore From Recovery Kit…** — uses native file dialogs plus the operating system's masked password UI (AppleScript, WinForms, or packaged `zenity`/`kdialog`), sends the passphrase only through a bounded stdin pipe, and delegates encryption, validation, initial sync, protected credentials, and service setup to `feanorfs recovery`; the tray never receives the decrypted workspace capability
 - **Check System Health…** — runs `feanorfs --json doctor`, retains only check names/statuses, shows generic native results, and offers explicit **Repair Mirroring** through `feanorfs start -- <folder>`; diagnostic details, sync, credentials, encryption, and conflict policy stay in the CLI
 - **Check for Updates…** — delegates the HTTPS/semantic/canonical-release validation to `feanorfs --json update`, repeats the exact official tag-page check, and opens that page only after an explicit click; the tray never downloads, installs, or executes update code
-- **Pause / Resume** — writes `.feanorfs/paused`; the background `feanorfs sync` watcher skips uploads/downloads while paused
+- **Pause / Resume** — writes only a private global workspace marker; the background `feanorfs sync` watcher skips uploads/downloads while paused
 - **Needs attention** — per-conflict submenu with plain-language labels and Keep local / cloud / both actions
 - **Agents** — `N working · M need attention` with Land shortcuts
 

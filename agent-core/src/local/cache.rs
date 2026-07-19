@@ -58,6 +58,15 @@ impl ClientDb {
         })
     }
 
+    pub async fn delete_cache_entries(&self, paths: &[String]) -> Result<()> {
+        self.state.with_write(|state| {
+            for path in paths {
+                state.local_files.remove(path);
+            }
+            Ok(())
+        })
+    }
+
     pub async fn set_deleted_at(&self, path: &str, deleted_at: i64) -> Result<()> {
         let path = path.to_string();
         self.state.with_write(|state| {

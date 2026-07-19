@@ -110,7 +110,7 @@ impl ApiClient {
 
     pub async fn from_config(workspace: &Path, config: &Config) -> Result<Self> {
         if config.is_local_hub() {
-            let hub_dir = config.hub_data_dir(workspace);
+            let hub_dir = config.hub_data_dir(workspace)?;
             let hub = LocalHub::open(hub_dir, config.server_password.clone()).await?;
             Ok(Self::local(hub, config.server_password.clone()))
         } else if let Some(relay) = config
@@ -132,7 +132,7 @@ impl ApiClient {
 
     pub async fn from_config_direct(workspace: &Path, config: &Config) -> Result<Self> {
         if config.is_local_hub() {
-            let hub_dir = config.hub_data_dir(workspace);
+            let hub_dir = config.hub_data_dir(workspace)?;
             let hub = LocalHub::open(hub_dir, config.server_password.clone()).await?;
             Ok(Self::local(hub, config.server_password.clone()))
         } else {

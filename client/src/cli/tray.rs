@@ -137,7 +137,7 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
             if json {
                 anyhow::bail!("tray pairing join is interactive and does not support --json");
             }
-            if folder.join(".feanorfs").join("config.json").exists() {
+            if feanorfs_agent_core::workspace_is_configured(&folder) {
                 anyhow::bail!(
                     "{} is already a FeanorFS workspace; choose a new or unconfigured folder",
                     folder.display()

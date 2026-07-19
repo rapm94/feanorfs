@@ -4,9 +4,10 @@ use crate::local::{load_config, save_config, validate_e2ee_key, ClientDb, Config
 use anyhow::{Context, Result};
 use feanorfs_common::LegacyPolicy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
-const JOURNAL_PATH: &str = ".feanorfs/migration-v3.json";
+const JOURNAL_PATH: &str = "migration-v3.json";
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +35,9 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
 
     let mut config = load_config(base)?;
     if config.format_version >= 3 {
+        if rekey {
+            return rekey_format_v3(base, config).await;
+        }
         remove_journal(base).await?;
         println!("Workspace is already format v3.");
         return Ok(());
@@ -164,6 +168,120 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
     Ok(())
 }
 
+async fn rekey_format_v3(base: &Path, mut config: Config) -> Result<()> {
+    let db = crate::open_client_db(base).await?;
+    let api = crate::open_api_client(base, &config).await?;
+    // Opening the endpoint can authenticate and persist a DHCP-resilient URL.
+    config = load_config(base)?;
+
+    let mut journal = match load_journal(base).await? {
+        Some(journal) => {
+            anyhow::ensure!(
+                journal.workspace_id == config.workspace_id,
+                "migration journal belongs to another workspace"
+            );
+            anyhow::ensure!(
+                journal.target_key != journal.old_key,
+                "format-v3 rekey journal does not contain a new encryption key"
+            );
+            journal
+        }
+        None => {
+            let old_key = config
+                .encryption_password
+                .clone()
+                .context("no encryption key configured")?;
+            let target_key = feanorfs_common::generate_password()?;
+            validate_e2ee_key(&target_key, 3)?;
+            let journal = MigrationJournal {
+                workspace_id: config.workspace_id.clone(),
+                old_key,
+                target_key,
+                fence_token: feanorfs_common::generate_password()?,
+                phase: MigrationPhase::Pulling,
+                resealed: 0,
+            };
+            write_journal(base, &journal).await?;
+            journal
+        }
+    };
+
+    ensure_no_agent_workspaces(base).await?;
+    let api = api.with_migration_token(journal.fence_token.clone());
+    api.begin_migration(&config.workspace_id).await?;
+
+    if matches!(journal.phase, MigrationPhase::Pulling) {
+        println!("Synchronizing latest workspace state...");
+        let mut source = config.clone();
+        source.encryption_password = Some(journal.old_key.clone());
+        crate::commands::do_sync(
+            &api,
+            &db,
+            base,
+            &source.workspace_id,
+            source.encryption_password.as_deref(),
+            false,
+        )
+        .await?;
+        anyhow::ensure!(
+            db.list_pending_conflict_paths().await?.is_empty(),
+            "resolve workspace conflicts before rekeying"
+        );
+        ensure_hydrated(&db).await?;
+        journal.phase = MigrationPhase::Resealing;
+        write_journal(base, &journal).await?;
+    }
+
+    let mut target = config.clone();
+    target.encryption_password = Some(journal.target_key.clone());
+    if matches!(journal.phase, MigrationPhase::Resealing) {
+        let entries = db.get_cache_entries().await?;
+        journal.resealed = 0;
+        for (path, entry) in entries {
+            if entry.deleted_at.is_none() {
+                db.delete_cache_entry(&path).await?;
+                journal.resealed += 1;
+            }
+        }
+        println!("Pushing re-sealed blobs...");
+        reseal_v3_files(&api, &db, base, &target).await?;
+        migration_failpoint(base, "after_reseal_upload").await?;
+        journal.phase = MigrationPhase::Resealed;
+        write_journal(base, &journal).await?;
+    }
+
+    if matches!(journal.phase, MigrationPhase::Resealed) {
+        let files = scan_rekeyed_view(&db, base, &target).await?;
+        let ctx = feanorfs_agent_core::SyncCtx::from_config(&api, &db, base, &target)?;
+        feanorfs_agent_core::SnapshotEngine::new(&ctx)
+            .publish_rekeyed_view(&files, "migrate")
+            .await?;
+        journal.phase = MigrationPhase::HeadPublished;
+        write_journal(base, &journal).await?;
+    }
+
+    if matches!(journal.phase, MigrationPhase::HeadPublished) {
+        clear_snapshot_refs(base).await?;
+        // Setting the existing format marker also atomically releases the migration fence.
+        api.set_workspace_format(&config.workspace_id, 3).await?;
+        journal.phase = MigrationPhase::Stamped;
+        write_journal(base, &journal).await?;
+    }
+
+    db.drop_legacy_snapshot_tables().await?;
+    config.encryption_password = Some(journal.target_key.clone());
+    save_config(base, &config)?;
+    remove_journal(base).await?;
+
+    println!("New encryption key (save this and share it with other machines):");
+    println!("{}", journal.target_key);
+    println!(
+        "Rekey complete. Workspace remains format v3. Re-sealed {} file(s).",
+        journal.resealed
+    );
+    Ok(())
+}
+
 async fn ensure_hydrated(db: &ClientDb) -> Result<()> {
     let entries = db.get_cache_entries().await?;
     let dehydrated: Vec<_> = entries
@@ -198,8 +316,46 @@ async fn reseal_files(api: &ApiClient, db: &ClientDb, base: &Path, config: &Conf
     Ok(())
 }
 
+async fn scan_rekeyed_view(
+    db: &ClientDb,
+    base: &Path,
+    config: &Config,
+) -> Result<HashMap<String, feanorfs_common::FileState>> {
+    let password = config
+        .encryption_password
+        .as_deref()
+        .context("no migration target key")?;
+    crate::local::scan_local_directory(base, db, Some(password)).await
+}
+
+async fn reseal_v3_files(
+    api: &ApiClient,
+    db: &ClientDb,
+    base: &Path,
+    config: &Config,
+) -> Result<()> {
+    let files = scan_rekeyed_view(db, base, config).await?;
+    let ctx = feanorfs_agent_core::SyncCtx::from_config(api, db, base, config)?;
+    for state in files.values().filter(|state| !state.deleted) {
+        if feanorfs_agent_core::large_file::uses_chunk_transport(state.size) {
+            feanorfs_agent_core::large_file::upload(&ctx, &state.path, &state.hash).await?;
+            continue;
+        }
+        let content = tokio::fs::read(base.join(&state.path)).await?;
+        let packed = feanorfs_common::pack_bytes(&content, ctx.password_str(), &state.path)?;
+        anyhow::ensure!(
+            feanorfs_common::hash_bytes(&packed) == state.hash,
+            "worktree changed during migration: {}",
+            state.path
+        );
+        api.upload_object(&config.workspace_id, &state.hash, packed)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn ensure_no_agent_workspaces(base: &Path) -> Result<()> {
-    let agents = base.join(".feanorfs/agents");
+    let agents = feanorfs_agent_core::paths::agents_dir(base)?;
     match tokio::fs::read_dir(agents).await {
         Ok(mut entries) => anyhow::ensure!(
             entries.next_entry().await?.is_none(),
@@ -212,8 +368,9 @@ async fn ensure_no_agent_workspaces(base: &Path) -> Result<()> {
 }
 
 async fn clear_snapshot_refs(base: &Path) -> Result<()> {
-    for relative in [".feanorfs/refs/workspace", ".feanorfs/refs/last-synced"] {
-        match tokio::fs::remove_file(base.join(relative)).await {
+    let state = feanorfs_agent_core::ensure_workspace_state(base)?;
+    for relative in ["refs/workspace", "refs/last-synced"] {
+        match tokio::fs::remove_file(state.join(relative)).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -223,7 +380,8 @@ async fn clear_snapshot_refs(base: &Path) -> Result<()> {
 }
 
 async fn load_journal(base: &Path) -> Result<Option<MigrationJournal>> {
-    match tokio::fs::read(base.join(JOURNAL_PATH)).await {
+    let state = feanorfs_agent_core::ensure_workspace_state(base)?;
+    match tokio::fs::read(state.join(JOURNAL_PATH)).await {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -232,11 +390,13 @@ async fn load_journal(base: &Path) -> Result<Option<MigrationJournal>> {
 
 async fn write_journal(base: &Path, journal: &MigrationJournal) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(journal)?;
-    crate::fs_util::atomic_write(base, JOURNAL_PATH, &bytes).await
+    let state = feanorfs_agent_core::ensure_workspace_state(base)?;
+    crate::fs_util::atomic_write(&state, JOURNAL_PATH, &bytes).await
 }
 
 async fn remove_journal(base: &Path) -> Result<()> {
-    match tokio::fs::remove_file(base.join(JOURNAL_PATH)).await {
+    let state = feanorfs_agent_core::ensure_workspace_state(base)?;
+    match tokio::fs::remove_file(state.join(JOURNAL_PATH)).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -244,7 +404,7 @@ async fn remove_journal(base: &Path) -> Result<()> {
 }
 
 async fn migration_failpoint(base: &Path, point: &str) -> Result<()> {
-    let path = base.join(".feanorfs/migration-failpoint");
+    let path = feanorfs_agent_core::ensure_workspace_state(base)?.join("migration-failpoint");
     if tokio::fs::read_to_string(path)
         .await
         .is_ok_and(|configured| configured.trim() == point)

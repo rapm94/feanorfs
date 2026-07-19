@@ -2,20 +2,20 @@ use anyhow::{Context, Result};
 use feanorfs_common::is_valid_hash;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio::fs;
 
 const KEEP_LAST: usize = 50;
-const RETENTION: Duration = Duration::from_secs(30 * 86_400);
 
 pub(crate) async fn prune(base: &Path) -> Result<()> {
-    let manifests_dir = base.join(".feanorfs/manifests");
+    let retention = crate::workspace_layout::retention_age();
+    let state = crate::workspace_layout::ensure_workspace_state(base)?;
+    let manifests_dir = state.join("manifests");
     let mut entries = match fs::read_dir(&manifests_dir).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("read local manifests"),
     };
-    let refs = referenced_snapshots(base).await?;
+    let refs = referenced_snapshots(&state).await?;
     let mut manifests = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
@@ -36,7 +36,7 @@ pub(crate) async fn prune(base: &Path) -> Result<()> {
     }
     let mut live = HashSet::new();
     for (index, (modified, id, path)) in manifests.into_iter().enumerate() {
-        let recent = modified.elapsed().is_ok_and(|age| age <= RETENTION);
+        let recent = modified.elapsed().is_ok_and(|age| age <= retention);
         if index < KEEP_LAST || recent || refs.contains(&id) {
             let manifest = fs::read_to_string(path).await?;
             live.extend(
@@ -49,7 +49,7 @@ pub(crate) async fn prune(base: &Path) -> Result<()> {
             fs::remove_file(path).await?;
         }
     }
-    let objects_dir = base.join(".feanorfs/objects");
+    let objects_dir = state.join("objects");
     let mut objects = match fs::read_dir(&objects_dir).await {
         Ok(objects) => objects,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -67,12 +67,9 @@ pub(crate) async fn prune(base: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn referenced_snapshots(base: &Path) -> Result<HashSet<String>> {
+async fn referenced_snapshots(state: &Path) -> Result<HashSet<String>> {
     let mut refs = HashSet::new();
-    for path in [
-        base.join(".feanorfs/refs/workspace"),
-        base.join(".feanorfs/refs/last-synced"),
-    ] {
+    for path in [state.join("refs/workspace"), state.join("refs/last-synced")] {
         if let Ok(id) = fs::read_to_string(path).await {
             let id = id.trim();
             if is_valid_hash(id) {
@@ -80,14 +77,14 @@ async fn referenced_snapshots(base: &Path) -> Result<HashSet<String>> {
             }
         }
     }
-    let agents = base.join(".feanorfs/agents");
+    let agents = state.join("agents");
     let mut entries = match fs::read_dir(agents).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(refs),
         Err(error) => return Err(error).context("read agent refs"),
     };
     while let Some(entry) = entries.next_entry().await? {
-        let path: PathBuf = entry.path().join(".feanorfs/base-snapshot");
+        let path: PathBuf = entry.path().join("state/base-snapshot");
         if let Ok(id) = fs::read_to_string(path).await {
             let id = id.trim();
             if is_valid_hash(id) {

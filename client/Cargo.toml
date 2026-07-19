@@ -63,6 +63,9 @@ zeroize = { workspace = true }
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true }
+
 [dev-dependencies]
 feanorfs-server = { workspace = true }
 tempfile = { workspace = true }

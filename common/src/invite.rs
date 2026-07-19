@@ -47,7 +47,7 @@ pub struct WorkspaceInvite {
     pub hub_local: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayConfig>,
-    /// Exact `.feanorfsignore` contents selected by the sharing workspace.
+    /// Exact legacy ignore-file contents selected by the sharing workspace.
     ///
     /// Pairing and recovery encrypt this field with the rest of the capability.
     /// `None` identifies an older capability whose policy is unknown; `Some("")`

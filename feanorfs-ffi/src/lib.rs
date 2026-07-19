@@ -37,6 +37,12 @@ fn ok_json<T: serde::Serialize>(value: &T) -> *mut c_char {
     }
 }
 
+fn ok_string(value: impl Into<Vec<u8>>) -> *mut c_char {
+    CString::new(value)
+        .map(CString::into_raw)
+        .unwrap_or(ptr::null_mut())
+}
+
 fn runtime() -> Result<Arc<Runtime>, String> {
     RUNTIME
         .lock()
@@ -164,6 +170,29 @@ pub extern "C" fn ffs_agent_spawn(
             },
             Err(e) => {
                 set_error(e);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Return the absolute worktree path for an existing agent. NULL on error.
+#[no_mangle]
+pub extern "C" fn ffs_agent_path(root: *const c_char, name: *const c_char) -> *mut c_char {
+    catch_ptr(|| {
+        clear_error();
+        let name = match unsafe { CStr::from_ptr(name) }.to_str() {
+            Ok(name) => name,
+            Err(error) => {
+                set_error(error.to_string());
+                return ptr::null_mut();
+            }
+        };
+        match workspace(root).and_then(|ws| ws.agent_path(name).map_err(|error| error.to_string()))
+        {
+            Ok(path) => ok_string(path.to_string_lossy().as_bytes()),
+            Err(error) => {
+                set_error(error);
                 ptr::null_mut()
             }
         }
@@ -404,7 +433,7 @@ mod smoke {
     fn setup_ws() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().join("ws");
-        fs::create_dir_all(ws.join(".feanorfs")).unwrap();
+        fs::create_dir_all(&ws).unwrap();
         let key = feanorfs_common::generate_password().unwrap();
         save_config(
             &ws,
@@ -436,7 +465,12 @@ mod smoke {
         assert!(!spawn_json.is_null(), "spawn failed: {}", last_err());
         assert!(cstr(spawn_json).contains("files_copied"));
 
-        let agent_dir = ws.join(".feanorfs/agents/ffi1");
+        let agent_path = ffs_agent_path(root.as_ptr(), name.as_ptr());
+        assert!(!agent_path.is_null(), "agent path failed: {}", last_err());
+        let agent_dir = PathBuf::from(cstr(agent_path));
+        assert!(agent_dir.is_dir());
+        assert!(!agent_dir.starts_with(&ws));
+        assert!(!ws.join(".feanorfs").exists());
         fs::write(agent_dir.join("note.txt"), b"ffi edit").unwrap();
 
         let land_json = ffs_agent_land(root.as_ptr(), name.as_ptr(), 0, 0);

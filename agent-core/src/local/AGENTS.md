@@ -22,7 +22,7 @@ Own local workspace configuration, JSON-backed `ClientDb` operations, filesystem
 - Keep public names re-exported from `../local.rs`; consumers must not depend on private submodule paths.
 - Preserve scanner race behavior: compare size and mtime before/after reading, and retain metadata observed before the read when stable.
 - Never follow symlinks. Prune nested valid `CACHEDIR.TAG` trees, but not a tagged workspace root.
-- Safe join preview may supply an in-memory `.feanorfsignore` override so the encrypted sender policy can govern the first scan before any destination file is written; ordinary scans continue reading the on-disk file.
+- Safe join preview may supply an in-memory ignore-policy override so the encrypted sender policy can govern the first scan before any destination file is written; ordinary scans read only the private global workspace policy.
 - Batch scanner cache changes through `bulk_upsert_cache_entries`.
 - Keep access-log bounds and durable-state locking rules documented in the parent `agent-core/AGENTS.md`.
 - Preserve unattended-sync credential boundaries: signed macOS releases and supported Windows/Linux sessions use the native OS store in-process; configs contain only random references. Unsigned macOS/source builds and unavailable stores fall back to atomic Unix `0700`/`0600` files, but migrated configs fail closed instead of returning secrets to JSON.

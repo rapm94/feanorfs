@@ -2,14 +2,14 @@ use anyhow::Context as _;
 use feanorfs_agent_core::ApiClient;
 use feanorfs_common::{hub_ca_fingerprint, hub_mdns_hostname, HUB_MDNS_SERVICE};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::local::{load_global_config, save_config, save_global_config, Config};
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(900);
-const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(1200);
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct StableEndpoint {
     url: String,
@@ -88,11 +88,12 @@ pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<Ap
 }
 
 fn same_machine_address(stable: &StableEndpoint, pinned_ca: &str) -> Option<SocketAddr> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     same_machine_address_in(
         stable,
         pinned_ca,
-        &PathBuf::from(home).join(".feanorfs").join("hub-data"),
+        &feanorfs_agent_core::global_state_root()
+            .ok()?
+            .join("hub-data"),
     )
 }
 
@@ -149,6 +150,14 @@ fn discover_addresses(
     port: u16,
     timeout: Duration,
 ) -> Vec<SocketAddr> {
+    #[cfg(target_os = "linux")]
+    {
+        let native = discover_addresses_avahi(fingerprint, hostname, port);
+        if !native.is_empty() {
+            return native;
+        }
+    }
+
     let Ok(daemon) = ServiceDaemon::new() else {
         return Vec::new();
     };
@@ -164,18 +173,24 @@ fn discover_addresses(
                 if info.get_property_val_str("v") == Some("1")
                     && info.get_property_val_str("scheme") == Some("https")
                     && info.get_property_val_str("ca") == Some(fingerprint)
-                    && info
-                        .get_hostname()
-                        .trim_end_matches('.')
-                        .eq_ignore_ascii_case(hostname)
+                    && service_identity_matches(&info, hostname)
                     && info.get_port() == port =>
             {
+                let resolved = info.get_addresses_v4();
                 addresses.extend(
-                    info.get_addresses_v4()
+                    resolved
                         .into_iter()
                         .map(|address| SocketAddr::new(IpAddr::V4(address), port)),
                 );
-                break;
+                if addresses.is_empty() {
+                    let service_host = info.get_hostname().trim_end_matches('.');
+                    if let Ok(system_addresses) = (service_host, port).to_socket_addrs() {
+                        addresses.extend(system_addresses.filter(SocketAddr::is_ipv4));
+                    }
+                }
+                if !addresses.is_empty() {
+                    break;
+                }
             }
             Ok(_) => {}
             Err(_) => break,
@@ -186,6 +201,108 @@ fn discover_addresses(
     addresses.sort_unstable();
     addresses.dedup();
     addresses
+}
+
+#[cfg(target_os = "linux")]
+fn discover_addresses_avahi(fingerprint: &str, hostname: &str, port: u16) -> Vec<SocketAddr> {
+    type ResolvedService = (
+        i32,
+        i32,
+        String,
+        String,
+        String,
+        String,
+        i32,
+        String,
+        u16,
+        Vec<Vec<u8>>,
+        u32,
+    );
+
+    let Ok(connection) = zbus::blocking::Connection::system() else {
+        return Vec::new();
+    };
+    let Ok(proxy) = zbus::blocking::Proxy::new(
+        &connection,
+        "org.freedesktop.Avahi",
+        "/",
+        "org.freedesktop.Avahi.Server",
+    ) else {
+        return Vec::new();
+    };
+    let instance = hostname.strip_suffix(".local").unwrap_or(hostname);
+    let service_type = HUB_MDNS_SERVICE
+        .strip_suffix(".local.")
+        .unwrap_or(HUB_MDNS_SERVICE);
+    let request = (
+        -1_i32,
+        -1_i32,
+        instance,
+        service_type,
+        "local",
+        0_i32,
+        0_u32,
+    );
+    let Ok((
+        _,
+        _,
+        resolved_instance,
+        resolved_type,
+        resolved_domain,
+        _,
+        _,
+        address,
+        resolved_port,
+        txt,
+        _,
+    )) = proxy.call::<_, _, ResolvedService>("ResolveService", &request)
+    else {
+        return Vec::new();
+    };
+    let identity_matches = resolved_instance.eq_ignore_ascii_case(instance)
+        && resolved_type.eq_ignore_ascii_case(service_type)
+        && resolved_domain
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case("local")
+        && resolved_port == port
+        && avahi_txt_value(&txt, "v") == Some("1")
+        && avahi_txt_value(&txt, "scheme") == Some("https")
+        && avahi_txt_value(&txt, "ca") == Some(fingerprint);
+    if !identity_matches {
+        return Vec::new();
+    }
+    address
+        .parse::<Ipv4Addr>()
+        .ok()
+        .map(|address| vec![SocketAddr::new(IpAddr::V4(address), port)])
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn avahi_txt_value<'a>(records: &'a [Vec<u8>], key: &str) -> Option<&'a str> {
+    records.iter().find_map(|record| {
+        let separator = record.iter().position(|byte| *byte == b'=')?;
+        let (record_key, value) = record.split_at(separator);
+        let value = value.get(1..)?;
+        (record_key == key.as_bytes())
+            .then(|| std::str::from_utf8(value).ok())
+            .flatten()
+    })
+}
+
+fn service_identity_matches(info: &mdns_sd::ResolvedService, hostname: &str) -> bool {
+    if info
+        .get_hostname()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(hostname)
+    {
+        return true;
+    }
+    let expected_instance = hostname.strip_suffix(".local").unwrap_or(hostname);
+    info.get_fullname()
+        .split('.')
+        .next()
+        .is_some_and(|instance| instance.eq_ignore_ascii_case(expected_instance))
 }
 
 fn persist_stable_url(workspace: &Path, config: &Config, url: &str) {
@@ -266,5 +383,27 @@ mod tests {
             same_machine_address_in(&stable, "managed-ca", data.path()),
             None
         );
+    }
+
+    #[test]
+    fn native_service_hostname_is_accepted_by_ca_bound_instance() {
+        let expected = hub_mdns_hostname("managed-ca");
+        let instance = expected.strip_suffix(".local").unwrap();
+        let info = mdns_sd::ServiceInfo::new(
+            HUB_MDNS_SERVICE,
+            instance,
+            "ordinary-mac-host.local.",
+            "192.0.2.10",
+            3030,
+            &[("v", "1")][..],
+        )
+        .unwrap()
+        .as_resolved_service();
+
+        assert!(service_identity_matches(&info, &expected));
+        assert!(!service_identity_matches(
+            &info,
+            "feanorfs-ffffffffffffffff.local"
+        ));
     }
 }

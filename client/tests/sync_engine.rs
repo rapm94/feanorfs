@@ -4,8 +4,8 @@ use feanorfs_client::{
     commit_agent, do_pull_only, do_push_only, do_status, do_sync, land_agent, spawn_agent,
 };
 use support::{
-    read_workspace_file, spawn_test_client, spawn_test_client_with_server, spawn_test_server,
-    write_workspace_file, TEST_PASSWORD, WORKSPACE_ID,
+    agent_path, read_workspace_file, spawn_test_client, spawn_test_client_with_server,
+    spawn_test_server, state_path, write_workspace_file, TEST_PASSWORD, WORKSPACE_ID,
 };
 
 #[tokio::test]
@@ -64,6 +64,148 @@ async fn pull_downloads_file_pushed_by_another_client() {
         read_workspace_file(downloader.workspace.path(), "shared.txt").await,
         b"shared payload"
     );
+}
+
+#[tokio::test]
+async fn format_v3_pull_with_local_only_file_does_not_publish_it() {
+    let server = spawn_test_server().await;
+
+    let uploader = spawn_test_client_with_server(&server).await;
+    let mut uploader_config = feanorfs_client::load_config(uploader.workspace.path()).unwrap();
+    uploader_config.format_version = 3;
+    feanorfs_client::save_config(uploader.workspace.path(), &uploader_config).unwrap();
+    write_workspace_file(uploader.workspace.path(), "remote-only.txt", b"remote").await;
+    do_push_only(
+        &server.api,
+        &uploader.db,
+        uploader.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    let head_before = server.api.get_head(WORKSPACE_ID).await.unwrap();
+
+    let downloader = spawn_test_client_with_server(&server).await;
+    let mut downloader_config = feanorfs_client::load_config(downloader.workspace.path()).unwrap();
+    downloader_config.format_version = 3;
+    feanorfs_client::save_config(downloader.workspace.path(), &downloader_config).unwrap();
+    write_workspace_file(downloader.workspace.path(), "local-only.txt", b"local").await;
+
+    let pulled = do_pull_only(
+        &server.api,
+        &downloader.db,
+        downloader.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(pulled.downloads, 1);
+    assert_eq!(
+        read_workspace_file(downloader.workspace.path(), "remote-only.txt").await,
+        b"remote"
+    );
+    assert_eq!(
+        read_workspace_file(downloader.workspace.path(), "local-only.txt").await,
+        b"local"
+    );
+    assert_eq!(
+        server.api.get_head(WORKSPACE_ID).await.unwrap(),
+        head_before
+    );
+}
+
+#[tokio::test]
+async fn format_v3_cloud_resolution_does_not_publish_unrelated_local_file() {
+    use feanorfs_client::{resolve_conflict, ResolveKeep, SyncCtx};
+
+    let server = spawn_test_server().await;
+    let first = spawn_test_client_with_server(&server).await;
+    let second = spawn_test_client_with_server(&server).await;
+    for client in [&first, &second] {
+        let mut config = feanorfs_client::load_config(client.workspace.path()).unwrap();
+        config.format_version = 3;
+        feanorfs_client::save_config(client.workspace.path(), &config).unwrap();
+    }
+
+    write_workspace_file(first.workspace.path(), "shared.txt", b"base").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_pull_only(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    write_workspace_file(first.workspace.path(), "shared.txt", b"cloud").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    write_workspace_file(second.workspace.path(), "shared.txt", b"local").await;
+    do_sync(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        second.db.list_pending_conflict_paths().await.unwrap(),
+        vec!["shared.txt"]
+    );
+
+    write_workspace_file(second.workspace.path(), "local-only.txt", b"local-only").await;
+    let config = feanorfs_client::load_config(second.workspace.path()).unwrap();
+    let ctx =
+        SyncCtx::from_config(&server.api, &second.db, second.workspace.path(), &config).unwrap();
+    resolve_conflict(&ctx, "shared.txt", ResolveKeep::Cloud, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_workspace_file(second.workspace.path(), "shared.txt").await,
+        b"cloud"
+    );
+    assert_eq!(
+        read_workspace_file(second.workspace.path(), "local-only.txt").await,
+        b"local-only"
+    );
+    let status = do_status(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status.upload_required, vec!["local-only.txt"]);
 }
 
 #[tokio::test]
@@ -326,7 +468,7 @@ async fn bulk_touch_sync_advances_local_ref_once_and_idle_writes_zero_objects() 
     )
     .await
     .unwrap();
-    let first_ref = std::fs::read_to_string(base.join(".feanorfs/refs/workspace")).unwrap();
+    let first_ref = std::fs::read_to_string(state_path(base).join("refs/workspace")).unwrap();
     for index in 0..20 {
         write_workspace_file(base, &format!("bulk/{index}.txt"), b"after").await;
     }
@@ -341,7 +483,7 @@ async fn bulk_touch_sync_advances_local_ref_once_and_idle_writes_zero_objects() 
     )
     .await
     .unwrap();
-    let second_ref = std::fs::read_to_string(base.join(".feanorfs/refs/workspace")).unwrap();
+    let second_ref = std::fs::read_to_string(state_path(base).join("refs/workspace")).unwrap();
     assert_ne!(second_ref, first_ref);
     let ctx = SyncCtx::new(
         &server.api,
@@ -356,7 +498,7 @@ async fn bulk_touch_sync_advances_local_ref_once_and_idle_writes_zero_objects() 
         .await
         .unwrap();
     assert_eq!(snapshot.parents, vec![first_ref.trim().to_string()]);
-    let object_count = std::fs::read_dir(base.join(".feanorfs/objects"))
+    let object_count = std::fs::read_dir(state_path(base).join("objects"))
         .unwrap()
         .count();
 
@@ -371,11 +513,11 @@ async fn bulk_touch_sync_advances_local_ref_once_and_idle_writes_zero_objects() 
     .await
     .unwrap();
     assert_eq!(
-        std::fs::read_to_string(base.join(".feanorfs/refs/workspace")).unwrap(),
+        std::fs::read_to_string(state_path(base).join("refs/workspace")).unwrap(),
         second_ref
     );
     assert_eq!(
-        std::fs::read_dir(base.join(".feanorfs/objects"))
+        std::fs::read_dir(state_path(base).join("objects"))
             .unwrap()
             .count(),
         object_count
@@ -446,12 +588,7 @@ async fn agent_commit_detects_concurrent_edit() {
     .await
     .unwrap();
 
-    write_workspace_file(
-        &base.join(".feanorfs/agents/ci1"),
-        "doc.txt",
-        b"agent version",
-    )
-    .await;
+    write_workspace_file(&agent_path(base, "ci1"), "doc.txt", b"agent version").await;
 
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     write_workspace_file(base, "doc.txt", b"server version").await;
@@ -528,7 +665,7 @@ async fn agent_conflict_snapshot_roundtrips_through_second_client() {
     .await
     .unwrap();
     write_workspace_file(
-        &base.join(".feanorfs/agents/portable-conflict"),
+        &agent_path(base, "portable-conflict"),
         "conflict.txt",
         b"agent edit",
     )
@@ -628,12 +765,7 @@ async fn agent_greenfield_spawn_land_new_file() {
     .unwrap();
     assert_eq!(copied, 0);
 
-    write_workspace_file(
-        &base.join(".feanorfs/agents/green"),
-        "task.txt",
-        b"new work",
-    )
-    .await;
+    write_workspace_file(&agent_path(base, "green"), "task.txt", b"new work").await;
 
     let land = land_agent(
         base,
@@ -675,9 +807,9 @@ async fn agent_spawn_replace_restores_original_workspace_on_failure() {
     .await
     .unwrap();
 
-    write_workspace_file(&base.join(".feanorfs/agents/replace"), "task.txt", b"old").await;
+    write_workspace_file(&agent_path(base, "replace"), "task.txt", b"old").await;
     tokio::fs::write(
-        base.join(".feanorfs/test-spawn-failpoint-replace"),
+        state_path(base).join("test-spawn-failpoint-replace"),
         b"after-stage",
     )
     .await
@@ -697,7 +829,7 @@ async fn agent_spawn_replace_restores_original_workspace_on_failure() {
     .expect_err("replace spawn should fail at the injected failpoint");
 
     assert!(error.to_string().contains("injected agent spawn failure"));
-    let agent_dir = base.join(".feanorfs/agents/replace");
+    let agent_dir = agent_path(base, "replace");
     assert!(
         tokio::fs::try_exists(&agent_dir).await.unwrap(),
         "restored agent directory missing"
@@ -725,12 +857,7 @@ async fn agent_land_pre_sync_detects_no_base_add_add() {
     .unwrap();
 
     write_workspace_file(base, "shared.txt", b"folder version").await;
-    write_workspace_file(
-        &base.join(".feanorfs/agents/add-add"),
-        "shared.txt",
-        b"agent version",
-    )
-    .await;
+    write_workspace_file(&agent_path(base, "add-add"), "shared.txt", b"agent version").await;
 
     let result = land_agent(
         base,
@@ -784,7 +911,7 @@ async fn agent_land_surfaces_rename_vs_unsynced_folder_edit() {
     .await
     .unwrap();
 
-    let agent_base = base.join(".feanorfs/agents/rename");
+    let agent_base = agent_path(base, "rename");
     tokio::fs::remove_file(agent_base.join("old.txt"))
         .await
         .unwrap();
@@ -847,7 +974,7 @@ async fn agent_land_retry_converges_after_content_reached_server() {
     .await
     .unwrap();
 
-    let agent_base = base.join(".feanorfs/agents/retry");
+    let agent_base = agent_path(base, "retry");
     let content = b"agent result";
     write_workspace_file(&agent_base, "retry.txt", content).await;
     let packed = feanorfs_common::pack_bytes(content, TEST_PASSWORD, "retry.txt").unwrap();
@@ -950,15 +1077,9 @@ async fn agent_land_converges_after_each_commit_boundary_failure() {
         )
         .await
         .unwrap();
-        write_workspace_file(
-            &base.join(".feanorfs/agents").join(&name),
-            "recover.txt",
-            b"agent result",
-        )
-        .await;
+        write_workspace_file(&agent_path(base, &name), "recover.txt", b"agent result").await;
         tokio::fs::write(
-            base.join(".feanorfs")
-                .join(format!("test-land-failpoint-{name}")),
+            state_path(base).join(format!("test-land-failpoint-{name}")),
             point,
         )
         .await
@@ -998,9 +1119,10 @@ async fn agent_land_converges_after_each_commit_boundary_failure() {
         let head = server.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
         assert_eq!(
             tokio::fs::read_to_string(
-                base.join(".feanorfs/agents")
+                state_path(base)
+                    .join("agents")
                     .join(&name)
-                    .join(".feanorfs/base-snapshot")
+                    .join("state/base-snapshot")
             )
             .await
             .unwrap(),
@@ -1076,13 +1198,13 @@ async fn concurrent_disjoint_agent_lands_recompute_after_head_race() {
     .await
     .unwrap();
     write_workspace_file(
-        &first.workspace.path().join(".feanorfs/agents/first"),
+        &agent_path(first.workspace.path(), "first"),
         "first.txt",
         b"one",
     )
     .await;
     write_workspace_file(
-        &second.workspace.path().join(".feanorfs/agents/second"),
+        &agent_path(second.workspace.path(), "second"),
         "second.txt",
         b"two",
     )
@@ -1158,7 +1280,7 @@ async fn agent_refresh_pulls_remote_additions_without_touching_agent_edits() {
     )
     .await
     .unwrap();
-    let agent = base.join(".feanorfs/agents/refresh-add");
+    let agent = agent_path(base, "refresh-add");
     write_workspace_file(&agent, "kept.txt", b"agent edit").await;
     write_workspace_file(base, "added.txt", b"remote addition").await;
     do_sync(
@@ -1219,7 +1341,7 @@ async fn agent_refresh_replace_retains_pre_operation_snapshot_parent() {
     )
     .await
     .unwrap();
-    let agent = base.join(".feanorfs/agents/replace");
+    let agent = agent_path(base, "replace");
     write_workspace_file(&agent, "replace.txt", b"agent draft").await;
     write_workspace_file(base, "replace.txt", b"current head").await;
     do_sync(
@@ -1249,9 +1371,10 @@ async fn agent_refresh_replace_retains_pre_operation_snapshot_parent() {
         read_workspace_file(&agent, "replace.txt").await,
         b"current head"
     );
-    let refreshed_id = tokio::fs::read_to_string(agent.join(".feanorfs/base-snapshot"))
-        .await
-        .unwrap();
+    let refreshed_id =
+        tokio::fs::read_to_string(state_path(base).join("agents/replace/state/base-snapshot"))
+            .await
+            .unwrap();
     let ctx = feanorfs_client::SyncCtx::new(
         &server.api,
         &main.db,
@@ -1298,12 +1421,7 @@ async fn history_log_and_undo_restore_pre_land_state_without_rewriting_history()
     )
     .await
     .unwrap();
-    write_workspace_file(
-        &base.join(".feanorfs/agents/history"),
-        "history.txt",
-        b"after",
-    )
-    .await;
+    write_workspace_file(&agent_path(base, "history"), "history.txt", b"after").await;
     let landed = land_agent(
         base,
         &main.db,
@@ -1988,6 +2106,88 @@ async fn gitignored_file_is_synced() {
 }
 
 #[tokio::test]
+async fn pruning_hard_excluded_metadata_preserves_local_bytes_and_clears_conflicts() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let base = client.workspace.path();
+    let path = ".jj/repo/store";
+    let content = b"local jujutsu metadata must survive";
+    write_workspace_file(base, path, content).await;
+    let encrypted = feanorfs_common::pack_bytes(content, TEST_PASSWORD, path).unwrap();
+    let encrypted_hash = feanorfs_common::hash_bytes(&encrypted);
+    let state = feanorfs_common::FileState {
+        path: path.into(),
+        hash: encrypted_hash.clone(),
+        size: content.len() as u64,
+        mtime: 1,
+        deleted: false,
+        mode: 0,
+    };
+    server
+        .api
+        .upload_file(WORKSPACE_ID, &state, encrypted)
+        .await
+        .unwrap();
+    client
+        .db
+        .upsert_cache_entry(&feanorfs_client::local::CacheEntry {
+            path: path.into(),
+            plaintext_hash: feanorfs_common::hash_bytes(content),
+            encrypted_hash,
+            size: content.len() as u64,
+            mtime: 1,
+            server_mtime: 1,
+            mode: 0,
+            hydrated: true,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    let conflict_dir = state_path(base).join("conflicts/1");
+    std::fs::create_dir_all(&conflict_dir).unwrap();
+    client
+        .db
+        .upsert_conflict(
+            path,
+            &feanorfs_common::ConflictKind::EditEdit,
+            &conflict_dir.to_string_lossy(),
+            1,
+            "pending",
+        )
+        .await
+        .unwrap();
+
+    let result = feanorfs_client::prune_ignored(&server.api, &client.db, base, WORKSPACE_ID, false)
+        .await
+        .unwrap();
+
+    assert_eq!(result.pruned, vec![path.to_string()]);
+    assert_eq!(read_workspace_file(base, path).await, content);
+    assert!(!client
+        .db
+        .get_cache_entries()
+        .await
+        .unwrap()
+        .contains_key(path));
+    assert!(client
+        .db
+        .list_pending_conflict_paths()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(server
+        .api
+        .peek_sync(&feanorfs_common::SyncRequest {
+            workspace_id: WORKSPACE_ID.into(),
+            files: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .download_required
+        .is_empty());
+}
+
+#[tokio::test]
 async fn agent_land_applies_clean_changes() {
     use feanorfs_client::land_agent;
 
@@ -2028,7 +2228,7 @@ async fn agent_land_applies_clean_changes() {
     )
     .await
     .unwrap();
-    write_workspace_file(&base.join(".feanorfs/agents/land1"), "land.txt", b"landed").await;
+    write_workspace_file(&agent_path(base, "land1"), "land.txt", b"landed").await;
 
     let result = land_agent(
         base,
@@ -2295,6 +2495,66 @@ async fn migrate_rekeys_before_committing_format_v3() {
 }
 
 #[tokio::test]
+async fn migrate_rekeys_an_existing_format_v3_workspace() {
+    use feanorfs_client::{load_config, migrate_workspace, save_config};
+
+    let server = spawn_test_server().await;
+    let source = spawn_test_client_with_server(&server).await;
+    write_workspace_file(source.workspace.path(), "v3-secret.txt", b"stronger key").await;
+    do_push_only(
+        &server.api,
+        &source.db,
+        source.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+
+    migrate_workspace(source.workspace.path(), false)
+        .await
+        .unwrap();
+    let migrated = load_config(source.workspace.path()).unwrap();
+    assert_eq!(migrated.format_version, 3);
+    assert_eq!(migrated.encryption_password.as_deref(), Some(TEST_PASSWORD));
+    write_workspace_file(
+        source.workspace.path(),
+        "v3-secret.txt",
+        b"stronger key after v3",
+    )
+    .await;
+
+    migrate_workspace(source.workspace.path(), true)
+        .await
+        .unwrap();
+    let rekeyed = load_config(source.workspace.path()).unwrap();
+    let new_key = rekeyed.encryption_password.clone().unwrap();
+    assert_eq!(new_key.len(), 64);
+    assert_ne!(new_key, TEST_PASSWORD);
+
+    let verifier = spawn_test_client_with_server(&server).await;
+    let mut verifier_config = load_config(verifier.workspace.path()).unwrap();
+    verifier_config.format_version = 3;
+    verifier_config.encryption_password = Some(new_key);
+    save_config(verifier.workspace.path(), &verifier_config).unwrap();
+    let pulled = do_pull_only(
+        &server.api,
+        &verifier.db,
+        verifier.workspace.path(),
+        WORKSPACE_ID,
+        verifier_config.encryption_password.as_deref(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pulled.downloads, 1);
+    assert_eq!(
+        read_workspace_file(verifier.workspace.path(), "v3-secret.txt").await,
+        b"stronger key after v3"
+    );
+}
+
+#[tokio::test]
 async fn migrate_rekey_resumes_from_durable_journal() {
     use feanorfs_client::{load_config, migrate_workspace};
 
@@ -2311,10 +2571,7 @@ async fn migrate_rekey_resumes_from_durable_journal() {
     .await
     .unwrap();
     tokio::fs::write(
-        source
-            .workspace
-            .path()
-            .join(".feanorfs/migration-failpoint"),
+        state_path(source.workspace.path()).join("migration-failpoint"),
         b"after_reseal_upload",
     )
     .await
@@ -2328,14 +2585,9 @@ async fn migrate_rekey_resumes_from_durable_journal() {
         interrupted.encryption_password.as_deref(),
         Some(TEST_PASSWORD)
     );
-    tokio::fs::remove_file(
-        source
-            .workspace
-            .path()
-            .join(".feanorfs/migration-failpoint"),
-    )
-    .await
-    .unwrap();
+    tokio::fs::remove_file(state_path(source.workspace.path()).join("migration-failpoint"))
+        .await
+        .unwrap();
 
     migrate_workspace(source.workspace.path(), false)
         .await
@@ -2343,10 +2595,8 @@ async fn migrate_rekey_resumes_from_durable_journal() {
     let resumed = load_config(source.workspace.path()).unwrap();
     assert_eq!(resumed.format_version, 3);
     assert_ne!(resumed.encryption_password.as_deref(), Some(TEST_PASSWORD));
-    assert!(!source
-        .workspace
-        .path()
-        .join(".feanorfs/migration-v3.json")
+    assert!(!state_path(source.workspace.path())
+        .join("migration-v3.json")
         .exists());
 }
 
@@ -2392,7 +2642,7 @@ async fn agent_revert_to_original_does_not_land() {
     )
     .await
     .unwrap();
-    write_workspace_file(&base.join(".feanorfs/agents/rv"), "revert.txt", content).await;
+    write_workspace_file(&agent_path(base, "rv"), "revert.txt", content).await;
 
     let result = land_agent(
         base,
@@ -2452,12 +2702,7 @@ async fn agent_land_conflict_artifact_uses_agent_copy() {
     .await
     .unwrap();
 
-    write_workspace_file(
-        &base.join(".feanorfs/agents/ci1"),
-        "doc.txt",
-        b"agent version",
-    )
-    .await;
+    write_workspace_file(&agent_path(base, "ci1"), "doc.txt", b"agent version").await;
 
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     write_workspace_file(base, "doc.txt", b"server version").await;
@@ -2532,7 +2777,7 @@ async fn agent_land_advances_snapshot_base() {
     .await
     .unwrap();
 
-    write_workspace_file(&base.join(".feanorfs/agents/snap"), "doc.txt", b"agent-v1").await;
+    write_workspace_file(&agent_path(base, "snap"), "doc.txt", b"agent-v1").await;
     land_agent(
         base,
         &main.db,
@@ -2561,7 +2806,7 @@ async fn agent_land_advances_snapshot_base() {
         "snapshot base must advance to agent-v1 after land"
     );
 
-    write_workspace_file(&base.join(".feanorfs/agents/snap"), "doc.txt", b"agent-v2").await;
+    write_workspace_file(&agent_path(base, "snap"), "doc.txt", b"agent-v2").await;
     let land2 = land_agent(
         base,
         &main.db,
@@ -2626,7 +2871,7 @@ async fn join_nonempty_folder_unions_without_silent_overwrite() {
         relay: None,
     };
     save_config(join_base, &config).unwrap();
-    let db = feanorfs_client::ClientDb::new(join_base.join(".feanorfs"))
+    let db = feanorfs_client::ClientDb::new(state_path(join_base))
         .await
         .unwrap();
     let api = feanorfs_client::ApiClient::new(&server.url, None);
@@ -2697,8 +2942,9 @@ async fn join_preflight_classifies_nonempty_folder_without_mutating_it() {
     write_workspace_file(destination.path(), "local-only.txt", b"local").await;
     write_workspace_file(destination.path(), "same.txt", b"same").await;
     write_workspace_file(destination.path(), "conflict.txt", b"local").await;
-    write_workspace_file(destination.path(), ".feanorfsignore", b"local-cache/\n").await;
-    let before = std::fs::read(destination.path().join(".feanorfsignore")).unwrap();
+    let destination_state = state_path(destination.path());
+    std::fs::write(destination_state.join("ignore"), b"local-cache/\n").unwrap();
+    let before = std::fs::read(destination_state.join("ignore")).unwrap();
 
     let preview = feanorfs_client::preview_join(
         destination.path(),
@@ -2722,9 +2968,10 @@ async fn join_preflight_classifies_nonempty_folder_without_mutating_it() {
     assert_eq!(preview.conflicts.count, 1);
     assert!(preview.ignore_policy_differs);
     assert!(preview.needs_confirmation());
-    assert!(!destination.path().join(".feanorfs/config.json").exists());
+    assert!(!destination.path().join(".feanorfs").exists());
+    assert!(!destination.path().join(".feanorfsignore").exists());
     assert_eq!(
-        std::fs::read(destination.path().join(".feanorfsignore")).unwrap(),
+        std::fs::read(destination_state.join("ignore")).unwrap(),
         before
     );
 }
@@ -2750,14 +2997,13 @@ async fn local_hub_in_process_sync() {
         relay: None,
     };
     save_config(base, &config).unwrap();
-    std::fs::create_dir_all(base.join(".feanorfs")).unwrap();
-    LocalHub::open(config.hub_data_dir(base), None)
+    LocalHub::open(config.hub_data_dir(base).unwrap(), None)
         .await
         .unwrap();
     assert!(config.is_local_hub());
     assert_eq!(config.server_url, LOCAL_HUB_URL);
 
-    let db = feanorfs_client::ClientDb::new(base.join(".feanorfs"))
+    let db = feanorfs_client::ClientDb::new(state_path(base))
         .await
         .unwrap();
     let api = ApiClient::from_config(base, &config).await.unwrap();
@@ -2938,12 +3184,7 @@ async fn tray_status_lists_working_agent() {
     .await
     .unwrap();
 
-    write_workspace_file(
-        &base.join(".feanorfs/agents/ci1"),
-        "task.txt",
-        b"agent edit",
-    )
-    .await;
+    write_workspace_file(&agent_path(base, "ci1"), "task.txt", b"agent edit").await;
 
     let status = do_tray_status(base).await.unwrap();
     assert!(

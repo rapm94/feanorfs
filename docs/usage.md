@@ -418,7 +418,7 @@ feanorfs start fnr1-...
 Interactive setup prints a `fnr1-…` workspace invite. Redirected output hides
 recovery keys and capability invites; use explicit `config --key` to export
 them. Local-hub workspaces (`--local`) are not portable via invite—share the
-embedded data through `feanorfs serve --data-dir .feanorfs/hub-data` first.
+embedded data through the workspace hub directory shown by `feanorfs config` first.
 
 ### `pair` — add another computer on this LAN
 
@@ -516,7 +516,7 @@ feanorfs config
 feanorfs config --key    # full E2EE key + invite, copied to clipboard
 ```
 
-Prints global connection (`~/.feanorfs/global.json`) and workspace config (`.feanorfs/config.json`). Default output truncates the key; `--key` shows the full value.
+Prints global connection (`~/.feanorfs/global.json`) and the private workspace config under `~/.feanorfs/workspaces/<opaque-id>/`. Default output truncates the key; `--key` shows the full value.
 
 ### `doctor` — diagnose connection issues
 
@@ -733,19 +733,19 @@ feanorfs status
 
 FeanorFS syncs the **current contents** of the workspace folder — including hidden files and paths that git would ignore (`.env`, local config, scratch WIP). That is intentional: those files are often exactly what you want on another machine.
 
-**Always skipped:** `.feanorfs/` (client state), `.git/` (VCS metadata).
+**Always skipped:** `.git/`, `.jj/`, and legacy FeanorFS metadata. FeanorFS creates no metadata or ignore file in the workspace.
 
 **Default artifact ignores:** `target/`, `node_modules/`, `.venv/`, `__pycache__/`, `dist/`, `build/`, `.next/`, `.cache/`, plus editor swap files and `.DS_Store`. These are high-churn build/install trees — syncing them would hammer the watcher on every compile, not just slow the first sync.
 
 **`.gitignore` is not read.** FeanorFS is not a git companion; workspaces need not be repos.
 
-**`.feanorfsignore` is optional** — gitignore syntax for project-specific exclusions (custom `out/`, `vendor/`, etc.). Most projects never need it; do not copy your entire `.gitignore` (that would exclude the files FeanorFS is for).
+**Custom rules are optional** — run `feanorfs ignore <pattern>` for a project-specific exclusion. Rules are stored in private global state, not the project. Do not copy your entire `.gitignore` (that would exclude the files FeanorFS is for).
 
 Full rationale: [sync-scope.md](sync-scope.md).
 
 ## Agent loop and reconciliation (orchestrators)
 
-FeanorFS isolates **files**, not processes. An agent workspace is a normal folder under `.feanorfs/agents/<name>/` — point any coding agent's cwd at it. `agent run` sets `FEANORFS_AGENT` and `FEANORFS_AGENT_DIR` on the child; it does **not** sandbox the process — absolute-path writes can escape the agent dir (see [threat-model.md](threat-model.md)).
+FeanorFS isolates **files**, not processes. An agent workspace is a normal worktree under the workspace's private global state — `feanorfs agent run` selects it without adding files to the project. It sets `FEANORFS_AGENT` and `FEANORFS_AGENT_DIR` on the child; it does **not** sandbox the process — absolute-path writes can escape the agent dir (see [threat-model.md](threat-model.md)).
 
 ### Loop
 
@@ -787,7 +787,7 @@ Resolution history: `feanorfs conflicts history --json` (records method, resolve
 
 ## Environment
 
-The server respects `RUST_LOG` for controlling log verbosity. The client writes trace-level logs to `.feanorfs/feanorfs.log` regardless of `RUST_LOG`.
+The server respects `RUST_LOG` for controlling log verbosity. The client writes bounded logs under `~/.feanorfs`, outside projects, regardless of `RUST_LOG`.
 
 ```bash
 # Server: enable debug logging for the server crate and tower-http
@@ -799,4 +799,4 @@ RUST_LOG=warn feanorfs serve
 
 If `RUST_LOG` is unset, the server defaults to `feanorfs_server=info,tower_http=info`.
 
-All other client configuration is stored in `.feanorfs/config.json`.
+All other client configuration is stored under `~/.feanorfs`; `FEANORFS_HOME` can override that root for isolated automation and tests.

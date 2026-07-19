@@ -1,4 +1,6 @@
-use feanorfs_agent_core::{ApiClient, ClientDb, LocalHub, SnapshotEngine, SyncCtx};
+use feanorfs_agent_core::{
+    ensure_workspace_state, ApiClient, ClientDb, LocalHub, SnapshotEngine, SyncCtx,
+};
 use feanorfs_common::{hash_bytes, FileState, LegacyPolicy};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,9 +13,8 @@ async fn publish_server_view_is_idempotent_and_parented() {
         .await
         .expect("open hub");
     let api = ApiClient::local(Arc::clone(&hub), None);
-    let db = ClientDb::new(client.path().join(".feanorfs"))
-        .await
-        .expect("open cache");
+    let state = ensure_workspace_state(client.path()).expect("resolve client state");
+    let db = ClientDb::new(&state).await.expect("open cache");
     let ctx = SyncCtx::new(
         &api,
         &db,
@@ -41,7 +42,7 @@ async fn publish_server_view_is_idempotent_and_parented() {
         .publish_server_view(&first_files, "folder")
         .await
         .expect("publish initial head");
-    let object_count = tokio::fs::read_dir(client.path().join(".feanorfs/objects"))
+    let object_count = tokio::fs::read_dir(state.join("objects"))
         .await
         .expect("read object cache");
     let object_count = collect_count(object_count).await;
@@ -50,7 +51,7 @@ async fn publish_server_view_is_idempotent_and_parented() {
         .await
         .expect("publish unchanged head");
     assert_eq!(unchanged, first);
-    let after_noop = tokio::fs::read_dir(client.path().join(".feanorfs/objects"))
+    let after_noop = tokio::fs::read_dir(state.join("objects"))
         .await
         .expect("read object cache");
     assert_eq!(collect_count(after_noop).await, object_count);
@@ -81,9 +82,8 @@ async fn local_and_last_synced_refs_skip_unchanged_views() {
         .await
         .expect("open hub");
     let api = ApiClient::local(hub, None);
-    let db = ClientDb::new(client.path().join(".feanorfs"))
-        .await
-        .expect("open cache");
+    let state = ensure_workspace_state(client.path()).expect("resolve client state");
+    let db = ClientDb::new(&state).await.expect("open cache");
     let ctx = SyncCtx::new(
         &api,
         &db,
@@ -114,8 +114,8 @@ async fn local_and_last_synced_refs_skip_unchanged_views() {
         engine.load_last_synced().await.unwrap()[path].hash,
         files[path].hash
     );
-    assert!(client.path().join(".feanorfs/refs/workspace").is_file());
-    assert!(client.path().join(".feanorfs/refs/last-synced").is_file());
+    assert!(state.join("refs/workspace").is_file());
+    assert!(state.join("refs/last-synced").is_file());
     assert_ne!(agreed, "");
 }
 
@@ -127,9 +127,8 @@ async fn one_change_in_10k_files_reads_only_changed_tree_depth() {
         .await
         .expect("open hub");
     let api = ApiClient::local(hub, None);
-    let db = ClientDb::new(client.path().join(".feanorfs"))
-        .await
-        .expect("open cache");
+    let state = ensure_workspace_state(client.path()).expect("resolve client state");
+    let db = ClientDb::new(&state).await.expect("open cache");
     let ctx = SyncCtx::new(
         &api,
         &db,
@@ -181,9 +180,8 @@ async fn directory_to_file_replacement_reports_leaf_deletes_and_file_add() {
         .await
         .expect("open hub");
     let api = ApiClient::local(hub, None);
-    let db = ClientDb::new(client.path().join(".feanorfs"))
-        .await
-        .expect("open cache");
+    let state = ensure_workspace_state(client.path()).expect("resolve client state");
+    let db = ClientDb::new(&state).await.expect("open cache");
     let ctx = SyncCtx::new(
         &api,
         &db,

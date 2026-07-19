@@ -133,9 +133,12 @@ pub mod fixtures {
         ConflictShowResult {
             path: "notes.txt".into(),
             kind: "edit_edit".into(),
-            local_path: ".feanorfs/conflicts/1719500000000/notes.txt.local".into(),
-            cloud_path: ".feanorfs/conflicts/1719500000000/notes.txt.cloud".into(),
-            original_path: ".feanorfs/conflicts/1719500000000/notes.txt.original".into(),
+            local_path: "~/.feanorfs/workspaces/opaque/conflicts/1719500000000/notes.txt.local"
+                .into(),
+            cloud_path: "~/.feanorfs/workspaces/opaque/conflicts/1719500000000/notes.txt.cloud"
+                .into(),
+            original_path:
+                "~/.feanorfs/workspaces/opaque/conflicts/1719500000000/notes.txt.original".into(),
             is_binary: false,
             diff: Some("--- notes.txt\n+++ notes.txt\n@@\n-local\n+cloud\n".into()),
         }

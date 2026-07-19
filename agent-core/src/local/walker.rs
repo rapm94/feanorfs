@@ -56,7 +56,7 @@ pub fn build_workspace_walker(base_path: &Path, no_default_ignores: bool) -> Wal
     build_workspace_walker_with_ignore_policy(base_path, no_default_ignores, None)
 }
 
-/// Build the workspace walker with an optional in-memory `.feanorfsignore` policy.
+/// Build the workspace walker with optional in-memory workspace ignore rules.
 ///
 /// Join preflight uses the encrypted sender policy before any destination file
 /// is written. `None` retains the ordinary behavior of reading the policy from
@@ -86,7 +86,9 @@ pub fn build_workspace_walker_with_ignore_policy(
         let content = match ignore_policy {
             Some(content) => Some(content),
             None => {
-                disk_policy = fs::read_to_string(base_path.join(".feanorfsignore")).ok();
+                disk_policy = crate::workspace_layout::workspace_state_path(base_path)
+                    .ok()
+                    .and_then(|state| fs::read_to_string(state.join("ignore")).ok());
                 disk_policy.as_deref()
             }
         };
@@ -108,18 +110,36 @@ pub fn build_workspace_walker_with_ignore_policy(
         if file_type.is_dir() && entry.path() != base && has_valid_cachedir_tag(entry.path()) {
             return false;
         }
-        let Some(ignores) = &ignores else {
-            return true;
-        };
         let Ok(relative) = entry.path().strip_prefix(&base) else {
             return true;
         };
         let Some(path) = relative.to_str() else {
             return true;
         };
+        if is_always_excluded(relative) {
+            return false;
+        }
+        let Some(ignores) = &ignores else {
+            return true;
+        };
         !ignores.matched(path, file_type.is_dir()).is_ignore()
     });
     builder
+}
+
+/// Metadata and VCS paths FeanorFS never transports, regardless of policy.
+#[must_use]
+pub fn is_always_excluded(relative: &Path) -> bool {
+    let first = relative
+        .components()
+        .next()
+        .and_then(|part| part.as_os_str().to_str());
+    matches!(first, Some(".git" | ".jj" | ".feanorfs"))
+        || relative == Path::new(".feanorfsignore")
+        || relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".feanorfs-tmp-"))
 }
 
 pub fn collect_symlink_warnings(base_path: &Path) -> Vec<String> {

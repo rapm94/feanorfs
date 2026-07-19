@@ -17,8 +17,10 @@ pub async fn migrate_workspace_stores(root: &Path) -> Result<()> {
 
 pub(crate) async fn migrate_workspace_stores_with_fault(root: &Path, fault: Fault) -> Result<()> {
     let feanorfs = root.join(".feanorfs");
+    if !feanorfs.exists() {
+        return Ok(());
+    }
     let lock_path = feanorfs.join("metadata-migration.lock");
-    std::fs::create_dir_all(&feanorfs)?;
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)

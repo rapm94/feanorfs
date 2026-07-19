@@ -34,8 +34,7 @@ SPAWN_JSON="$(json agent spawn worker)"
 printf '%s\n' "$SPAWN_JSON" >&2
 grep -q '"files_copied"' <<<"$SPAWN_JSON"
 
-AGENT_DIR=".feanorfs/agents/worker"
-echo "agent edit" > "$AGENT_DIR/task.txt"
+"$FEANORFS" agent run worker -- sh -c 'printf "%s\n" "agent edit" > task.txt'
 
 echo "== land (expect clean or conflicts JSON) =="
 LAND_JSON="$(json agent land worker)"

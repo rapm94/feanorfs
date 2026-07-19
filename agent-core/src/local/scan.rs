@@ -27,10 +27,10 @@ pub async fn scan_local_directory_with_opts(
     scan_local_directory_with_policy(base_path, db, password, no_default_ignores, None).await
 }
 
-/// Scan with an optional in-memory `.feanorfsignore` override.
+/// Scan with optional in-memory workspace ignore rules.
 ///
 /// This exists for safe join preview: the receiver can classify its files
-/// under the encrypted mirror policy before writing that policy locally.
+/// under the encrypted mirror policy before saving it in global state.
 pub async fn scan_local_directory_with_policy(
     base_path: &Path,
     db: &ClientDb,

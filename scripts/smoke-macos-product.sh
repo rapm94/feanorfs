@@ -30,6 +30,20 @@ RELAY_PID=""
 mkdir -p "$HOME" "$WORKSPACE"
 printf 'workspace recovery smoke\n' >"$WORKSPACE/recovery-smoke.txt"
 
+workspace_state_dir() {
+  local workspace canonical candidate
+  workspace="$1"
+  canonical="$(cd "$workspace" && pwd -P)"
+  for candidate in "$HOME"/.feanorfs/workspaces/*; do
+    [[ -d "$candidate" && -f "$candidate/location" ]] || continue
+    if [[ "$(<"$candidate/location")" == "$canonical" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 cleanup() {
   if [[ -n "$PAIR_PID" ]] && kill -0 "$PAIR_PID" 2>/dev/null; then
     kill "$PAIR_PID" 2>/dev/null || true
@@ -111,6 +125,8 @@ if ! "$FEANORFS" start "$WORKSPACE" >"$ROOT/initial-start.log" 2>&1; then
     "$ROOT/initial-start.log" >&2
   exit 1
 fi
+WORKSPACE_STATE="$(workspace_state_dir "$WORKSPACE")"
+[[ ! -e "$WORKSPACE/.feanorfs" && ! -e "$WORKSPACE/.feanorfsignore" ]]
 
 HUB_PORT="$(<"$HOME/.feanorfs/hub-data/listen-port")"
 if [[ ! "$HUB_PORT" =~ ^[0-9]+$ ]] || (( HUB_PORT < 1 || HUB_PORT > 65535 )); then
@@ -119,13 +135,13 @@ if [[ ! "$HUB_PORT" =~ ^[0-9]+$ ]] || (( HUB_PORT < 1 || HUB_PORT > 65535 )); th
 fi
 
 jq -e '.workspace_id | startswith("fsw1-") and length == 37' \
-  "$WORKSPACE/.feanorfs/config.json" >/dev/null
+  "$WORKSPACE_STATE/config.json" >/dev/null
 # Same-host multicast is unavailable on GitHub-hosted runners. In that case
 # endpoint discovery deliberately retains the authenticated HTTPS loopback URL
 # until the CA-bound mDNS name can be probed successfully.
 jq -e --arg port "$HUB_PORT" \
   '.server_url | test("^https://(127\\.0\\.0\\.1|feanorfs-[0-9a-f]{16}\\.local):" + $port + "$")' \
-  "$WORKSPACE/.feanorfs/config.json" >/dev/null
+  "$WORKSPACE_STATE/config.json" >/dev/null
 
 # Resume must hand off directly to the supervised watcher without a transient
 # lock failure or launchd restart backoff.
@@ -155,20 +171,20 @@ for private_file in \
   "$HOME/.feanorfs/hub-data/listen-port" \
   "$HOME/.feanorfs/hub-data/tls/ca-key.pem" \
   "$HOME/.feanorfs/hub-data/tls/server-key.pem" \
-  "$WORKSPACE/.feanorfs/config.json"; do
+  "$WORKSPACE_STATE/config.json"; do
   [[ "$(/usr/bin/stat -f '%Lp' "$private_file")" == "600" ]]
 done
 
 jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
   "$HOME/.feanorfs/hub-data/service-program" >/dev/null
 jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
-  "$WORKSPACE/.feanorfs/service-program" >/dev/null
+  "$WORKSPACE_STATE/service-program" >/dev/null
 jq -e 'length == 2 and all(.[][1]; length == 64)' \
   "$HOME/.feanorfs/tray-service-program" >/dev/null
 
 CA="$HOME/.feanorfs/hub-data/tls/ca-cert.pem"
 [[ "$(curl --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://127.0.0.1:$HUB_PORT/api/workspaces")" == "401" ]]
-CONFIGURED_HOST="$(jq -r '.server_url | capture("^https://(?<host>[^:]+):[0-9]+$").host' "$WORKSPACE/.feanorfs/config.json")"
+CONFIGURED_HOST="$(jq -r '.server_url | capture("^https://(?<host>[^:]+):[0-9]+$").host' "$WORKSPACE_STATE/config.json")"
 [[ "$(curl --resolve "$CONFIGURED_HOST:$HUB_PORT:127.0.0.1" --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://$CONFIGURED_HOST:$HUB_PORT/api/workspaces")" == "401" ]]
 if curl -o /dev/null -fsS "http://127.0.0.1:$HUB_PORT/api/workspaces" 2>/dev/null; then
   echo "Private hub unexpectedly accepted plaintext HTTP." >&2
@@ -237,7 +253,7 @@ WRONG_RECOVERY_PASSPHRASE="$(/usr/bin/uuidgen | /usr/bin/tr -d '-')-wrong"
     "$FEANORFS" recovery export --passphrase-stdin -- "$RECOVERY_KIT" >/dev/null
 )
 [[ "$(/usr/bin/stat -f '%Lp' "$RECOVERY_KIT")" == "600" ]]
-workspace_id="$(jq -r '.workspace_id' "$WORKSPACE/.feanorfs/config.json")"
+workspace_id="$(jq -r '.workspace_id' "$WORKSPACE_STATE/config.json")"
 if /usr/bin/grep -Fq "$workspace_id" "$RECOVERY_KIT"; then
   echo "Workspace recovery kit exposed its workspace capability in plaintext." >&2
   exit 1
@@ -253,8 +269,10 @@ printf '%s\n' "$RECOVERY_PASSPHRASE" |
   "$FEANORFS" recovery import --passphrase-stdin --no-watch -- \
     "$RECOVERY_KIT" "$RECOVERED_WORKSPACE" >"$ROOT/recovery-import.log"
 /usr/bin/cmp "$WORKSPACE/recovery-smoke.txt" "$RECOVERED_WORKSPACE/recovery-smoke.txt"
+RECOVERED_STATE="$(workspace_state_dir "$RECOVERED_WORKSPACE")"
+[[ ! -e "$RECOVERED_WORKSPACE/.feanorfs" && ! -e "$RECOVERED_WORKSPACE/.feanorfsignore" ]]
 jq -e --arg workspace "$workspace_id" '.workspace_id == $workspace' \
-  "$RECOVERED_WORKSPACE/.feanorfs/config.json" >/dev/null
+  "$RECOVERED_STATE/config.json" >/dev/null
 "$FEANORFS" --json stop -- "$RECOVERED_WORKSPACE" >/dev/null
 
 echo "Smoke: receiver-side tray-to-tray LAN join"
@@ -332,8 +350,10 @@ else
     echo "Tray-joined workspace did not materialize the shared file." >&2
     exit 1
   }
+  JOINED_STATE="$(workspace_state_dir "$JOINED_WORKSPACE")"
+  [[ ! -e "$JOINED_WORKSPACE/.feanorfs" && ! -e "$JOINED_WORKSPACE/.feanorfsignore" ]]
   jq -e --arg workspace "$workspace_id" '.workspace_id == $workspace' \
-    "$JOINED_WORKSPACE/.feanorfs/config.json" >/dev/null || {
+    "$JOINED_STATE/config.json" >/dev/null || {
     echo "Tray-joined workspace identity does not match the sharing workspace." >&2
     exit 1
   }
@@ -431,7 +451,8 @@ echo "Smoke: reversible consumer stop and resume"
   and .setup_preserved == true
   and .hub_preserved == true
 ' >/dev/null
-[[ -f "$WORKSPACE/.feanorfs/config.json" ]]
+[[ -f "$WORKSPACE_STATE/config.json" ]]
+[[ ! -e "$WORKSPACE/.feanorfs" && ! -e "$WORKSPACE/.feanorfsignore" ]]
 "$FEANORFS" service status "$WORKSPACE" | grep -q 'Automatic sync is not installed'
 "$FEANORFS" --json tray recent | jq -e '
   .active == null and (.workspaces | length) == 0

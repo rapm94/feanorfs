@@ -4,26 +4,24 @@ use std::path::{Path, PathBuf};
 
 use crate::local::Config;
 
-#[must_use]
-pub fn agents_dir(base: &Path) -> PathBuf {
-    base.join(".feanorfs").join("agents")
+pub fn agents_dir(base: &Path) -> Result<PathBuf> {
+    Ok(crate::workspace_layout::ensure_workspace_state(base)?.join("agents"))
 }
 
-#[must_use]
-pub fn agent_dir(base: &Path, name: &str) -> PathBuf {
-    agents_dir(base).join(name)
+pub fn agent_root(base: &Path, name: &str) -> Result<PathBuf> {
+    Ok(agents_dir(base)?.join(name))
 }
 
-#[must_use]
-pub fn agent_base_ref(base: &Path, name: &str) -> PathBuf {
-    agent_dir(base, name)
-        .join(".feanorfs")
-        .join("base-snapshot")
+pub fn agent_dir(base: &Path, name: &str) -> Result<PathBuf> {
+    Ok(agent_root(base, name)?.join("worktree"))
 }
 
-#[must_use]
-pub fn conflicts_dir(base: &Path) -> PathBuf {
-    base.join(".feanorfs").join("conflicts")
+pub fn agent_base_ref(base: &Path, name: &str) -> Result<PathBuf> {
+    Ok(agent_root(base, name)?.join("state").join("base-snapshot"))
+}
+
+pub fn conflicts_dir(base: &Path) -> Result<PathBuf> {
+    Ok(crate::workspace_layout::ensure_workspace_state(base)?.join("conflicts"))
 }
 
 pub fn validate_name(name: &str) -> Result<()> {

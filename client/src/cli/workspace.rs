@@ -100,6 +100,17 @@ pub enum WorkspaceAction {
     },
     /// List folders mirrored on this computer
     Folders,
+    /// List or change this folder's global ignore rules (no project file is created)
+    Ignore {
+        /// Pattern to add; omit to list current rules
+        pattern: Option<String>,
+        /// Remove PATTERN instead of adding it
+        #[arg(long, conflicts_with = "clear")]
+        remove: bool,
+        /// Remove all custom rules
+        #[arg(long, conflicts_with = "remove")]
+        clear: bool,
+    },
     /// Summarize files that changed since you last opened this workspace
     Summary {
         /// Shell out to FEANORFS_SUMMARY_CMD to produce prose instead of listing paths
@@ -334,6 +345,11 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
         WorkspaceAction::Folders => {
             super::tray::run(current_dir, super::tray::TrayAction::Recent, json).await
         }
+        WorkspaceAction::Ignore {
+            pattern,
+            remove,
+            clear,
+        } => run_ignore(current_dir, pattern.as_deref(), remove, clear, json).await,
         WorkspaceAction::Workspaces { server_url } => {
             run_workspaces(current_dir, json, server_url).await
         }
@@ -381,6 +397,74 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
         WorkspaceAction::Mcp => super::mcp::run_mcp(current_dir).await,
         WorkspaceAction::Tray { action } => super::tray::run(current_dir, action, json).await,
     }
+}
+
+#[derive(Debug, Serialize)]
+struct IgnoreRulesResult {
+    workspace: String,
+    patterns: Vec<String>,
+}
+
+async fn run_ignore(
+    current_dir: &Path,
+    pattern: Option<&str>,
+    remove: bool,
+    clear: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    load_config(current_dir).context("open this command inside a mirrored folder")?;
+    if clear && pattern.is_some() {
+        anyhow::bail!("PATTERN cannot be used with --clear");
+    }
+    let policy = feanorfs_client::join_preflight::read_ignore_policy(current_dir)?;
+    let mut patterns = policy
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    if clear {
+        patterns.clear();
+    } else if let Some(pattern) = pattern {
+        let pattern = pattern.trim();
+        if pattern.is_empty() || pattern.contains(['\r', '\n', '\0']) {
+            anyhow::bail!("ignore pattern must be one non-empty text line");
+        }
+        if remove {
+            patterns.remove(pattern);
+        } else {
+            patterns.insert(pattern.to_owned());
+        }
+    } else if remove {
+        anyhow::bail!("--remove requires PATTERN");
+    }
+
+    if pattern.is_some() || clear {
+        let mut content = patterns.iter().cloned().collect::<Vec<_>>().join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        feanorfs_client::join_preflight::write_ignore_policy(current_dir, &content).await?;
+    }
+
+    let result = IgnoreRulesResult {
+        workspace: current_dir.display().to_string(),
+        patterns: patterns.into_iter().collect(),
+    };
+    if json {
+        return output_json(&result);
+    }
+    if result.patterns.is_empty() {
+        println!("No custom ignore rules. FeanorFS still excludes its metadata and VCS internals.");
+    } else {
+        println!("Custom ignore rules for this folder:");
+        for pattern in &result.patterns {
+            println!("  {pattern}");
+        }
+    }
+    println!("Rules are stored under ~/.feanorfs, outside the project.");
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -580,7 +664,7 @@ fn run_config(current_dir: &Path, show_key: bool) -> anyhow::Result<()> {
     println!();
     match load_config(current_dir) {
         Ok(c) => {
-            println!("Workspace (.feanorfs/config.json):");
+            println!("Workspace (private state under ~/.feanorfs):");
             println!("  Server:        {}", c.server_url);
             println!(
                 "  Transport:     {}",
@@ -636,9 +720,11 @@ fn run_show_key(current_dir: &Path) -> anyhow::Result<()> {
             copy_to_clipboard(key);
             eprintln!("\nCopied to clipboard.");
             if config.is_local_hub() {
+                let hub_dir = config.hub_data_dir(current_dir)?;
                 eprintln!(
-                    "\nEmbedded local hub — invites are not portable. \
-                     Run `feanorfs serve --data-dir .feanorfs/hub-data` to share on the network."
+                    "\nEmbedded local hub — invites are not portable. Run \
+                     `feanorfs serve --data-dir {}` to share on the network.",
+                    hub_dir.display()
                 );
             } else if let Some(invite) = invite_from_config(&config) {
                 print_invite(&invite)?;
@@ -748,10 +834,7 @@ fn render_doctor(result: &DoctorResult) {
 }
 
 fn global_config_is_present() -> bool {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .is_some_and(|home| home.join(".feanorfs/global.json").is_file())
+    feanorfs_agent_core::global_state_root().is_ok_and(|root| root.join("global.json").is_file())
 }
 
 fn legacy_format_version() -> u32 {
@@ -796,7 +879,12 @@ impl Default for MigrationReport {
 impl MigrationReport {
     fn observe(&mut self, workspace: &Path) {
         self.workspaces_checked += 1;
-        let config_path = workspace.join(".feanorfs").join("config.json");
+        let Ok(config_path) = feanorfs_agent_core::ensure_workspace_state(workspace)
+            .map(|state| state.join("config.json"))
+        else {
+            self.unreadable_or_missing += 1;
+            return;
+        };
         let Ok(content) = std::fs::read_to_string(config_path) else {
             self.unreadable_or_missing += 1;
             return;
@@ -840,7 +928,7 @@ fn collect_migration_report_from(
                 .map(|entry| normalized_workspace_path(Path::new(&entry.path))),
         );
     }
-    if current_dir.join(".feanorfs/config.json").is_file() {
+    if feanorfs_agent_core::workspace_is_configured(current_dir) {
         workspaces.insert(normalized_workspace_path(current_dir));
     }
 
@@ -938,7 +1026,7 @@ async fn run_doctor(current_dir: &Path, json: bool) -> anyhow::Result<()> {
     let config = match load_config(current_dir) {
         Ok(config) => config,
         Err(error) => {
-            let config_exists = current_dir.join(".feanorfs/config.json").is_file();
+            let config_exists = feanorfs_agent_core::workspace_is_configured(current_dir);
             result.add(
                 "workspace_config",
                 DoctorCheckStatus::Failure,

@@ -18,10 +18,7 @@ struct RecentStore {
 }
 
 fn recent_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("HOME or USERPROFILE environment variable not set")?;
-    Ok(PathBuf::from(home).join(".feanorfs").join("recent.json"))
+    Ok(feanorfs_agent_core::global_state_root()?.join("recent.json"))
 }
 
 fn create_store_dir(path: &Path) -> Result<()> {
@@ -128,10 +125,7 @@ fn remove_workspace(store: &mut RecentStore, path: &str) {
 }
 
 fn workspace_is_available(workspace: &RecentWorkspaceEntry) -> bool {
-    Path::new(&workspace.path)
-        .join(".feanorfs")
-        .join("config.json")
-        .is_file()
+    feanorfs_agent_core::workspace_is_configured(Path::new(&workspace.path))
 }
 
 fn forget_unavailable_from_store(store: &mut RecentStore) -> usize {

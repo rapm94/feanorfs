@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 const agentModule = process.env.FEANORFS_AGENT_IMPORT ?? '../api.mjs';
-const { spawn, land, clean, refresh, conflictsKeep } = await import(agentModule);
+const { spawn, agentPath, land, clean, refresh, conflictsKeep } = await import(agentModule);
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const feanorfs =
@@ -31,7 +31,10 @@ try {
     throw new Error(`unexpected spawn: ${JSON.stringify(spawnResult)}`);
   }
 
-  const agentDir = path.join(ws, '.feanorfs/agents/worker');
+  const agentDir = await agentPath(ws, 'worker');
+  if (agentDir.startsWith(ws) || fs.existsSync(path.join(ws, '.feanorfs'))) {
+    throw new Error(`agent state leaked into project: ${agentDir}`);
+  }
   fs.writeFileSync(path.join(agentDir, 'task.txt'), 'node edit\n');
 
   const landResult = await land(ws, 'worker', {});

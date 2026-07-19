@@ -46,7 +46,10 @@ trap cleanup EXIT HUP INT TERM
     >/dev/null
 )
 
-CONFIG="$WORKSPACE/.feanorfs/config.json"
+STATE="$(find "$SMOKE_HOME/.feanorfs/workspaces" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+[[ -n "$STATE" && "$(<"$STATE/location")" == "$WORKSPACE" ]]
+[[ ! -e "$WORKSPACE/.feanorfs" && ! -e "$WORKSPACE/.feanorfsignore" ]]
+CONFIG="$STATE/config.json"
 CREDENTIAL_ID="$(jq -er '
   select(.credential_store == "os")
   | select(has("encryption_password") | not)

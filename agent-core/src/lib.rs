@@ -28,6 +28,7 @@ mod state;
 pub mod sync_pass;
 mod tree_reconcile;
 pub mod tunnel;
+pub mod workspace_layout;
 
 pub use agent::{
     check_agent, clean_agent, commit_agent, land_agent, list_agents, refresh_agent,
@@ -56,6 +57,10 @@ pub use paths::legacy_policy_for_config;
 pub use paths::{agent_dir, agents_dir, conflicts_dir, validate_name};
 pub use snapshot::SnapshotEngine;
 pub use snapshot_diff::TreeDiffStats;
+pub use workspace_layout::{
+    ensure_workspace_state, global_state_root, maintain_workspace_state, workspace_is_configured,
+    workspace_state_id, workspace_state_path,
+};
 
 use anyhow::{Context, Result};
 #[doc(hidden)]
@@ -95,7 +100,7 @@ impl Runtime {
         self.inner.block_on(fut)
     }
 
-    /// Open a workspace rooted at `path` (must contain `.feanorfs/config.json`).
+    /// Open a workspace rooted at `path` (state is resolved under `~/.feanorfs`).
     pub fn open_workspace(self: &Arc<Self>, path: impl AsRef<Path>) -> Result<Workspace> {
         Workspace::open(self, path.as_ref())
     }
@@ -129,7 +134,8 @@ impl Workspace {
     pub fn open(rt: &Arc<Runtime>, root: &Path) -> Result<Self> {
         let root = root.to_path_buf();
         let config = load_config(&root)?;
-        let db = rt.block_on(ClientDb::new(root.join(".feanorfs")))?;
+        let state = ensure_workspace_state(&root)?;
+        let db = rt.block_on(ClientDb::new(state))?;
         let api = rt.block_on(ApiClient::from_config(&root, &config))?;
         Ok(Self {
             root,
@@ -158,9 +164,18 @@ impl Workspace {
         &self.config.workspace_id
     }
 
-    /// List agent workspace names under `.feanorfs/agents/`.
+    /// List agent workspace names from global workspace state.
     pub fn list(&self) -> Result<Vec<String>> {
         self.rt.block_on(list_agents(&self.root, &self.db))
+    }
+
+    /// Return the absolute worktree path for an existing agent.
+    pub fn agent_path(&self, name: &str) -> Result<PathBuf> {
+        let path = agent_dir(&self.root, name)?;
+        if !path.is_dir() {
+            anyhow::bail!("agent workspace '{name}' not found");
+        }
+        Ok(path)
     }
 
     /// Spawn an isolated agent workspace.

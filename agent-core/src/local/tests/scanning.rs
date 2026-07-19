@@ -4,7 +4,8 @@ use std::path::Path;
 
 use super::super::walker::CACHEDIR_TAG_SIGNATURE;
 use super::super::{
-    build_workspace_walker, collect_symlink_warnings, scan_local_directory, ClientDb,
+    build_workspace_walker, collect_symlink_warnings, scan_local_directory,
+    scan_local_directory_with_policy, ClientDb,
 };
 
 fn walked_files(root: &Path) -> HashSet<String> {
@@ -87,8 +88,6 @@ async fn valid_cachedir_tag_at_workspace_root_does_not_prune_workspace() {
 #[tokio::test]
 async fn custom_directory_ignore_prunes_the_directory_before_descending() {
     let workspace = tempfile::tempdir().expect("create workspace");
-    fs::write(workspace.path().join(".feanorfsignore"), b"server-data/\n")
-        .expect("write custom ignore");
     fs::create_dir_all(workspace.path().join("server-data/blobs"))
         .expect("create ignored directory");
     fs::write(
@@ -99,10 +98,40 @@ async fn custom_directory_ignore_prunes_the_directory_before_descending() {
     fs::write(workspace.path().join("keep.txt"), b"workspace content")
         .expect("write retained file");
 
-    let files = scanned_files(workspace.path()).await;
-    assert!(files.contains(".feanorfsignore"));
+    let state = tempfile::tempdir().expect("create scanner state");
+    let db = ClientDb::new(state.path())
+        .await
+        .expect("create scanner DB");
+    let files = scan_local_directory_with_policy(
+        workspace.path(),
+        &db,
+        Some("test-key"),
+        false,
+        Some("server-data/\n"),
+    )
+    .await
+    .expect("scan with global ignore rules")
+    .into_keys()
+    .collect::<HashSet<_>>();
     assert!(files.contains("keep.txt"));
     assert!(!files.contains("server-data/blobs/changing"));
+    assert!(!workspace.path().join(".feanorfsignore").exists());
+}
+
+#[test]
+fn vcs_and_legacy_metadata_are_hard_excluded() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    for path in [".git/index", ".jj/repo/store", ".feanorfs/config.json"] {
+        let path = workspace.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"metadata").unwrap();
+    }
+    fs::write(workspace.path().join(".feanorfsignore"), b"legacy").unwrap();
+    fs::write(workspace.path().join("keep.txt"), b"content").unwrap();
+
+    let files = walked_files(workspace.path());
+
+    assert_eq!(files, HashSet::from(["keep.txt".to_string()]));
 }
 
 #[cfg(unix)]

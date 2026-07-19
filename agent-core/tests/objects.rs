@@ -1,4 +1,6 @@
-use feanorfs_agent_core::{ApiClient, ClientDb, LocalHub, ObjectStore, SyncCtx};
+use feanorfs_agent_core::{
+    ensure_workspace_state, ApiClient, ClientDb, LocalHub, ObjectStore, SyncCtx,
+};
 use feanorfs_common::{
     flat_to_tree, hash_bytes, FileState, LegacyPolicy, Snapshot, TreeEntryKind, AEAD_PREFIX_BYTE,
 };
@@ -15,12 +17,10 @@ async fn fresh_client_resolves_encrypted_snapshot_chain() {
         .expect("open local hub");
     let api_a = ApiClient::local(Arc::clone(&hub), None);
     let api_b = ApiClient::local(hub, None);
-    let db_a = ClientDb::new(client_a.path().join(".feanorfs"))
-        .await
-        .expect("open client A cache");
-    let db_b = ClientDb::new(client_b.path().join(".feanorfs"))
-        .await
-        .expect("open client B cache");
+    let state_a = ensure_workspace_state(client_a.path()).expect("resolve client A state");
+    let state_b = ensure_workspace_state(client_b.path()).expect("resolve client B state");
+    let db_a = ClientDb::new(&state_a).await.expect("open client A cache");
+    let db_b = ClientDb::new(&state_b).await.expect("open client B cache");
     let ctx_a = SyncCtx::new(
         &api_a,
         &db_a,
@@ -93,9 +93,8 @@ async fn fresh_client_resolves_encrypted_snapshot_chain() {
     assert!(!remote
         .windows("filename.txt".len())
         .any(|window| window == b"filename.txt"));
-    assert!(client_b
-        .path()
-        .join(".feanorfs/objects")
+    assert!(state_b
+        .join("objects")
         .read_dir()
         .expect("read client B object cache")
         .next()
@@ -119,9 +118,8 @@ async fn corrupted_cached_object_is_refetched_and_verified() {
         .await
         .expect("open local hub");
     let api = ApiClient::local(hub, None);
-    let db = ClientDb::new(client.path().join(".feanorfs"))
-        .await
-        .expect("open cache");
+    let state = ensure_workspace_state(client.path()).expect("resolve client state");
+    let db = ClientDb::new(&state).await.expect("open cache");
     let ctx = SyncCtx::new(
         &api,
         &db,
@@ -133,12 +131,9 @@ async fn corrupted_cached_object_is_refetched_and_verified() {
     let store = ObjectStore::new(&ctx);
     let tree = feanorfs_common::Tree::default();
     let id = store.put_tree(&tree).await.expect("upload tree");
-    tokio::fs::write(
-        client.path().join(".feanorfs/objects").join(&id),
-        b"corrupt cache",
-    )
-    .await
-    .expect("corrupt local cache");
+    tokio::fs::write(state.join("objects").join(&id), b"corrupt cache")
+        .await
+        .expect("corrupt local cache");
 
     assert_eq!(store.get_tree(&id).await.expect("refetch tree"), tree);
 }

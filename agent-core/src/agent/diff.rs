@@ -56,7 +56,7 @@ pub(super) async fn build_land_candidate(
 
 pub(super) async fn compute_agent_diff(ctx: &SyncCtx<'_>, name: &str) -> Result<AgentDiff> {
     validate_name(name)?;
-    let agent_path = agent_dir(ctx.base, name);
+    let agent_path = agent_dir(ctx.base, name)?;
     if !agent_path.exists() {
         bail!("Agent workspace '{name}' does not exist. Run `feanorfs agent spawn {name}` first.");
     }
@@ -72,7 +72,10 @@ pub(super) async fn compute_agent_diff(ctx: &SyncCtx<'_>, name: &str) -> Result<
         }
     };
     let server_files = snapshots.load_files(&current_head).await?;
-    let agent_cache = ClientDb::new(agent_path.join(".feanorfs")).await?;
+    let agent_cache = ClientDb::new(crate::workspace_layout::ensure_workspace_state(
+        &agent_path,
+    )?)
+    .await?;
     let agent_scan =
         crate::local::scan_local_directory(&agent_path, &agent_cache, ctx.password()).await?;
     let our_diff = snapshots.diff_file_view(&base_id, &agent_scan).await?;

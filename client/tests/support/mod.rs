@@ -8,9 +8,16 @@ use tempfile::TempDir;
 pub const TEST_PASSWORD: &str = "integration-test-password";
 pub const WORKSPACE_ID: &str = "test-workspace";
 
+pub fn state_path(workspace: &Path) -> PathBuf {
+    feanorfs_agent_core::ensure_workspace_state(workspace).unwrap()
+}
+
+pub fn agent_path(workspace: &Path, name: &str) -> PathBuf {
+    feanorfs_agent_core::agent_dir(workspace, name).unwrap()
+}
+
 pub fn write_test_config(workspace: &Path, server_url: &str) {
-    let feanorfs = workspace.join(".feanorfs");
-    std::fs::create_dir_all(&feanorfs).unwrap();
+    let state = state_path(workspace);
     let cfg = Config {
         server_url: server_url.to_string(),
         workspace_id: WORKSPACE_ID.to_string(),
@@ -22,7 +29,8 @@ pub fn write_test_config(workspace: &Path, server_url: &str) {
         relay: None,
     };
     let json = serde_json::to_string_pretty(&cfg).unwrap();
-    std::fs::write(feanorfs.join("config.json"), json).unwrap();
+    std::fs::write(state.join("config.json"), json).unwrap();
+    assert!(!workspace.join(".feanorfs").exists());
 }
 
 pub struct TestServer {
@@ -59,9 +67,7 @@ pub struct TestClient {
 
 pub async fn spawn_test_client() -> TestClient {
     let workspace = TempDir::new().unwrap();
-    let db = ClientDb::new(workspace.path().join(".feanorfs"))
-        .await
-        .unwrap();
+    let db = ClientDb::new(state_path(workspace.path())).await.unwrap();
     TestClient { workspace, db }
 }
 

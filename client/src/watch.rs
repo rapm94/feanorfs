@@ -14,11 +14,11 @@ pub fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
             continue;
         };
         let normalized = normalize_path(path_str);
-        if !normalized.contains("/.feanorfs/")
-            && !normalized.contains("/.git/")
-            && !normalized.ends_with(".feanorfs")
-            && !normalized.ends_with(".git")
-        {
+        let ignored_component = normalized.split('/').any(|part| {
+            matches!(part, ".feanorfs" | ".feanorfsignore" | ".git" | ".jj")
+                || part.starts_with(".feanorfs-tmp-")
+        });
+        if !ignored_component {
             return true;
         }
     }
@@ -244,6 +244,12 @@ mod tests {
         )]));
         assert!(!event_paths_warrant_sync(&[PathBuf::from(
             "/workspace/src/.git/config"
+        )]));
+        assert!(!event_paths_warrant_sync(&[PathBuf::from(
+            "/workspace/.jj/repo/store"
+        )]));
+        assert!(!event_paths_warrant_sync(&[PathBuf::from(
+            "/workspace/.feanorfsignore"
         )]));
     }
 

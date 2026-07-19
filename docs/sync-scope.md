@@ -10,7 +10,7 @@ FeanorFS mirrors the **current contents** of a workspace folder. This document r
 2. **No git coupling.** A workspace does not need to be a git repo. Honoring `.gitignore` would pull in nested rules, negation, global excludes, and submodule semantics — complexity that belongs in git, not in a sync tool.
 3. **Ongoing cost matters more than first sync.** Build and package-manager trees are not just large once; they **churn on every build** (`target/`, `node_modules/`, …). The watcher would rehash, encrypt, and upload gigabytes per compile. A "sync everything, first sync is slow" policy makes the tool unusable on typical Rust/Node projects, not merely slow on day one.
 4. **Small frozen defaults, not a growing framework list.** Expanding `DEFAULT_IGNORES` to dozens of framework-specific directories is a maintenance treadmill (the slippery slope). Defaults stay short; admission to the list is gated by a written criterion below.
-5. **One optional escape hatch.** `.feanorfsignore` covers project-specific exclusions. Most users should never need it.
+5. **One optional escape hatch without project litter.** `feanorfs ignore <pattern>` stores project-specific exclusions in private global state. Most users should never need it.
 
 ---
 
@@ -23,9 +23,10 @@ FeanorFS mirrors the **current contents** of a workspace folder. This document r
 
 | Path | Reason |
 |------|--------|
-| `.feanorfs/` | Client state: config, cache DB, agent dirs, locks |
 | `.git/` | VCS metadata — not user work product |
-| `.feanorfs/agents/` | Scanned only inside agent isolation; excluded from main workspace walk |
+| `.jj/` | Jujutsu VCS metadata — never transport repositories or working-copy state |
+| Legacy `.feanorfs/` and `.feanorfsignore` | Imported once into global state, removed from the project, and never transported |
+| `.feanorfs-tmp-*` | Crash-safe sibling write staging; stale files are cleaned automatically |
 | Symlinks | Reported by `status` as sorted, deduplicated skipped paths; links are never followed |
 | Valid `CACHEDIR.TAG` directories | Regeneratable cache trees declared by their owning tools; contents remain untouched on disk |
 
@@ -58,13 +59,13 @@ If a candidate fails (3), it stays out of defaults even when gitignored in most 
 | Large framework denylist (~50+ entries) | Slippery slope; every new bundler/framework adds maintenance |
 | `--use-gitignore` as default | Same exclusion problem; extra mode surface |
 
-## `.feanorfsignore`
+## Custom ignore rules
 
-Optional, gitignore-syntax file at the workspace root. Use for project-specific artifact dirs not in `DEFAULT_IGNORES` (e.g. custom `out/`, `vendor/` in PHP).
+Use `feanorfs ignore <pattern>` for a project-specific artifact directory not in `DEFAULT_IGNORES` (for example, custom `out/`). Run `feanorfs ignore` to list rules, `feanorfs ignore --remove <pattern>` to remove one, or `feanorfs ignore --clear` to clear them. Rules use gitignore syntax and live under the workspace's opaque directory in `~/.feanorfs`; no file is added to the project.
 
 - **Not required** for typical Rust/Node/Python projects — defaults cover the heavy dirs.
 - **Not a substitute for git** — duplicating an entire `.gitignore` defeats the product goal (sync what git ignores).
-- Hidden `prune-ignored` removes server metadata for paths that newly match ignore rules.
+- Pruning removes excluded paths from encrypted mirror state without deleting the local files. Hard-excluded VCS and legacy metadata are cleaned from transport/conflict state automatically.
 
 ## `CACHEDIR.TAG`
 
@@ -82,8 +83,8 @@ A missing LF, different signature, non-file tag, or symlinked tag is invalid and
 
 | Concern | Location |
 |---------|----------|
-| `DEFAULT_IGNORES`, walker, `.feanorfsignore` | `agent-core/src/local.rs` — `build_workspace_walker`, `scan_local_directory` |
+| `DEFAULT_IGNORES`, hard exclusions, global rules | `agent-core/src/local/walker.rs` and `workspace_layout.rs` |
 | Prune tracked paths matching ignores | `client/src/commands.rs` — `prune_ignored` |
-| Agent workspace scan | Separate walk under `.feanorfs/agents/<name>/`; same ignore machinery |
+| Agent workspace scan | Separate global `agents/<name>/worktree`; same ignore machinery |
 
 Git ignore machinery is explicitly disabled on the walker (`git_ignore(false)`, `git_exclude(false)`, `git_global(false)`).

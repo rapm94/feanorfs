@@ -1,0 +1,283 @@
+# Explicit founder-approved fallback for preview releases when platform signing
+# credentials are unavailable. These artifacts are checksummed, attested, and
+# conspicuously named "unsigned"; the trusted release workflows remain the
+# default path and continue to fail closed without signing credentials.
+name: Unsigned desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable application release tag
+        required: true
+        type: string
+      confirm_unsigned:
+        description: Publish clearly labeled untrusted macOS and Windows installers
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: unsigned-desktop-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate-release:
+    if: ${{ inputs.confirm_unsigned }}
+    name: Validate immutable release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Require matching tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Invalid stable release tag $RELEASE_TAG"; exit 1 ;;
+          esac
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            tag_sha="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
+          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
+          test "$tag_sha" = "$release_sha"
+
+  build-macos:
+    needs: validate-release
+    name: Build unsigned macOS ${{ matrix.target }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build CLI and tray
+        run: >-
+          cargo build --release -p feanorfs-client -p feanorfs-tray
+          --target ${{ matrix.target }} --locked
+      - name: Verify native architecture
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "$TARGET" in
+            aarch64-apple-darwin) expected=arm64 ;;
+            x86_64-apple-darwin) expected=x86_64 ;;
+            *) exit 1 ;;
+          esac
+          lipo "target/$TARGET/release/feanorfs" -verify_arch "$expected"
+          lipo "target/$TARGET/release/feanorfs-tray" -verify_arch "$expected"
+      - name: Upload native binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unsigned-macos-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/feanorfs
+            target/${{ matrix.target }}/release/feanorfs-tray
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-macos:
+    needs:
+      - validate-release
+      - build-macos
+    name: Publish attested unsigned universal macOS installers
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Download arm64 binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: unsigned-macos-aarch64-apple-darwin
+          path: native/arm64
+      - name: Download x86_64 binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: unsigned-macos-x86_64-apple-darwin
+          path: native/x86_64
+      - name: Assemble, package, and smoke universal product
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          chmod 755 native/arm64/feanorfs native/arm64/feanorfs-tray
+          chmod 755 native/x86_64/feanorfs native/x86_64/feanorfs-tray
+          mkdir -p universal
+          for binary in feanorfs feanorfs-tray; do
+            lipo -create "native/arm64/$binary" "native/x86_64/$binary" -output "universal/$binary"
+            chmod 755 "universal/$binary"
+            lipo "universal/$binary" -verify_arch arm64 x86_64
+          done
+
+          version="${RELEASE_TAG#v}"
+          package_root="$RUNNER_TEMP/feanorfs-unsigned-package"
+          sh scripts/package-macos.sh assemble \
+            "$version" universal/feanorfs universal/feanorfs-tray "$package_root"
+          sh scripts/package-macos.sh build \
+            "$version" "$package_root" FeanorFS-macOS-unsigned.pkg
+          sh scripts/package-macos.sh dmg \
+            "$version" FeanorFS-macOS-unsigned.pkg FeanorFS-macOS-unsigned.dmg
+
+          pkgutil --expand-full FeanorFS-macOS-unsigned.pkg expanded
+          cli="expanded/Payload/usr/local/bin/feanorfs"
+          tray="expanded/Payload/Applications/FeanorFS.app/Contents/MacOS/feanorfs-tray"
+          cmp universal/feanorfs "$cli"
+          cmp universal/feanorfs-tray "$tray"
+          lipo "$cli" -verify_arch arm64 x86_64
+          lipo "$tray" -verify_arch arm64 x86_64
+          mkdir dmg
+          hdiutil attach -quiet -readonly -nobrowse -mountpoint dmg FeanorFS-macOS-unsigned.dmg
+          cmp FeanorFS-macOS-unsigned.pkg dmg/FeanorFS-macOS.pkg
+          hdiutil detach -quiet dmg
+          bash scripts/smoke-macos-product.sh "$cli" "$tray"
+
+          cat > FeanorFS-macOS-UNSIGNED.txt <<'NOTICE'
+          UNSIGNED PREVIEW BUILD
+          This macOS package and disk image are not code-signed or notarized.
+          Verify the published SHA-256 checksum and GitHub artifact attestation.
+          macOS will warn or block normal installation until trusted signing is configured.
+          NOTICE
+          shasum -a 256 FeanorFS-macOS-unsigned.pkg > FeanorFS-macOS-unsigned.pkg.sha256
+          shasum -a 256 FeanorFS-macOS-unsigned.dmg > FeanorFS-macOS-unsigned.dmg.sha256
+      - name: Attest unsigned macOS assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            FeanorFS-macOS-unsigned.pkg
+            FeanorFS-macOS-unsigned.pkg.sha256
+            FeanorFS-macOS-unsigned.dmg
+            FeanorFS-macOS-unsigned.dmg.sha256
+            FeanorFS-macOS-UNSIGNED.txt
+      - name: Upload unsigned macOS release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          FeanorFS-macOS-unsigned.pkg
+          FeanorFS-macOS-unsigned.pkg.sha256
+          FeanorFS-macOS-unsigned.dmg
+          FeanorFS-macOS-unsigned.dmg.sha256
+          FeanorFS-macOS-UNSIGNED.txt
+          --repo "$REPOSITORY"
+          --clobber
+
+  publish-windows:
+    needs: validate-release
+    name: Publish attested unsigned Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: Build CLI and tray
+        run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
+      - name: Compile, verify, and smoke unsigned installer
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            $candidate = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+            if (Test-Path -PathType Leaf $candidate) { $iscc = $candidate }
+          }
+          if (-not $iscc) { throw "GitHub's Windows runner does not provide Inno Setup 6." }
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          New-Item -ItemType Directory -Force -Path unsigned-installer | Out-Null
+          & $iscc "/DAppVersion=$version" "/DSourceDir=$pwd\target\release" "/DRepoRoot=$pwd" "/DOutputDir=$pwd\unsigned-installer" scripts/windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with status $LASTEXITCODE." }
+
+          $installer = "unsigned-installer/FeanorFS-windows-x86_64-setup.exe"
+          $assets = @("target/release/feanorfs.exe", "target/release/feanorfs-tray.exe", $installer)
+          foreach ($asset in $assets) {
+            $signature = Get-AuthenticodeSignature $asset
+            if ($signature.Status -ne "NotSigned") {
+              throw "$asset unexpectedly has Authenticode status $($signature.Status)."
+            }
+          }
+          scripts/smoke-windows-installer.ps1 $installer target/release/feanorfs.exe target/release/feanorfs-tray.exe
+          scripts/smoke-windows-product.ps1 target/release/feanorfs.exe target/release/feanorfs-tray.exe
+
+          Copy-Item $installer FeanorFS-windows-x86_64-unsigned-setup.exe
+          Compress-Archive -Path target/release/feanorfs.exe,target/release/feanorfs-tray.exe -DestinationPath FeanorFS-windows-x86_64-unsigned.zip
+          $installerHash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64-unsigned-setup.exe).Hash.ToLowerInvariant()
+          "$installerHash  FeanorFS-windows-x86_64-unsigned-setup.exe" | Set-Content -Encoding ascii FeanorFS-windows-x86_64-unsigned-setup.exe.sha256
+          $zipHash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64-unsigned.zip).Hash.ToLowerInvariant()
+          "$zipHash  FeanorFS-windows-x86_64-unsigned.zip" | Set-Content -Encoding ascii FeanorFS-windows-x86_64-unsigned.zip.sha256
+          @(
+            "UNSIGNED PREVIEW BUILD",
+            "This installer and both executables are not Authenticode-signed.",
+            "Verify the published SHA-256 checksum and GitHub artifact attestation.",
+            "Windows will display an untrusted-publisher warning until trusted signing is configured."
+          ) | Set-Content -Encoding utf8NoBOM FeanorFS-windows-UNSIGNED.txt
+      - name: Attest unsigned Windows assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            FeanorFS-windows-x86_64-unsigned-setup.exe
+            FeanorFS-windows-x86_64-unsigned-setup.exe.sha256
+            FeanorFS-windows-x86_64-unsigned.zip
+            FeanorFS-windows-x86_64-unsigned.zip.sha256
+            FeanorFS-windows-UNSIGNED.txt
+      - name: Upload unsigned Windows release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          FeanorFS-windows-x86_64-unsigned-setup.exe
+          FeanorFS-windows-x86_64-unsigned-setup.exe.sha256
+          FeanorFS-windows-x86_64-unsigned.zip
+          FeanorFS-windows-x86_64-unsigned.zip.sha256
+          FeanorFS-windows-UNSIGNED.txt
+          --repo "$REPOSITORY"
+          --clobber

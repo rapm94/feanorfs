@@ -115,6 +115,7 @@ export declare function spawn(
   name: string,
   opts?: SpawnOptions,
 ): Promise<SpawnResult>
+export declare function agentPath(root: string, name: string): Promise<string>
 export declare function status(root: string, name: string): Promise<AgentCheckResult>
 export declare function refresh(root: string, name: string): Promise<AgentRefreshResult>
 export declare function land(

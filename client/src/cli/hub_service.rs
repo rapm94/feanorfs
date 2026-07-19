@@ -79,10 +79,7 @@ impl HubServiceSpec {
 }
 
 fn default_data_dir() -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .context("HOME or USERPROFILE is not set")?;
-    Ok(PathBuf::from(home).join(".feanorfs").join("hub-data"))
+    Ok(feanorfs_agent_core::global_state_root()?.join("hub-data"))
 }
 
 fn listen_port_path(data_dir: &Path) -> PathBuf {

@@ -14,7 +14,7 @@ It is designed for one specific situation: you write code on more than one machi
 
 FeanorFS mirrors the current contents of a working directory to a blob server. It is **not version control**: no staging, branches, tags, rebase, or merge UI. Its bounded snapshot log supports transport recovery and undo. Use a version control system for project history.
 
-It syncs files on disk (including gitignored/untracked paths — often the point), skips `.git/` and `.feanorfs/`, and blocks common artifact trees (`target/`, `node_modules/`, …) by default. It does not read `.gitignore`. See [docs/sync-scope.md](docs/sync-scope.md).
+It syncs files on disk (including gitignored/untracked paths — often the point), skips `.git/`, `.jj/`, and legacy FeanorFS metadata, and blocks common artifact trees (`target/`, `node_modules/`, …) by default. It creates no metadata or ignore file in the project. See [docs/sync-scope.md](docs/sync-scope.md).
 
 ## Features
 
@@ -24,7 +24,7 @@ It syncs files on disk (including gitignored/untracked paths — often the point
 
 - **Zero-knowledge E2EE** — ChaCha20-Poly1305 protects file bytes, filenames, tree layout, conflicts, and snapshots in format v3. Run `feanorfs migrate` on older workspaces.
 - **Content-addressed storage** — Blake3-hashed blobs with deduplication and upload integrity checks.
-- **Default ignores** — small built-in denylist for high-churn artifacts; optional `.feanorfsignore` for edge cases (does not honor `.gitignore`).
+- **Zero project litter** — config, cache, locks, objects, agents, conflicts, logs, and custom ignore rules live under an opaque `~/.feanorfs/workspaces/<id>/` directory. Use `feanorfs ignore <pattern>` for an edge case; no project file is created.
 - **One verb onboarding** — on the first computer, `feanorfs start [folder]` creates a secure private hub; on another computer it securely pairs on-LAN (`fnp1-…`), through an off-LAN rendezvous (`fnp2-…`), or joins (`fnr1-…`). The same command syncs, installs automatic background services, and returns.
 - **Reversible folder lifecycle** — `feanorfs stop [folder]`, or **Stop Mirroring This Folder…** in the tray, removes automatic sync and the tray entry while preserving ordinary files and encrypted setup for a later `start`.
 - **Recoverable workspace list** — moved, deleted, or disconnected folders are labeled unavailable instead of failing when clicked; the tray can explicitly remove only those list entries after warning about offline external drives.
@@ -59,7 +59,7 @@ One binary (`feanorfs`) hides the normal sync-client and private-hub lifecycle b
 │  │ sync client │ ──────────────────▶ │ managed private │  │
 │  │ start/sync  │                    │ hub + SQLite    │  │
 │  └─────────────┘                    └──────────────────┘  │
-│       │ .feanorfs/local_state.json                          │
+│       │ ~/.feanorfs/workspaces/<opaque-id>/                 │
 │       └── local mode: hub_state.json + blobs/               │
 └───────┼─────────────────────────────────────────────────────┘
         │ encrypted objects + compare-and-swap head
@@ -377,13 +377,13 @@ cannot replace the invite-pinned CA or bearer token.
 - New encrypted workspaces accept only the generated 64-character lowercase-hex recovery-key shape. Manual human passphrases are rejected before configuration is written because the content-key derivation is not a password-stretching KDF. Historical format-v1 workspaces remain readable for migration; use `feanorfs migrate --rekey` when their key was human-chosen.
 - Format-v3 servers do not store file paths. They can still observe ciphertext sizes, object counts, hash equality, retention, and access timing. Legacy formats expose path metadata.
 - `--allow-http` disables native TLS and exposes bearer tokens to the network unless a correctly configured TLS reverse proxy or VPN encloses that connection.
-- Unattended credentials are stored in the native OS credential store when available. Signed macOS releases use Keychain; unsigned macOS/source builds deliberately use the atomic private-file fallback to avoid code-identity prompts after rebuilds. `.feanorfs/config.json` and `~/.feanorfs/global.json` otherwise contain random references. Treat the logged-in user account as part of the trust boundary.
+- Unattended credentials are stored in the native OS credential store when available. Signed macOS releases use Keychain; unsigned macOS/source builds deliberately use the atomic private-file fallback to avoid code-identity prompts after rebuilds. The private workspace config under `~/.feanorfs/workspaces/<opaque-id>/config.json` and `~/.feanorfs/global.json` otherwise contain random references. Treat the logged-in user account as part of the trust boundary.
 
 To report a security vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Configuration
 
-The client stores its configuration in `.feanorfs/config.json`:
+The client stores each folder's private configuration outside the project at `~/.feanorfs/workspaces/<opaque-id>/config.json`:
 
 ```json
 {
@@ -406,7 +406,7 @@ The global server connection is cached in `~/.feanorfs/global.json`:
 }
 ```
 
-All files in the workspace directory are synced, including hidden files and paths git would ignore. `.feanorfs/` and `.git/` are always skipped; common build trees are skipped by default. Details: [docs/sync-scope.md](docs/sync-scope.md).
+All files in the workspace directory are synced, including hidden files and paths git would ignore. `.git/`, `.jj/`, and legacy FeanorFS metadata are always skipped; common build trees are skipped by default. Details: [docs/sync-scope.md](docs/sync-scope.md).
 
 ## Development
 

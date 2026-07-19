@@ -38,16 +38,17 @@ Record only OS/version and secret-free acceptance or reproduction evidence.
 
 ### AI-1. Publish and validate the exact next release
 
-- [ ] Push the completed product changes, let CI and the product-aware release
-  PR pass, merge the release PR, and validate the immutable tag plus every
-  artifact/checksum/attestation that can publish without F1 credentials.
+- [ ] Push the completed v0.7.1 product changes, create the immutable tag, and
+  validate every artifact, checksum, and attestation that can publish without
+  F1 credentials.
 - [ ] Install the exact published CLI archive on this Mac and the exact
   `.pkg.tar.zst` desktop product on CachyOS. Verify matching versions, tray
   visibility/folder switching, managed services, mDNS, `doctor`, and a bounded
-  cross-machine sync while preserving CachyOS `~/p/net` as authoritative.
+  cross-machine sync while preserving the Mac workspaces as authoritative.
 - [ ] Confirm the release clean-package jobs pass on Debian and Fedora and that
   no key, token, invite, route, passphrase, filename, or file content appears in
   release evidence, service argv/environment, logs, or discovery.
 
-The macOS `.dmg`/`.pkg` and Windows `.exe` remain correctly blocked until F1;
-do not weaken signing gates to make this task appear complete.
+If signing credentials are unavailable, publish clearly labeled unsigned
+`.dmg`/`.pkg`/`.exe` artifacts only through the explicit no-signing release
+path requested by the founder; never label them trusted or notarized.

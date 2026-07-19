@@ -45,15 +45,18 @@ overrides:
       - libayatana-appindicator3-1
       - xdg-desktop-portal
       - zenity
+      - avahi-daemon
   rpm:
     depends:
       - gtk3
       - libayatana-appindicator-gtk3
       - xdg-desktop-portal
       - zenity
+      - avahi
   archlinux:
     depends:
       - gtk3
       - libayatana-appindicator
       - xdg-desktop-portal
       - zenity
+      - avahi

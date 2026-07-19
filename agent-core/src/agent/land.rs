@@ -70,7 +70,7 @@ async fn land_agent_with_ctx(
         }
         diff = compute_agent_diff(ctx, name).await?;
     }
-    let agent_path = agent_dir(ctx.base, name);
+    let agent_path = agent_dir(ctx.base, name)?;
     let gate_local = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     if !recovering_committed_land {
         let (_, blocked) = negotiate_sync_with_conflict_gate(ctx, &gate_local, false).await?;

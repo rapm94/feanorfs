@@ -365,9 +365,11 @@ pub async fn offer(
 ) -> anyhow::Result<()> {
     let mut config = feanorfs_client::load_config(workspace)?;
     if config.is_local_hub() {
+        let hub_dir = config.hub_data_dir(workspace)?;
         bail!(
-            "This workspace uses an embedded local hub. Run `feanorfs serve --data-dir \
-             .feanorfs/hub-data` first, then relink it to that LAN hub before pairing."
+            "This workspace uses an embedded local hub. Run `feanorfs serve --data-dir {}` \
+             first, then relink it to that LAN hub before pairing.",
+            hub_dir.display()
         );
     }
     if let Some(relay_url) = relay_url {

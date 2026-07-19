@@ -37,9 +37,8 @@ impl Config {
         self.hub_local || self.server_url == LOCAL_HUB_URL
     }
 
-    #[must_use]
-    pub fn hub_data_dir(&self, workspace: &Path) -> PathBuf {
-        workspace.join(".feanorfs").join("hub-data")
+    pub fn hub_data_dir(&self, workspace: &Path) -> Result<PathBuf> {
+        Ok(crate::workspace_layout::ensure_workspace_state(workspace)?.join("hub-data"))
     }
 }
 
@@ -69,7 +68,8 @@ pub fn validate_e2ee_key(key: &str, format_version: u32) -> Result<()> {
 }
 
 pub fn load_config(base_path: &Path) -> Result<Config> {
-    let config_path = base_path.join(".feanorfs").join("config.json");
+    let config_path =
+        crate::workspace_layout::ensure_workspace_state(base_path)?.join("config.json");
     let content = std::fs::read_to_string(&config_path)
         .context("Could not read config file. Make sure you have initialized the client.")?;
     let mut config: Config = serde_json::from_str(&content).context("parse workspace config")?;
@@ -81,7 +81,7 @@ pub fn load_config(base_path: &Path) -> Result<Config> {
 }
 
 pub fn save_config(base_path: &Path, config: &Config) -> Result<()> {
-    let fs_dir = base_path.join(".feanorfs");
+    let fs_dir = crate::workspace_layout::ensure_workspace_state(base_path)?;
     create_private_dir(&fs_dir)?;
     let path = fs_dir.join("config.json");
     if config_uses_os_store(&path)? {
@@ -101,7 +101,7 @@ pub fn save_config(base_path: &Path, config: &Config) -> Result<()> {
 }
 
 pub fn save_config_secure(base_path: &Path, config: &Config) -> Result<CredentialProtection> {
-    let fs_dir = base_path.join(".feanorfs");
+    let fs_dir = crate::workspace_layout::ensure_workspace_state(base_path)?;
     create_private_dir(&fs_dir)?;
     let path = fs_dir.join("config.json");
     let require_existing = config_uses_os_store(&path)?;
@@ -117,10 +117,7 @@ pub fn save_config_secure(base_path: &Path, config: &Config) -> Result<Credentia
 }
 
 fn global_config_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .context("HOME or USERPROFILE environment variable not set")?;
-    Ok(PathBuf::from(home).join(".feanorfs"))
+    crate::workspace_layout::global_state_root()
 }
 
 pub fn load_global_config() -> Result<GlobalConfig> {
@@ -195,7 +192,8 @@ mod tests {
 
         save_config(workspace.path(), &config).unwrap();
 
-        let fs_dir = workspace.path().join(".feanorfs");
+        let fs_dir = crate::workspace_layout::ensure_workspace_state(workspace.path()).unwrap();
+        assert!(!workspace.path().join(".feanorfs").exists());
         assert_eq!(
             fs::metadata(&fs_dir).unwrap().permissions().mode() & 0o777,
             0o700

@@ -6,6 +6,8 @@ export declare function agentLand(root: string, name: string, opts?: LandOptions
 
 export declare function agentList(root: string): Promise<string>
 
+export declare function agentPath(root: string, name: string): Promise<string>
+
 export declare function agentRefresh(root: string, name: string): Promise<string>
 
 export declare function agentSpawn(root: string, name: string, opts?: SpawnOptionsJs | undefined | null): Promise<string>

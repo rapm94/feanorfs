@@ -65,6 +65,11 @@ mkdir -p "$workspace"
 printf 'Debian package smoke\n' > "$workspace/smoke.txt"
 HOME="$home" FEANORFS_CREDENTIAL_STORE=file \
     /usr/bin/feanorfs start --local --no-watch "$workspace" >/dev/null
+state=$(find "$home/.feanorfs/workspaces" -mindepth 1 -maxdepth 1 -type d -print -quit)
+[ -n "$state" ]
+[ "$(cat "$state/location")" = "$workspace" ]
+[ ! -e "$workspace/.feanorfs" ]
+[ ! -e "$workspace/.feanorfsignore" ]
 status_json=$(
     cd "$workspace"
     HOME="$home" FEANORFS_CREDENTIAL_STORE=file /usr/bin/feanorfs --json status
@@ -76,11 +81,11 @@ printf '%s\n' "$status_json" | jq -e '
     (.download_required | length) == 0 and
     (.pending_conflicts | length) == 0
 ' >/dev/null
-test "$(stat -c '%a' "$workspace/.feanorfs/config.json")" = 600
-grep -q '"format_version": 3' "$workspace/.feanorfs/config.json"
-grep -q '"hub_local": true' "$workspace/.feanorfs/config.json"
-test -s "$workspace/.feanorfs/refs/last-synced"
-find "$workspace/.feanorfs/objects" -type f -print -quit | grep -q .
+test "$(stat -c '%a' "$state/config.json")" = 600
+grep -q '"format_version": 3' "$state/config.json"
+grep -q '"hub_local": true' "$state/config.json"
+test -s "$state/refs/last-synced"
+find "$state/objects" -type f -print -quit | grep -q .
 
 Xvfb :99 -screen 0 1024x768x24 >/tmp/feanorfs-xvfb.log 2>&1 &
 xvfb_pid=$!
@@ -118,6 +123,11 @@ mkdir -p "$workspace"
 printf 'Fedora package smoke\n' > "$workspace/smoke.txt"
 HOME="$home" FEANORFS_CREDENTIAL_STORE=file \
     /usr/bin/feanorfs start --local --no-watch "$workspace" >/dev/null
+state=$(find "$home/.feanorfs/workspaces" -mindepth 1 -maxdepth 1 -type d -print -quit)
+[ -n "$state" ]
+[ "$(cat "$state/location")" = "$workspace" ]
+[ ! -e "$workspace/.feanorfs" ]
+[ ! -e "$workspace/.feanorfsignore" ]
 status_json=$(
     cd "$workspace"
     HOME="$home" FEANORFS_CREDENTIAL_STORE=file /usr/bin/feanorfs --json status
@@ -129,11 +139,11 @@ printf '%s\n' "$status_json" | jq -e '
     (.download_required | length) == 0 and
     (.pending_conflicts | length) == 0
 ' >/dev/null
-test "$(stat -c '%a' "$workspace/.feanorfs/config.json")" = 600
-grep -q '"format_version": 3' "$workspace/.feanorfs/config.json"
-grep -q '"hub_local": true' "$workspace/.feanorfs/config.json"
-test -s "$workspace/.feanorfs/refs/last-synced"
-find "$workspace/.feanorfs/objects" -type f -print -quit | grep -q .
+test "$(stat -c '%a' "$state/config.json")" = 600
+grep -q '"format_version": 3' "$state/config.json"
+grep -q '"hub_local": true' "$state/config.json"
+test -s "$state/refs/last-synced"
+find "$state/objects" -type f -print -quit | grep -q .
 
 Xvfb :99 -screen 0 1024x768x24 >/tmp/feanorfs-xvfb.log 2>&1 &
 xvfb_pid=$!
@@ -173,6 +183,11 @@ mkdir -p "$workspace"
 printf 'Arch package smoke\n' > "$workspace/smoke.txt"
 HOME="$home" FEANORFS_CREDENTIAL_STORE=file \
     /usr/bin/feanorfs start --local --no-watch "$workspace" >/dev/null
+state=$(find "$home/.feanorfs/workspaces" -mindepth 1 -maxdepth 1 -type d -print -quit)
+[ -n "$state" ]
+[ "$(cat "$state/location")" = "$workspace" ]
+[ ! -e "$workspace/.feanorfs" ]
+[ ! -e "$workspace/.feanorfsignore" ]
 status_json=$(
     cd "$workspace"
     HOME="$home" FEANORFS_CREDENTIAL_STORE=file /usr/bin/feanorfs --json status
@@ -184,11 +199,11 @@ printf '%s\n' "$status_json" | jq -e '
     (.download_required | length) == 0 and
     (.pending_conflicts | length) == 0
 ' >/dev/null
-test "$(stat -c '%a' "$workspace/.feanorfs/config.json")" = 600
-grep -q '"format_version": 3' "$workspace/.feanorfs/config.json"
-grep -q '"hub_local": true' "$workspace/.feanorfs/config.json"
-test -s "$workspace/.feanorfs/refs/last-synced"
-find "$workspace/.feanorfs/objects" -type f -print -quit | grep -q .
+test "$(stat -c '%a' "$state/config.json")" = 600
+grep -q '"format_version": 3' "$state/config.json"
+grep -q '"hub_local": true' "$state/config.json"
+test -s "$state/refs/last-synced"
+find "$state/objects" -type f -print -quit | grep -q .
 
 Xvfb :99 -screen 0 1024x768x24 >/tmp/feanorfs-xvfb.log 2>&1 &
 xvfb_pid=$!

@@ -42,7 +42,7 @@ cargo run --bin feanorfs -- sync --no-watch
 ### Conventions
 
 - **Paths**: All file paths are tracked and uploaded using forward slashes (`/`). Normalize with `feanorfs_common::normalize_path` before cache or database operations.
-- **No redundant hashing**: Check `.feanorfs/local_state.json` first. Rehash only if `mtime` or `size` differs.
+- **No redundant hashing**: Check the private global workspace `local_state.json` first. Rehash only if `mtime` or `size` differs.
 - **Zero-knowledge encryption**: File bytes and format-v3 tree/snapshot objects must be sealed through the existing AEAD object pipeline before upload. Never add a plaintext or legacy-XOR write path.
 - **Error handling**: Use `anyhow::Result` for application code. Provide context with `.context()` or `.with_context()`. Avoid bare `.unwrap()` on fallible operations — use `.unwrap_or()` / `.unwrap_or_default()` only when the default is genuinely safe.
 - **Skip control directories**: `.feanorfs` and `.git` must be hardcoded as skipped in directory scanning. Do not rely on `.gitignore` for these. Sync scope and ignore policy: [docs/sync-scope.md](docs/sync-scope.md).

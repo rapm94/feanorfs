@@ -7,16 +7,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const PAUSED_FILE: &str = "paused";
 const WATCH_PID_FILE: &str = "watch.pid";
 
-fn feanorfs_dir(base: &Path) -> std::path::PathBuf {
-    base.join(".feanorfs")
+fn feanorfs_dir(base: &Path) -> std::io::Result<std::path::PathBuf> {
+    feanorfs_agent_core::ensure_workspace_state(base)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 pub fn is_paused(base: &Path) -> bool {
-    feanorfs_dir(base).join(PAUSED_FILE).is_file()
+    feanorfs_dir(base).is_ok_and(|dir| dir.join(PAUSED_FILE).is_file())
 }
 
 pub fn set_paused(base: &Path, paused: bool) -> std::io::Result<()> {
-    let dir = feanorfs_dir(base);
+    let dir = feanorfs_dir(base)?;
     fs::create_dir_all(&dir)?;
     let path = dir.join(PAUSED_FILE);
     if paused {
@@ -40,7 +41,9 @@ fn now_secs() -> u64 {
 }
 
 pub fn write_watch_pid(base: &Path) {
-    let dir = feanorfs_dir(base);
+    let Ok(dir) = feanorfs_dir(base) else {
+        return;
+    };
     let _ = fs::create_dir_all(&dir);
     let pid = std::process::id();
     let content = format!("{pid}\n{}\n", now_secs());
@@ -48,11 +51,16 @@ pub fn write_watch_pid(base: &Path) {
 }
 
 pub fn clear_watch_pid(base: &Path) {
-    let _ = fs::remove_file(feanorfs_dir(base).join(WATCH_PID_FILE));
+    if let Ok(dir) = feanorfs_dir(base) {
+        let _ = fs::remove_file(dir.join(WATCH_PID_FILE));
+    }
 }
 
 pub fn is_watching(base: &Path) -> bool {
-    let path = feanorfs_dir(base).join(WATCH_PID_FILE);
+    let Ok(dir) = feanorfs_dir(base) else {
+        return false;
+    };
+    let path = dir.join(WATCH_PID_FILE);
     let Ok(content) = fs::read_to_string(&path) else {
         return false;
     };

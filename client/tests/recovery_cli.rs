@@ -13,6 +13,7 @@ fn run_recovery_cli(cwd: &Path, home: &Path, args: &[&std::ffi::OsStr], pass: &s
         .args(args)
         .current_dir(cwd)
         .env("HOME", home)
+        .env("FEANORFS_HOME", home.join(".feanorfs"))
         .env("FEANORFS_CREDENTIAL_STORE", "file")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -51,8 +52,16 @@ async fn encrypted_kit_restores_through_real_start_without_secret_arguments() {
         hub_local: false,
         relay: None,
     };
-    feanorfs_client::save_config(&source, &config).unwrap();
-    let db = ClientDb::new(source.join(".feanorfs")).await.unwrap();
+    let state = home
+        .join(".feanorfs/workspaces")
+        .join(feanorfs_agent_core::workspace_state_id(&source).unwrap());
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let db = ClientDb::new(&state).await.unwrap();
     do_sync(
         &server.api,
         &db,
@@ -146,7 +155,12 @@ async fn encrypted_kit_restores_through_real_start_without_secret_arguments() {
         std::fs::read(restored.join("hello.txt")).unwrap(),
         b"encrypted recovery payload"
     );
-    let restored_config = feanorfs_client::load_config(&restored).unwrap();
+    let restored_state = home
+        .join(".feanorfs/workspaces")
+        .join(feanorfs_agent_core::workspace_state_id(&restored).unwrap());
+    let restored_config: Config =
+        serde_json::from_slice(&std::fs::read(restored_state.join("config.json")).unwrap())
+            .unwrap();
     assert_eq!(restored_config.workspace_id, config.workspace_id);
     assert_eq!(
         restored_config.encryption_password.as_deref(),

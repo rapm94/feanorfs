@@ -84,6 +84,17 @@ pub async fn agent_spawn(
 }
 
 #[napi]
+pub async fn agent_path(root: String, name: String) -> Result<String> {
+    run(move || {
+        let path = open(&root)?
+            .agent_path(&name)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+#[napi]
 pub async fn agent_status(root: String, name: String) -> Result<String> {
     run(move || {
         let result = open(&root)?

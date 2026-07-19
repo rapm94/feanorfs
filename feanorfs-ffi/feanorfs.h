@@ -36,6 +36,11 @@ char *ffs_agent_list(const char *root);
 char *ffs_agent_spawn(const char *root, const char *name, int32_t no_sync, int32_t replace);
 
 /**
+ * Return the absolute worktree path for an existing agent. NULL on error.
+ */
+char *ffs_agent_path(const char *root, const char *name);
+
+/**
  * Preview one agent's changes. JSON: `AgentCheckResult`. NULL on error.
  */
 char *ffs_agent_status(const char *root, const char *name);

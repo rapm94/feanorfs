@@ -11,7 +11,11 @@ use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 
 pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
-    let log_dir = current_dir.join(".feanorfs");
+    let log_dir = if feanorfs_agent_core::workspace_is_configured(current_dir) {
+        feanorfs_agent_core::ensure_workspace_state(current_dir)?
+    } else {
+        feanorfs_agent_core::global_state_root()?.join("logs")
+    };
     let _ = std::fs::create_dir_all(&log_dir)
         .map_err(|e| eprintln!("Warning: could not create log directory: {e:?}"));
 
@@ -446,7 +450,7 @@ pub async fn initialize_new_mirror(
     let _db = crate::open_client_db(current_dir).await?;
 
     if hub_local {
-        let hub_dir = config.hub_data_dir(current_dir);
+        let hub_dir = config.hub_data_dir(current_dir)?;
         LocalHub::open(hub_dir, srv_pass.clone()).await?;
     }
 
@@ -481,7 +485,7 @@ pub async fn initialize_new_mirror(
         if hub_local {
             println!(
                 "\nThis workspace uses an embedded local hub. Invites are not portable — \
-                 run `feanorfs serve --data-dir .feanorfs/hub-data` to share it on the network."
+                 run `feanorfs serve --data-dir ~/.feanorfs/workspaces/<workspace>/hub-data` to share it on the network."
             );
         } else {
             print_invite(&invite)?;
@@ -498,7 +502,7 @@ pub async fn initialize_new_mirror(
     } else if hub_local {
         println!(
             "\nThis workspace uses an embedded local hub. Invites are not portable — \
-             run `feanorfs serve --data-dir .feanorfs/hub-data` to share it on the network."
+             run `feanorfs serve --data-dir ~/.feanorfs/workspaces/<workspace>/hub-data` to share it on the network."
         );
     } else if reveal_secrets {
         print_invite(&invite)?;
@@ -560,7 +564,7 @@ pub async fn link_existing_mirror(
     let db = crate::open_client_db(current_dir).await?;
 
     if hub_local {
-        LocalHub::open(config.hub_data_dir(current_dir), srv_pass.clone()).await?;
+        LocalHub::open(config.hub_data_dir(current_dir)?, srv_pass.clone()).await?;
     }
 
     println!("Linked this folder to mirrored workspace '{workspace}'.");
@@ -684,12 +688,12 @@ fn print_join_preflight(preview: &feanorfs_client::JoinPreflight) {
     );
     if preview.ignore_policy_differs {
         println!(
-            "  Ignore policy: differs; the encrypted mirror policy will replace this folder's .feanorfsignore"
+            "  Ignore rules: differ; the encrypted mirror rules will replace this folder's global rules"
         );
     } else if preview.ignore_policy_known {
-        println!("  Ignore policy: matches the encrypted mirror");
+        println!("  Ignore rules: match the encrypted mirror");
     } else {
-        println!("  Ignore policy: older invite; keeping this folder's current policy");
+        println!("  Ignore rules: older invite; keeping this folder's current rules");
     }
     if preview.large_files.count > 0 {
         print_preflight_group(

@@ -124,7 +124,7 @@ pub async fn materialize(
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let (temporary_path, mut temporary) = create_temp(ctx.base).await?;
+    let (temporary_path, mut temporary) = create_temp(&destination).await?;
     let mut guard = TempGuard(Some(temporary_path.clone()));
     let mut plaintext_hasher = blake3::Hasher::new();
     let mut total = 0_u64;
@@ -348,11 +348,15 @@ async fn download_verified(api: &ApiClient, hash: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn create_temp(base: &Path) -> Result<(PathBuf, tokio::fs::File)> {
-    let directory = base.join(".feanorfs/tmp");
+async fn create_temp(destination: &Path) -> Result<(PathBuf, tokio::fs::File)> {
+    // A sibling temp guarantees the verified file can be published with one
+    // atomic rename even when the workspace is on a separate volume.
+    let directory = destination
+        .parent()
+        .context("large-file destination has no parent")?;
     tokio::fs::create_dir_all(&directory).await?;
     for attempt in 0..64_u64 {
-        let path = directory.join(format!("chunk-download-{}-{attempt}", std::process::id()));
+        let path = directory.join(format!(".feanorfs-tmp-{}-{attempt}", std::process::id()));
         match tokio::fs::OpenOptions::new()
             .create_new(true)
             .write(true)

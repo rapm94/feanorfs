@@ -410,7 +410,7 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
     }
 }
 
-/// Remove tracked files that match built-in or `.feanorfsignore` patterns (DX-5).
+/// Remove ignored paths from the encrypted mirror without deleting local files.
 pub async fn prune_ignored(
     api: &ApiClient,
     db: &ClientDb,
@@ -433,7 +433,8 @@ async fn prune_ignored_with_ctx(ctx: &SyncCtx<'_>, dry_run: bool) -> Result<Prun
     for pattern in crate::local::DEFAULT_IGNORES {
         let _ = igb.add_line(None, pattern);
     }
-    if let Ok(content) = tokio::fs::read_to_string(ctx.base.join(".feanorfsignore")).await {
+    let ignore_path = ctx.state_dir()?.join("ignore");
+    if let Ok(content) = tokio::fs::read_to_string(ignore_path).await {
         for line in content.lines() {
             let line = line.trim();
             if !line.is_empty() && !line.starts_with('#') {
@@ -442,15 +443,25 @@ async fn prune_ignored_with_ctx(ctx: &SyncCtx<'_>, dry_run: bool) -> Result<Prun
         }
     }
     let ig = igb.build()?;
-    let mut to_prune = Vec::new();
+    let mut to_prune = std::collections::BTreeSet::new();
     for (path, entry) in &tracked {
         if entry.deleted_at.is_some() {
             continue;
         }
-        if ig.matched(path, false).is_ignore() {
-            to_prune.push(path.clone());
+        if feanorfs_agent_core::local::is_always_excluded(Path::new(path))
+            || ig.matched(path, false).is_ignore()
+        {
+            to_prune.insert(path.clone());
         }
     }
+    for path in ctx.db.list_pending_conflict_paths().await? {
+        if feanorfs_agent_core::local::is_always_excluded(Path::new(&path))
+            || ig.matched(&path, false).is_ignore()
+        {
+            to_prune.insert(path);
+        }
+    }
+    let to_prune = to_prune.into_iter().collect::<Vec<_>>();
     if dry_run {
         return Ok(PruneIgnoredResult {
             pruned: Vec::new(),
@@ -468,10 +479,7 @@ async fn prune_ignored_with_ctx(ctx: &SyncCtx<'_>, dry_run: bool) -> Result<Prun
                 .await?;
         }
         ctx.db.delete_cache_entry(path).await?;
-        let full = ctx.base.join(path);
-        if full.exists() {
-            tokio::fs::remove_file(&full).await.ok();
-        }
+        feanorfs_agent_core::conflicts::discard_excluded_conflict(ctx.db, path).await?;
         pruned.push(path.clone());
     }
     if ctx.format_version() >= 3 && !pruned.is_empty() {

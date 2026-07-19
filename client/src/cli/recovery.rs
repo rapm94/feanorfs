@@ -79,7 +79,7 @@ pub async fn run(current_dir: &Path, action: RecoveryAction, json: bool) -> anyh
             passphrase_stdin,
         } => {
             let destination = folder.as_deref().unwrap_or(current_dir);
-            if destination.join(".feanorfs").join("config.json").exists() {
+            if feanorfs_agent_core::workspace_is_configured(destination) {
                 anyhow::bail!(
                     "{} is already a FeanorFS workspace; choose a new or unconfigured folder",
                     destination.display()

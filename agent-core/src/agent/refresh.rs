@@ -49,12 +49,15 @@ pub async fn refresh_agent_with_options(
     let config = crate::local::load_config(base)?;
     let ctx = SyncCtx::from_config(api, db, base, &config)?;
     let diff = compute_agent_diff(&ctx, name).await?;
-    let agent_path = agent_dir(base, name);
+    let agent_path = agent_dir(base, name)?;
     let snapshots = SnapshotEngine::new(&ctx);
     let base_snapshot = snapshots.read_agent_base(name).await?;
     let mut refreshed_base = snapshots.load_files(&base_snapshot).await?;
     if options.replace {
-        let agent_db = ClientDb::new(agent_path.join(".feanorfs")).await?;
+        let agent_db = ClientDb::new(crate::workspace_layout::ensure_workspace_state(
+            &agent_path,
+        )?)
+        .await?;
         let agent_scan =
             crate::local::scan_local_directory(&agent_path, &agent_db, ctx.password()).await?;
         let agent_ctx = SyncCtx::from_config(api, &agent_db, &agent_path, &config)?;
@@ -121,7 +124,10 @@ pub async fn refresh_agent_with_options(
     }
     let mut refreshed = Vec::new();
     let mut deferred = Vec::new();
-    let agent_db = ClientDb::new(agent_path.join(".feanorfs")).await?;
+    let agent_db = ClientDb::new(crate::workspace_layout::ensure_workspace_state(
+        &agent_path,
+    )?)
+    .await?;
     let agent_ctx = SyncCtx::from_config(api, &agent_db, &agent_path, &config)?;
     for theirs in &diff.their_changes {
         let response = if theirs.deleted {

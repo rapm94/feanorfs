@@ -29,10 +29,10 @@
 
 ## OVERVIEW
 `FeanorFS` is a developer-focused uncommitted-code synchronization tool written in Rust. It uses a self-contained local-first architecture:
-1. **Snapshot synchronization**: Format-v3 clients compare encrypted Merkle trees against `.feanorfs/refs/last-synced`, stage blobs and tree objects, then compare-and-swap one workspace head.
+1. **Snapshot synchronization**: Format-v3 clients compare encrypted Merkle trees against the private global workspace ref, stage blobs and tree objects under `~/.feanorfs/workspaces/<opaque-id>/`, then compare-and-swap one workspace head.
 2. **Blob storage**: Content-addressed storage (CAS) blobs use Blake3 ciphertext hashes. Remote `feanorfs serve` uses SQLite for opaque heads, manifests, format markers, and legacy-format metadata; the embedded LocalHub uses lock-protected JSON plus blob files.
 3. **End-to-End Encryption (E2EE)**: New blobs are sealed with ChaCha20-Poly1305 AEAD (`pack_bytes`/`unpack_bytes`), key derived from `blake3(domain ‖ len-prefixed password ‖ len-prefixed path)`, deterministic SIV-style nonce (required for CAS stability). Format v2 workspaces reject non-AEAD blobs (`LegacyPolicy::Reject`); unmigrated v1 workspaces still fall back to legacy XOR on decrypt until `feanorfs migrate`. Removing compatibility requires separately approved representative field evidence. Client re-hashes downloaded ciphertext against `encrypted_hash` before decrypting.
-4. **Local hub (in-process)**: `setup --local` / `hub_local` config uses agent-core `LocalHub` directly — no socket, daemon, server crate, or SQLite. Share on the network via `feanorfs serve --data-dir .feanorfs/hub-data` (invites are not portable for embedded hubs).
+4. **Local hub (in-process)**: `setup --local` / `hub_local` config uses agent-core `LocalHub` directly — no socket, daemon, server crate, or SQLite. Its data lives in the global workspace state (invites are not portable for embedded hubs).
 5. **On-Demand Hydration (Lazy Sync)**: `pull --lazy` creates 0-byte placeholders; actual bytes fetched via `hydrate` or `cat`.
 6. **Workspace isolation**: `agent spawn` clones files and writes one base snapshot ref. Status and land descend only into changed subtrees. Land commits through head compare-and-swap, and conflicts survive in encrypted tree entries plus human-readable artifacts.
 7. **Agent Library API**: Client crate is split into `lib.rs` + `main.rs`; `feanorfs_client::sync/push/pull/hydrate/cat` are callable from any Rust program. `--json` flag on the CLI emits structurally-typed results for every status-returning command.
@@ -94,7 +94,7 @@ feanorfs/
 ---
 
 ## THE LOCAL CACHE DESIGN
-To avoid unnecessary re-hashing, the client stores schema-versioned state in `.feanorfs/local_state.json`, protected by a separate advisory lock and atomic replacement:
+To avoid unnecessary re-hashing, the client stores schema-versioned state under `~/.feanorfs/workspaces/<opaque-id>/local_state.json`, protected by a separate advisory lock and atomic replacement. No FeanorFS metadata or ignore file is created inside a project:
 1. **State maps:** cache entries, pending conflicts, conflict resolution history, session markers, and bounded predictive access weights.
 2. **Legacy import:** client-owned migration reads WAL-visible `local_cache.db` rows for the workspace and each agent, verifies semantic equality after JSON import, then archives SQLite files as `.migrated-v1.db`.
 3. **Double-hash and Server Mtime Tracking** in cache entries:
@@ -116,7 +116,7 @@ To avoid unnecessary re-hashing, the client stores schema-versioned state in `.f
 | Encrypted objects + snapshots | [objects.rs](agent-core/src/objects.rs), [snapshot.rs](agent-core/src/snapshot.rs) | Immutable encrypted tree/snapshot CAS, refs, manifests, and head publication. |
 | History | [history.rs](agent-core/src/history.rs) | Reachable DAG log, short-ID resolution, append-only undo, and worktree materialization. |
 | Directory Scanning | [local.rs](client/src/local.rs) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
-| Sync scope & ignores | [sync-scope.md](docs/sync-scope.md) | Why we sync gitignored paths, small `DEFAULT_IGNORES`, no `.gitignore`, optional `.feanorfsignore`, and nested valid `CACHEDIR.TAG` pruning. |
+| Sync scope & ignores | [sync-scope.md](docs/sync-scope.md) | Why we sync gitignored paths, hard-exclude `.git`/`.jj`/legacy metadata, keep custom rules in global state, and prune valid `CACHEDIR.TAG` trees. |
 | Transport (`ApiClient`) | [api.rs](client/src/api.rs) + [hub.rs](client/src/hub.rs) | HTTP or in-process hub via `Backend::Http` / `Backend::Local`. Wraps `/api/sync/diff`, upload, download, workspaces. |
 | Native TLS | [tls.rs](server/src/tls.rs), [api.rs](agent-core/src/api.rs), [invite.rs](common/src/invite.rs) | Rustls server, invite-pinned private CA, system-root public TLS, and secure hub/workspace capabilities. |
 | Private-hub recovery | [recovery.rs](server/src/recovery.rs), [serve.rs](client/src/cli/serve.rs) | Argon2id + XChaCha20-Poly1305 identity bundles, offline runtime lock, durable import fence, CA/key validation, and leaf regeneration. |
@@ -163,7 +163,7 @@ To avoid unnecessary re-hashing, the client stores schema-versioned state in `.f
 - Conflict registry and resolution history preserve needs-attention state and explicit choices.
 - Session key/value state stores the previous `last_scan` summary baseline.
 - Global config: `~/.feanorfs/global.json` stores server URL, optional public hub CA, and either a random OS-credential reference or a protected-file token fallback (cached automatically by `feanorfs start`; hidden `connect` also writes it).
-- Workspace config: `.feanorfs/config.json` stores server URL, workspace ID, optional public hub CA, and either a random OS-credential reference or a protected-file E2EE key/token fallback.
+- Workspace config: `~/.feanorfs/workspaces/<opaque-id>/config.json` stores server URL, workspace ID, optional public hub CA, and either a random OS-credential reference or a protected-file E2EE key/token fallback.
 
 ---
 
@@ -172,10 +172,10 @@ To avoid unnecessary re-hashing, the client stores schema-versioned state in `.f
 2. **No Redundant Hashing**: Check `local_state.json` first. Rehash only if `mtime` or `size` differs.
 3. **Zero-knowledge encryption**: Seal file bytes by path and tree/snapshot objects under the fixed object domain before upload. Format-v3 server metadata contains no filenames.
 4. **Library-First Result Types**: Commands return `Serialize`-derived structs (`SyncResult`, `PushResult`, etc.) so the `--json` flag and `feanorfs_client::` library callers see the same shape.
-5. **No Auto-Merge**: `agent land` emits three-way `ConcurrentEdit` triples under `.feanorfs/conflicts/` (`.original`/`.local`/`.cloud`). Reconciliation is the consumer's job via `conflicts keep`.
-6. **Predictive Hydration is Local-Only**: access weights never leave the client. They stay in `.feanorfs/local_state.json`.
+5. **No Auto-Merge**: `agent land` emits three-way `ConcurrentEdit` triples in private global conflict state (`.original`/`.local`/`.cloud`). Reconciliation is the consumer's job via `conflicts keep`.
+6. **Predictive Hydration is Local-Only**: access weights never leave the client. They stay in the global workspace `local_state.json`.
 7. **Data Isolation ≠ Sandbox**: agent workspaces isolate files, not processes. Never claim sandboxing in code or copy; link the "Process isolation" section of [docs/threat-model.md](docs/threat-model.md) instead.
-8. **Sync scope**: mirror disk contents (including gitignored paths); hard skip `.feanorfs/`, `.git/`, symlinks, and nested valid `CACHEDIR.TAG` trees; small frozen `DEFAULT_IGNORES` only — see [docs/sync-scope.md](docs/sync-scope.md). Do not honor `.gitignore` or expand defaults into a framework-specific denylist.
+8. **Sync scope**: mirror disk contents (including gitignored paths); hard skip `.git/`, `.jj/`, legacy Feanor metadata, symlinks, and nested valid `CACHEDIR.TAG` trees; small frozen `DEFAULT_IGNORES` only — see [docs/sync-scope.md](docs/sync-scope.md). Do not honor `.gitignore` or expand defaults into a framework-specific denylist. Custom rules are managed with `feanorfs ignore` and stored globally.
 9. **CI/CD ownership**: Pin repository-owned actions to immutable SHAs, keep permissions least-privilege, and validate workflows with actionlint/zizmor. Never hand-edit cargo-dist's generated `.github/workflows/release.yml`; change `dist-workspace.toml` and regenerate it.
 10. **Release changelog ownership**: Root `CHANGELOG.md` is canonical. Release-plz must use `changelog_path = "./CHANGELOG.md"`; do not create crate-local changelogs.
 11. **Shared pre-1.0 versions**: Internal workspace path dependencies use a pre-1.0 range so release-plz can bump all `version.workspace` crates together. These crates remain unpublished; main CI validates their compatibility.
@@ -183,13 +183,13 @@ To avoid unnecessary re-hashing, the client stores schema-versioned state in `.f
 ---
 
 ## ANTI-PATTERNS (THIS PROJECT)
-- **DO NOT** scan the `.feanorfs`, `.git`, or `.feanorfs/agents/` directories as part of the main workspace scan. They are hardcoded as skipped. Agents have their own scan inside their workspace dir (separate `ClientDb`).
+- **DO NOT** scan `.git`, `.jj`, legacy Feanor metadata, or global state as project content. Agents have a separate global `worktree/` and `state/` (separate `ClientDb`).
 - **DO NOT** trigger syncs on every raw filesystem change event. Filesystem saves are noisy. Debounce updates for 500ms using a channel.
 - **DO NOT** download remote file bytes immediately during sync if `--lazy` is enabled. Write 0-byte placeholders instead.
 - **DO NOT** add a new server endpoint when encrypted objects, manifests, and head compare-and-swap already express the operation. Keep the server dumb.
 - **DO NOT** ship file contents to a remote LLM when implementing `--summarize`. The shell-out tool is fed paths and metadata only; the E2EE password and file bytes stay local.
-- **DO NOT** attempt to merge concurrent edits. `agent land` writes `.original`/`.local`/`.cloud` under `.feanorfs/conflicts/` and stops. A consumer reconciles with `conflicts keep`.
-- **DO NOT** honor `.gitignore` or grow `DEFAULT_IGNORES` into a per-framework cache list. Follow [docs/sync-scope.md](docs/sync-scope.md) admission criteria; use `.feanorfsignore` for project-specific exclusions.
+- **DO NOT** attempt to merge concurrent edits. `agent land` writes `.original`/`.local`/`.cloud` in private global conflict state and stops. A consumer reconciles with `conflicts keep`.
+- **DO NOT** honor `.gitignore` or grow `DEFAULT_IGNORES` into a per-framework cache list. Follow [docs/sync-scope.md](docs/sync-scope.md) admission criteria; use `feanorfs ignore <pattern>` for project-specific exclusions.
 
 ---
 

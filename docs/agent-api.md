@@ -13,6 +13,7 @@ Canonical fixtures live in `common/src/agent_contract.rs`. Snapshot tests in `cl
 | List agents | `agent status` | `list()` + CLI-only status enrichment | `AgentListOfflineResult` (SDK), `AgentListResult` (CLI enriched) |
 | List agents (legacy) | hidden `agent list` | — | always `AgentListOfflineResult` (plain names, even when online) |
 | Spawn | `agent spawn <name>` | `spawn(name, opts)` | `SpawnResult` |
+| Agent path | `agent run <name> -- …` | `agent_path(name)` | absolute global worktree path |
 | Preview | `agent status <name>` | `status(name)` | `AgentCheckResult` |
 | Refresh | `agent refresh <name> [--replace]` | `refresh(name)` | `AgentRefreshResult` |
 | Land | `agent land <name>` | `land(name, opts)` | `AgentLandResult` |
@@ -126,9 +127,9 @@ Emitted inside `conflicts[]` on land/check when paths overlap:
   "base": { "path": "…", "hash": "…", "size": 0, "mtime": 0, "deleted": false },
   "ours": { "…": "…" },
   "theirs": { "…": "…" },
-  "original_file": ".feanorfs/conflicts/<ts>/src/main.rs.original",
-  "local_file": ".feanorfs/conflicts/<ts>/src/main.rs.local",
-  "cloud_file": ".feanorfs/conflicts/<ts>/src/main.rs.cloud",
+  "original_file": "~/.feanorfs/workspaces/<id>/conflicts/<ts>/src/main.rs.original",
+  "local_file": "~/.feanorfs/workspaces/<id>/conflicts/<ts>/src/main.rs.local",
+  "cloud_file": "~/.feanorfs/workspaces/<id>/conflicts/<ts>/src/main.rs.cloud",
   "kind": "edit_edit",
   "local_available": true,
   "cloud_available": true,
@@ -145,7 +146,7 @@ Optional when `--propose`: `proposed_file`, `proposal_clean`.
 
 ## Conflict artifact layout
 
-Under `.feanorfs/conflicts/<unix_ms>/`:
+Under `~/.feanorfs/workspaces/<id>/conflicts/<unix_ms>/`:
 
 | File | Role |
 |------|------|
@@ -179,6 +180,8 @@ Thread model:
 - `ffs_last_error()` is **per-thread**. Errors from one thread are invisible to another.
 - Returned `char*` values (including from `ffs_last_error`) must be freed with `ffs_string_free`.
 - JSON-returning functions: **NULL = error** (read `ffs_last_error` on the same thread).
+- `ffs_agent_path(root, name)` returns the existing agent's absolute global
+  worktree path without requiring callers to know FeanorFS's private layout.
 - `ffs_conflicts_keep`: **0 = success**, **-1 = error**.
 - `ffs_log(root, limit)` returns `LogResult` JSON.
 - `ffs_undo(root, snapshot_id)` returns `UndoResult` JSON.

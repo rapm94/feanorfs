@@ -142,13 +142,13 @@ run_as_root() {
 linux_dependency_repair() {
     if command -v apt-get >/dev/null 2>&1; then
         echo "Install the required desktop libraries with:" >&2
-        echo "  sudo apt-get install libgtk-3-0 libayatana-appindicator3-1 xdg-desktop-portal zenity" >&2
+        echo "  sudo apt-get install libgtk-3-0 libayatana-appindicator3-1 xdg-desktop-portal zenity avahi-daemon" >&2
     elif command -v dnf >/dev/null 2>&1; then
         echo "Install the required desktop libraries with:" >&2
-        echo "  sudo dnf install gtk3 libayatana-appindicator-gtk3 xdg-desktop-portal zenity" >&2
+        echo "  sudo dnf install gtk3 libayatana-appindicator-gtk3 xdg-desktop-portal zenity avahi" >&2
     elif command -v pacman >/dev/null 2>&1; then
         echo "Install the required desktop libraries with:" >&2
-        echo "  sudo pacman -S gtk3 libayatana-appindicator xdg-desktop-portal zenity" >&2
+        echo "  sudo pacman -S gtk3 libayatana-appindicator xdg-desktop-portal zenity avahi" >&2
     else
         echo "Install GTK 3, Ayatana AppIndicator 3, XDG Desktop Portal, and zenity with this system's package manager." >&2
     fi

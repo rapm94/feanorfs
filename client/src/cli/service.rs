@@ -113,16 +113,17 @@ impl ServiceSpec {
         ]
     }
 
-    fn marker_path(&self) -> PathBuf {
-        self.workspace.join(".feanorfs/service-program")
+    fn marker_path(&self) -> anyhow::Result<PathBuf> {
+        Ok(feanorfs_agent_core::ensure_workspace_state(&self.workspace)?.join("service-program"))
     }
 
     fn installed_program_matches(&self) -> bool {
-        service_identity_matches(&self.marker_path(), &[&self.program])
+        self.marker_path()
+            .is_ok_and(|path| service_identity_matches(&path, &[&self.program]))
     }
 
     fn record_installed_program(&self) -> anyhow::Result<()> {
-        record_service_identity(&self.marker_path(), &[&self.program])
+        record_service_identity(&self.marker_path()?, &[&self.program])
             .context("record automatic sync executable")
     }
 }
@@ -192,7 +193,7 @@ async fn refresh_installation() -> anyhow::Result<InstallationRefreshResult> {
 
     for entry in recent.workspaces {
         let workspace = PathBuf::from(entry.path);
-        if !workspace.join(".feanorfs/config.json").is_file() {
+        if !feanorfs_agent_core::workspace_is_configured(&workspace) {
             continue;
         }
         let config = feanorfs_client::load_config(&workspace).with_context(|| {
@@ -317,7 +318,7 @@ pub(crate) fn uninstall_for_workspace_stop(workspace: &Path) -> anyhow::Result<(
         if !feanorfs_client::is_watching(&spec.workspace)
             && !feanorfs_client::lock::is_sync_lock_active(&spec.workspace)
         {
-            match std::fs::remove_file(spec.marker_path()) {
+            match std::fs::remove_file(spec.marker_path()?) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).context("remove automatic sync identity marker"),
@@ -384,13 +385,10 @@ impl TrayServiceSpec {
         let Some(program) = candidates.into_iter().find(|path| path.is_file()) else {
             return Ok(None);
         };
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .context("HOME or USERPROFILE is not set")?;
         Ok(Some(Self {
             program,
             feanorfs_program: spec.program.clone(),
-            marker: PathBuf::from(home).join(".feanorfs/tray-service-program"),
+            marker: feanorfs_agent_core::global_state_root()?.join("tray-service-program"),
         }))
     }
 

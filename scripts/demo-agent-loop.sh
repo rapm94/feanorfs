@@ -41,8 +41,8 @@ echo "== spawn two agents =="
 "$ROOT/target/debug/feanorfs" agent spawn a
 "$ROOT/target/debug/feanorfs" agent spawn b
 
-echo "agent version" > .feanorfs/agents/a/doc.txt
-echo "other agent" > .feanorfs/agents/b/doc.txt
+"$ROOT/target/debug/feanorfs" agent run a -- sh -c 'printf "%s\n" "agent version" > doc.txt'
+"$ROOT/target/debug/feanorfs" agent run b -- sh -c 'printf "%s\n" "other agent" > doc.txt'
 echo "human edit" > doc.txt
 "$ROOT/target/debug/feanorfs" sync --up --no-watch 2>/dev/null || "$ROOT/target/debug/feanorfs" push
 

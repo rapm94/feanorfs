@@ -79,7 +79,8 @@ use std::path::Path;
 
 pub async fn open_client_db(workspace_root: &Path) -> Result<feanorfs_agent_core::ClientDb> {
     crate::migrate_sqlite::migrate_workspace_stores(workspace_root).await?;
-    feanorfs_agent_core::ClientDb::new(workspace_root.join(".feanorfs")).await
+    let state = feanorfs_agent_core::ensure_workspace_state(workspace_root)?;
+    feanorfs_agent_core::ClientDb::new(state).await
 }
 
 pub async fn open_api_client(

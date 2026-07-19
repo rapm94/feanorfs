@@ -83,7 +83,7 @@ pub async fn spawn_agent(
     no_sync: bool,
     replace: bool,
 ) -> Result<usize> {
-    let config = if base.join(".feanorfs/config.json").exists() {
+    let config = if crate::workspace_layout::workspace_is_configured(base) {
         crate::local::load_config(base)?
     } else {
         crate::local::Config {
@@ -109,7 +109,7 @@ async fn spawn_agent_with_ctx(
     replace: bool,
 ) -> Result<usize> {
     validate_name(name)?;
-    let target = agent_dir(ctx.base, name);
+    let target = agent_dir(ctx.base, name)?;
     if target.exists() {
         if replace {
             // Preserve the original agent tree until the new copy is committed.
@@ -247,8 +247,7 @@ async fn spawn_agent_with_ctx(
 }
 
 async fn inject_spawn_failure(base: &Path, name: &str, point: &str) -> Result<()> {
-    let path = base
-        .join(".feanorfs")
+    let path = crate::workspace_layout::ensure_workspace_state(base)?
         .join(format!("test-spawn-failpoint-{name}"));
     if fs::read_to_string(&path).await.ok().as_deref() == Some(point) {
         fs::remove_file(path).await?;

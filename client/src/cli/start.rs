@@ -189,7 +189,7 @@ pub(crate) async fn finish_sync_watch(
             println!("  {path}");
         }
         println!(
-            "Keep legitimate large files normally; add disposable artifacts to .feanorfsignore."
+            "Keep legitimate large files normally; run `feanorfs ignore <pattern>` for disposable artifacts."
         );
     }
 

@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const STALE_SYNC_SECS: u64 = 600;
 const STALE_LAND_SECS: u64 = 600;
 
-fn lock_path(base: &Path, name: &str) -> PathBuf {
-    base.join(".feanorfs").join(name)
+fn lock_path(base: &Path, name: &str) -> Result<PathBuf> {
+    Ok(crate::workspace_layout::ensure_workspace_state(base)?.join(name))
 }
 
 pub fn pid_alive(pid: u32) -> bool {
@@ -65,7 +65,9 @@ pub fn is_stale(path: &Path, max_age_secs: u64) -> bool {
 
 /// Check whether the sync lock is actively held (not stale) by another process.
 pub fn is_sync_lock_active(base: &Path) -> bool {
-    let path = lock_path(base, "sync.lock");
+    let Ok(path) = lock_path(base, "sync.lock") else {
+        return false;
+    };
     if !path.exists() || is_stale(&path, STALE_SYNC_SECS) {
         return false;
     }
@@ -89,7 +91,7 @@ fn break_stale(path: &Path, max_age_secs: u64, label: &str) {
     }
 }
 
-/// Process-wide sync lock (`.feanorfs/sync.lock`). Re-entrant for the owning pid.
+/// Process-wide sync lock in global workspace state. Re-entrant for the owning pid.
 pub struct SyncLock {
     path: Option<PathBuf>,
     _file: File,
@@ -97,9 +99,9 @@ pub struct SyncLock {
 
 impl SyncLock {
     pub fn acquire(base: &Path) -> Result<Self> {
-        let dir = base.join(".feanorfs");
+        let dir = crate::workspace_layout::ensure_workspace_state(base)?;
         std::fs::create_dir_all(&dir)?;
-        let path = lock_path(base, "sync.lock");
+        let path = lock_path(base, "sync.lock")?;
         let self_pid = std::process::id();
 
         if let Some((pid, _)) = read_lock_meta(&path) {
@@ -151,9 +153,9 @@ pub struct LandLock {
 
 impl LandLock {
     pub fn acquire(base: &Path) -> Result<Self> {
-        let dir = base.join(".feanorfs");
+        let dir = crate::workspace_layout::ensure_workspace_state(base)?;
         std::fs::create_dir_all(&dir)?;
-        let path = lock_path(base, "land.lock");
+        let path = lock_path(base, "land.lock")?;
 
         break_stale(&path, STALE_LAND_SECS, "agent land");
 

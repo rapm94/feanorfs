@@ -49,6 +49,10 @@ impl<'a> SyncCtx<'a> {
         self.format_version
     }
 
+    pub fn state_dir(&self) -> Result<std::path::PathBuf> {
+        crate::workspace_layout::ensure_workspace_state(self.base)
+    }
+
     /// Build a context from an explicit policy.
     #[must_use]
     pub fn new(

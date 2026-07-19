@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/rapm94/feanorfs/compare/v0.7.0...v0.7.1) - 2026-07-19
+
+### Added
+
+- Zero-litter workspace state: config, credentials references, cache, refs,
+  objects, manifests, agents, conflicts, locks, logs, and custom ignore rules
+  now live under opaque `~/.feanorfs/workspaces/<id>/` directories.
+- `feanorfs ignore [PATTERN]` lists or changes per-workspace gitignore-syntax
+  rules without adding a file to the project.
+
+### Changed
+
+- Existing project-local state and ignore rules migrate transactionally into
+  global state, including a verified cross-filesystem copy fallback,
+  interrupted-migration recovery, conflict-path relocation, folder-rename
+  identity tracking, and quarantine of ambiguous prior global copies.
+- Agent copies now separate `worktree/` from transport `state/` under the
+  global root, so agent metadata can never appear as agent-authored work.
+
+### Fixed
+
+- `.git/`, `.jj/`, and legacy FeanorFS metadata are hard-excluded from scans,
+  watcher events, mirror state, and conflict state. Cleanup preserves every
+  local byte while removing accidental encrypted copies and stale conflicts.
+- macOS private hubs now register through the native DNS-SD responder, while
+  clients correlate the CA-derived service instance and retain pinned-CA TLS
+  hostname verification. Discovery waits through IPv6-only resolution events
+  and uses Avahi's system D-Bus resolver on Linux before its pure-Rust fallback,
+  remaining stable across DHCP changes without persisting a numeric address or
+  changing TLS SNI.
+- Local objects/manifests, recovery temporaries, logs, download staging, and
+  abandoned atomic-write files have bounded retention and cleanup. Large-file
+  materialization stages beside its destination to remain atomic on external
+  volumes.
+- Format-v3 pull-only sync never publishes a downloader's unrelated local-only
+  files or manifests; it records the remote head as the last agreed state and
+  keeps remaining local work pending locally.
+- Cloud conflict resolution now publishes only the explicitly resolved paths
+  over the current hub head, so unrelated local work is neither uploaded nor
+  discarded.
+
+### Security
+
+- Global workspace directories are private (`0700`) and sensitive configs are
+  `0600`; secrets remain in the OS credential store or protected fallback.
+  Migration never silently discards divergent state.
+
 ## [0.7.0](https://github.com/rapm94/feanorfs/compare/v0.6.4...v0.7.0) - 2026-07-19
 
 ### Added

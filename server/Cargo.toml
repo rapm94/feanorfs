@@ -54,6 +54,9 @@ getrandom = { workspace = true }
 atomic-write-file = "0.3"
 fs2 = "0.4"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+dns-sd-native = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }

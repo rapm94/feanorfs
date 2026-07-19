@@ -14,7 +14,7 @@ use tokio::fs;
 
 use crate::api::ApiClient;
 use crate::local::ClientDb;
-use crate::paths::{agent_base_ref, agent_dir, agents_dir, validate_name};
+use crate::paths::{agent_base_ref, agent_root, agents_dir, validate_name};
 
 pub use check::check_agent;
 pub use land::land_agent;
@@ -48,14 +48,14 @@ pub async fn commit_agent(
 
 pub async fn list_agents(base: &Path, _db: &ClientDb) -> Result<Vec<String>> {
     let mut visible = Vec::new();
-    let mut entries = match fs::read_dir(agents_dir(base)).await {
+    let mut entries = match fs::read_dir(agents_dir(base)?).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(visible),
         Err(error) => return Err(error.into()),
     };
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if entry.file_type().await?.is_dir() && agent_base_ref(base, &name).is_file() {
+        if entry.file_type().await?.is_dir() && agent_base_ref(base, &name)?.is_file() {
             visible.push(name);
         }
     }
@@ -65,7 +65,7 @@ pub async fn list_agents(base: &Path, _db: &ClientDb) -> Result<Vec<String>> {
 
 pub async fn clean_agent(base: &Path, _db: &ClientDb, name: &str) -> Result<()> {
     validate_name(name)?;
-    let target = agent_dir(base, name);
+    let target = agent_root(base, name)?;
     if target.exists() {
         fs::remove_dir_all(target).await?;
     }

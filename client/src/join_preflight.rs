@@ -72,42 +72,59 @@ impl Drop for ScratchState {
 pub fn normalize_ignore_policy(policy: &str) -> Result<String> {
     if policy.len() > MAX_IGNORE_POLICY_BYTES {
         bail!(
-            ".feanorfsignore is too large for secure pairing ({} bytes; maximum {MAX_IGNORE_POLICY_BYTES})",
+            "workspace ignore rules are too large for secure pairing ({} bytes; maximum {MAX_IGNORE_POLICY_BYTES})",
             policy.len()
         );
     }
     if policy.contains('\0') {
-        bail!(".feanorfsignore contains an unsupported NUL character");
+        bail!("workspace ignore rules contain an unsupported NUL character");
     }
     Ok(policy.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 pub fn read_ignore_policy(workspace: &Path) -> Result<String> {
-    match std::fs::read_to_string(workspace.join(".feanorfsignore")) {
+    let path = feanorfs_agent_core::workspace_state_path(workspace)?.join("ignore");
+    match std::fs::read_to_string(path) {
         Ok(policy) => normalize_ignore_policy(&policy),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error).context("read destination .feanorfsignore"),
+        Err(error) => Err(error).context("read global workspace ignore policy"),
     }
+}
+
+/// Replace this workspace's private global ignore policy without creating a
+/// project-local control file.
+pub async fn write_ignore_policy(workspace: &Path, policy: &str) -> Result<()> {
+    let policy = normalize_ignore_policy(policy)?;
+    let state = feanorfs_agent_core::ensure_workspace_state(workspace)?;
+    let path = state.join("ignore");
+    if policy.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("clear global workspace ignore policy"),
+        }
+        return Ok(());
+    }
+
+    crate::fs_util::atomic_write(&state, "ignore", policy.as_bytes())
+        .await
+        .context("write global workspace ignore policy")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("protect global workspace ignore policy")?;
+    }
+    Ok(())
 }
 
 pub async fn apply_invited_ignore_policy(workspace: &Path, policy: Option<&str>) -> Result<()> {
     let Some(policy) = policy else {
         return Ok(());
     };
-    let policy = normalize_ignore_policy(policy)?;
-    let path = workspace.join(".feanorfsignore");
-    if policy.is_empty() {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("apply mirror ignore policy"),
-        }
-    } else {
-        crate::fs_util::atomic_write(workspace, ".feanorfsignore", policy.as_bytes())
-            .await
-            .context("apply mirror ignore policy")?;
-    }
-    Ok(())
+    write_ignore_policy(workspace, policy)
+        .await
+        .context("apply mirror ignore policy")
 }
 
 pub async fn preview_join(workspace: &Path, invite: &WorkspaceInvite) -> Result<JoinPreflight> {
@@ -134,11 +151,8 @@ pub async fn preview_join(workspace: &Path, invite: &WorkspaceInvite) -> Result<
         Some(effective_policy),
     )
     .await?;
-    if ignore_policy_differs {
-        // The accepted policy is applied before the real scan. Do not report
-        // the old policy file as a content conflict that cannot actually occur.
-        local.remove(".feanorfsignore");
-    }
+    // Legacy project-local policy files are always excluded from content.
+    local.remove(".feanorfsignore");
 
     let config = Config {
         server_url: invite.server_url.clone(),

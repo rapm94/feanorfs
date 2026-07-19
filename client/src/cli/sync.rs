@@ -327,7 +327,7 @@ fn print_large_file_notice(count: usize, examples: &[String]) {
         println!("    … and {} more", count - examples.len());
     }
     println!(
-        "  Keep legitimate large files normally; add disposable large artifacts to .feanorfsignore to avoid transferring them."
+        "  Keep legitimate large files normally; run `feanorfs ignore <pattern>` for disposable artifacts."
     );
 }
 

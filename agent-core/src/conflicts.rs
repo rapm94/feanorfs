@@ -140,7 +140,7 @@ pub async fn register_and_write_conflicts(
     ours_base: Option<&Path>,
 ) -> Result<(PathBuf, HashSet<String>)> {
     let ts = chrono::Utc::now().timestamp_millis();
-    let dir = conflicts_dir(ctx.base).join(ts.to_string());
+    let dir = conflicts_dir(ctx.base)?.join(ts.to_string());
     fs::create_dir_all(&dir).await?;
 
     let local_root = ours_base.unwrap_or(ctx.base);
@@ -197,6 +197,26 @@ async fn remove_path_artifacts(conflict_dir: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Forget a conflict for a path that transport policy now excludes. Local
+/// working bytes are deliberately untouched.
+pub async fn discard_excluded_conflict(db: &ClientDb, path: &str) -> Result<()> {
+    let Some(record) = db.get_conflict_record(path).await? else {
+        return Ok(());
+    };
+    let conflict_dir = PathBuf::from(&record.conflict_dir);
+    remove_path_artifacts(&conflict_dir, path).await?;
+    db.resolve_conflict_path(path).await?;
+    if db.count_pending_in_dir(&record.conflict_dir).await? == 0 && conflict_dir.is_dir() {
+        if let Err(error) = fs::remove_dir_all(&conflict_dir).await {
+            tracing::warn!(
+                "Could not remove resolved conflict directory {}: {error}",
+                conflict_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn resolve_conflict(
     ctx: &SyncCtx<'_>,
     path: &str,
@@ -216,6 +236,7 @@ pub async fn resolve_conflict(
         .snapshot_local_view(&before, "you")
         .await?;
     let conflict_dir = PathBuf::from(&record.conflict_dir);
+    let mut additional_paths = Vec::new();
 
     match keep {
         ResolveKeep::File => {
@@ -287,6 +308,7 @@ pub async fn resolve_conflict(
                         chrono::Utc::now().timestamp_millis(),
                     )
                     .await?;
+                    additional_paths.push(alt_path);
                 }
             }
         }
@@ -299,7 +321,7 @@ pub async fn resolve_conflict(
     };
     let resolver = std::env::var("FEANORFS_AGENT").unwrap_or_else(|_| "human".into());
     crate::snapshot::SnapshotEngine::new(ctx)
-        .resolve_conflict(path, &resolved_files, &resolver)
+        .resolve_conflict(path, &resolved_files, &additional_paths, &resolver)
         .await?;
 
     ctx.db.resolve_conflict_path(path).await?;
@@ -413,7 +435,7 @@ async fn resolve_all_conflicts(ctx: &SyncCtx<'_>, keep: ResolveKeep) -> Result<V
     let resolver = std::env::var("FEANORFS_AGENT").unwrap_or_else(|_| "human".into());
     let paths: Vec<String> = records.iter().map(|record| record.path.clone()).collect();
     crate::snapshot::SnapshotEngine::new(ctx)
-        .resolve_conflicts(&paths, &resolved_files, &resolver)
+        .resolve_conflicts(&paths, &resolved_files, &[], &resolver)
         .await?;
     ctx.db
         .resolve_conflict_paths_with_history(
@@ -546,7 +568,7 @@ pub async fn register_placeholder_corruption(base: &Path, db: &ClientDb, path: &
         return Ok(());
     }
     let ts = chrono::Utc::now().timestamp_millis();
-    let dir = conflicts_dir(base).join(format!("placeholder_{ts}"));
+    let dir = conflicts_dir(base)?.join(format!("placeholder_{ts}"));
     fs::create_dir_all(&dir).await?;
     let stray = fs::read(base.join(path)).await?;
     let local_dest = resolve_artifact(&dir, path, ArtifactRole::Local);
@@ -800,7 +822,7 @@ pub async fn negotiate_sync_with_conflict_gate(
 
     if register && !all_detected.is_empty() {
         tracing::warn!(
-            "{} concurrent workspace edit conflict(s); wrote base/ours/theirs under .feanorfs/conflicts/",
+            "{} concurrent workspace edit conflict(s); saved base/local/cloud versions in global FeanorFS state",
             all_detected.len()
         );
         for (c, _) in &all_detected {

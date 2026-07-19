@@ -15,7 +15,7 @@ pub enum AgentAction {
         /// Agent name. If omitted, lists all agents with a one-line summary.
         name: Option<String>,
     },
-    /// Spawn a new isolated agent workspace `.feanorfs/agents/<name>/`.
+    /// Spawn a new isolated agent workspace under global FeanorFS state.
     Spawn {
         name: String,
         /// Skip pre-spawn sync (requires folder to match last synced state).
@@ -90,7 +90,11 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                     files_copied: count,
                 })?;
             } else {
-                println!("Agent '{name}' spawned with {count} files at .feanorfs/agents/{name}/");
+                let path = feanorfs_agent_core::agent_dir(current_dir, &name)?;
+                println!(
+                    "Agent '{name}' spawned with {count} files at {}",
+                    path.display()
+                );
             }
         }
         AgentAction::Land {
@@ -153,7 +157,7 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 anyhow::bail!("`agent run` requires a command after `--`");
             }
             feanorfs_client::agent::validate_name(&name)?;
-            let agent_path = feanorfs_client::agent::agent_dir(current_dir, &name);
+            let agent_path = feanorfs_client::agent::agent_dir(current_dir, &name)?;
             if !agent_path.exists() {
                 anyhow::bail!(
                     "Agent workspace '{name}' not found. Run `feanorfs agent spawn {name}` first."

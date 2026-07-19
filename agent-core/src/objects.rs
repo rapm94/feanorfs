@@ -205,12 +205,8 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     pub(crate) async fn cache_manifest(&self, id: &str, hashes: &[String]) -> Result<()> {
         let mut manifest = hashes.join("\n").into_bytes();
         manifest.push(b'\n');
-        atomic_write(
-            self.ctx.base,
-            &format!(".feanorfs/manifests/{id}"),
-            &manifest,
-        )
-        .await?;
+        let state = self.ctx.state_dir()?;
+        atomic_write(&state, &format!("manifests/{id}"), &manifest).await?;
         crate::object_gc::prune(self.ctx.base).await
     }
 
@@ -232,10 +228,11 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
         if !is_valid_hash(id) {
             bail!("invalid object id {id:?}");
         }
-        let ciphertext = match fs::read(self.cache_path(id)).await {
+        let cache_path = self.cache_path(id)?;
+        let ciphertext = match fs::read(&cache_path).await {
             Ok(bytes) if hash_bytes(&bytes) == id => bytes,
             Ok(_) => {
-                match fs::remove_file(self.cache_path(id)).await {
+                match fs::remove_file(&cache_path).await {
                     Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => return Err(error).context("remove corrupt object cache"),
@@ -267,17 +264,14 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     }
 
     async fn cache(&self, id: &str, ciphertext: &[u8]) -> Result<()> {
-        atomic_write(
-            self.ctx.base,
-            &format!(".feanorfs/objects/{id}"),
-            ciphertext,
-        )
-        .await
-        .with_context(|| format!("cache object {id}"))
+        let state = self.ctx.state_dir()?;
+        atomic_write(&state, &format!("objects/{id}"), ciphertext)
+            .await
+            .with_context(|| format!("cache object {id}"))
     }
 
-    fn cache_path(&self, id: &str) -> std::path::PathBuf {
-        self.ctx.base.join(".feanorfs/objects").join(id)
+    fn cache_path(&self, id: &str) -> Result<std::path::PathBuf> {
+        Ok(self.ctx.state_dir()?.join("objects").join(id))
     }
 }
 

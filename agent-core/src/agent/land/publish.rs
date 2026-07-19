@@ -18,8 +18,7 @@ pub(super) struct PublishInput<'a, 'ctx> {
 pub(super) async fn inject_land_failure(base: &Path, name: &str, point: &str) -> Result<()> {
     #[cfg(debug_assertions)]
     {
-        let path = base
-            .join(".feanorfs")
+        let path = crate::workspace_layout::ensure_workspace_state(base)?
             .join(format!("test-land-failpoint-{name}"));
         if fs::read_to_string(&path).await.ok().as_deref() == Some(point) {
             fs::remove_file(path).await?;

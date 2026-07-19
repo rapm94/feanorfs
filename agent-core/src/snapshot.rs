@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 
 const MAX_HEAD_RETRIES: usize = 8;
-const WORKSPACE_REF: &str = ".feanorfs/refs/workspace";
-const LAST_SYNCED_REF: &str = ".feanorfs/refs/last-synced";
+const WORKSPACE_REF: &str = "refs/workspace";
+const LAST_SYNCED_REF: &str = "refs/last-synced";
 
 pub(crate) struct SnapshotInput<'a> {
     pub files: &'a HashMap<String, FileState>,
@@ -169,9 +169,10 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         &self,
         path: &str,
         files: &HashMap<String, FileState>,
+        additional_paths: &[String],
         author: &str,
     ) -> Result<String> {
-        self.resolve_conflicts(&[path.to_string()], files, author)
+        self.resolve_conflicts(&[path.to_string()], files, additional_paths, author)
             .await
     }
 
@@ -179,6 +180,7 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         &self,
         paths: &[String],
         files: &HashMap<String, FileState>,
+        additional_paths: &[String],
         author: &str,
     ) -> Result<String> {
         if paths.is_empty() {
@@ -186,7 +188,7 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         }
         let resolved: HashSet<&str> = paths.iter().map(String::as_str).collect();
         let Some(mut expected) = self.ctx.api.get_head(self.ctx.workspace_id()).await? else {
-            return self.publish_server_view(files, author).await;
+            bail!("workspace head disappeared during conflict resolution");
         };
         for _ in 0..MAX_HEAD_RETRIES {
             let snapshot = self.load_snapshot(&expected).await?;
@@ -194,6 +196,16 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
             state
                 .conflicts
                 .retain(|conflict| !resolved.contains(conflict.path.as_str()));
+            for path in paths.iter().chain(additional_paths) {
+                match files.get(path).filter(|file| !file.deleted) {
+                    Some(file) => {
+                        state.files.insert(path.clone(), file.clone());
+                    }
+                    None => {
+                        state.files.remove(path);
+                    }
+                }
+            }
             let message = if paths.len() == 1 {
                 format!("resolve {}", paths[0])
             } else {
@@ -201,7 +213,7 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
             };
             let candidate = self
                 .write(SnapshotInput {
-                    files,
+                    files: &state.files,
                     conflicts: &state.conflicts,
                     parents: vec![expected.clone()],
                     author,
@@ -261,7 +273,7 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
 
     pub(crate) async fn read_agent_base(&self, name: &str) -> Result<String> {
         validate_name(name)?;
-        self.read_ref(&format!(".feanorfs/agents/{name}/.feanorfs/base-snapshot"))
+        self.read_ref(&format!("agents/{name}/state/base-snapshot"))
             .await?
             .with_context(|| format!("agent {name} has no base snapshot ref"))
     }
@@ -271,9 +283,10 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         if !is_valid_hash(id) {
             bail!("invalid agent base snapshot id");
         }
+        let state = self.ctx.state_dir()?;
         atomic_write(
-            self.ctx.base,
-            &format!(".feanorfs/agents/{name}/.feanorfs/base-snapshot"),
+            &state,
+            &format!("agents/{name}/state/base-snapshot"),
             id.as_bytes(),
         )
         .await
@@ -283,15 +296,17 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         if !is_valid_hash(id) {
             bail!("invalid committed snapshot id");
         }
-        atomic_write(self.ctx.base, WORKSPACE_REF, id.as_bytes()).await?;
-        atomic_write(self.ctx.base, LAST_SYNCED_REF, id.as_bytes()).await
+        let state = self.ctx.state_dir()?;
+        atomic_write(&state, WORKSPACE_REF, id.as_bytes()).await?;
+        atomic_write(&state, LAST_SYNCED_REF, id.as_bytes()).await
     }
 
     pub(crate) async fn record_last_synced_ref(&self, id: &str) -> Result<()> {
         if !is_valid_hash(id) {
             bail!("invalid last-synced snapshot id");
         }
-        atomic_write(self.ctx.base, LAST_SYNCED_REF, id.as_bytes()).await
+        let state = self.ctx.state_dir()?;
+        atomic_write(&state, LAST_SYNCED_REF, id.as_bytes()).await
     }
 
     async fn record_ref_view(
@@ -315,12 +330,13 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
                 message: None,
             })
             .await?;
-        atomic_write(self.ctx.base, reference, id.as_bytes()).await?;
+        let state = self.ctx.state_dir()?;
+        atomic_write(&state, reference, id.as_bytes()).await?;
         Ok(id)
     }
 
     async fn read_ref(&self, reference: &str) -> Result<Option<String>> {
-        let path = self.ctx.base.join(reference);
+        let path = self.ctx.state_dir()?.join(reference);
         let value = match tokio::fs::read_to_string(&path).await {
             Ok(value) => value,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),

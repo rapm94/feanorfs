@@ -29,10 +29,19 @@ pub fn main() !void {
     defer c.ffs_string_free(spawn);
     std.debug.print("spawn: {s}\n", .{std.mem.span(spawn)});
 
+    const agent_dir = c.ffs_agent_path(root.ptr, name.ptr);
+    if (agent_dir == null) {
+        const err = c.ffs_last_error();
+        defer c.ffs_string_free(err);
+        std.debug.print("agent path failed: {s}\n", .{std.mem.span(err)});
+        return error.AgentPathFailed;
+    }
+    defer c.ffs_string_free(agent_dir);
+
     const agent_task = try std.fmt.allocPrint(
         std.heap.page_allocator,
-        "{s}/.feanorfs/agents/{s}/task.txt",
-        .{ root, name },
+        "{s}/task.txt",
+        .{std.mem.span(agent_dir)},
     );
     defer std.heap.page_allocator.free(agent_task);
     const fp = c.fopen(agent_task.ptr, "w") orelse return error.WriteFailed;

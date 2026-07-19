@@ -38,8 +38,8 @@ pub async fn file_mtime_ms(path: &Path) -> Result<i64> {
         .unwrap_or(0))
 }
 
-/// Write `content` to `base_path/rel` atomically via a temp file under
-/// `.feanorfs/tmp/` and `rename` (same-filesystem rename is atomic).
+/// Write `content` to `base_path/rel` atomically via a sibling temporary file
+/// and `rename` (same-filesystem rename is atomic).
 pub async fn atomic_write(base_path: &Path, rel: &str, content: &[u8]) -> Result<()> {
     atomic_write_inner(base_path, rel, content, None, None).await
 }
@@ -56,14 +56,14 @@ async fn atomic_write_inner(
         fs::create_dir_all(parent).await?;
     }
 
-    let tmp_dir = base_path.join(".feanorfs/tmp");
+    let tmp_dir = dest.parent().unwrap_or(base_path).to_path_buf();
     fs::create_dir_all(&tmp_dir).await?;
 
     let temp_stem = match forced_temp_stem {
         Some(stem) => stem.to_owned(),
         None => {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            format!("{}-{sequence}", std::process::id())
+            format!(".feanorfs-tmp-{}-{sequence}", std::process::id())
         }
     };
     let (tmp_path, mut temp) = create_temp_file(&tmp_dir, &temp_stem).await?;
@@ -144,12 +144,17 @@ mod tests {
     use std::fs;
 
     fn assert_temp_dir_empty(workspace: &std::path::Path) {
-        assert_eq!(
-            fs::read_dir(workspace.join(".feanorfs/tmp"))
-                .expect("read temp directory")
-                .count(),
-            0
-        );
+        let leftovers = fs::read_dir(workspace)
+            .expect("read workspace")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".feanorfs-tmp-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[tokio::test]
@@ -195,9 +200,7 @@ mod tests {
     #[tokio::test]
     async fn temp_name_collision_never_removes_another_writers_file() {
         let workspace = tempfile::tempdir().expect("create workspace");
-        let tmp_dir = workspace.path().join(".feanorfs/tmp");
-        fs::create_dir_all(&tmp_dir).expect("create temp directory");
-        let colliding = tmp_dir.join("forced-collision-0");
+        let colliding = workspace.path().join("forced-collision-0");
         fs::write(&colliding, b"other writer").expect("seed colliding temp file");
 
         atomic_write_inner(
@@ -218,12 +221,6 @@ mod tests {
             fs::read(workspace.path().join("file.txt")).expect("read destination"),
             b"replacement"
         );
-        assert_eq!(
-            fs::read_dir(&tmp_dir)
-                .expect("read temp directory")
-                .map(|entry| entry.expect("read temp entry").path())
-                .collect::<Vec<_>>(),
-            vec![colliding]
-        );
+        assert_temp_dir_empty(workspace.path());
     }
 }

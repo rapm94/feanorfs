@@ -26,8 +26,10 @@ struct CachedAgents {
     summary: TrayAgentsSummary,
 }
 
-fn agent_cache_path(current_dir: &Path) -> PathBuf {
-    current_dir.join(".feanorfs").join(AGENT_CACHE_FILE)
+fn agent_cache_path(current_dir: &Path) -> Option<PathBuf> {
+    feanorfs_agent_core::ensure_workspace_state(current_dir)
+        .ok()
+        .map(|state| state.join(AGENT_CACHE_FILE))
 }
 
 fn cache_agents(current_dir: &Path, summary: &TrayAgentsSummary) {
@@ -36,12 +38,14 @@ fn cache_agents(current_dir: &Path, summary: &TrayAgentsSummary) {
         summary: summary.clone(),
     };
     if let Ok(json) = serde_json::to_string(&entry) {
-        let _ = std::fs::write(agent_cache_path(current_dir), json);
+        if let Some(path) = agent_cache_path(current_dir) {
+            let _ = std::fs::write(path, json);
+        }
     }
 }
 
 fn cached_agents(current_dir: &Path) -> Option<TrayAgentsSummary> {
-    let content = std::fs::read_to_string(agent_cache_path(current_dir)).ok()?;
+    let content = std::fs::read_to_string(agent_cache_path(current_dir)?).ok()?;
     let entry: CachedAgents = serde_json::from_str(&content).ok()?;
     let age_ms = chrono::Utc::now()
         .timestamp_millis()
@@ -55,7 +59,9 @@ fn cached_agents(current_dir: &Path) -> Option<TrayAgentsSummary> {
 
 /// Drop cached agent summary after land/keep so the next tray status is fresh.
 pub fn invalidate_agent_cache(current_dir: &Path) {
-    let _ = std::fs::remove_file(agent_cache_path(current_dir));
+    if let Some(path) = agent_cache_path(current_dir) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn conflict_kind_str(kind: ConflictKind) -> &'static str {

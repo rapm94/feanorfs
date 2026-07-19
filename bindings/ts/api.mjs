@@ -19,6 +19,10 @@ export async function spawn(root, name, opts = {}) {
   return JSON.parse(await native.agentSpawn(root, name, opts))
 }
 
+export async function agentPath(root, name) {
+  return native.agentPath(root, name)
+}
+
 export async function status(root, name) {
   return JSON.parse(await native.agentStatus(root, name))
 }

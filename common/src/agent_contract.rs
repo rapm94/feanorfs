@@ -81,9 +81,16 @@ fn sample_concurrent_edit() -> ConcurrentEdit {
         base: Some(sample_file_state("src/main.rs")),
         ours: Some(sample_file_state("src/main.rs")),
         theirs: Some(sample_file_state("src/main.rs")),
-        original_file: Some(".feanorfs/conflicts/1719500000000/src/main.rs.original".to_string()),
-        local_file: Some(".feanorfs/conflicts/1719500000000/src/main.rs.local".to_string()),
-        cloud_file: Some(".feanorfs/conflicts/1719500000000/src/main.rs.cloud".to_string()),
+        original_file: Some(
+            "~/.feanorfs/workspaces/opaque/conflicts/1719500000000/src/main.rs.original"
+                .to_string(),
+        ),
+        local_file: Some(
+            "~/.feanorfs/workspaces/opaque/conflicts/1719500000000/src/main.rs.local".to_string(),
+        ),
+        cloud_file: Some(
+            "~/.feanorfs/workspaces/opaque/conflicts/1719500000000/src/main.rs.cloud".to_string(),
+        ),
         kind: Some(ConflictKind::EditEdit),
         local_available: true,
         cloud_available: true,

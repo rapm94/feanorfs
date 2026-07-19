@@ -93,6 +93,7 @@ pub(crate) fn validate_auth_token(token: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn mdns_service_info(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<mdns_sd::ServiceInfo> {
     let mut addresses: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
         .unwrap_or_default()
@@ -112,6 +113,7 @@ fn mdns_service_info(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<mdns
     mdns_service_info_with_addresses(port, tls, &addresses)
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn mdns_service_info_with_addresses(
     port: u16,
     tls: Option<&crate::TlsIdentity>,
@@ -139,20 +141,64 @@ fn mdns_service_info_with_addresses(
     .map_err(Into::into)
 }
 
-struct MdnsRegistration {
-    daemon: mdns_sd::ServiceDaemon,
-    refresh_task: tokio::task::JoinHandle<()>,
+enum MdnsRegistration {
+    #[cfg(target_os = "macos")]
+    Native {
+        _registration: dns_sd_native::ServiceRegistration,
+    },
+    #[cfg(not(target_os = "macos"))]
+    Rust {
+        daemon: mdns_sd::ServiceDaemon,
+        refresh_task: tokio::task::JoinHandle<()>,
+    },
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Drop for MdnsRegistration {
     fn drop(&mut self) {
-        self.refresh_task.abort();
-        let _ = self.daemon.shutdown();
+        match self {
+            Self::Rust {
+                daemon,
+                refresh_task,
+            } => {
+                refresh_task.abort();
+                let _ = daemon.shutdown();
+            }
+        }
     }
 }
 
-fn register_mdns(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<MdnsRegistration> {
+#[cfg(target_os = "macos")]
+async fn register_mdns(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<MdnsRegistration> {
+    use dns_sd_native::ServiceRegistrationBuilder;
+
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let hostname = tls
+        .and_then(|identity| identity.mdns_hostname.as_deref())
+        .unwrap_or("feanorfs-server.local");
+    let instance = hostname.strip_suffix(".local").unwrap_or(hostname);
+    let service_type = feanorfs_common::HUB_MDNS_SERVICE
+        .strip_suffix(".local.")
+        .unwrap_or(feanorfs_common::HUB_MDNS_SERVICE);
+    let mut builder = ServiceRegistrationBuilder::new(service_type, port);
+    builder
+        .name(instance)
+        .domain("local.")
+        .add_txt_record_key_string("v", "1")
+        .add_txt_record_key_string("scheme", scheme);
+    if let Some(fingerprint) = tls.and_then(|identity| identity.fingerprint.as_deref()) {
+        builder.add_txt_record_key_string("ca", fingerprint);
+    }
+    let registration = builder.register().await?;
+    Ok(MdnsRegistration::Native {
+        _registration: registration,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn register_mdns(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<MdnsRegistration> {
     use mdns_sd::{DaemonEvent, ServiceDaemon};
+    use tokio::time::MissedTickBehavior;
 
     let daemon = ServiceDaemon::new()?;
     let monitor = daemon.monitor()?;
@@ -160,28 +206,44 @@ fn register_mdns(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<MdnsRegi
     let update_daemon = daemon.clone();
     let update_tls = tls.cloned();
     let refresh_task = tokio::spawn(async move {
-        while let Ok(event) = monitor.recv_async().await {
-            match event {
-                DaemonEvent::IpAdd(IpAddr::V4(_)) | DaemonEvent::IpDel(IpAddr::V4(_)) => {
+        let mut periodic = tokio::time::interval(Duration::from_secs(30));
+        periodic.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        periodic.tick().await;
+        loop {
+            tokio::select! {
+                event = monitor.recv_async() => match event {
+                    Ok(DaemonEvent::IpAdd(IpAddr::V4(_)) | DaemonEvent::IpDel(IpAddr::V4(_))) => {
+                        match mdns_service_info(port, update_tls.as_ref())
+                            .and_then(|info| update_daemon.register(info).map_err(Into::into))
+                        {
+                            Ok(()) => tracing::info!(
+                                "mDNS service refreshed after a network address change"
+                            ),
+                            Err(error) => tracing::warn!(
+                                "Failed to refresh mDNS service after a network address change: {error}"
+                            ),
+                        }
+                    }
+                    Ok(DaemonEvent::Error(error)) => {
+                        tracing::warn!("mDNS service error: {error}");
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                _ = periodic.tick() => {
                     match mdns_service_info(port, update_tls.as_ref())
                         .and_then(|info| update_daemon.register(info).map_err(Into::into))
                     {
-                        Ok(()) => {
-                            tracing::info!("mDNS service refreshed after a network address change")
-                        }
+                        Ok(()) => tracing::debug!("mDNS service periodically refreshed"),
                         Err(error) => tracing::warn!(
-                            "Failed to refresh mDNS service after a network address change: {error}"
+                            "Failed to periodically refresh mDNS service: {error}"
                         ),
                     }
                 }
-                DaemonEvent::Error(error) => {
-                    tracing::warn!("mDNS service error: {error}");
-                }
-                _ => {}
             }
         }
     });
-    Ok(MdnsRegistration {
+    Ok(MdnsRegistration::Rust {
         daemon,
         refresh_task,
     })
@@ -218,7 +280,7 @@ pub async fn run_http_server_guarded(
     );
 
     let _mdns_daemon = if opts.mdns {
-        match register_mdns(addr.port(), tls.as_ref()) {
+        match register_mdns(addr.port(), tls.as_ref()).await {
             Ok(d) => {
                 tracing::info!("mDNS service registered (discoverable on local network)");
                 Some(d)

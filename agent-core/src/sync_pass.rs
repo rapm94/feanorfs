@@ -19,8 +19,7 @@ pub fn build_ctx_or_fallback<'a>(
     workspace_id: &str,
     password: Option<&str>,
 ) -> Result<SyncCtx<'a>> {
-    let config_path = base_path.join(".feanorfs").join("config.json");
-    if config_path.exists() {
+    if crate::workspace_layout::workspace_is_configured(base_path) {
         let config = load_config(base_path)?;
         SyncCtx::from_config(api, db, base_path, &config)
     } else {
@@ -39,6 +38,7 @@ async fn finish_sync_pass(
     ctx: &SyncCtx<'_>,
     local_files_before: &HashMap<String, FileState>,
     conflict_paths: &HashSet<String>,
+    mode: SyncMode,
 ) -> Result<()> {
     let current_files =
         crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
@@ -53,6 +53,21 @@ async fn finish_sync_pass(
             }
             None => (HashMap::new(), Vec::new(), None),
         };
+        if mode == SyncMode::Pull {
+            if let Some(committed) = expected.as_deref() {
+                let local_root = snapshots.candidate_root(&current_files, &head_conflicts)?;
+                if conflict_paths.is_empty() && current_root.as_deref() == Some(local_root.as_str())
+                {
+                    snapshots.record_committed_refs(committed).await?;
+                } else {
+                    snapshots.snapshot_local_view(&current_files, "you").await?;
+                    snapshots.record_last_synced_ref(committed).await?;
+                }
+            } else {
+                snapshots.snapshot_local_view(&current_files, "you").await?;
+            }
+            return Ok(());
+        }
         let mut candidate_files = current_files.clone();
         for path in conflict_paths {
             match head_files.get(path) {
@@ -216,6 +231,7 @@ pub(crate) async fn run_sync_pass_locked(
         SyncMode::Full => "Sync",
     };
     tracing::info!("{label} started (lazy={lazy})");
+    discard_hard_excluded_state(ctx).await?;
     let local_files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     tracing::debug!("Scanned {} entries", local_files.len());
     crate::snapshot::SnapshotEngine::new(ctx)
@@ -263,7 +279,7 @@ pub(crate) async fn run_sync_pass_locked(
             format!(" (and {remainder} more)")
         };
         anyhow::bail!(
-            "Large files cannot use the legacy single-blob transport: {examples}{remainder}. Run `feanorfs migrate` to enable authenticated encrypted chunks, or add disposable files to .feanorfsignore."
+            "Large files cannot use the legacy single-blob transport: {examples}{remainder}. Run `feanorfs migrate` to enable authenticated encrypted chunks, or `feanorfs ignore <pattern>` for disposable files."
         );
     }
 
@@ -308,9 +324,46 @@ pub(crate) async fn run_sync_pass_locked(
         outcome.deletes_remote
     );
 
-    finish_sync_pass(ctx, &local_files, &blocked).await?;
+    finish_sync_pass(ctx, &local_files, &blocked, mode).await?;
 
     Ok((outcome, blocked))
+}
+
+async fn discard_hard_excluded_state(ctx: &SyncCtx<'_>) -> Result<()> {
+    let cache = ctx.db.get_cache_entries().await?;
+    let pending = ctx.db.list_pending_conflict_paths().await?;
+    let mut excluded = cache
+        .keys()
+        .chain(pending.iter())
+        .filter(|path| crate::local::is_always_excluded(Path::new(path)))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in &excluded {
+        if ctx.format_version() < 3 {
+            let hash = cache.get(path).map_or_else(
+                || feanorfs_common::hash_bytes(b""),
+                |entry| entry.encrypted_hash.clone(),
+            );
+            ctx.api
+                .upload_tombstone(
+                    ctx.workspace_id(),
+                    path,
+                    &hash,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+        }
+        ctx.db.delete_cache_entry(path).await?;
+        conflicts::discard_excluded_conflict(ctx.db, path).await?;
+    }
+    if !excluded.is_empty() {
+        tracing::info!(
+            "Removed {} excluded metadata path(s) from transport state without touching local files",
+            excluded.len()
+        );
+    }
+    excluded.clear();
+    Ok(())
 }
 
 pub async fn do_sync(
@@ -475,7 +528,7 @@ pub(crate) async fn process_uploads(
         }
         if !local_file.deleted && crate::large_file::uses_chunk_transport(local_file.size) {
             anyhow::bail!(
-                "Cannot upload large file {path} from this legacy workspace. Run `feanorfs migrate` to enable authenticated encrypted chunks, or add disposable files to .feanorfsignore."
+                "Cannot upload large file {path} from this legacy workspace. Run `feanorfs migrate` to enable authenticated encrypted chunks, or `feanorfs ignore <pattern>` for disposable files."
             );
         }
         if local_file.deleted {
@@ -507,13 +560,15 @@ pub(crate) async fn cleanup_deleted_cache(
     local_files: &HashMap<String, FileState>,
     db: &ClientDb,
 ) -> Result<u32> {
-    let mut count = 0u32;
-    for (path, local_file) in local_files {
-        if local_file.deleted {
-            tracing::info!("Cleanup cache: {}", path);
-            db.delete_cache_entry(path).await?;
-            count += 1;
-        }
+    let paths = local_files
+        .iter()
+        .filter(|(_, local_file)| local_file.deleted)
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(0);
     }
-    Ok(count)
+    db.delete_cache_entries(&paths).await?;
+    tracing::info!("Cleaned {} deleted cache entries", paths.len());
+    Ok(u32::try_from(paths.len()).unwrap_or(u32::MAX))
 }

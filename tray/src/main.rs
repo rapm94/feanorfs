@@ -499,7 +499,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 fn is_paused_on_disk(workspace: &Path) -> bool {
-    workspace.join(".feanorfs/paused").is_file()
+    tray_status(workspace).is_ok_and(|status| status.paused)
 }
 
 fn resolve_initial_workspace() -> Option<PathBuf> {

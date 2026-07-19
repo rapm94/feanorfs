@@ -77,3 +77,27 @@ async fn bulk_upsert_overwrites_existing_entries() {
     let all = db.get_cache_entries().await.expect("get");
     assert_eq!(all.get("a.txt").expect("entry").size, 99);
 }
+
+#[tokio::test]
+async fn bulk_delete_removes_selected_entries_in_one_commit() {
+    let (_dir, db) = new_db().await;
+    let entries = (0..100)
+        .map(|index| cache_entry(&format!("file_{index:03}.txt"), &index.to_string(), index))
+        .collect::<Vec<_>>();
+    db.bulk_upsert_cache_entries(&entries)
+        .await
+        .expect("bulk upsert");
+    let removed = (0..75)
+        .map(|index| format!("file_{index:03}.txt"))
+        .collect::<Vec<_>>();
+
+    db.delete_cache_entries(&removed)
+        .await
+        .expect("bulk delete");
+
+    let remaining = db.get_cache_entries().await.expect("get remaining");
+    assert_eq!(remaining.len(), 25);
+    assert!(!remaining.contains_key("file_000.txt"));
+    assert!(remaining.contains_key("file_075.txt"));
+    assert!(remaining.contains_key("file_099.txt"));
+}

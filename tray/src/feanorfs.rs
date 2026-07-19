@@ -94,7 +94,7 @@ fn packaged_cli_candidates() -> Vec<PathBuf> {
 }
 
 pub fn workspace_has_config(path: &Path) -> bool {
-    path.join(".feanorfs").join("config.json").is_file()
+    run_in(path, &["--json", "config"]).is_ok_and(|output| output.status.success())
 }
 
 fn home_dir() -> PathBuf {
@@ -447,7 +447,7 @@ fn join_confirmation_copy(preview: &JoinPreview) -> String {
     );
     if preview.ignore_policy_differs {
         message.push_str(
-            "\n\nThe mirror uses different ignore rules. Its encrypted .feanorfsignore policy will replace this folder's policy before the first sync.",
+            "\n\nThe mirror uses different ignore rules. Its encrypted rules will replace this folder's global rules before the first sync.",
         );
     } else if !preview.ignore_policy_known {
         message
@@ -455,7 +455,7 @@ fn join_confirmation_copy(preview: &JoinPreview) -> String {
     }
     if preview.large_files.count > 0 {
         message.push_str(&format!(
-            "\n\nLarge files: {}. They will use authenticated encrypted chunks; add disposable files to .feanorfsignore to avoid transferring them.",
+            "\n\nLarge files: {}. They will use authenticated encrypted chunks; use `feanorfs ignore <pattern>` for disposable files.",
             preview.large_files.count
         ));
     }

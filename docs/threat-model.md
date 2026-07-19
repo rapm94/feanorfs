@@ -9,7 +9,7 @@ This document provides a detailed security analysis of FeanorFS. For the policy 
 │  Trusted zone (client machine)                              │
 │                                                             │
 │  ┌───────────────┐   ┌─────────────────┐                    │
-│  │  feanorfs CLI │   │ .feanorfs/      │                    │
+│  │  feanorfs CLI │   │ ~/.feanorfs/    │                    │
 │  │  (encrypt/    │   │  config.json    │ ← credential ref   │
 │  │   decrypt)    │   │  local_state.json│ ← plaintext hashes │
 │  └───────┬───────┘   └─────────────────┘                    │
@@ -107,7 +107,7 @@ injection, and the passive/active server attacks above.
 
 ### Adversary D: Local attacker on client machine
 
-**Can observe:** All files in the workspace directory, including `.feanorfs/config.json` (endpoint plus a random credential reference) and `.feanorfs/local_state.json` (plaintext hashes, conflict metadata, session markers, and local access history). On a headless system where the native credential store was unavailable at first setup, the private config fallback also contains the key.
+**Can observe:** All files available to the logged-in account, including the workspace and its private state under `~/.feanorfs/workspaces/<opaque-id>/` (endpoint, random credential reference, plaintext hashes, conflict metadata, session markers, and local access history). On a headless system where the native credential store was unavailable at first setup, the private config fallback also contains the key. FeanorFS deliberately leaves no metadata inside the project.
 
 **Goal:** Recover the encryption password, then decrypt all server-side blobs.
 
@@ -267,7 +267,7 @@ Unauthenticated and malleable — an attacker who knows plaintext at a position 
 | Workspace credential loss | Medium | Offline recovery kit seals the complete portable capability with Argon2id + XChaCha20-Poly1305; import authenticates before local writes and delegates to `start` | Implemented; kit and passphrase loss remain unrecoverable, and the hub must retain the encrypted snapshot |
 | Workspace recovery-kit disclosure | High | Kit exposes only versioned KDF/cipher metadata plus authenticated ciphertext; `0600` atomic write, 12-character minimum passphrase, no secret argv/env/logs | Offline guessing remains bounded by passphrase strength; store kit and passphrase separately |
 | Unattended local credential access | Medium | Native OS credential store with random config references; atomic private-file fallback only when unavailable | Implemented; logged-in account remains trusted |
-| Migration journal stores old and target keys | Medium | Journal stays under `.feanorfs/` and is removed after successful cutover | Temporary local exposure |
+| Migration journal stores old and target keys | Medium | Journal stays in the private global workspace directory and is removed after successful cutover | Temporary local exposure |
 | Metadata leakage (sizes, counts, equality, timing) | Medium | Format v3 encrypts paths and structure; no size padding is claimed | Accepted limitation |
 | No password-stretching KDF for content keys | Medium | New workspaces require generated-shape 256-bit keys; migrate weak historical keys with `migrate --rekey` | Historical format-v1 limitation |
 | Replay attacks (old snapshot heads or blobs) | Low | Immutable history and observed-regression warnings; no external transparency log is claimed | Accepted limitation |
@@ -283,7 +283,7 @@ hosted recovery, the default relay, and independent review are tracked only in
 
 FeanorFS's agent workspaces provide **data isolation, not process sandboxing.**
 
-**What IS isolated (data):** each agent works in its own copy under `.feanorfs/agents/<name>/`; nothing reaches the main folder or the server without going through `agent land`'s three-way diff. Conflicted paths are blocked from sync with all versions preserved (on disk and as immutable content-addressed blobs). An honest agent cannot make a mess.
+**What IS isolated (data):** each agent works in its own `worktree/` under the private global workspace state; nothing reaches the main folder or the server without going through `agent land`'s three-way diff. Conflicted paths are blocked from sync with all versions preserved (on disk and as immutable content-addressed blobs). An honest agent cannot make a mess.
 
 **What is NOT isolated (processes):** `agent run` sets the child's working directory — nothing else. The child inherits the full filesystem (absolute-path writes escape the agent folder), network access, and environment variables. An agent that pushes to another repo, exfiltrates secrets, or runs a malicious `build.rs` is not stopped by FeanorFS.
 
