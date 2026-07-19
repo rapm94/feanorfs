@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.7](https://github.com/rapm94/feanorfs/compare/v0.7.6...v0.7.7) - 2026-07-19
+
+### Fixed
+
+- Windows release checksum files now use portable LF line endings, with a
+  publication-time regression check, so standard Unix `sha256sum -c` and
+  `shasum -a 256 -c` verification work without rewriting release evidence.
+
 ## [0.7.6](https://github.com/rapm94/feanorfs/compare/v0.7.4...v0.7.6) - 2026-07-19
 
 ### Fixed

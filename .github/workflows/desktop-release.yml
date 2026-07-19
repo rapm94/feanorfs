@@ -404,10 +404,26 @@ jobs:
           $evidence | Set-Content -Encoding utf8NoBOM FeanorFS-windows-x86_64.verification.txt
           Compress-Archive -Path @("native/feanorfs.exe", "native/feanorfs-tray.exe") -DestinationPath FeanorFS-windows-x86_64.zip
           $hash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64.zip).Hash.ToLowerInvariant()
-          "$hash  FeanorFS-windows-x86_64.zip" | Set-Content -Encoding ascii FeanorFS-windows-x86_64.zip.sha256
+          [IO.File]::WriteAllText(
+            "FeanorFS-windows-x86_64.zip.sha256",
+            "$hash  FeanorFS-windows-x86_64.zip`n",
+            [Text.UTF8Encoding]::new($false)
+          )
           Copy-Item $installer FeanorFS-windows-x86_64-setup.exe
           $installerHash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64-setup.exe).Hash.ToLowerInvariant()
-          "$installerHash  FeanorFS-windows-x86_64-setup.exe" | Set-Content -Encoding ascii FeanorFS-windows-x86_64-setup.exe.sha256
+          [IO.File]::WriteAllText(
+            "FeanorFS-windows-x86_64-setup.exe.sha256",
+            "$installerHash  FeanorFS-windows-x86_64-setup.exe`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          foreach ($checksum in @(
+            "FeanorFS-windows-x86_64.zip.sha256",
+            "FeanorFS-windows-x86_64-setup.exe.sha256"
+          )) {
+            if ([IO.File]::ReadAllBytes($checksum) -contains 13) {
+              throw "$checksum contains a carriage return."
+            }
+          }
           Copy-Item scripts/install.ps1 feanorfs-windows-installer.ps1
       - name: Smoke signed Windows installer
         shell: pwsh

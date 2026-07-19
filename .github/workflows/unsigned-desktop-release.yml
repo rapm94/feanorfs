@@ -248,9 +248,25 @@ jobs:
           Copy-Item $installer FeanorFS-windows-x86_64-unsigned-setup.exe
           Compress-Archive -Path target/release/feanorfs.exe,target/release/feanorfs-tray.exe -DestinationPath FeanorFS-windows-x86_64-unsigned.zip
           $installerHash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64-unsigned-setup.exe).Hash.ToLowerInvariant()
-          "$installerHash  FeanorFS-windows-x86_64-unsigned-setup.exe" | Set-Content -Encoding ascii FeanorFS-windows-x86_64-unsigned-setup.exe.sha256
+          [IO.File]::WriteAllText(
+            "FeanorFS-windows-x86_64-unsigned-setup.exe.sha256",
+            "$installerHash  FeanorFS-windows-x86_64-unsigned-setup.exe`n",
+            [Text.UTF8Encoding]::new($false)
+          )
           $zipHash = (Get-FileHash -Algorithm SHA256 FeanorFS-windows-x86_64-unsigned.zip).Hash.ToLowerInvariant()
-          "$zipHash  FeanorFS-windows-x86_64-unsigned.zip" | Set-Content -Encoding ascii FeanorFS-windows-x86_64-unsigned.zip.sha256
+          [IO.File]::WriteAllText(
+            "FeanorFS-windows-x86_64-unsigned.zip.sha256",
+            "$zipHash  FeanorFS-windows-x86_64-unsigned.zip`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          foreach ($checksum in @(
+            "FeanorFS-windows-x86_64-unsigned-setup.exe.sha256",
+            "FeanorFS-windows-x86_64-unsigned.zip.sha256"
+          )) {
+            if ([IO.File]::ReadAllBytes($checksum) -contains 13) {
+              throw "$checksum contains a carriage return."
+            }
+          }
           @(
             "UNSIGNED PREVIEW BUILD",
             "This installer and both executables are not Authenticode-signed.",
