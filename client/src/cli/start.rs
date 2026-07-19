@@ -35,6 +35,7 @@ pub struct StartOptions {
     pub relay: Option<String>,
     pub no_watch: bool,
     pub foreground: bool,
+    pub accept_join: bool,
     /// Decrypted in-process recovery input. This never comes from argv and is
     /// intentionally excluded from `Debug` output.
     pub recovery_invite: Option<WorkspaceInvite>,
@@ -446,19 +447,19 @@ pub async fn run_start(current_dir: &Path, mut opts: StartOptions) -> anyhow::Re
     }
 
     if let Some(invite) = recovery_invite.take() {
-        join_from_workspace_invite(&work_dir, invite, false).await?;
+        join_from_workspace_invite(&work_dir, invite, false, opts.accept_join).await?;
         return finish_sync_watch(&work_dir, watch_mode).await;
     }
 
     if let Some(token) = invite {
-        join_from_invite(&work_dir, &token, false).await?;
+        join_from_invite(&work_dir, &token, false, opts.accept_join).await?;
         return finish_sync_watch(&work_dir, watch_mode).await;
     }
 
     if let Some(code) = pair_code {
         println!("Finding the other computer…");
         let token = receive(&code, std::time::Duration::from_secs(20)).await?;
-        join_from_invite(&work_dir, &token, false).await?;
+        join_from_invite(&work_dir, &token, false, opts.accept_join).await?;
         return finish_sync_watch(&work_dir, watch_mode).await;
     }
 

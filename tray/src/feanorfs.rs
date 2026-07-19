@@ -300,13 +300,196 @@ fn start_args(path: &str) -> [&str; 3] {
 }
 
 pub fn join_workspace(path: &Path, pairing_code: Zeroizing<String>) -> Result<(), String> {
-    run_with_stdin_secret(
-        &home_dir(),
-        tray_join_args(path),
-        pairing_code,
-        "pairing capability",
-        "secure workspace join",
-    )
+    join_workspace_interactive(path, pairing_code).and_then(|outcome| match outcome {
+        JoinOutcome::Joined => Ok(()),
+        JoinOutcome::Canceled => Err("__FEANORFS_JOIN_CANCELED__".into()),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinOutcome {
+    Joined,
+    Canceled,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinPreviewEvent {
+    event: String,
+    preview: JoinPreview,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinPreview {
+    local_only: JoinPathGroup,
+    remote_only: JoinPathGroup,
+    same: JoinPathGroup,
+    conflicts: JoinPathGroup,
+    oversized: JoinPathGroup,
+    ignore_policy_known: bool,
+    ignore_policy_differs: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinPathGroup {
+    count: usize,
+    examples: Vec<String>,
+}
+
+fn join_workspace_interactive(
+    path: &Path,
+    pairing_code: Zeroizing<String>,
+) -> Result<JoinOutcome, String> {
+    if pairing_code.contains(['\r', '\n', '\0']) {
+        return Err("The pairing capability cannot contain line breaks or NUL characters.".into());
+    }
+    let mut child = Command::new(feanorfs_bin())
+        .args(tray_join_args(path))
+        .current_dir(home_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start secure workspace join: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open secure pairing input".to_string())?;
+    stdin
+        .write_all(pairing_code.as_bytes())
+        .and_then(|()| stdin.write_all(b"\n"))
+        .and_then(|()| stdin.flush())
+        .map_err(|error| format!("send pairing capability: {error}"))?;
+    drop(pairing_code);
+
+    let stdout = child.stdout.take().expect("join stdout is piped");
+    let mut stdout = BufReader::new(stdout);
+    let mut event_line = String::new();
+    let bytes = std::io::Read::by_ref(&mut stdout)
+        .take(65_537)
+        .read_line(&mut event_line)
+        .map_err(|error| format!("read secure join preview: {error}"))?;
+    if bytes == 0 || bytes > 65_536 || !event_line.ends_with('\n') {
+        graceful_stop_child(&mut child);
+        return Err("FeanorFS ended before the safe join preview was ready.".into());
+    }
+    let event: JoinPreviewEvent = serde_json::from_str(event_line.trim_end())
+        .map_err(|_| "FeanorFS returned an invalid safe join preview.".to_string())?;
+    if event.event != "join_preview" {
+        graceful_stop_child(&mut child);
+        return Err("FeanorFS returned an unexpected secure join stage.".into());
+    }
+
+    if event.preview.oversized.count > 0 {
+        let _ = stdin.write_all(b"CANCEL\n");
+        drop(stdin);
+        graceful_stop_child(&mut child);
+        return Err(join_oversized_copy(&event.preview));
+    }
+
+    let needs_confirmation = event.preview.local_only.count > 0
+        || event.preview.conflicts.count > 0
+        || event.preview.ignore_policy_differs;
+    if needs_confirmation {
+        let confirmed = rfd::MessageDialog::new()
+            .set_title("Join this existing folder?")
+            .set_description(join_confirmation_copy(&event.preview))
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show();
+        if !matches!(confirmed, rfd::MessageDialogResult::Ok) {
+            let _ = stdin.write_all(b"CANCEL\n");
+            drop(stdin);
+            graceful_stop_child(&mut child);
+            return Ok(JoinOutcome::Canceled);
+        }
+    }
+    stdin
+        .write_all(b"CONFIRM\n")
+        .and_then(|()| stdin.flush())
+        .map_err(|error| format!("confirm secure workspace join: {error}"))?;
+    drop(stdin);
+
+    let stdout_thread = std::thread::spawn(move || drain_bounded(stdout, 8192));
+    let stderr = child.stderr.take().expect("join stderr is piped");
+    let stderr_thread = std::thread::spawn(move || drain_bounded(stderr, 8192));
+    let status = child
+        .wait()
+        .map_err(|error| format!("wait for secure workspace join: {error}"))?;
+    let _ = stdout_thread.join();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if status.success() {
+        Ok(JoinOutcome::Joined)
+    } else {
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        Err(truncate_error(if stderr.is_empty() {
+            "secure workspace join failed"
+        } else {
+            &stderr
+        }))
+    }
+}
+
+fn drain_bounded(mut reader: impl std::io::Read, limit: usize) -> Vec<u8> {
+    let mut captured = Vec::with_capacity(limit);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = limit.saturating_sub(captured.len());
+                captured.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+        }
+    }
+    captured
+}
+
+fn join_confirmation_copy(preview: &JoinPreview) -> String {
+    let mut message = format!(
+        "FeanorFS compared this folder with the encrypted mirror before changing anything.\n\nLocal only — upload: {}\nMirror only — download: {}\nAlready identical: {}\nDifferent at the same path — keep for review: {}",
+        preview.local_only.count,
+        preview.remote_only.count,
+        preview.same.count,
+        preview.conflicts.count,
+    );
+    if preview.ignore_policy_differs {
+        message.push_str(
+            "\n\nThe mirror uses different ignore rules. Its encrypted .feanorfsignore policy will replace this folder's policy before the first sync.",
+        );
+    } else if !preview.ignore_policy_known {
+        message
+            .push_str("\n\nThis is an older invite, so this folder's ignore rules will be kept.");
+    }
+    let examples = preview
+        .conflicts
+        .examples
+        .iter()
+        .chain(preview.local_only.examples.iter())
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !examples.is_empty() {
+        message.push_str("\n\nExamples:\n");
+        message.push_str(&examples.join("\n"));
+    }
+    message.push_str(
+        "\n\nChoose OK only if you want to continue. FeanorFS will not auto-merge different content; those paths remain visible for your choice.",
+    );
+    message
+}
+
+fn join_oversized_copy(preview: &JoinPreview) -> String {
+    let mut message = format!(
+        "Join stopped before changing this folder. {} file(s) exceed the current 100 MiB transport limit.",
+        preview.oversized.count
+    );
+    if !preview.oversized.examples.is_empty() {
+        message.push_str(" Files: ");
+        message.push_str(&preview.oversized.examples.join(", "));
+    }
+    message
+        .push_str(" Add them to .feanorfsignore or move them out of this folder, then try again.");
+    message
 }
 
 pub fn stop_workspace(path: &Path) -> Result<(), String> {

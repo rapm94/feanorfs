@@ -221,6 +221,10 @@ fn validate_invite(invite: &WorkspaceInvite) -> Result<()> {
     if invite.tls_ca_pem.is_some() && url.scheme() != "https" {
         bail!("recovery capability with a private CA must use HTTPS");
     }
+    if let Some(policy) = invite.ignore_policy.as_deref() {
+        crate::join_preflight::normalize_ignore_policy(policy)
+            .context("recovery capability has an invalid mirror ignore policy")?;
+    }
     Ok(())
 }
 
@@ -302,6 +306,7 @@ mod tests {
                 url: "https://relay.example".into(),
                 route: "opaque-secret-route".into(),
             }),
+            ignore_policy: Some("target/\n".into()),
         }
     }
 

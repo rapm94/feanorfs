@@ -377,7 +377,11 @@ pub async fn offer(
         super::hub_service::refresh_for_pairing(&config).await?;
     }
     ensure_hub_reachable(workspace, &config).await?;
-    let invite = invite_from_config(&config).context("workspace has no encryption key")?;
+    let mut invite = invite_from_config(&config).context("workspace has no encryption key")?;
+    invite.ignore_policy = Some(
+        feanorfs_client::join_preflight::read_ignore_policy(workspace)
+            .context("read mirror ignore policy before pairing")?,
+    );
     let effective_relay = relay_url
         .map(str::to_owned)
         .or_else(|| invite.relay.as_ref().map(|relay| relay.url.clone()));
@@ -937,6 +941,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            ignore_policy: None,
         };
         assert!(ensure_internet_hub(&invite("https://sync.example")).is_ok());
         assert!(ensure_internet_hub(&invite("http://sync.example")).is_err());
@@ -1025,6 +1030,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            ignore_policy: Some("target/\n".into()),
         };
         let encoded = feanorfs_client::encode_invite(&invite).unwrap();
         let host_code = code.clone();
@@ -1086,6 +1092,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            ignore_policy: None,
         };
         let encoded = feanorfs_client::encode_invite(&invite).unwrap();
         let offer = connect_relay(&code, "offer").await.unwrap();
@@ -1139,6 +1146,7 @@ mod tests {
                 tls_ca_pem: None,
                 hub_local: false,
                 relay: None,
+                ignore_policy: None,
             };
             host_exchange(
                 PairChannel::Tcp(stream),
@@ -1189,6 +1197,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            ignore_policy: None,
         };
         let encoded =
             invite_for_connection(&invite, Some("192.168.1.13".parse().unwrap())).unwrap();

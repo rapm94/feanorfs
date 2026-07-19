@@ -18,9 +18,12 @@ pub use config::{
     save_global_config_secure, validate_e2ee_key, Config, CredentialProtection, GlobalConfig,
     LOCAL_HUB_URL,
 };
-pub use scan::{scan_local_directory, scan_local_directory_with_opts};
+pub use scan::{
+    scan_local_directory, scan_local_directory_with_opts, scan_local_directory_with_policy,
+};
 pub use walker::{
-    build_workspace_walker, collect_symlink_warnings, normalize_path_nfc, DEFAULT_IGNORES,
+    build_workspace_walker, build_workspace_walker_with_ignore_policy, collect_symlink_warnings,
+    normalize_path_nfc, DEFAULT_IGNORES,
 };
 
 #[derive(Debug, Clone)]

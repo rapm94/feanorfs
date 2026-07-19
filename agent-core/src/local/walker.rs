@@ -53,6 +53,19 @@ pub(super) fn portable_mode(_metadata: &fs::Metadata) -> u32 {
 }
 
 pub fn build_workspace_walker(base_path: &Path, no_default_ignores: bool) -> WalkBuilder {
+    build_workspace_walker_with_ignore_policy(base_path, no_default_ignores, None)
+}
+
+/// Build the workspace walker with an optional in-memory `.feanorfsignore` policy.
+///
+/// Join preflight uses the encrypted sender policy before any destination file
+/// is written. `None` retains the ordinary behavior of reading the policy from
+/// disk; `Some("")` explicitly applies no custom rules.
+pub fn build_workspace_walker_with_ignore_policy(
+    base_path: &Path,
+    no_default_ignores: bool,
+    ignore_policy: Option<&str>,
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(base_path);
     builder
         .hidden(false)
@@ -69,7 +82,15 @@ pub fn build_workspace_walker(base_path: &Path, no_default_ignores: bool) -> Wal
         for pattern in DEFAULT_IGNORES {
             let _ = patterns.add_line(None, pattern);
         }
-        if let Ok(content) = fs::read_to_string(base_path.join(".feanorfsignore")) {
+        let disk_policy;
+        let content = match ignore_policy {
+            Some(content) => Some(content),
+            None => {
+                disk_policy = fs::read_to_string(base_path.join(".feanorfsignore")).ok();
+                disk_policy.as_deref()
+            }
+        };
+        if let Some(content) = content {
             for line in content.lines().map(str::trim) {
                 if !line.is_empty() && !line.starts_with('#') {
                     let _ = patterns.add_line(None, line);

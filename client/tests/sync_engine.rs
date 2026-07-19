@@ -2575,6 +2575,63 @@ async fn join_nonempty_folder_unions_without_silent_overwrite() {
 }
 
 #[tokio::test]
+async fn join_preflight_classifies_nonempty_folder_without_mutating_it() {
+    let server = spawn_test_server().await;
+    let uploader = spawn_test_client_with_server(&server).await;
+    let mut uploader_config = feanorfs_client::load_config(uploader.workspace.path()).unwrap();
+    uploader_config.format_version = 3;
+    feanorfs_client::save_config(uploader.workspace.path(), &uploader_config).unwrap();
+    write_workspace_file(uploader.workspace.path(), "remote-only.txt", b"remote").await;
+    write_workspace_file(uploader.workspace.path(), "same.txt", b"same").await;
+    write_workspace_file(uploader.workspace.path(), "conflict.txt", b"remote").await;
+    do_sync(
+        &server.api,
+        &uploader.db,
+        uploader.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let destination = tempfile::tempdir().unwrap();
+    write_workspace_file(destination.path(), "local-only.txt", b"local").await;
+    write_workspace_file(destination.path(), "same.txt", b"same").await;
+    write_workspace_file(destination.path(), "conflict.txt", b"local").await;
+    write_workspace_file(destination.path(), ".feanorfsignore", b"local-cache/\n").await;
+    let before = std::fs::read(destination.path().join(".feanorfsignore")).unwrap();
+
+    let preview = feanorfs_client::preview_join(
+        destination.path(),
+        &feanorfs_client::WorkspaceInvite {
+            server_url: server.url.clone(),
+            workspace_id: WORKSPACE_ID.into(),
+            server_token: None,
+            encryption_key: TEST_PASSWORD.into(),
+            tls_ca_pem: None,
+            hub_local: false,
+            relay: None,
+            ignore_policy: Some("remote-cache/\n".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(preview.local_only.count, 1);
+    assert_eq!(preview.remote_only.count, 1);
+    assert_eq!(preview.same.count, 1);
+    assert_eq!(preview.conflicts.count, 1);
+    assert!(preview.ignore_policy_differs);
+    assert!(preview.needs_confirmation());
+    assert!(!destination.path().join(".feanorfs/config.json").exists());
+    assert_eq!(
+        std::fs::read(destination.path().join(".feanorfsignore")).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn local_hub_in_process_sync() {
     use feanorfs_client::{
         hub::LocalHub, save_config, validate_e2ee_key, ApiClient, Config, LOCAL_HUB_URL,

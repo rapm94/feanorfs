@@ -8,11 +8,18 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-use super::pair::PairCode;
+use super::pair::{receive, PairCode};
 use super::start::{run_start, StartOptions};
 use super::util::output_json;
 
 const MAX_PAIRING_STDIN_BYTES: u64 = 1024;
+const MAX_JOIN_DECISION_BYTES: u64 = 32;
+
+#[derive(serde::Serialize)]
+struct JoinPreviewEvent<'a> {
+    event: &'static str,
+    preview: &'a feanorfs_client::JoinPreflight,
+}
 
 #[derive(Subcommand)]
 pub enum TrayAction {
@@ -136,7 +143,17 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                     folder.display()
                 );
             }
-            let pair_code = read_pairing_code(std::io::stdin().lock())?;
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            let pair_code = read_pairing_code(&mut stdin)?;
+            let token = receive(&pair_code, std::time::Duration::from_secs(20)).await?;
+            let invite = feanorfs_client::decode_invite(token.as_str())?;
+            drop(token);
+            let preview = feanorfs_client::preview_join(&folder, &invite).await?;
+            write_join_preview(&preview)?;
+            if !read_join_decision(&mut stdin)? {
+                anyhow::bail!("Join canceled. No FeanorFS setup or workspace files were changed.");
+            }
             Box::pin(run_start(
                 current_dir,
                 StartOptions {
@@ -151,14 +168,41 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                     relay: None,
                     no_watch: false,
                     foreground: false,
-                    recovery_invite: None,
-                    pair_code: Some(pair_code),
+                    accept_join: true,
+                    recovery_invite: Some(invite),
+                    pair_code: None,
                 },
             ))
             .await?;
         }
     }
     Ok(())
+}
+
+fn write_join_preview(preview: &feanorfs_client::JoinPreflight) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(
+        &mut stdout,
+        &JoinPreviewEvent {
+            event: "join_preview",
+            preview,
+        },
+    )?;
+    writeln!(stdout)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn read_join_decision<R: BufRead>(reader: R) -> anyhow::Result<bool> {
+    let mut limited = reader.take(MAX_JOIN_DECISION_BYTES + 1);
+    let mut decision = String::new();
+    let bytes = limited.read_line(&mut decision)?;
+    if bytes == 0 || bytes as u64 > MAX_JOIN_DECISION_BYTES {
+        anyhow::bail!("bundled tray did not provide a valid join decision");
+    }
+    Ok(decision.trim() == "CONFIRM")
 }
 
 fn read_pairing_code<R: BufRead>(reader: R) -> anyhow::Result<PairCode> {

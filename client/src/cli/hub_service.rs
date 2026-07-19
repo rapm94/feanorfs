@@ -830,6 +830,7 @@ mod tests {
             tls_ca_pem: Some("managed-public-ca".into()),
             hub_local: false,
             relay: None,
+            ignore_policy: None,
         };
         let portable = portable_invite_for_managed_ca(invite.clone(), "managed-public-ca");
         assert_eq!(

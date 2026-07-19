@@ -8,6 +8,7 @@ mod endpoint;
 pub mod fs_util;
 pub mod hub;
 pub mod hub_transfer;
+pub mod join_preflight;
 pub mod local;
 pub mod lock;
 pub mod migrate;
@@ -50,6 +51,7 @@ pub use feanorfs_common::{
     TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayStatusResult,
 };
 pub use hub_transfer::{transfer_hub, HubTransferResult};
+pub use join_preflight::{preview_join, JoinPathGroup, JoinPreflight};
 pub use local::{
     load_config, load_global_config, save_config, save_config_secure, save_global_config,
     save_global_config_secure, validate_e2ee_key, ClientDb, Config, CredentialProtection,

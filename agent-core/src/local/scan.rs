@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use super::walker::portable_mode;
-use super::{build_workspace_walker, normalize_path_nfc, CacheEntry, ClientDb};
+use super::{build_workspace_walker_with_ignore_policy, normalize_path_nfc, CacheEntry, ClientDb};
 
 static WARNED_LEGACY_PASSWORD_SCAN: OnceLock<()> = OnceLock::new();
 
@@ -24,6 +24,20 @@ pub async fn scan_local_directory_with_opts(
     password: Option<&str>,
     no_default_ignores: bool,
 ) -> Result<HashMap<String, FileState>> {
+    scan_local_directory_with_policy(base_path, db, password, no_default_ignores, None).await
+}
+
+/// Scan with an optional in-memory `.feanorfsignore` override.
+///
+/// This exists for safe join preview: the receiver can classify its files
+/// under the encrypted mirror policy before writing that policy locally.
+pub async fn scan_local_directory_with_policy(
+    base_path: &Path,
+    db: &ClientDb,
+    password: Option<&str>,
+    no_default_ignores: bool,
+    ignore_policy: Option<&str>,
+) -> Result<HashMap<String, FileState>> {
     let mut cached_entries = db.get_cache_entries().await?;
     let mut cache_hits = HashSet::new();
     let mut disk_files = HashMap::new();
@@ -36,7 +50,10 @@ pub async fn scan_local_directory_with_opts(
         feanorfs_common::LEGACY_DEFAULT_PASSWORD
     });
 
-    for result in build_workspace_walker(base_path, no_default_ignores).build() {
+    for result in
+        build_workspace_walker_with_ignore_policy(base_path, no_default_ignores, ignore_policy)
+            .build()
+    {
         let Ok(entry) = result else { continue };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;

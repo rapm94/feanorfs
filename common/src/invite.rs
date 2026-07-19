@@ -47,6 +47,13 @@ pub struct WorkspaceInvite {
     pub hub_local: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayConfig>,
+    /// Exact `.feanorfsignore` contents selected by the sharing workspace.
+    ///
+    /// Pairing and recovery encrypt this field with the rest of the capability.
+    /// `None` identifies an older capability whose policy is unknown; `Some("")`
+    /// explicitly means that the mirror has no custom ignore rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_policy: Option<String>,
 }
 
 /// Secure hub introduction used before a workspace and E2EE key exist.
@@ -131,6 +138,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            ignore_policy: Some("target/\n".into()),
         };
         let enc = encode_invite(&inv).unwrap();
         assert!(enc.starts_with(INVITE_PREFIX));
@@ -154,6 +162,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: true,
             relay: None,
+            ignore_policy: None,
         };
         let enc = encode_invite(&inv).unwrap();
         assert!(decode_invite(&enc).unwrap().hub_local);
@@ -186,6 +195,7 @@ mod tests {
         assert_eq!(workspace.tls_ca_pem, None);
         assert!(!workspace.hub_local);
         assert_eq!(workspace.relay, None);
+        assert_eq!(workspace.ignore_policy, None);
 
         let hub_json = br#"{"server_url":"https://hub.example","server_token":"token"}"#;
         let hub =

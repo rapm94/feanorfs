@@ -76,6 +76,9 @@ enum Action {
         kind: SetupKind,
         error: Option<String>,
     },
+    SetupCanceled {
+        generation: u64,
+    },
     StopDone {
         generation: u64,
         path: PathBuf,
@@ -1523,14 +1526,18 @@ fn handle_menu_action(
             state.setup_kind = Some(SetupKind::JoinFolder);
             state.error_message = Some("Connecting shared folder securely…".into());
             let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = join_workspace(&path, pairing_code).err();
-                let _ = proxy.send_event(Action::SetupDone {
-                    generation,
-                    path,
-                    kind: SetupKind::JoinFolder,
-                    error,
-                });
+            std::thread::spawn(move || match join_workspace(&path, pairing_code) {
+                Err(error) if error == "__FEANORFS_JOIN_CANCELED__" => {
+                    let _ = proxy.send_event(Action::SetupCanceled { generation });
+                }
+                result => {
+                    let _ = proxy.send_event(Action::SetupDone {
+                        generation,
+                        path,
+                        kind: SetupKind::JoinFolder,
+                        error: result.err(),
+                    });
+                }
             });
         }
         MenuAction::StopMirroring => {
@@ -2280,6 +2287,16 @@ fn main() {
                 if let Some((title, description, success)) = dialog {
                     show_setup_result_dialog(title, description, success);
                 }
+            }
+            Action::SetupCanceled { generation } => {
+                if generation != st.task_generation {
+                    return;
+                }
+                st.setup_inflight = false;
+                st.setup_kind = None;
+                st.error_message = None;
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::StopDone {
                 generation,

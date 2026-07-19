@@ -334,6 +334,7 @@ pub fn invite_from_config(config: &Config) -> Option<WorkspaceInvite> {
         tls_ca_pem: config.tls_ca_pem.clone(),
         hub_local: config.is_local_hub(),
         relay: config.relay.clone(),
+        ignore_policy: None,
     })
 }
 
@@ -453,6 +454,7 @@ pub async fn initialize_new_mirror(
         tls_ca_pem,
         hub_local,
         relay,
+        ignore_policy: feanorfs_client::join_preflight::read_ignore_policy(current_dir).ok(),
     };
 
     let reveal_secrets = std::io::stdout().is_terminal();
@@ -602,15 +604,17 @@ pub async fn join_from_invite(
     current_dir: &Path,
     token: &str,
     run_initial_sync: bool,
+    accept_join: bool,
 ) -> anyhow::Result<()> {
     let invite = feanorfs_client::decode_invite(token)?;
-    join_from_workspace_invite(current_dir, invite, run_initial_sync).await
+    join_from_workspace_invite(current_dir, invite, run_initial_sync, accept_join).await
 }
 
 pub async fn join_from_workspace_invite(
     current_dir: &Path,
     invite: WorkspaceInvite,
     run_initial_sync: bool,
+    accept_join: bool,
 ) -> anyhow::Result<()> {
     if invite.hub_local {
         anyhow::bail!(
@@ -618,6 +622,27 @@ pub async fn join_from_workspace_invite(
              Run `feanorfs serve` on the host and join with a remote invite, or copy the folder."
         );
     }
+    let preview = feanorfs_client::preview_join(current_dir, &invite)
+        .await
+        .context("preview this folder against the encrypted mirror")?;
+    if preview.destination_has_files() || preview.ignore_policy_differs || preview.is_blocked() {
+        print_join_preflight(&preview);
+    }
+    if preview.is_blocked() {
+        anyhow::bail!(
+            "Join stopped before changing this folder: files larger than 100 MiB require chunked transport. Move or ignore the listed files, then retry."
+        );
+    }
+    if preview.needs_confirmation() && !accept_join {
+        confirm_join_preflight()?;
+    }
+
+    feanorfs_client::join_preflight::apply_invited_ignore_policy(
+        current_dir,
+        invite.ignore_policy.as_deref(),
+    )
+    .await?;
+
     link_existing_mirror(
         current_dir,
         invite.workspace_id,
@@ -632,6 +657,56 @@ pub async fn join_from_workspace_invite(
         run_initial_sync,
     )
     .await
+}
+
+fn print_join_preflight(preview: &feanorfs_client::JoinPreflight) {
+    println!("\nBefore this folder is joined:");
+    print_preflight_group("Local only (will upload)", &preview.local_only);
+    print_preflight_group("Mirror only (will download)", &preview.remote_only);
+    print_preflight_group("Already identical", &preview.same);
+    print_preflight_group(
+        "Same path, different content (needs attention)",
+        &preview.conflicts,
+    );
+    if preview.ignore_policy_differs {
+        println!(
+            "  Ignore policy: differs; the encrypted mirror policy will replace this folder's .feanorfsignore"
+        );
+    } else if preview.ignore_policy_known {
+        println!("  Ignore policy: matches the encrypted mirror");
+    } else {
+        println!("  Ignore policy: older invite; keeping this folder's current policy");
+    }
+    if preview.oversized.count > 0 {
+        print_preflight_group("Too large for current transport", &preview.oversized);
+    }
+    println!("No files or FeanorFS setup have been changed by this preview.");
+}
+
+fn print_preflight_group(label: &str, group: &feanorfs_client::JoinPathGroup) {
+    println!("  {label}: {}", group.count);
+    for path in &group.examples {
+        println!("    {path}");
+    }
+    if group.count > group.examples.len() {
+        println!("    … and {} more", group.count - group.examples.len());
+    }
+}
+
+fn confirm_join_preflight() -> anyhow::Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "Join needs confirmation and input is not an interactive terminal. Review the preview, then rerun with --accept-join."
+        );
+    }
+    print!("Type JOIN to upload local-only files, download mirror-only files, and keep conflicts for review: ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "JOIN" {
+        anyhow::bail!("Join canceled; no FeanorFS setup or workspace files were changed");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

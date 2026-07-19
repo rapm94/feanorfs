@@ -111,6 +111,7 @@ pub async fn run(current_dir: &Path, action: RecoveryAction, json: bool) -> anyh
                     relay: None,
                     no_watch,
                     foreground,
+                    accept_join: false,
                     recovery_invite: Some(invite),
                     pair_code: None,
                 },

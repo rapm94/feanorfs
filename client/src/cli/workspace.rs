@@ -53,6 +53,9 @@ pub enum WorkspaceAction {
         /// Keep sync attached to this terminal instead of installing a background service
         #[arg(long)]
         foreground: bool,
+        /// Accept the displayed non-empty-folder join plan without prompting
+        #[arg(long)]
+        accept_join: bool,
     },
     /// Stop mirroring a folder while keeping its files and encrypted setup
     Stop {
@@ -204,6 +207,7 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
             relay,
             no_watch,
             foreground,
+            accept_join,
         } => {
             Box::pin(run_start(
                 current_dir,
@@ -219,6 +223,7 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
                     relay,
                     no_watch,
                     foreground,
+                    accept_join,
                     recovery_invite: None,
                     pair_code: None,
                 },
@@ -261,7 +266,7 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
                     .await;
             }
             if let Some(token) = invite {
-                return join_from_invite(current_dir, &token, true).await;
+                return join_from_invite(current_dir, &token, true, false).await;
             }
             run_join_interactive(current_dir, lan).await
         }
@@ -536,7 +541,7 @@ async fn run_join_interactive(current_dir: &Path, lan: bool) -> anyhow::Result<(
     if token.is_empty() {
         anyhow::bail!("No invite provided.");
     }
-    join_from_invite(current_dir, token, true).await
+    join_from_invite(current_dir, token, true, false).await
 }
 
 fn run_config(current_dir: &Path, show_key: bool) -> anyhow::Result<()> {
