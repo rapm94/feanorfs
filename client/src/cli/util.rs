@@ -187,9 +187,25 @@ pub async fn probe_server_auth(url: &str) -> anyhow::Result<bool> {
 }
 
 pub fn output_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
-    let s = serde_json::to_string_pretty(value)?;
-    println!("{s}");
-    Ok(())
+    let stdout = std::io::stdout();
+    output_json_to(stdout.lock(), value)
+}
+
+fn output_json_to<T: serde::Serialize>(
+    mut writer: impl std::io::Write,
+    value: &T,
+) -> anyhow::Result<()> {
+    if let Err(error) = serde_json::to_writer_pretty(&mut writer, value) {
+        if error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe) {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    match writeln!(writer) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) fn service_identity(programs: &[&Path]) -> anyhow::Result<String> {
@@ -713,9 +729,26 @@ fn confirm_join_preflight() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        record_service_identity, resolve_connection_token, service_identity_matches,
-        truncate_password_for_display,
+        output_json_to, record_service_identity, resolve_connection_token,
+        service_identity_matches, truncate_password_for_display,
     };
+
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_output_exits_cleanly_when_its_reader_closes() {
+        output_json_to(ClosedPipe, &vec!["path"; 10_000]).unwrap();
+    }
 
     #[test]
     fn service_identity_detects_same_path_binary_upgrades() {

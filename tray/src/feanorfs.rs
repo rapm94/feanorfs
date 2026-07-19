@@ -840,6 +840,15 @@ pub fn conflicts_keep(workspace: &Path, path: &str, choice: &str) -> Result<(), 
     )
 }
 
+pub fn conflicts_keep_all(workspace: &Path, choice: &str) -> Result<(), String> {
+    let flag = match choice {
+        "local" => "--local",
+        "cloud" => "--cloud",
+        _ => return Err(format!("unknown bulk keep choice: {choice}")),
+    };
+    run_checked(workspace, &["--json", "conflicts", "keep", "--all", flag])
+}
+
 pub fn agent_land(workspace: &Path, name: &str) -> Result<(), String> {
     run_checked(workspace, &["--json", "agent", "land", "--", name])
 }

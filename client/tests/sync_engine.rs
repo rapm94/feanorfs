@@ -1771,6 +1771,104 @@ async fn bulk_keep_local_resolves_and_publishes_all_workspace_conflicts() {
 }
 
 #[tokio::test]
+async fn bulk_keep_cloud_materializes_and_publishes_all_mirror_versions() {
+    use feanorfs_client::{conflicts, SyncCtx};
+
+    let server = spawn_test_server().await;
+    let local = spawn_test_client_with_server(&server).await;
+    let remote = spawn_test_client_with_server(&server).await;
+    for workspace in [local.workspace.path(), remote.workspace.path()] {
+        let mut config = feanorfs_client::load_config(workspace).unwrap();
+        config.format_version = 3;
+        feanorfs_client::save_config(workspace, &config).unwrap();
+    }
+
+    for path in ["first.txt", "second.txt"] {
+        write_workspace_file(local.workspace.path(), path, b"base").await;
+    }
+    do_sync(
+        &server.api,
+        &local.db,
+        local.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &remote.db,
+        remote.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    write_workspace_file(local.workspace.path(), "first.txt", b"local first").await;
+    write_workspace_file(local.workspace.path(), "second.txt", b"local second").await;
+    write_workspace_file(remote.workspace.path(), "first.txt", b"mirror first").await;
+    tokio::fs::remove_file(remote.workspace.path().join("second.txt"))
+        .await
+        .unwrap();
+    do_sync(
+        &server.api,
+        &remote.db,
+        remote.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &local.db,
+        local.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(local.db.list_conflict_records().await.unwrap().len(), 2);
+    let config = feanorfs_client::load_config(local.workspace.path()).unwrap();
+    let ctx =
+        SyncCtx::from_config(&server.api, &local.db, local.workspace.path(), &config).unwrap();
+    let mut resolved = conflicts::resolve_all_cloud_conflicts(&ctx).await.unwrap();
+    resolved.sort();
+    assert_eq!(resolved, vec!["first.txt", "second.txt"]);
+    assert_eq!(
+        read_workspace_file(local.workspace.path(), "first.txt").await,
+        b"mirror first"
+    );
+    assert!(!local.workspace.path().join("second.txt").exists());
+    assert!(local
+        .db
+        .list_conflict_resolutions()
+        .await
+        .unwrap()
+        .iter()
+        .all(|resolution| resolution.method == "cloud"));
+
+    let after = do_sync(
+        &server.api,
+        &local.db,
+        local.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(after.uploads, 0);
+    assert_eq!(after.downloads, 0);
+}
+
+#[tokio::test]
 async fn concurrent_delete_is_not_a_workspace_conflict() {
     use feanorfs_client::conflicts;
 

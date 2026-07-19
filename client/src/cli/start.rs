@@ -174,7 +174,10 @@ pub(crate) async fn finish_sync_watch(
                     );
                 }
             }
-            return Err(error);
+            anyhow::bail!(
+                "Initial sync did not complete. This folder's encrypted FeanorFS setup is saved, and rerunning `feanorfs start -- {}` will resume it without pairing again or changing its workspace identity. Details: {error:#}",
+                work_dir.display()
+            );
         }
     };
     if sync_result.large_file_count > 0 {
@@ -197,6 +200,7 @@ pub(crate) async fn finish_sync_watch(
     // overwrite that migration with the stale pre-probe config.
     let config = load_config(work_dir)?;
     save_config_secure(work_dir, &config)?;
+    println!("Initial sync completed.");
     if let Ok(global) = load_global_config() {
         if let Err(error) = save_global_config_secure(&global) {
             eprintln!("Warning: could not migrate cached server credentials: {error}");
@@ -474,8 +478,16 @@ pub async fn run_start(current_dir: &Path, mut opts: StartOptions) -> anyhow::Re
     if let Some(code) = pair_code {
         println!("Finding the other computer…");
         let token = receive(&code, std::time::Duration::from_secs(20)).await?;
-        join_from_invite(&work_dir, &token, false, opts.accept_join).await?;
-        return finish_sync_watch(&work_dir, watch_mode).await;
+        println!("Secure pairing completed.");
+        if let Err(error) = join_from_invite(&work_dir, &token, false, opts.accept_join).await {
+            anyhow::bail!(
+                "Secure pairing completed, but this folder was not linked. No pairing secret was saved; retry with a new one-time code. Details: {error:#}"
+            );
+        }
+        if let Err(error) = finish_sync_watch(&work_dir, watch_mode).await {
+            anyhow::bail!("Secure pairing completed. {error:#}");
+        }
+        return Ok(());
     }
 
     if let Some(invite) = hub_invite {

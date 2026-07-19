@@ -153,19 +153,34 @@ pub async fn run(current_dir: &Path, action: ServiceAction, json: bool) -> anyho
 
 fn install_result(workspace: &Path) -> anyhow::Result<ServiceResult> {
     let spec = ServiceSpec::load(workspace)?;
-    let status = platform_install_and_start(&spec)?;
+    let status = platform_install_and_start(&spec).context("install automatic background sync")?;
     let mut result = result("install", &spec, status);
-    match install_tray_if_available(&spec) {
-        Ok(tray) => result.tray = tray,
-        Err(error) => {
-            eprintln!("Warning: background sync started, but the tray could not start: {error}")
-        }
-    }
+    result.tray = install_tray_if_available(&spec).context("install the FeanorFS system tray")?;
     Ok(result)
 }
 
 pub(crate) fn install_and_start(workspace: &Path) -> anyhow::Result<()> {
-    let result = install_result(workspace)?;
+    let spec = ServiceSpec::load(workspace)?;
+    let status = platform_install_and_start(&spec).map_err(|error| {
+        anyhow::anyhow!(
+            "Initial sync completed, but automatic background sync could not be installed. Rerun `feanorfs start -- {}` to retry this stage; the completed sync and encrypted workspace identity will be preserved. Details: {error:#}",
+            spec.workspace.display()
+        )
+    })?;
+    println!("Automatic background sync installed.");
+    let tray = install_tray_if_available(&spec).map_err(|error| {
+        anyhow::anyhow!(
+            "Initial sync and automatic background sync completed, but the system tray could not be installed. Rerun `feanorfs start -- {}` to retry only the remaining lifecycle checks; synced files and encrypted workspace identity will be preserved. Details: {error:#}",
+            spec.workspace.display()
+        )
+    })?;
+    let result = ServiceResult {
+        action: "install",
+        workspace: spec.workspace.display().to_string(),
+        service: spec.label,
+        status,
+        tray,
+    };
     println!("FeanorFS is running in the background and will restart when you log in.");
     println!("  Workspace: {}", result.workspace);
     if result.tray == Some(BackgroundStatus::Running) {
@@ -185,7 +200,8 @@ pub(crate) fn stop_for_start(workspace: &Path) -> anyhow::Result<bool> {
 }
 
 pub(crate) fn restore_after_failed_start(workspace: &Path) -> anyhow::Result<()> {
-    let _ = install_result(workspace)?;
+    let spec = ServiceSpec::load(workspace)?;
+    let _ = platform_install_and_start(&spec)?;
     Ok(())
 }
 

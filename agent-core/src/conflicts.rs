@@ -330,6 +330,17 @@ pub async fn resolve_conflict(
 }
 
 pub async fn resolve_all_local_conflicts(ctx: &SyncCtx<'_>) -> Result<Vec<String>> {
+    resolve_all_conflicts(ctx, ResolveKeep::Local).await
+}
+
+pub async fn resolve_all_cloud_conflicts(ctx: &SyncCtx<'_>) -> Result<Vec<String>> {
+    resolve_all_conflicts(ctx, ResolveKeep::Cloud).await
+}
+
+async fn resolve_all_conflicts(ctx: &SyncCtx<'_>, keep: ResolveKeep) -> Result<Vec<String>> {
+    if !matches!(keep, ResolveKeep::Local | ResolveKeep::Cloud) {
+        bail!("bulk conflict resolution supports only local or cloud choices");
+    }
     let records = ctx.db.list_conflict_records().await?;
     if records.is_empty() {
         return Ok(Vec::new());
@@ -340,19 +351,57 @@ pub async fn resolve_all_local_conflicts(ctx: &SyncCtx<'_>) -> Result<Vec<String
         }
     }
 
+    let mut cloud_actions = Vec::new();
+    if keep == ResolveKeep::Cloud {
+        for record in &records {
+            let artifact = resolve_artifact(
+                Path::new(&record.conflict_dir),
+                &record.path,
+                ArtifactRole::Cloud,
+            );
+            let content = fs::read(&artifact)
+                .await
+                .with_context(|| format!("cloud version unavailable for {}", record.path))?;
+            if is_cloud_deleted_sentinel(&content) {
+                cloud_actions.push((record.path.clone(), None));
+            } else if is_sentinel_content(&content) {
+                bail!(
+                    "cloud version unavailable for {}; re-run sync while online",
+                    record.path
+                );
+            } else {
+                cloud_actions.push((record.path.clone(), Some(content)));
+            }
+        }
+    }
+
     let before = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     crate::snapshot::SnapshotEngine::new(ctx)
         .snapshot_local_view(&before, "you")
         .await?;
 
-    for record in &records {
-        let ours_path = ctx.base.join(&record.path);
-        if ours_path.exists() {
-            let plain = fs::read(&ours_path).await?;
-            let mtime = file_mtime_ms(&ours_path).await?;
-            upload_sealed(ctx, &record.path, &plain, mtime).await?;
-        } else {
-            upload_tombstone_for(ctx, &record.path).await?;
+    if keep == ResolveKeep::Local {
+        for record in &records {
+            let ours_path = ctx.base.join(&record.path);
+            if ours_path.exists() {
+                let plain = fs::read(&ours_path).await?;
+                let mtime = file_mtime_ms(&ours_path).await?;
+                upload_sealed(ctx, &record.path, &plain, mtime).await?;
+            } else {
+                upload_tombstone_for(ctx, &record.path).await?;
+            }
+        }
+    } else {
+        for (path, content) in cloud_actions {
+            let destination = ctx.base.join(&path);
+            match content {
+                Some(content) => atomic_write(ctx.base, &path, &content).await?,
+                None => match fs::remove_file(&destination).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                },
+            }
         }
     }
 
@@ -367,7 +416,15 @@ pub async fn resolve_all_local_conflicts(ctx: &SyncCtx<'_>) -> Result<Vec<String
         .resolve_conflicts(&paths, &resolved_files, &resolver)
         .await?;
     ctx.db
-        .resolve_conflict_paths_with_history(&paths, "local", &resolver)
+        .resolve_conflict_paths_with_history(
+            &paths,
+            if keep == ResolveKeep::Local {
+                "local"
+            } else {
+                "cloud"
+            },
+            &resolver,
+        )
         .await?;
 
     let conflict_dirs: HashSet<PathBuf> = records

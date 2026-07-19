@@ -23,6 +23,7 @@
 - Server auth = **token**; workspace secrecy = **encryption key** (distinct concepts in user-facing copy).
 - Native TLS is the hub default. `--allow-http` is explicit reverse-proxy/development mode; never disable certificate verification in clients.
 - Surface conflicts; never auto-merge file content.
+- Bulk conflict choices may apply one explicitly confirmed local-or-mirror policy to every pending path, but still never merge file content.
 - Self-host and hosted deployments share the same API and client binary.
 - Agent-first, human-legible: every agent capability keeps a plain-files, plain-language human path (working copy stays normal files; conflicts resolved by editing + `conflicts keep`/tray). Transport/snapshot internals stay invisible to humans until needed — FeanorFS is not a VCS and grows no git-shaped porcelain.
 
@@ -262,6 +263,7 @@ cargo run --bin feanorfs -- agent run ci1 -- cargo test
 cargo run --bin feanorfs -- conflicts
 cargo run --bin feanorfs -- conflicts keep src/main.rs --local
 cargo run --bin feanorfs -- conflicts keep --all --local
+cargo run --bin feanorfs -- conflicts keep --all --cloud
 cargo run --bin feanorfs -- conflicts show src/main.rs --open
 ```
 

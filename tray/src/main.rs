@@ -5,11 +5,12 @@ mod password_dialog;
 use feanorfs::feanorfs_bin;
 use feanorfs::{
     agent_land, background_service_managed, background_service_start, background_service_stop,
-    check_for_updates, clear_pairing_clipboard, conflicts_keep, copy_pairing_clipboard,
-    export_recovery_kit, forget_unavailable_workspaces, graceful_stop_child, import_recovery_kit,
-    join_workspace, run_pairing_session, start_workspace, stop_workspace, sync_once, system_health,
-    tray_activate, tray_pause, tray_recent, tray_status, workspace_has_config, HealthReport,
-    HealthStatus, PairSessionEvent, UpdateCheckResult, UpdateStatus,
+    check_for_updates, clear_pairing_clipboard, conflicts_keep, conflicts_keep_all,
+    copy_pairing_clipboard, export_recovery_kit, forget_unavailable_workspaces,
+    graceful_stop_child, import_recovery_kit, join_workspace, run_pairing_session, start_workspace,
+    stop_workspace, sync_once, system_health, tray_activate, tray_pause, tray_recent, tray_status,
+    workspace_has_config, HealthReport, HealthStatus, PairSessionEvent, UpdateCheckResult,
+    UpdateStatus,
 };
 use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
 use icons::{icon_for, visual_from_state, TrayVisual};
@@ -879,6 +880,37 @@ fn setup_failure_copy(
     error: &str,
 ) -> (&'static str, String) {
     let name = folder_name(path);
+    let normalized_error = error.to_ascii_lowercase();
+    let initial_sync_failed = normalized_error.contains("initial sync did not complete");
+    let service_failed =
+        normalized_error.contains("automatic background sync could not be installed");
+    let tray_failed = normalized_error.contains("system tray could not be installed");
+    if initial_sync_failed || service_failed || tray_failed {
+        let (title, completed, next_step) = if tray_failed {
+            (
+                "Folder synced — tray needs repair",
+                format!("“{name}” is securely synced and automatic background sync is running."),
+                "Choose Add Folder again to retry the tray registration. FeanorFS will keep the existing workspace identity and recheck the completed stages.",
+            )
+        } else if service_failed {
+            (
+                "Folder synced — automatic sync needs repair",
+                format!("The initial secure sync for “{name}” completed."),
+                "Choose Add Folder again to retry automatic background sync and the tray. FeanorFS will keep the completed sync and existing workspace identity.",
+            )
+        } else {
+            (
+                "Folder setup saved — sync paused",
+                format!("The encrypted FeanorFS setup for “{name}” is saved, but its initial sync did not complete."),
+                "Make sure the mirror is reachable, then choose Add Folder again. FeanorFS will resume without pairing again or changing the workspace identity.",
+            )
+        };
+        let detail = error.trim().strip_prefix("Error:").unwrap_or(error.trim());
+        return (
+            title,
+            format!("{completed}\n\n{next_step}\n\nDetails: {detail}"),
+        );
+    }
     let (title, outcome) = match kind {
         SetupKind::AddFolder => ("Folder wasn’t added", format!("“{name}” was not added.")),
         SetupKind::JoinFolder => (
@@ -1054,6 +1086,19 @@ fn build_menu(state: &AppState) -> Menu {
             let _ = menu.append(&PredefinedMenuItem::separator());
             let title = format!("Needs attention ({})", s.pending_conflicts.len());
             let conflict_menu = Submenu::with_id(muda::MenuId::new("conflicts"), title, true);
+            let _ = conflict_menu.append(&MenuItem::with_id(
+                muda::MenuId::new("keep-all-local"),
+                format!("Keep all {} local versions…", s.pending_conflicts.len()),
+                actions_enabled,
+                None,
+            ));
+            let _ = conflict_menu.append(&MenuItem::with_id(
+                muda::MenuId::new("keep-all-cloud"),
+                format!("Keep all {} mirror versions…", s.pending_conflicts.len()),
+                actions_enabled,
+                None,
+            ));
+            let _ = conflict_menu.append(&PredefinedMenuItem::separator());
             for c in &s.pending_conflicts {
                 let _ = conflict_menu.append(&MenuItem::with_id(
                     muda::MenuId::new(format!("conflict-hdr:{}", c.path)),
@@ -1237,6 +1282,7 @@ enum MenuAction {
     TogglePause,
     SyncNow,
     Keep { path: String, choice: String },
+    KeepAll { choice: String },
     Land { agent: String },
     SwitchWorkspace(PathBuf),
     ForgetUnavailable,
@@ -1284,6 +1330,13 @@ fn parse_menu_action(id: &str) -> Option<MenuAction> {
     }
     if id == "quit" {
         return Some(MenuAction::Quit);
+    }
+    if let Some(choice) = id.strip_prefix("keep-all-") {
+        if matches!(choice, "local" | "cloud") {
+            return Some(MenuAction::KeepAll {
+                choice: choice.into(),
+            });
+        }
     }
     if let Some(rest) = id.strip_prefix("keep-") {
         if let Some((choice, path)) = rest.split_once(':') {
@@ -1826,6 +1879,55 @@ fn handle_menu_action(
             std::thread::spawn(move || {
                 let error = run_exclusive_service_action(&workspace, external_watcher, || {
                     conflicts_keep(&workspace, &path, &choice).and_then(|()| sync_once(&workspace))
+                });
+                let _ = proxy.send_event(Action::TaskDone {
+                    error,
+                    restart_watch: !external_watcher,
+                    set_paused: None,
+                    generation,
+                });
+            });
+        }
+        MenuAction::KeepAll { choice } => {
+            let Some(workspace) = state.workspace.clone() else {
+                return;
+            };
+            let count = state
+                .last_status
+                .as_ref()
+                .map_or(0, |status| status.pending_conflicts.len());
+            if count == 0 {
+                return;
+            }
+            let (title, consequence) = if choice == "local" {
+                (
+                    format!("Keep all {count} local versions?"),
+                    "Every conflicting mirror version will be discarded. Current local files and local deletions become the shared result.",
+                )
+            } else {
+                (
+                    format!("Keep all {count} mirror versions?"),
+                    "Every conflicting local version will be replaced or deleted to match the mirror. Local conflict copies remain recoverable only in immutable FeanorFS history.",
+                )
+            };
+            let confirmed = rfd::MessageDialog::new()
+                .set_title(title)
+                .set_description(format!(
+                    "This applies one choice to {count} paths.\n\n{consequence}\n\nFeanorFS will not merge file contents. Choose OK only if this single policy is correct for every listed conflict."
+                ))
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show();
+            if !matches!(confirmed, rfd::MessageDialogResult::Ok) {
+                return;
+            }
+            let external_watcher = state.external_watcher_active();
+            state.stop_watch();
+            let generation = state.task_generation;
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                let error = run_exclusive_service_action(&workspace, external_watcher, || {
+                    conflicts_keep_all(&workspace, &choice).and_then(|()| sync_once(&workspace))
                 });
                 let _ = proxy.send_event(Action::TaskDone {
                     error,
@@ -2501,6 +2603,35 @@ mod tests {
     }
 
     #[test]
+    fn partial_setup_failures_name_the_completed_stage_and_safe_retry() {
+        let path = Path::new("/Users/test/project");
+        let cases = [
+            (
+                "Initial sync did not complete. Details: mirror offline",
+                "Folder setup saved — sync paused",
+                "without pairing again",
+            ),
+            (
+                "Initial sync completed, but automatic background sync could not be installed",
+                "Folder synced — automatic sync needs repair",
+                "retry automatic background sync and the tray",
+            ),
+            (
+                "Initial sync and automatic background sync completed, but the system tray could not be installed",
+                "Folder synced — tray needs repair",
+                "retry the tray registration",
+            ),
+        ];
+
+        for (error, expected_title, expected_retry) in cases {
+            let (title, description) = setup_failure_copy(SetupKind::JoinFolder, path, true, error);
+            assert_eq!(title, expected_title);
+            assert!(description.contains(expected_retry));
+            assert!(description.contains("workspace identity"));
+        }
+    }
+
+    #[test]
     fn unchanged_refresh_does_not_replace_the_native_menu() {
         let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
         state.last_status = Some(make_status("idle", false));
@@ -2828,6 +2959,18 @@ mod tests {
         assert!(matches!(
             parse_menu_action("keep-both:README.md"),
             Some(MenuAction::Keep { ref path, ref choice }) if path == "README.md" && choice == "both"
+        ));
+    }
+
+    #[test]
+    fn parse_menu_action_bulk_keep_choices() {
+        assert!(matches!(
+            parse_menu_action("keep-all-local"),
+            Some(MenuAction::KeepAll { ref choice }) if choice == "local"
+        ));
+        assert!(matches!(
+            parse_menu_action("keep-all-cloud"),
+            Some(MenuAction::KeepAll { ref choice }) if choice == "cloud"
         ));
     }
 

@@ -3,13 +3,17 @@ use clap::Subcommand;
 use feanorfs_client::{
     build_conflict_show,
     conflict_artifacts::{is_binary_content, resolve_artifact, ArtifactRole},
-    conflicts, invalidate_agent_cache, load_config, ClientDb, ConflictKeepResult, ResolveKeep,
-    SyncCtx,
+    conflicts, invalidate_agent_cache, load_config, ClientDb, ConflictKeepResult, ConflictRecord,
+    ConflictResolution, ResolveKeep, SyncCtx,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{fmt::Write as _, io::Write as _};
 
 use super::util::output_json;
+
+const MAX_CONFLICT_OUTPUT: usize = 20;
+const MAX_DIFF_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Subcommand)]
 pub enum ConflictsAction {
@@ -88,10 +92,7 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
             } else if records.is_empty() {
                 println!("No paths need attention.");
             } else {
-                println!("Paths needing attention:");
-                for r in &records {
-                    println!("  {} ({:?}) — {}", r.path, r.kind, r.conflict_dir);
-                }
+                write_stdout(&render_conflict_list(&records)?)?;
             }
         }
         ConflictsAction::Keep {
@@ -104,10 +105,11 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
         } => {
             let (keep, file_path) = parse_keep_flags(local, cloud, both, file)?;
             if all {
-                if keep != ResolveKeep::Local {
-                    anyhow::bail!("--all currently requires --local");
-                }
-                let paths = conflicts::resolve_all_local_conflicts(&ctx).await?;
+                let paths = match keep {
+                    ResolveKeep::Local => conflicts::resolve_all_local_conflicts(&ctx).await?,
+                    ResolveKeep::Cloud => conflicts::resolve_all_cloud_conflicts(&ctx).await?,
+                    _ => anyhow::bail!("--all requires --local or --cloud"),
+                };
                 invalidate_agent_cache(current_dir);
                 if json {
                     let results: Vec<ConflictKeepResult> = paths
@@ -117,8 +119,9 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
                     output_json(&results)?;
                 } else {
                     println!(
-                        "Resolved {} conflict(s) with this folder's versions. Run 'feanorfs sync' to continue.",
-                        paths.len()
+                        "Resolved {} conflict(s) with the {} versions. Run 'feanorfs sync' to continue.",
+                        paths.len(),
+                        if keep == ResolveKeep::Local { "local" } else { "mirror" }
                     );
                 }
             } else {
@@ -152,13 +155,7 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
             } else if history.is_empty() {
                 println!("No conflict resolutions recorded.");
             } else {
-                println!("Conflict resolution history:");
-                for r in &history {
-                    println!(
-                        "  {} — {} via {} ({})",
-                        r.path, r.method, r.resolver, r.resolved_at
-                    );
-                }
+                write_stdout(&render_conflict_history(&history)?)?;
             }
         }
     }
@@ -176,18 +173,82 @@ async fn show_conflict_diff(db: &ClientDb, path: &str) -> anyhow::Result<()> {
     let local_bytes = std::fs::read(&local).unwrap_or_default();
     let cloud_bytes = std::fs::read(&cloud).unwrap_or_default();
     if is_binary_content(&local_bytes) || is_binary_content(&cloud_bytes) {
-        println!(
-            "Binary file — local {} bytes vs cloud {} bytes",
+        write_stdout(&format!(
+            "Binary file — local {} bytes vs cloud {} bytes\n",
             local_bytes.len(),
             cloud_bytes.len()
-        );
+        ))?;
     } else {
-        let local_s = String::from_utf8_lossy(&local_bytes);
-        let cloud_s = String::from_utf8_lossy(&cloud_bytes);
-        let diff = diffy::create_patch(local_s.as_ref(), cloud_s.as_ref());
-        println!("{diff}");
+        write_stdout(&render_text_diff(&local_bytes, &cloud_bytes))?;
     }
     Ok(())
+}
+
+fn render_conflict_list(records: &[ConflictRecord]) -> anyhow::Result<String> {
+    let mut output = String::from("Paths needing attention:\n");
+    for record in records.iter().take(MAX_CONFLICT_OUTPUT) {
+        writeln!(
+            output,
+            "  {} ({:?}) — {}",
+            record.path, record.kind, record.conflict_dir
+        )?;
+    }
+    if records.len() > MAX_CONFLICT_OUTPUT {
+        writeln!(
+            output,
+            "  … and {} more (use `feanorfs --json conflicts` for automation)",
+            records.len() - MAX_CONFLICT_OUTPUT
+        )?;
+    }
+    Ok(output)
+}
+
+fn render_conflict_history(records: &[ConflictResolution]) -> anyhow::Result<String> {
+    let mut output = String::from("Conflict resolution history:\n");
+    for record in records.iter().take(MAX_CONFLICT_OUTPUT) {
+        writeln!(
+            output,
+            "  {} — {} via {} ({})",
+            record.path, record.method, record.resolver, record.resolved_at
+        )?;
+    }
+    if records.len() > MAX_CONFLICT_OUTPUT {
+        writeln!(
+            output,
+            "  … and {} more",
+            records.len() - MAX_CONFLICT_OUTPUT
+        )?;
+    }
+    Ok(output)
+}
+
+fn render_text_diff(local_bytes: &[u8], cloud_bytes: &[u8]) -> String {
+    let local = String::from_utf8_lossy(local_bytes);
+    let cloud = String::from_utf8_lossy(cloud_bytes);
+    let rendered = diffy::create_patch(local.as_ref(), cloud.as_ref()).to_string();
+    if rendered.len() <= MAX_DIFF_OUTPUT_BYTES {
+        return format!("{rendered}\n");
+    }
+    let boundary = rendered
+        .char_indices()
+        .take_while(|(index, _)| *index <= MAX_DIFF_OUTPUT_BYTES)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    format!(
+        "{}\n… diff truncated; use `feanorfs conflicts show --open` for the full comparison\n",
+        &rendered[..boundary]
+    )
+}
+
+fn write_stdout(output: &str) -> anyhow::Result<()> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    match stdout.write_all(output.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn open_conflict_compare(db: &ClientDb, path: &str) -> anyhow::Result<()> {
@@ -221,4 +282,51 @@ async fn open_conflict_compare(db: &ClientDb, path: &str) -> anyhow::Result<()> 
         anyhow::bail!("Set EDITOR or install VS Code (`code`) for compare view");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feanorfs_client::ConflictKind;
+
+    #[test]
+    fn human_conflict_list_and_history_are_bounded() {
+        let conflicts: Vec<_> = (0..25)
+            .map(|index| ConflictRecord {
+                path: format!("path-{index:02}.txt"),
+                kind: ConflictKind::EditEdit,
+                conflict_dir: format!("/conflicts/{index}"),
+                opened_at: index,
+                status: "open".into(),
+            })
+            .collect();
+        let list = render_conflict_list(&conflicts).unwrap();
+        assert!(list.contains("path-19.txt"));
+        assert!(!list.contains("path-20.txt"));
+        assert!(list.contains("… and 5 more"));
+
+        let history: Vec<_> = (0..25)
+            .map(|index| ConflictResolution {
+                path: format!("resolved-{index:02}.txt"),
+                method: "local".into(),
+                source_file_hash: None,
+                resolved_at: index,
+                resolver: "test".into(),
+            })
+            .collect();
+        let history = render_conflict_history(&history).unwrap();
+        assert!(history.contains("resolved-19.txt"));
+        assert!(!history.contains("resolved-20.txt"));
+        assert!(history.contains("… and 5 more"));
+    }
+
+    #[test]
+    fn human_diff_is_utf8_safe_and_bounded() {
+        let local = format!("{}\n", "é".repeat(40_000));
+        let cloud = format!("{}\n", "ø".repeat(40_000));
+        let rendered = render_text_diff(local.as_bytes(), cloud.as_bytes());
+        assert!(rendered.is_char_boundary(rendered.len()));
+        assert!(rendered.contains("diff truncated"));
+        assert!(rendered.len() <= MAX_DIFF_OUTPUT_BYTES + 128);
+    }
 }
