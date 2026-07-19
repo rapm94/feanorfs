@@ -46,3 +46,12 @@ Record only OS/version and secret-free acceptance or reproduction evidence.
 The verified installers are open on both machines and await the local macOS
 administrator approval and the CachyOS `sudo` password. Never capture or relay
 either credential through logs, scripts, environment variables, or chat.
+
+### AI-2. Remove unavailable tray entries reliably
+
+- [ ] Fix `feanorfs tray forget-unavailable` so a missing working directory is
+  removed from the recent-folder switcher even when its encrypted global state
+  remains available under `~/.feanorfs`.
+- [ ] Add a macOS regression test covering canonical `/private/var` temporary
+  paths and verify `folders` omits only the unavailable entry while preserving
+  every available folder and all encrypted workspace state.
