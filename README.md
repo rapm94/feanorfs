@@ -264,6 +264,9 @@ feanorfs start --local --workspace my-workspace
 feanorfs start
 feanorfs start ~/other/project   # resume/create in another folder
 
+# List every mirrored folder on this computer (`*` marks the tray selection)
+feanorfs folders
+
 # Terminal-only development mode
 feanorfs start --foreground
 ```

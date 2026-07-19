@@ -297,7 +297,7 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   echo "GitHub-hosted runner: verified mDNS announcement readiness; same-host discovery skipped."
 else
   (
-    printf '%s\n' "$PAIR_CODE" |
+    printf '%s\n%s\n' "$PAIR_CODE" CONFIRM |
       "$FEANORFS" tray join -- "$JOINED_WORKSPACE" >"$ROOT/tray-join.log" 2>&1
   ) &
   JOIN_PID=$!
@@ -313,6 +313,15 @@ else
     exit 1
   fi
   JOIN_PID=""
+  head -n 1 "$ROOT/tray-join.log" | jq -e '
+    .event == "join_preview"
+    and .preview.local_only.count == 0
+    and .preview.remote_only.count == 1
+    and .preview.conflicts.count == 0
+  ' >/dev/null || {
+    echo "Receiver-side tray join did not emit the expected safe preview." >&2
+    exit 1
+  }
   if ! wait "$PAIR_PID"; then
     echo "Sharing-side pairing process failed during tray join." >&2
     exit 1

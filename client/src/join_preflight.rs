@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::{ApiClient, ClientDb, Config, SyncCtx, WorkspaceInvite};
+use crate::{ClientDb, Config, SyncCtx, WorkspaceInvite};
 
 pub const MAX_PREFLIGHT_EXAMPLES: usize = 5;
 pub const MAX_IGNORE_POLICY_BYTES: usize = 4 * 1024;
@@ -150,7 +150,7 @@ pub async fn preview_join(workspace: &Path, invite: &WorkspaceInvite) -> Result<
         hub_local: invite.hub_local,
         relay: invite.relay.clone(),
     };
-    let api = ApiClient::from_config(&scratch.0, &config).await?;
+    let api = crate::endpoint::open(&scratch.0, &config).await?;
     let ctx = SyncCtx::from_config(&api, &db, workspace, &config)?;
     let remote = crate::conflicts::load_server_view(&ctx).await?;
 

@@ -164,6 +164,8 @@ mod cli_tests {
         Cli::try_parse_from(["feanorfs", "agent", "status"]).unwrap();
         Cli::try_parse_from(["feanorfs", "conflicts"]).unwrap();
         Cli::try_parse_from(["feanorfs", "doctor", "--migration-report"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "folders"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "--json", "folders"]).unwrap();
         Cli::try_parse_from(["feanorfs", "update"]).unwrap();
         Cli::try_parse_from(["feanorfs", "--json", "update"]).unwrap();
         Cli::try_parse_from(["feanorfs", "--json", "doctor", "--migration-report"]).unwrap();

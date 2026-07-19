@@ -98,6 +98,8 @@ pub enum WorkspaceAction {
         #[arg(long)]
         migration_report: bool,
     },
+    /// List folders mirrored on this computer
+    Folders,
     /// Summarize files that changed since you last opened this workspace
     Summary {
         /// Shell out to FEANORFS_SUMMARY_CMD to produce prose instead of listing paths
@@ -328,6 +330,9 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
             } else {
                 run_doctor(current_dir, json).await
             }
+        }
+        WorkspaceAction::Folders => {
+            super::tray::run(current_dir, super::tray::TrayAction::Recent, json).await
         }
         WorkspaceAction::Workspaces { server_url } => {
             run_workspaces(current_dir, json, server_url).await
