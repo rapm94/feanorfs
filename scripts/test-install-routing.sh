@@ -87,6 +87,13 @@ exit 0
 EOF
 chmod 755 "$STUBS/ldd"
 
+cat >"$STUBS/ldconfig" <<'EOF'
+#!/bin/sh
+[ "${FAKE_LDCONFIG_MISSING:-0}" = 1 ] && exit 0
+printf '%s\n' 'libayatana-appindicator3.so.1 => /usr/lib/libayatana-appindicator3.so.1'
+EOF
+chmod 755 "$STUBS/ldconfig"
+
 cat >"$STUBS/pgrep" <<'EOF'
 #!/bin/sh
 exit 1
@@ -102,6 +109,13 @@ else
 fi
 EOF
 chmod 755 "$STUBS/id"
+
+cat >"$STUBS/sudo" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = -n ]; then shift; fi
+exec "$@"
+EOF
+chmod 755 "$STUBS/sudo"
 
 cat >"$STUBS/dpkg-deb" <<'EOF'
 #!/bin/sh
@@ -122,6 +136,10 @@ set -eu
 [ "$3" = --no-install-recommends ]
 case "$4" in */FeanorFS-linux-x86_64.deb) ;; *) exit 1 ;; esac
 : > "$FAKE_APT_MARKER"
+mkdir -p "$FEANORFS_NATIVE_BIN_DIR"
+cp "$FAKE_NATIVE_FEANORFS" "$FEANORFS_NATIVE_BIN_DIR/feanorfs"
+cp "$FAKE_NATIVE_TRAY" "$FEANORFS_NATIVE_BIN_DIR/feanorfs-tray"
+chmod 755 "$FEANORFS_NATIVE_BIN_DIR/feanorfs" "$FEANORFS_NATIVE_BIN_DIR/feanorfs-tray"
 EOF
 chmod 755 "$STUBS/apt-get"
 
@@ -155,6 +173,10 @@ set -eu
 [ "$3" = --setopt=install_weak_deps=False ]
 case "$4" in */FeanorFS-linux-x86_64.rpm) ;; *) exit 1 ;; esac
 : > "$FAKE_DNF_MARKER"
+mkdir -p "$FEANORFS_NATIVE_BIN_DIR"
+cp "$FAKE_NATIVE_FEANORFS" "$FEANORFS_NATIVE_BIN_DIR/feanorfs"
+cp "$FAKE_NATIVE_TRAY" "$FEANORFS_NATIVE_BIN_DIR/feanorfs-tray"
+chmod 755 "$FEANORFS_NATIVE_BIN_DIR/feanorfs" "$FEANORFS_NATIVE_BIN_DIR/feanorfs-tray"
 EOF
 chmod 755 "$STUBS/dnf"
 
@@ -180,6 +202,10 @@ set -eu
 [ "$2" = --noconfirm ]
 case "$3" in */FeanorFS-linux-x86_64.pkg.tar.zst) ;; *) exit 1 ;; esac
 : > "$FAKE_PACMAN_MARKER"
+mkdir -p "$FEANORFS_NATIVE_BIN_DIR"
+cp "$FAKE_NATIVE_FEANORFS" "$FEANORFS_NATIVE_BIN_DIR/feanorfs"
+cp "$FAKE_NATIVE_TRAY" "$FEANORFS_NATIVE_BIN_DIR/feanorfs-tray"
+chmod 755 "$FEANORFS_NATIVE_BIN_DIR/feanorfs" "$FEANORFS_NATIVE_BIN_DIR/feanorfs-tray"
 EOF
 chmod 755 "$STUBS/pacman"
 
@@ -188,11 +214,16 @@ export FEANORFS_RELEASE_API="https://example.invalid/releases/latest"
 export FEANORFS_BASE_URL="https://example.invalid/download/v9.9.9"
 export FEANORFS_TEST_CLI_MARKER="$ROOT/cli-installed"
 export FEANORFS_NO_LAUNCH=1
+export HOME="$ROOT/home"
+mkdir -p "$HOME"
 
 export FAKE_RELEASE_JSON='{"tag_name":"v9.9.9","assets":[{"name":"feanorfs-client-installer.sh"}]}'
-sh scripts/install.sh >"$ROOT/fallback.log"
-[[ -f "$FEANORFS_TEST_CLI_MARKER" ]]
-grep -Fq 'does not include the signed menu-bar package' "$ROOT/fallback.log"
+if sh scripts/install.sh >"$ROOT/fallback.log" 2>&1; then
+  echo "CLI-only fallback unexpectedly replaced the desktop installer." >&2
+  exit 1
+fi
+[[ ! -f "$FEANORFS_TEST_CLI_MARKER" ]]
+grep -Fq 'no CLI-only fallback was installed' "$ROOT/fallback.log"
 
 rm -f "$FEANORFS_TEST_CLI_MARKER"
 export FAKE_RELEASE_JSON='{"tag_name":"v9.9.9","assets":[{"name":"FeanorFS-macOS.pkg"}]}'
@@ -226,6 +257,9 @@ printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$*" > "$FEANORFS_TEST_TRAY_MARKER"' 's
 cp tray/assets/com.feanorfs.tray.desktop "$fixture/com.feanorfs.tray.desktop"
 cp tray/assets/com.feanorfs.tray.svg "$fixture/com.feanorfs.tray.svg"
 chmod 755 "$fixture/feanorfs" "$fixture/feanorfs-tray"
+export FEANORFS_NATIVE_BIN_DIR="$ROOT/native-bin"
+export FAKE_NATIVE_FEANORFS="$fixture/feanorfs"
+export FAKE_NATIVE_TRAY="$fixture/feanorfs-tray"
 export FAKE_LINUX_BUNDLE="$ROOT/FeanorFS-linux-x86_64.tar.xz"
 tar -C "$fixture" -cJf "$FAKE_LINUX_BUNDLE" \
   feanorfs feanorfs-tray com.feanorfs.tray.desktop com.feanorfs.tray.svg
@@ -254,6 +288,16 @@ grep -Fq 'CLI + system tray' "$ROOT/linux.log"
 grep -Fq 'Headless setup: feanorfs start' "$ROOT/linux.log"
 [[ ! -f "$FEANORFS_TEST_TRAY_MARKER" ]]
 
+tray_before="$(shasum -a 256 "$BINDIR/feanorfs-tray" | awk '{print $1}')"
+export FAKE_LDCONFIG_MISSING=1
+if sh scripts/install.sh >"$ROOT/missing-appindicator.log" 2>&1; then
+  echo "Linux bundle with a missing AppIndicator runtime unexpectedly installed." >&2
+  exit 1
+fi
+unset FAKE_LDCONFIG_MISSING
+grep -Fq 'sudo apt-get install libgtk-3-0 libayatana-appindicator3-1' "$ROOT/missing-appindicator.log"
+[[ "$(shasum -a 256 "$BINDIR/feanorfs-tray" | awk '{print $1}')" = "$tray_before" ]]
+
 unset FEANORFS_NO_LAUNCH
 export DISPLAY=:99
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/feanorfs-test-bus
@@ -267,7 +311,11 @@ unset DISPLAY DBUS_SESSION_BUS_ADDRESS
 
 unset BINDIR
 unset FEANORFS_CLIENT_INSTALL_DIR || true
-export FAKE_ID_U=0
+export FAKE_ID_U=1000
+mkdir -p "$HOME/.local/bin"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$HOME/.local/bin/feanorfs"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$HOME/.local/bin/feanorfs-tray"
+chmod 755 "$HOME/.local/bin/feanorfs" "$HOME/.local/bin/feanorfs-tray"
 export FAKE_APT_MARKER="$ROOT/apt-installed"
 export FAKE_LINUX_DEB="$ROOT/FeanorFS-linux-x86_64.deb"
 printf 'fake-deb-payload' >"$FAKE_LINUX_DEB"
@@ -293,6 +341,9 @@ sh scripts/install.sh >"$ROOT/deb.log"
 [[ -f "$FAKE_APT_MARKER" ]]
 [[ ! -f "$FEANORFS_TEST_CLI_MARKER" ]]
 grep -Fq 'automatic desktop dependencies' "$ROOT/deb.log"
+[[ ! -e "$HOME/.local/bin/feanorfs" && ! -e "$HOME/.local/bin/feanorfs-tray" ]]
+[[ -x "$XDG_DATA_HOME/feanorfs/legacy-bin-backup/v9.9.9/feanorfs" ]]
+[[ -x "$XDG_DATA_HOME/feanorfs/legacy-bin-backup/v9.9.9/feanorfs-tray" ]]
 
 rm -f "$FAKE_APT_MARKER"
 export FAKE_DNF_MARKER="$ROOT/dnf-installed"
@@ -345,4 +396,4 @@ sh scripts/install.sh >"$ROOT/arch.log"
 [[ ! -f "$FEANORFS_TEST_CLI_MARKER" ]]
 grep -Fq 'automatic desktop dependencies' "$ROOT/arch.log"
 
-echo "Installer routing passed: legacy fallback, fail-closed macOS/Linux trust, headless opt-out, verified Linux tray launch, and deb/rpm/Arch routing."
+echo "Installer routing passed: no CLI-only downgrade, fail-closed macOS/Linux trust, headless opt-out, verified Linux tray launch, migration, and deb/rpm/Arch routing."

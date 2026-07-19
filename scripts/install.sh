@@ -133,9 +133,92 @@ run_as_root() {
     fi
     command -v sudo >/dev/null 2>&1 || \
         err "administrator access is required to install the Linux desktop package"
-    [ -t 1 ] || \
+    if [ ! -t 1 ] && ! sudo -n true 2>/dev/null; then
         err "run this installer from an interactive terminal so Linux can request administrator access"
+    fi
     sudo "$@"
+}
+
+linux_dependency_repair() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "Install the required desktop libraries with:" >&2
+        echo "  sudo apt-get install libgtk-3-0 libayatana-appindicator3-1 xdg-desktop-portal zenity" >&2
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "Install the required desktop libraries with:" >&2
+        echo "  sudo dnf install gtk3 libayatana-appindicator-gtk3 xdg-desktop-portal zenity" >&2
+    elif command -v pacman >/dev/null 2>&1; then
+        echo "Install the required desktop libraries with:" >&2
+        echo "  sudo pacman -S gtk3 libayatana-appindicator xdg-desktop-portal zenity" >&2
+    else
+        echo "Install GTK 3, Ayatana AppIndicator 3, XDG Desktop Portal, and zenity with this system's package manager." >&2
+    fi
+}
+
+verify_linux_tray() {
+    tray_path="$1"
+    [ -x "$tray_path" ] || err "the installed desktop package did not provide $tray_path"
+    command -v ldd >/dev/null 2>&1 || err "ldd is required to verify the FeanorFS tray"
+    linkage="$(ldd "$tray_path" 2>&1)" || {
+        printf '%s\n' "$linkage" >&2
+        err "could not inspect the FeanorFS tray's native libraries"
+    }
+    missing="$(printf '%s\n' "$linkage" | sed -n '/not found/p')"
+    if [ -n "$missing" ]; then
+        printf '%s\n' "$missing" >&2
+        linux_dependency_repair
+        err "the FeanorFS tray is missing native desktop libraries and will not be launched"
+    fi
+    if printf '%s\n' "$linkage" | grep -F 'libxdo.so' >/dev/null; then
+        err "this tray uses a distro-specific libxdo ABI and is not safe to install on this Linux system"
+    fi
+    appindicator_available=false
+    if command -v ldconfig >/dev/null 2>&1 && \
+        ldconfig -p 2>/dev/null | grep -E 'lib(ayatana-)?appindicator3\.so' >/dev/null; then
+        appindicator_available=true
+    fi
+    for library_dir in /lib /lib64 /usr/lib /usr/lib64; do
+        if [ -e "$library_dir/libayatana-appindicator3.so.1" ] || \
+            [ -e "$library_dir/libappindicator3.so.1" ]; then
+            appindicator_available=true
+        fi
+    done
+    if [ "$appindicator_available" != true ]; then
+        echo "The AppIndicator runtime used by the system tray is missing." >&2
+        linux_dependency_repair
+        err "the FeanorFS tray cannot open until its AppIndicator runtime is installed"
+    fi
+}
+
+migrate_legacy_linux_user_bins() {
+    [ "$(id -u)" -ne 0 ] || return 0
+    legacy_dir="$HOME/.local/bin"
+    [ -d "$legacy_dir" ] || return 0
+    safe_version="$(printf '%s' "$VERSION" | tr -c 'A-Za-z0-9._-' '_')"
+    backup_dir="${XDG_DATA_HOME:-$HOME/.local/share}/feanorfs/legacy-bin-backup/$safe_version"
+    moved=0
+    for name in feanorfs feanorfs-tray; do
+        legacy="$legacy_dir/$name"
+        [ -e "$legacy" ] || [ -L "$legacy" ] || continue
+        if [ "$legacy" -ef "/usr/bin/$name" ]; then
+            continue
+        fi
+        mkdir -p "$backup_dir"
+        destination="$backup_dir/$name"
+        [ ! -e "$destination" ] || destination="$destination.$(date +%s)"
+        mv "$legacy" "$destination"
+        echo "Moved the older $legacy installation to $destination."
+        moved=1
+    done
+    [ "$moved" -eq 0 ] || hash -r 2>/dev/null || true
+}
+
+refresh_linux_services() {
+    cli_path="$1"
+    [ -f "$HOME/.feanorfs/recent.json" ] || return 0
+    if ! "$cli_path" service refresh-installation; then
+        echo "Warning: FeanorFS was installed, but one or more existing login services could not be refreshed." >&2
+        echo "Open the tray and choose Check System Health… after logging into the desktop session." >&2
+    fi
 }
 
 install_linux_native_package() {
@@ -196,7 +279,16 @@ install_linux_native_package() {
         run_as_root pacman -U --noconfirm "$temp_dir/$asset"
     fi
 
+    native_bin_dir="${FEANORFS_NATIVE_BIN_DIR:-/usr/bin}"
+    verify_linux_tray "$native_bin_dir/feanorfs-tray"
+    migrate_legacy_linux_user_bins
+    refresh_linux_services "$native_bin_dir/feanorfs"
     hash -r 2>/dev/null || true
+    resolved="$(command -v feanorfs 2>/dev/null || true)"
+    if [ -n "$resolved" ] && [ "$resolved" != "$native_bin_dir/feanorfs" ]; then
+        echo "Warning: your shell still resolves feanorfs to $resolved instead of $native_bin_dir/feanorfs." >&2
+        echo "Remove that older installation or put $native_bin_dir earlier on PATH." >&2
+    fi
     echo "Installed feanorfs, the system tray, and its desktop launcher."
 }
 
@@ -224,11 +316,7 @@ install_linux_bundle() {
         com.feanorfs.tray.desktop com.feanorfs.tray.svg feanorfs feanorfs-tray | LC_ALL=C sort)"
     [ "$contents" = "$expected" ] || err "Linux desktop bundle contains unexpected files"
     tar -xJf "$temp_dir/$asset" -C "$temp_dir"
-    missing="$(ldd "$temp_dir/feanorfs-tray" 2>/dev/null | sed -n '/not found/p')"
-    if [ -n "$missing" ]; then
-        echo "$missing" >&2
-        err "desktop libraries are missing; install GTK 3, Ayatana AppIndicator 3, and libxdo, then retry"
-    fi
+    verify_linux_tray "$temp_dir/feanorfs-tray"
 
     install_dir="${BINDIR:-${FEANORFS_CLIENT_INSTALL_DIR:-$HOME/.local/bin}}"
     mkdir -p "$install_dir"
@@ -241,6 +329,7 @@ install_linux_bundle() {
     chmod 644 "$data_home/applications/com.feanorfs.tray.desktop"
     install -m 644 "$temp_dir/com.feanorfs.tray.svg" \
         "$data_home/icons/hicolor/scalable/apps/com.feanorfs.tray.svg"
+    refresh_linux_services "$install_dir/feanorfs"
     hash -r 2>/dev/null || true
     echo "Installed feanorfs and feanorfs-tray to $install_dir with an application-menu launcher."
 }
@@ -257,7 +346,7 @@ if [ "$(uname -s)" = "Linux" ]; then
         command -v apt-get >/dev/null 2>&1 && command -v dpkg-deb >/dev/null 2>&1 && \
        has_release_asset "FeanorFS-linux-${arch}.deb"; then
         install_linux_native_package "$arch" deb
-        launch_desktop_tray linux /usr/bin/feanorfs-tray
+        launch_desktop_tray linux "${FEANORFS_NATIVE_BIN_DIR:-/usr/bin}/feanorfs-tray"
         exit 0
     fi
     if [ -n "$arch" ] && [ -z "${BINDIR:-}" ] && [ -z "${FEANORFS_CLIENT_INSTALL_DIR:-}" ] && \
@@ -265,14 +354,14 @@ if [ "$(uname -s)" = "Linux" ]; then
         { command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; } && \
        has_release_asset "FeanorFS-linux-${arch}.rpm"; then
         install_linux_native_package "$arch" rpm
-        launch_desktop_tray linux /usr/bin/feanorfs-tray
+        launch_desktop_tray linux "${FEANORFS_NATIVE_BIN_DIR:-/usr/bin}/feanorfs-tray"
         exit 0
     fi
     if [ -n "$arch" ] && [ -z "${BINDIR:-}" ] && [ -z "${FEANORFS_CLIENT_INSTALL_DIR:-}" ] && \
         command -v pacman >/dev/null 2>&1 && command -v bsdtar >/dev/null 2>&1 && \
        has_release_asset "FeanorFS-linux-${arch}.pkg.tar.zst"; then
         install_linux_native_package "$arch" arch
-        launch_desktop_tray linux /usr/bin/feanorfs-tray
+        launch_desktop_tray linux "${FEANORFS_NATIVE_BIN_DIR:-/usr/bin}/feanorfs-tray"
         exit 0
     fi
     if [ -n "$arch" ] && has_release_asset "FeanorFS-linux-${arch}.tar.xz"; then
@@ -282,19 +371,14 @@ if [ "$(uname -s)" = "Linux" ]; then
     fi
 fi
 
-if [ -n "${BINDIR:-}" ]; then
-    export FEANORFS_CLIENT_INSTALL_DIR="$BINDIR"
-fi
-
-echo "Installing feanorfs ${VERSION}..."
-fetch "${BASE_URL}/feanorfs-client-installer.sh" | sh
-
-echo ""
-echo "Done. feanorfs ${VERSION} installed."
-if [ "$(uname -s)" = "Darwin" ]; then
-    echo "This release does not include the signed menu-bar package; the CLI is installed."
-elif [ "$(uname -s)" = "Linux" ]; then
-    echo "This release does not include a tray for this Linux architecture; the CLI is installed."
-fi
-echo "First computer:  feanorfs start /path/to/project"
-echo "Another computer: feanorfs start <pair-code-or-invite> /path/to/project"
+case "$(uname -s)" in
+    Darwin)
+        err "release ${VERSION} does not contain the trusted macOS desktop installer; no CLI-only fallback was installed"
+        ;;
+    Linux)
+        err "release ${VERSION} does not contain a complete Linux desktop product for $(uname -m); no CLI-only fallback was installed"
+        ;;
+    *)
+        err "this installer supports macOS and Linux desktop products; use the documented native installer for this platform"
+        ;;
+esac

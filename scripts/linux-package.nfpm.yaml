@@ -43,20 +43,17 @@ overrides:
     depends:
       - libgtk-3-0t64 | libgtk-3-0
       - libayatana-appindicator3-1
-      - libxdo3
       - xdg-desktop-portal
       - zenity
   rpm:
     depends:
       - gtk3
       - libayatana-appindicator-gtk3
-      - libxdo
       - xdg-desktop-portal
       - zenity
   archlinux:
     depends:
       - gtk3
       - libayatana-appindicator
-      - xdotool
       - xdg-desktop-portal
       - zenity

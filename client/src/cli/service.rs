@@ -42,6 +42,9 @@ pub enum ServiceAction {
     /// Run the supervised private hub
     #[command(hide = true)]
     HubRun { data_dir: PathBuf },
+    /// Refresh managed jobs after replacing the installed executables
+    #[command(hide = true)]
+    RefreshInstallation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -60,6 +63,18 @@ struct ServiceResult {
     status: BackgroundStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     tray: Option<BackgroundStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstallationRefreshResult {
+    workspaces_restarted: usize,
+    private_hub_restarted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tray: Option<BackgroundStatus>,
+}
+
+fn installation_changed(status: BackgroundStatus, installed_program_matches: bool) -> bool {
+    status == BackgroundStatus::NotInstalled || !installed_program_matches
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +163,80 @@ pub async fn run(current_dir: &Path, action: ServiceAction, json: bool) -> anyho
             let result = result("uninstall", &spec, status);
             print_result(&result, json)
         }
+        ServiceAction::RefreshInstallation => {
+            let result = refresh_installation().await?;
+            if json {
+                output_json(&result)
+            } else {
+                println!(
+                    "Refreshed {} automatic workspace service(s) for this installation.",
+                    result.workspaces_restarted
+                );
+                if result.private_hub_restarted {
+                    println!("Refreshed the automatic private hub service.");
+                }
+                if result.tray == Some(BackgroundStatus::Running) {
+                    println!("Refreshed the FeanorFS system tray service.");
+                }
+                Ok(())
+            }
+        }
     }
+}
+
+async fn refresh_installation() -> anyhow::Result<InstallationRefreshResult> {
+    let recent = feanorfs_client::list_recent_workspaces()?;
+    let mut workspaces_restarted = 0;
+    let mut private_hub_restarted = false;
+    let mut tray_spec = None;
+
+    for entry in recent.workspaces {
+        let workspace = PathBuf::from(entry.path);
+        if !workspace.join(".feanorfs/config.json").is_file() {
+            continue;
+        }
+        let config = feanorfs_client::load_config(&workspace).with_context(|| {
+            format!(
+                "load existing workspace while refreshing {}",
+                workspace.display()
+            )
+        })?;
+        if !private_hub_restarted
+            && config.tls_ca_pem.is_some()
+            && super::hub_service::owns_workspace(&config)
+        {
+            super::hub_service::ensure_private_hub(config.server_password.clone(), false)
+                .await
+                .context("refresh automatic private hub after installation")?;
+            private_hub_restarted = true;
+        }
+
+        let spec = ServiceSpec::load(&workspace)?;
+        let status = platform_status(&spec)?;
+        if !installation_changed(status, spec.installed_program_matches()) {
+            tray_spec.get_or_insert(spec);
+            continue;
+        }
+        if status == BackgroundStatus::Running {
+            platform_stop(&spec).context("stop previous automatic sync executable")?;
+        }
+        platform_install_and_start(&spec).context("refresh automatic sync executable")?;
+        workspaces_restarted += 1;
+        tray_spec.get_or_insert(spec);
+    }
+
+    let fallback_spec = ServiceSpec {
+        workspace: std::env::current_dir().context("locate installer working directory")?,
+        program: std::env::current_exe().context("locate the feanorfs executable")?,
+        label: "com.feanorfs.installation-refresh".into(),
+    };
+    let tray = install_tray_if_available(tray_spec.as_ref().unwrap_or(&fallback_spec))
+        .context("refresh system tray executable")?;
+    Ok(InstallationRefreshResult {
+        workspaces_restarted,
+        private_hub_restarted,
+        tray,
+    })
 }
 
 fn install_result(workspace: &Path) -> anyhow::Result<ServiceResult> {
@@ -754,6 +842,15 @@ fn platform_uninstall(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installation_refresh_skips_unchanged_jobs() {
+        assert!(!installation_changed(BackgroundStatus::Running, true));
+        assert!(!installation_changed(BackgroundStatus::Stopped, true));
+        assert!(installation_changed(BackgroundStatus::Running, false));
+        assert!(installation_changed(BackgroundStatus::Stopped, false));
+        assert!(installation_changed(BackgroundStatus::NotInstalled, true));
+    }
 
     #[test]
     fn worker_command_contains_only_workspace_location() {

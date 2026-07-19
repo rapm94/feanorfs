@@ -76,7 +76,7 @@ jobs:
         run: >-
           sudo apt-get update &&
           sudo apt-get install -y --no-install-recommends
-          cpio libgtk-3-dev libxdo-dev libayatana-appindicator3-dev rpm zstd
+          cpio libgtk-3-dev libayatana-appindicator3-dev rpm zstd
       - name: Install pinned nFPM
         env:
           NFPM_ARCHIVE_ARCH: ${{ matrix.nfpm_archive_arch }}
@@ -107,6 +107,10 @@ jobs:
           test -x target/release/feanorfs-tray
           if ldd target/release/feanorfs-tray | tee "FeanorFS-linux-$ASSET_ARCH.linkage.txt" | grep -F 'not found'; then
             echo "::error::Linux tray has unresolved shared libraries."
+            exit 1
+          fi
+          if grep -F 'libxdo.so' "FeanorFS-linux-$ASSET_ARCH.linkage.txt"; then
+            echo "::error::Linux tray unexpectedly depends on the distro-variant libxdo ABI."
             exit 1
           fi
           root="$(mktemp -d)"

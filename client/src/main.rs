@@ -191,6 +191,7 @@ mod cli_tests {
         Cli::try_parse_from(["feanorfs", "--json", "tray", "forget-unavailable"]).unwrap();
         Cli::try_parse_from(["feanorfs", "tray", "activate", "--", "/tmp/ws"]).unwrap();
         Cli::try_parse_from(["feanorfs", "tray", "join", "--", "/tmp/joined"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "service", "refresh-installation"]).unwrap();
         Cli::try_parse_from(["feanorfs", "--json", "stop", "--", "/tmp/ws"]).unwrap();
         Cli::try_parse_from([
             "feanorfs",

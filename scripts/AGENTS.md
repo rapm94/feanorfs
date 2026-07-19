@@ -9,6 +9,7 @@ tests used by local verification and GitHub release workflows.
 
 - `install.sh`, `install-macos.sh`, and `install.ps1` — public platform-aware installers.
 - `package-macos.sh`, `package-linux.sh`, `linux-package.nfpm.yaml`, and `windows-installer.iss` — exact native desktop installer assembly and metadata.
+- `update-release-product-state.sh` and `check-release-readiness.sh` — deterministic product-change carrier plus pre-tag Cargo/Node/changelog/tag/installer/artifact agreement gate.
 - `smoke-macos-product.sh`, `smoke-macos-keychain.sh`, `smoke-linux-packages.sh`, `smoke-windows-installer.ps1`, and `smoke-windows-product.ps1` — installed-product lifecycle, signed-credential, clean-distribution, and native-installer proof.
 - `smoke-relay-container.sh` — hardened opaque-relay image proof.
 - `test-install-routing.sh` and `test-install-routing.ps1` — fail-closed installer routing tests.
@@ -17,7 +18,7 @@ tests used by local verification and GitHub release workflows.
 ## Local Contracts
 
 - A listed desktop artifact must pass checksum, payload, architecture, signature/attestation, and platform-specific validation. Verification failure never falls back to a weaker product.
-- Package scripts emit only the documented CLI, tray, launcher/icon, license, and README payloads. Keep native dependency metadata synchronized with the tray implementation.
+- Package scripts emit only the documented CLI, tray, launcher/icon, license, and README payloads. Keep native dependency metadata synchronized with the tray implementation. The Linux tray must have no `libxdo` dependency because the app uses no predefined editing actions and Debian/Arch publish incompatible SONAMEs.
 - `smoke-linux-packages.sh` mounts only the exact package read-only into digest-pinned Debian/Fedora images on both architectures and official Arch on x86-64, requires normal dependency resolution, creates an idle format-v3 encrypted workspace, and proves the tray remains alive under Xvfb/D-Bus. Official Arch has no ARM64 container; that leg combines exact Arch metadata/payload verification with native ARM64 execution in Debian/Fedora. Docker is the CI default; Podman is equivalent.
 - Product smoke tests use isolated homes/data, clean up services/processes on every exit, and never print or place credentials, recovery passphrases, pairing capabilities, invites, routes, or private keys in argv/environment/logs.
 - Product-smoke failure diagnostics must remain bounded and redact capability
@@ -27,6 +28,8 @@ tests used by local verification and GitHub release workflows.
 - Windows product smoke requires real Credential Manager references, verifies global/workspace JSON redaction plus background reload, and deletes only its exact random credential targets during cleanup; never leave CI credentials orphaned.
 - Downloaded tools and release artifacts use HTTPS, fail on transport errors, and are checksum- or signature-pinned before execution.
 - Verified desktop installers hand an interactive user directly to the tray after installation. Launch only the exact installed tray with the public, non-secret `--first-run` hint after all checksum, signature, architecture, and payload checks succeed; never launch a CLI-only fallback or failed artifact. When no workspace resolves, the tray presents its native start-or-join choice and delegates the result to existing menu actions. Root/headless sessions and `FEANORFS_NO_LAUNCH=1` must remain noninteractive and print the terminal setup path. A tray launch failure must not roll back an otherwise verified installation.
+- Native Linux installation verifies the tray's complete `ldd` result and rejects any `libxdo` ABI before launch. It gives distro-specific dependency repair, backs up superseded `~/.local/bin/feanorfs{,-tray}` files only after the native package succeeds, and invokes hidden `service refresh-installation` so existing hub/workspace/tray login jobs select the new executable identities.
+- `update-release-product-state.sh` hashes only tracked product implementation/automation paths and excludes its carrier file. Release automation commits a changed digest onto the release branch so external client/tray/installer/workflow changes select the common release package without a manual version edit. `check-release-readiness.sh` must pass only for the versioned, CI-tested pre-tag commit.
 
 ## Work Guidance
 

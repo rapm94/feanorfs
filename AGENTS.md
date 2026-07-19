@@ -55,6 +55,7 @@
 ## STRUCTURE
 ```
 feanorfs/
+├── Dockerfile.relay-binary # Binary-only native-architecture release image assembly
 ├── common/              # Shared data models and utilities
 │   └── src/lib.rs       # FileState, SyncRequest/Response, invite encode/decode, crypto
 ├── server/              # Pure blob storage server

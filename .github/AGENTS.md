@@ -33,7 +33,7 @@ contributor templates.
 - The macOS release requires Developer ID Application and Developer ID Installer certificates plus an App Store Connect notarization key. It signs the universal CLI and `FeanorFS.app` with hardened runtime and timestamping, signs/notarizes/staples the Installer package, wraps that exact package in a separately notarized/stapled DMG, requires Gatekeeper acceptance, and publishes verification evidence before upload. There is no unsigned fallback.
 - Before packaging, the Developer ID CLI must pass `scripts/smoke-macos-keychain.sh`: auto-detected Keychain storage, redacted config, live credential reload, cleanup, and a public smoke record whose SHA-256 matches the packaged CLI. CI separately requires unsigned development builds to fail this gate.
 - Native arm64/x86_64 jobs receive no Apple secrets. One privileged job combines them with `lipo`, builds `FeanorFS-macOS.pkg` and its exact DMG container, and uploads only the signed/notarized/stapled/checksummed/attested products plus evidence and the verifying convenience installer.
-- Linux release jobs publish exact native `.deb`/`.rpm`/`.pkg.tar.zst` packages plus a four-file tar fallback only after architecture, dependency metadata, payload, install-script, `ldd`, SHA-256, clean-container, and GitHub-attestation checks. Windows native builds must pass the complete Task Scheduler product smoke and compile/install/uninstall the Inno Setup product before becoming artifacts; the privileged job repeats those smokes after verifying Azure Authenticode on both executables and the installer EXE, then publishes only the exact checksummed/attested products. There is no unsigned Windows fallback.
+- Linux release jobs publish exact native `.deb`/`.rpm`/`.pkg.tar.zst` packages plus a four-file tar fallback only after architecture, dependency metadata, payload, install-script, `ldd`, explicit absence of the unused distro-variant `libxdo` ABI, SHA-256, clean-container, and GitHub-attestation checks. Windows native builds must pass the complete Task Scheduler product smoke and compile/install/uninstall the Inno Setup product before becoming artifacts; the privileged job repeats those smokes after verifying Azure Authenticode on both executables and the installer EXE, then publishes only the exact checksummed/attested products. There is no unsigned Windows fallback.
 - Pull requests require the fast Linux gates: format, Clippy, tests,
   dependency policy, and workflow lint. MSRV, macOS/Windows tests, docs,
   release builds, SDK, tray, and CodeQL run on `main` before release.
@@ -41,6 +41,7 @@ contributor templates.
 - Release PR automation updates Cargo versions first, then runs
   `assemble-metadata` on the release branch so npm facade, lockfile, and five
   native package manifests use the same version before merge.
+- Release PR automation deterministically updates `common/release-product-state.txt` and creates a conventional local carrier commit only when tracked client, server, agent-core, tray, installer, workflow, or relay-image files changed. This makes product-only changes select the release package without manual version edits. A merged versioned release candidate must pass `scripts/check-release-readiness.sh` before `release-plz release` may tag it.
 - Release PR automation limits `git_only` history to `feanorfs-common`, wraps
   cargo package commands with `--no-verify`, and extracts generated archives
   because immutable historical tags contain unpublished internal crates.
@@ -57,6 +58,8 @@ contributor templates.
 - Apple Application/Installer identities and notarization credentials are scoped to the privileged package steps, decoded only under `$RUNNER_TEMP`, imported into a temporary keychain, and removed by an `always()` cleanup step. Never expose them to native build steps or persist them as artifacts.
 - `release.yml` is cargo-dist generated. Configure `dist-workspace.toml` and
   regenerate; never patch the workflow directly.
+- cargo-dist publishes attested CLI archives only; it must not generate shell/PowerShell installers that look like the tray-inclusive desktop product. Public installer routing belongs to `scripts/install.sh`, the signed macOS package/DMG, verified Linux native packages/full bundle, and the Authenticode Windows setup EXE.
+- Relay image publication builds amd64 and arm64 `feanorfs` binaries inside the pinned Bookworm Rust environment on matching native runners, assembles each through `Dockerfile.relay-binary` with the same Bookworm runtime ABI, attests each architecture, then merges their immutable digests into one tagged OCI manifest. Never restore QEMU workspace compilation or copy a newer host-glibc binary into the runtime image.
 
 ## Work Guidance
 

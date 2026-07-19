@@ -66,7 +66,6 @@ nfpm package --config scripts/linux-package.nfpm.yaml --packager archlinux --tar
 [ "$(dpkg-deb -f "$deb" Package)" = feanorfs ]
 [ "$(dpkg-deb -f "$deb" Architecture)" = "$nfpm_arch" ]
 dpkg-deb -f "$deb" Depends | grep -F 'libayatana-appindicator3-1' >/dev/null
-dpkg-deb -f "$deb" Depends | grep -F 'libxdo3' >/dev/null
 dpkg-deb -f "$deb" Depends | grep -F 'xdg-desktop-portal' >/dev/null
 dpkg-deb -f "$deb" Depends | grep -F 'zenity' >/dev/null
 deb_contents="$(dpkg-deb --fsys-tarfile "$deb" | tar -tf - | sed '/\/$/d' | LC_ALL=C sort)"
@@ -86,7 +85,6 @@ expected_contents="$(printf '%s\n' \
 [ "$(rpm -qp --queryformat '%{ARCH}' "$rpm_package")" = "$rpm_arch" ]
 rpm -qpR "$rpm_package" | grep -Fx gtk3 >/dev/null
 rpm -qpR "$rpm_package" | grep -Fx libayatana-appindicator-gtk3 >/dev/null
-rpm -qpR "$rpm_package" | grep -Fx libxdo >/dev/null
 rpm -qpR "$rpm_package" | grep -Fx xdg-desktop-portal >/dev/null
 rpm -qpR "$rpm_package" | grep -Fx zenity >/dev/null
 rpm_contents="$(rpm -qpl "$rpm_package" | LC_ALL=C sort)"
@@ -105,7 +103,7 @@ expected_rpm_contents="$(printf '%s\n' \
 arch_metadata="$(tar --zstd -xOf "$arch_package" .PKGINFO)"
 printf '%s\n' "$arch_metadata" | grep -Fx 'pkgname = feanorfs' >/dev/null
 printf '%s\n' "$arch_metadata" | grep -Fx "arch = $rpm_arch" >/dev/null
-for dependency in gtk3 libayatana-appindicator xdotool xdg-desktop-portal zenity; do
+for dependency in gtk3 libayatana-appindicator xdg-desktop-portal zenity; do
     printf '%s\n' "$arch_metadata" | grep -Fx "depend = $dependency" >/dev/null
 done
 arch_contents="$(tar --zstd -tf "$arch_package" | \

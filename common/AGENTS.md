@@ -7,6 +7,7 @@ Shared data models, canonical Merkle tree/snapshot objects, sync delta (`compute
 ## Ownership
 
 - Crate: `feanorfs-common` (library only; no binary).
+- `release-product-state.txt` is a content-only release-selection carrier maintained by `scripts/update-release-product-state.sh`; it is not compiled or read at runtime.
 - Public surface: every item in `src/lib.rs` is `pub` and re-exported through downstream crates. Treat the wire types as a binding contract — changing field names or types requires server AND client releases in lockstep.
 - No file system, network, or sqlite dependencies. This crate must remain leaf-only so it can be embedded in both server and client without pulling their heaviest transitive deps.
 

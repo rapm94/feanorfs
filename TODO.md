@@ -16,94 +16,38 @@ commit credentials or paste them into issues, logs, or chat.
 - [ ] Configure Azure Artifact Signing through GitHub OIDC for the Windows CLI,
   tray, and installer `.exe`.
 
-Done when the existing fail-closed workflows publish notarized macOS and
-Authenticode Windows products from one immutable tag. Unsigned GitHub releases
-must not be presented as trusted macOS or Windows installers.
+Done when the fail-closed workflows publish notarized macOS and Authenticode
+Windows products from one immutable tag. Unsigned GitHub releases must not be
+presented as trusted macOS or Windows installers.
 
-### F2. Accept onboarding on clean user machines
+### F2. Accept onboarding on ordinary desktop sessions
 
 Blocked on F1 for macOS and Windows.
 
-- [ ] Install through `.dmg`, `.exe`, `.deb`, `.rpm`, and `.pkg.tar.zst` on
-  ordinary user accounts; verify the tray-first Start/Join/Not Now flow,
-  automatic login persistence, update behavior, and clean uninstall.
-- [ ] Record the OS/version and either accept the flow or provide a reproducible
-  defect without workspace secrets. Include a real CachyOS Wayland session.
+- [ ] Install through the trusted `.dmg`, `.exe`, `.deb`, `.rpm`, and
+  `.pkg.tar.zst` products as ordinary users; accept or report a reproducible
+  defect in tray-first Start/Join/Not Now, login persistence, update behavior,
+  and clean uninstall.
+- [ ] Repeat the released Arch package and tray flow in a real CachyOS Wayland
+  session. The currently available CachyOS session is i3/X11, so automated SSH
+  evidence cannot honestly satisfy the Wayland acceptance requirement.
+
+Record only OS/version and secret-free acceptance or reproduction evidence.
 
 ## AI tasks
 
-### AI-1. Make non-empty-folder joining predictable before mutation
+### AI-1. Publish and validate the exact next release
 
-- [ ] Show a bounded preflight summary for local-only, remote-only, same, and
-  conflicting paths before joining a non-empty destination.
-- [ ] Load the destination `.feanorfsignore` before the first scan and transfer
-  the mirror's ignore policy during pairing, requiring confirmation when the
-  two policies differ.
+- [ ] Push the completed product changes, let CI and the product-aware release
+  PR pass, merge the release PR, and validate the immutable tag plus every
+  artifact/checksum/attestation that can publish without F1 credentials.
+- [ ] Install the exact published CLI archive on this Mac and the exact
+  `.pkg.tar.zst` desktop product on CachyOS. Verify matching versions, tray
+  visibility/folder switching, managed services, mDNS, `doctor`, and a bounded
+  cross-machine sync while preserving CachyOS `~/p/net` as authoritative.
+- [ ] Confirm the release clean-package jobs pass on Debian and Fedora and that
+  no key, token, invite, route, passphrase, filename, or file content appears in
+  release evidence, service argv/environment, logs, or discovery.
 
-Done when joining never begins a large upload or conflict set without first
-showing what will happen and how the local/cloud choices work.
-
-### AI-2. Handle large files deliberately
-
-- [ ] Detect files over the current 100 MiB transport limit before upload and
-  report bounded exact paths with ignore/remove guidance.
-- [ ] Design and implement authenticated chunked encrypted transport before
-  claiming support for legitimate files above that limit.
-
-### AI-3. Finish conflict and failure UX
-
-- [ ] Add the tested bulk local/cloud conflict choices to the tray with path
-  counts, clear consequences, and a strong confirmation step.
-- [ ] Bound repeated conflict-path terminal output and make JSON/human output
-  exit cleanly on a closed stdout pipe.
-- [ ] Report pairing completion separately from initial sync and service/tray
-  installation; make partial first-run retries resume from the correct stage.
-
-### AI-4. Prove Linux desktop behavior outside CI containers
-
-- [ ] Replace the misleading cargo-dist `feanorfs-client-installer.sh`
-  entrypoint with one canonical desktop installer, or name it explicitly as
-  CLI-only. On Linux, the public install command must select the native
-  `.deb`, `.rpm`, or `.pkg.tar.zst` and include the tray; an unprivileged
-  fallback must install the complete checksummed desktop bundle.
-- [ ] Build or bundle Linux tray dependencies for the target package ABI
-  instead of putting an Ubuntu-linked `libxdo.so.3` binary in the Arch
-  package. Test current CachyOS/Arch `libxdo.so.4` resolution before
-  publication and reject unresolved native libraries before replacing a
-  working tray.
-- [ ] Migrate an existing `~/.local/bin` source/cargo-dist installation to a
-  native package without leaving an older CLI or tray first on `PATH`, and
-  restart both managed processes from the selected installation.
-- [ ] Diagnose missing native tray libraries before launch and provide the exact
-  package-manager repair without requiring source-build knowledge.
-- [ ] Verify install, tray visibility, folder switching, pairing, background
-  service restart, mDNS discovery, and `doctor` on CachyOS Wayland plus clean
-  Debian and Fedora desktops.
-
-### AI-5. Verify trusted desktop releases
-
-Blocked on F1 and F2.
-
-- [ ] Prove tag/target identity, signatures, notarization/stapling,
-  checksums/attestations, exact payload, native credential storage, automatic
-  services, TLS, MCP, tray-first onboarding, and uninstall for every published
-  installer.
-- [ ] Confirm secrets, capabilities, private routes, filenames, and file content
-  never appear in argv, environment, logs, discovery, or release evidence.
-
-### AI-6. Make release automation product-aware
-
-- [ ] Make client, tray, installer, and workflow-only product changes create a
-  release PR even when `feanorfs-common` has no changed packaged files;
-  `changelog_include` alone does not trigger release-plz package selection.
-- [ ] Add a release dry-run gate that proves the shared Cargo and Node versions,
-  changelog section, tag target, public installer entrypoint, and expected
-  platform artifact set all agree before a tag can be pushed.
-- [ ] Build amd64 and arm64 relay images on native runners, or assemble them
-  from the already attested release binaries, then merge one immutable OCI
-  manifest. Do not compile the complete arm64 Rust workspace under QEMU: the
-  `v0.6.4` publish was cancelled at the 60-minute job timeout while compilation
-  was still making progress.
-
-Done when ordinary product fixes cannot require a manual version carrier edit
-or silently leave the latest release on the previous version.
+The macOS `.dmg`/`.pkg` and Windows `.exe` remain correctly blocked until F1;
+do not weaken signing gates to make this task appear complete.
