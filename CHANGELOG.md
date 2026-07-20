@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.9](https://github.com/rapm94/feanorfs/compare/v0.7.8...v0.7.9) - 2026-07-20
+
+### Fixed
+
+- The desktop tray now enforces one process per signed-in user, preventing
+  duplicate tray icons when login startup and a manual launch overlap.
+- Mirrored-folder paths and other dynamic tray labels now have a consistent
+  width bound with middle ellipses, while native dialog copy wraps long paths
+  and errors instead of expanding across the screen.
+- Windows now recognizes its native lock-contention result when another tray
+  already owns the singleton lock, matching the macOS and Linux behavior.
+
 ## [0.7.8](https://github.com/rapm94/feanorfs/compare/v0.7.7...v0.7.8) - 2026-07-19
 
 ### Fixed
