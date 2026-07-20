@@ -72,7 +72,9 @@ fn acquire_tray_instance_lock_at(path: &Path) -> io::Result<Option<TrayInstanceG
     let file = options.open(path)?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(Some(TrayInstanceGuard { _file: file })),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
