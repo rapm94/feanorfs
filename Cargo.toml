@@ -39,7 +39,7 @@ tower-http = { version = "0.7", features = ["fs", "trace"] }
 futures-util = "0.3"
 # tokio-tungstenite 0.30 supports this MSRV, but current Axum 0.8.9 selects
 # 0.29. Keep one WebSocket protocol stack until Axum advances its dependency.
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.10"
 
