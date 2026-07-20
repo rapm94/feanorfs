@@ -68,7 +68,7 @@ jobs:
             nfpm_sha256: 1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
           persist-credentials: false
@@ -242,7 +242,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
           persist-credentials: false
@@ -316,7 +316,7 @@ jobs:
           test "$tag_sha" = "$release_sha"
           if [ -n "$EXPECTED_SHA" ]; then test "$tag_sha" = "$EXPECTED_SHA"; fi
       - name: Checkout release commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
           persist-credentials: false
