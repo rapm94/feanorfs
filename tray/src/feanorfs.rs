@@ -1,5 +1,6 @@
 //! Spawn `feanorfs` subprocesses — the tray never duplicates sync logic.
 
+use crate::ui::dialog_text;
 use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
 use serde::Deserialize;
 use std::ffi::OsString;
@@ -385,7 +386,7 @@ fn join_workspace_interactive(
     if needs_confirmation {
         let confirmed = rfd::MessageDialog::new()
             .set_title("Join this existing folder?")
-            .set_description(join_confirmation_copy(&event.preview))
+            .set_description(dialog_text(join_confirmation_copy(&event.preview)))
             .set_level(rfd::MessageLevel::Warning)
             .set_buttons(rfd::MessageButtons::OkCancel)
             .show();

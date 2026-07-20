@@ -1,6 +1,7 @@
 mod feanorfs;
 mod icons;
 mod password_dialog;
+mod ui;
 
 use feanorfs::feanorfs_bin;
 use feanorfs::{
@@ -18,7 +19,9 @@ use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
@@ -26,11 +29,53 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::{TrayIcon, TrayIconBuilder};
+use ui::{dialog_text, menu_label, menu_label_with_suffix};
 
 const REFRESH_SECS: u64 = 10;
 const RECENT_CACHE_SECS: u64 = 30;
 const MAX_WATCH_FAILURES: u32 = 3;
 const FAST_EXIT_SECS: u64 = 10;
+
+struct TrayInstanceGuard {
+    _file: File,
+}
+
+fn tray_instance_lock_path() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".feanorfs").join("tray-instance.lock"))
+        .ok_or_else(|| "FeanorFS could not find this user's home folder.".into())
+}
+
+fn acquire_tray_instance_lock() -> Result<Option<TrayInstanceGuard>, String> {
+    let path = tray_instance_lock_path()?;
+    acquire_tray_instance_lock_at(&path).map_err(|error| {
+        format!(
+            "FeanorFS could not create its single-tray lock at {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn acquire_tray_instance_lock_at(path: &Path) -> io::Result<Option<TrayInstanceGuard>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(TrayInstanceGuard { _file: file })),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SetupKind {
@@ -414,10 +459,12 @@ fn workspace_switch_item_with(
 ) -> MirroredFolderMenuItem {
     let available = has_config(Path::new(path));
     let selected = active.is_some_and(|active| same_workspace_path(active, path));
-    let mut menu_label = format!("{label} — {}", compact_workspace_path(Path::new(path)));
-    if !available {
-        menu_label.push_str(" — unavailable");
-    }
+    let base_label = format!("{label} — {}", compact_workspace_path(Path::new(path)));
+    let menu_label = if available {
+        menu_label(base_label)
+    } else {
+        menu_label_with_suffix(&base_label, " — unavailable")
+    };
     MirroredFolderMenuItem {
         id: format!("switch:{path}"),
         label: menu_label,
@@ -583,9 +630,9 @@ fn show_first_run_choice() -> FirstRunChoice {
     first_run_choice(
         rfd::MessageDialog::new()
             .set_title("Welcome to FeanorFS")
-            .set_description(
+            .set_description(dialog_text(
                 "Add a folder from this computer, or securely join one shared from another computer. FeanorFS will keep it synced automatically.",
-            )
+            ))
             .set_level(rfd::MessageLevel::Info)
             .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
                 FIRST_RUN_START.into(),
@@ -782,9 +829,9 @@ fn prompt_new_recovery_passphrase() -> Option<zeroize::Zeroizing<String>> {
     if passphrase.as_str() != confirmation.as_str() {
         let _ = rfd::MessageDialog::new()
             .set_title("Passphrases do not match")
-            .set_description(
+            .set_description(dialog_text(
                 "The recovery kit was not created. Try again with matching passphrases.",
-            )
+            ))
             .set_level(rfd::MessageLevel::Error)
             .set_buttons(rfd::MessageButtons::Ok)
             .show();
@@ -799,7 +846,7 @@ fn native_password_input(title: &str, message: &str) -> Option<zeroize::Zeroizin
         Err(error) => {
             let _ = rfd::MessageDialog::new()
                 .set_title("Could not open secure password dialog")
-                .set_description(error)
+                .set_description(dialog_text(error))
                 .set_level(rfd::MessageLevel::Error)
                 .set_buttons(rfd::MessageButtons::Ok)
                 .show();
@@ -971,7 +1018,7 @@ fn show_setup_result_dialog(title: &str, description: String, success: bool) {
     activate_for_native_dialog();
     let _ = rfd::MessageDialog::new()
         .set_title(title)
-        .set_description(description)
+        .set_description(dialog_text(description))
         .set_level(if success {
             rfd::MessageLevel::Info
         } else {
@@ -1044,9 +1091,11 @@ fn build_menu(state: &AppState) -> Menu {
     if let Some(s) = status {
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("header"),
-            activity_header(state)
-                .map(str::to_string)
-                .unwrap_or_else(|| header_label(s)),
+            menu_label(
+                activity_header(state)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| header_label(s)),
+            ),
             false,
             None,
         ));
@@ -1061,7 +1110,7 @@ fn build_menu(state: &AppState) -> Menu {
         if let Some(ref msg) = state.error_message {
             let _ = menu.append(&MenuItem::with_id(
                 muda::MenuId::new("error"),
-                msg,
+                menu_label(msg),
                 false,
                 None,
             ));
@@ -1128,7 +1177,7 @@ fn build_menu(state: &AppState) -> Menu {
             for c in &s.pending_conflicts {
                 let _ = conflict_menu.append(&MenuItem::with_id(
                     muda::MenuId::new(format!("conflict-hdr:{}", c.path)),
-                    format!("{} — {}", c.path, c.label),
+                    menu_label(format!("{} — {}", c.path, c.label)),
                     false,
                     None,
                 ));
@@ -1157,7 +1206,7 @@ fn build_menu(state: &AppState) -> Menu {
             } else {
                 "Agents".into()
             };
-            let agent_menu = Submenu::with_id(muda::MenuId::new("agents"), title, true);
+            let agent_menu = Submenu::with_id(muda::MenuId::new("agents"), menu_label(title), true);
             for a in &s.agents.entries {
                 let label = match a.state.as_str() {
                     "changes" => format!("{} — {} change(s)", a.name, a.change_count),
@@ -1168,14 +1217,14 @@ fn build_menu(state: &AppState) -> Menu {
                 if a.state == "changes" || a.state == "conflicts" {
                     let _ = agent_menu.append(&MenuItem::with_id(
                         muda::MenuId::new(format!("land:{}", a.name)),
-                        format!("  Land {label}"),
+                        menu_label(format!("Land {label}")),
                         actions_enabled,
                         None,
                     ));
                 } else {
                     let _ = agent_menu.append(&MenuItem::with_id(
                         muda::MenuId::new(format!("agent-hdr:{}", a.name)),
-                        &label,
+                        menu_label(&label),
                         false,
                         None,
                     ));
@@ -1205,14 +1254,14 @@ fn build_menu(state: &AppState) -> Menu {
         });
         let _ = menu.append(&MenuItem::with_id(
             muda::MenuId::new("header"),
-            header,
+            menu_label(header),
             false,
             None,
         ));
         if let Some(ref msg) = state.error_message {
             let _ = menu.append(&MenuItem::with_id(
                 muda::MenuId::new("error"),
-                msg,
+                menu_label(msg),
                 false,
                 None,
             ));
@@ -1632,9 +1681,9 @@ fn handle_menu_action(
             };
             let confirmed = rfd::MessageDialog::new()
                 .set_title("Stop mirroring this folder?")
-                .set_description(
+                .set_description(dialog_text(
                     "Automatic sync will stop and this folder will be removed from the FeanorFS tray.\n\nYour files and encrypted setup will be kept, so you can start mirroring it again later.",
-                )
+                ))
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::OkCancel)
                 .show();
@@ -1872,9 +1921,9 @@ fn handle_menu_action(
             let noun = if before == 1 { "folder" } else { "folders" };
             let confirmed = rfd::MessageDialog::new()
                 .set_title("Remove unavailable folders from this list?")
-                .set_description(format!(
+                .set_description(dialog_text(format!(
                     "{before} {noun} cannot be opened right now. This can happen when a folder was moved or deleted, or when an external drive is disconnected.\n\nFeanorFS will remove only these entries from the tray. It will not delete files, encrypted setup, credentials, services, hub data, or remote snapshots. Reconnect external drives and cancel if you want to keep them listed."
-                ))
+                )))
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::OkCancel)
                 .show();
@@ -1938,9 +1987,9 @@ fn handle_menu_action(
             };
             let confirmed = rfd::MessageDialog::new()
                 .set_title(title)
-                .set_description(format!(
+                .set_description(dialog_text(format!(
                     "This applies one choice to {count} paths.\n\n{consequence}\n\nFeanorFS will not merge file contents. Choose OK only if this single policy is correct for every listed conflict."
-                ))
+                )))
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::OkCancel)
                 .show();
@@ -2015,6 +2064,14 @@ fn handle_menu_action(
 }
 
 fn main() {
+    let _instance_guard = match acquire_tray_instance_lock() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("{error}");
+            return;
+        }
+    };
     let workspace = resolve_initial_workspace();
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let prompt_first_run =
@@ -2162,7 +2219,7 @@ fn main() {
                         activate_for_native_dialog();
                         let _ = rfd::MessageDialog::new()
                             .set_title("System health check unavailable")
-                            .set_description(error)
+                            .set_description(dialog_text(error))
                             .set_level(rfd::MessageLevel::Error)
                             .set_buttons(rfd::MessageButtons::Ok)
                             .show();
@@ -2186,7 +2243,7 @@ fn main() {
                             } else {
                                 "FeanorFS system health"
                             })
-                            .set_description(description)
+                            .set_description(dialog_text(description))
                             .set_level(if needs_repair {
                                 rfd::MessageLevel::Error
                             } else if has_warning {
@@ -2221,7 +2278,7 @@ fn main() {
                         activate_for_native_dialog();
                         let _ = rfd::MessageDialog::new()
                             .set_title("Could not check for updates")
-                            .set_description(error)
+                            .set_description(dialog_text(error))
                             .set_level(rfd::MessageLevel::Error)
                             .set_buttons(rfd::MessageButtons::Ok)
                             .show();
@@ -2235,7 +2292,7 @@ fn main() {
                             } else {
                                 "FeanorFS updates"
                             })
-                            .set_description(update_description(&result))
+                            .set_description(dialog_text(update_description(&result)))
                             .set_level(rfd::MessageLevel::Info);
                         if available {
                             dialog = dialog.set_buttons(rfd::MessageButtons::OkCancelCustom(
@@ -2359,9 +2416,9 @@ fn main() {
                         let noun = if removed == 1 { "folder" } else { "folders" };
                         let _ = rfd::MessageDialog::new()
                             .set_title("Folder list cleaned up")
-                            .set_description(format!(
+                            .set_description(dialog_text(format!(
                                 "Removed {removed} unavailable {noun} from the tray. No files, encrypted setup, credentials, services, hub data, or remote snapshots were changed."
-                            ))
+                            )))
                             .set_level(rfd::MessageLevel::Info)
                             .set_buttons(rfd::MessageButtons::Ok)
                             .show();
@@ -2463,7 +2520,7 @@ fn main() {
                 copy_pairing_clipboard(&code);
                 let _ = rfd::MessageDialog::new()
                     .set_title("Share selected folder")
-                    .set_description(description)
+                    .set_description(dialog_text(description))
                     .set_level(rfd::MessageLevel::Info)
                     .set_buttons(rfd::MessageButtons::OkCancel)
                     .show();
@@ -2523,9 +2580,9 @@ fn main() {
                         st.last_status = None;
                         let _ = rfd::MessageDialog::new()
                             .set_title("Workspace restored")
-                            .set_description(
+                            .set_description(dialog_text(
                                 "The encrypted recovery kit was authenticated. FeanorFS restored the workspace and enabled automatic syncing.",
-                            )
+                            ))
                             .set_level(rfd::MessageLevel::Info)
                             .set_buttons(rfd::MessageButtons::Ok)
                             .show();
@@ -2539,9 +2596,9 @@ fn main() {
                     st.error_message = None;
                     let _ = rfd::MessageDialog::new()
                         .set_title("Recovery kit saved")
-                        .set_description(
+                        .set_description(dialog_text(
                             "The workspace capability is encrypted. Keep the kit and its passphrase in separate safe places.",
-                        )
+                        ))
                         .set_level(rfd::MessageLevel::Info)
                         .set_buttons(rfd::MessageButtons::Ok)
                         .show();
@@ -2594,6 +2651,29 @@ mod tests {
         assert!(state.pair_cancel.is_none());
         assert_eq!(state.last_menu_revision.get(), None);
         assert!(!state.has_managed_service());
+    }
+
+    #[test]
+    fn only_one_tray_instance_can_hold_the_user_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "feanorfs-tray-instance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let lock_path = root.join("tray-instance.lock");
+        let first = acquire_tray_instance_lock_at(&lock_path)
+            .unwrap()
+            .expect("first tray owns the lock");
+        assert!(acquire_tray_instance_lock_at(&lock_path).unwrap().is_none());
+        drop(first);
+        let replacement = acquire_tray_instance_lock_at(&lock_path)
+            .unwrap()
+            .expect("lock is released when the tray exits");
+        drop(replacement);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2948,14 +3028,15 @@ mod tests {
         assert!(unavailable_item.selected);
         assert!(unavailable_item.label.contains("offline drive"));
         assert!(unavailable_item.label.ends_with("— unavailable"));
+        assert!(unavailable_item.label.chars().count() <= 52);
 
         let available_item =
             workspace_switch_item_with("available", &available.to_string_lossy(), None, has_config);
         assert!(available_item.available);
         assert!(!available_item.selected);
-        assert!(available_item
-            .label
-            .contains(&available.display().to_string()));
+        assert!(available_item.label.starts_with("available"));
+        assert!(available_item.label.ends_with("available"));
+        assert!(available_item.label.chars().count() <= 52);
 
         // The tray's in-memory selection is authoritative for Open Folder and
         // every other folder-scoped action, even before a cached registry is

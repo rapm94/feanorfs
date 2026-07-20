@@ -1569,6 +1569,7 @@ version = "0.7.8"
 dependencies = [
  "arboard",
  "feanorfs-common",
+ "fs2",
  "libc",
  "muda",
  "objc2",
