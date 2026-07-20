@@ -52,7 +52,7 @@ getrandom = "0.4"
 which = "8"
 rpassword = "7"
 # constant_time_eq 0.5 requires Rust 1.95.
-constant_time_eq = "0.4"
+constant_time_eq = "0.5"
 chacha20poly1305 = "0.11"
 # Latest stable line; 0.6 is pre-release. Direct KDF use does not need password-hash/rand.
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "zeroize"] }
