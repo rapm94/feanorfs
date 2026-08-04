@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Periodic tray refreshes now coalesce while a slow workspace status scan is
   still running, leaving the managed sync worker a fair opportunity to acquire
   the workspace lock instead of reporting false concurrent-sync failures.
+- macOS package upgrades now stop the previous user tray and its read-only
+  status subprocess before refreshing hub and workspace login jobs, ensuring
+  every running component moves to the newly installed version.
+- macOS upgrades now preserve obsolete `~/.local/bin` CLI and tray copies in a
+  recoverable global backup before they can shadow the native package, and the
+  terminal installer no longer skips managed-service refresh while suppressing
+  first-run UI.
 
 ## [0.7.9](https://github.com/rapm94/feanorfs/compare/v0.7.8...v0.7.9) - 2026-07-20
 

@@ -217,6 +217,20 @@ export FEANORFS_NO_LAUNCH=1
 export HOME="$ROOT/home"
 mkdir -p "$HOME"
 
+macos_home="$ROOT/macos-home"
+mkdir -p "$macos_home/.local/bin"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$macos_home/.local/bin/feanorfs"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$macos_home/.local/bin/feanorfs-tray"
+chmod 755 "$macos_home/.local/bin/feanorfs" "$macos_home/.local/bin/feanorfs-tray"
+HOME="$macos_home" sh scripts/migrate-macos-user-bins.sh v9.9.9 >"$ROOT/macos-migration.log"
+[[ ! -e "$macos_home/.local/bin/feanorfs" && ! -e "$macos_home/.local/bin/feanorfs-tray" ]]
+[[ -x "$macos_home/.local/share/feanorfs/legacy-bin-backup/v9.9.9/feanorfs" ]]
+[[ -x "$macos_home/.local/share/feanorfs/legacy-bin-backup/v9.9.9/feanorfs-tray" ]]
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$macos_home/.local/bin/feanorfs"
+chmod 755 "$macos_home/.local/bin/feanorfs"
+HOME="$macos_home" sh scripts/migrate-macos-user-bins.sh v9.9.9 >>"$ROOT/macos-migration.log"
+[[ -x "$macos_home/.local/share/feanorfs/legacy-bin-backup/v9.9.9/feanorfs.1" ]]
+
 export FAKE_RELEASE_JSON='{"tag_name":"v9.9.9","assets":[{"name":"feanorfs-client-installer.sh"}]}'
 if sh scripts/install.sh >"$ROOT/fallback.log" 2>&1; then
   echo "CLI-only fallback unexpectedly replaced the desktop installer." >&2
