@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.11](https://github.com/rapm94/feanorfs/compare/v0.7.10...v0.7.11) - 2026-08-04
+
+### Fixed
+
+- Consumer `start` now waits for a transient tray status scan to release the
+  workspace lock, so stopping and immediately resuming a mirrored folder does
+  not incorrectly report that another terminal is syncing it.
+
 ## [0.7.10](https://github.com/rapm94/feanorfs/compare/v0.7.9...v0.7.10) - 2026-08-04
 
 ### Fixed

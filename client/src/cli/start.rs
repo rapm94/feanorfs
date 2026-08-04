@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use feanorfs_client::lock::try_acquire_sync_lock;
 use feanorfs_client::{
     do_sync, load_config, load_global_config, register_workspace, save_config_secure,
     save_global_config_secure, watch, ApiClient, Config, GlobalConfig,
@@ -155,14 +156,25 @@ pub(crate) async fn finish_sync_watch(
     let api = crate::open_api_client(work_dir, &config).await?;
 
     println!("Running sync...");
-    let sync_result = do_sync(
-        &api,
-        &db,
-        work_dir,
-        &config.workspace_id,
-        config.encryption_password.as_deref(),
-        false,
-    )
+    // A tray status scan can have read the recent-workspace registry just
+    // before `stop` removes it. Give that already-running read-only scan a
+    // bounded opportunity to finish, then hold the lock across initial sync so
+    // neither the tray nor a newly starting worker can win the handoff race.
+    let sync_result = async {
+        let initial_sync_guard =
+            try_acquire_sync_lock(work_dir, std::time::Duration::from_secs(10)).await?;
+        let result = do_sync(
+            &api,
+            &db,
+            work_dir,
+            &config.workspace_id,
+            config.encryption_password.as_deref(),
+            false,
+        )
+        .await;
+        drop(initial_sync_guard);
+        result
+    }
     .await;
     let sync_result = match sync_result {
         Ok(result) => result,
