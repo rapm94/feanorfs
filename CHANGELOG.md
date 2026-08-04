@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.10](https://github.com/rapm94/feanorfs/compare/v0.7.9...v0.7.10) - 2026-08-04
+
+### Fixed
+
+- Periodic tray refreshes now coalesce while a slow workspace status scan is
+  still running, leaving the managed sync worker a fair opportunity to acquire
+  the workspace lock instead of reporting false concurrent-sync failures.
+
 ## [0.7.9](https://github.com/rapm94/feanorfs/compare/v0.7.8...v0.7.9) - 2026-07-20
 
 ### Fixed

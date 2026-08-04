@@ -1490,19 +1490,28 @@ fn apply_ui(state: &AppState, tray: &TrayIcon, visual: &mut TrayVisual) {
     state.last_menu_revision.set(Some(revision));
 }
 
-fn request_status_fetch(state: &mut AppState, proxy: &tao::event_loop::EventLoopProxy<Action>) {
+fn prepare_status_fetch(state: &mut AppState, queue_if_busy: bool) -> Option<(u64, PathBuf)> {
     if state.setup_inflight || state.stop_inflight || state.recovery_inflight {
-        return;
+        return None;
     }
     if state.status_inflight {
-        state.status_pending = true;
-        return;
+        if queue_if_busy {
+            state.status_pending = true;
+        }
+        return None;
     }
+    let workspace = state.workspace.clone()?;
     state.status_inflight = true;
     state.status_pending = false;
-    let generation = state.task_generation;
-    let Some(workspace) = state.workspace.clone() else {
-        state.status_inflight = false;
+    Some((state.task_generation, workspace))
+}
+
+fn request_status_fetch_with_policy(
+    state: &mut AppState,
+    proxy: &tao::event_loop::EventLoopProxy<Action>,
+    queue_if_busy: bool,
+) {
+    let Some((generation, workspace)) = prepare_status_fetch(state, queue_if_busy) else {
         return;
     };
     let proxy = proxy.clone();
@@ -1514,6 +1523,17 @@ fn request_status_fetch(state: &mut AppState, proxy: &tao::event_loop::EventLoop
             status,
         });
     });
+}
+
+fn request_status_fetch(state: &mut AppState, proxy: &tao::event_loop::EventLoopProxy<Action>) {
+    request_status_fetch_with_policy(state, proxy, true);
+}
+
+fn request_periodic_status_fetch(
+    state: &mut AppState,
+    proxy: &tao::event_loop::EventLoopProxy<Action>,
+) {
+    request_status_fetch_with_policy(state, proxy, false);
 }
 
 fn run_exclusive_service_action(
@@ -2168,7 +2188,7 @@ fn main() {
                 if st.adopt_recent_if_unconfigured() {
                     st.last_status = None;
                 }
-                request_status_fetch(&mut st, &proxy);
+                request_periodic_status_fetch(&mut st, &proxy);
                 apply_ui(&st, &tray, &mut visual);
             }
             Action::StatusReady {
@@ -2676,6 +2696,18 @@ mod tests {
             .expect("lock is released when the tray exits");
         drop(replacement);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn periodic_status_ticks_do_not_queue_behind_a_slow_scan() {
+        let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
+        state.status_inflight = true;
+
+        assert!(prepare_status_fetch(&mut state, false).is_none());
+        assert!(!state.status_pending);
+
+        assert!(prepare_status_fetch(&mut state, true).is_none());
+        assert!(state.status_pending);
     }
 
     #[test]
