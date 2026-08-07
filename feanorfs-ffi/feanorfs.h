@@ -71,9 +71,56 @@ char *ffs_log(const char *root, uint32_t limit);
 char *ffs_undo(const char *root, const char *snapshot_id);
 
 /**
+ * Send an encrypted agent signal. JSON in: `AgentMessageInput`; JSON out:
+ * `AgentSendResult`. NULL on error.
+ */
+char *ffs_agent_send(const char *root, const char *input_json);
+
+/**
+ * Read agent signals. JSON in: `AgentInboxQuery`; JSON out: `AgentInboxResult`.
+ * NULL on error.
+ */
+char *ffs_agent_inbox(const char *root, const char *query_json);
+
+/**
  * Resolve a pending conflict. Returns `0` on success, `-1` on error.
  * `keep`: 0=local, 1=cloud, 2=both, 3=file (requires non-null `file_path`).
  */
 int32_t ffs_conflicts_keep(const char *root, const char *path, int32_t keep, const char *file_path);
+
+/**
+ * Assign one batch to a randomly ranked integrator. JSON in:
+ * `IntegratorAssignInput`; JSON out: `IntegratorAssignResult`. NULL on error.
+ */
+char *ffs_integrator_assign(const char *root, const char *input_json);
+
+/**
+ * Read the active integrator assignment (or one by id). JSON out:
+ * `IntegratorStatusResult`. NULL on error; pass NULL `assignment_id` for the
+ * active assignment.
+ */
+char *ffs_integrator_status(const char *root, const char *assignment_id);
+
+/**
+ * Explicitly revoke the active integrator assignment. JSON out:
+ * `IntegratorStatusResult`. NULL on error.
+ */
+char *ffs_integrator_revoke(const char *root, const char *assignment_id, const char *reason);
+
+/**
+ * Resume dispatcher observation after a restart. JSON in: object with
+ * optional `ack_timeout_ms` (u64) and `fallback_on_blocked` (bool); JSON out:
+ * `IntegratorObserveResult`. NULL on error; pass NULL `options_json` for
+ * conservative defaults.
+ */
+char *ffs_integrator_resume(const char *root, const char *options_json);
+
+/**
+ * Materialize the encrypted conflict triple for a snapshot. JSON in: object
+ * with `about_snapshot` (string, optional: defaults to the head) and `paths`
+ * (array of strings, optional); JSON out: `ConflictMaterializeResult`.
+ * NULL on error.
+ */
+char *ffs_conflict_materialize(const char *root, const char *input_json);
 
 #endif  /* FEANORFS_H */

@@ -64,6 +64,176 @@ pub struct UndoResult {
     pub changed_paths: Vec<String>,
 }
 
+/// Versioned discriminator prefix for encrypted agent signal envelopes.
+///
+/// A signal lives in `Snapshot.message` as `ffmsg1:` followed by canonical
+/// compact JSON. Unknown future versions remain ordinary history messages and
+/// are ignored by typed inbox readers.
+pub const AGENT_MESSAGE_DISCRIMINATOR: &str = "ffmsg1";
+
+/// Maximum encoded UTF-8 body length for one agent signal.
+pub const AGENT_MESSAGE_MAX_BODY_BYTES: usize = 8 * 1024;
+
+/// Default result count for one inbox read.
+pub const AGENT_INBOX_DEFAULT_LIMIT: usize = 50;
+
+/// Maximum result count for one inbox read.
+pub const AGENT_INBOX_MAX_LIMIT: usize = 1000;
+
+/// Kind of one encrypted agent signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessageKind {
+    /// Ask another agent to perform bounded work against a snapshot.
+    Request,
+    /// Short progress update; no acknowledgement required.
+    Status,
+    /// Final bounded outcome; the requester consumes it.
+    Result,
+    /// Final explanation of why a request cannot complete.
+    Blocked,
+}
+
+impl AgentMessageKind {
+    /// Returns the stable wire string for this kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Status => "status",
+            Self::Result => "result",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// Canonical `ffmsg1` envelope payload stored in `Snapshot.message`.
+///
+/// Fields derived from the enclosing snapshot (`message_id`, `from`,
+/// `created_at_ms`) are intentionally not duplicated in the payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessagePayload {
+    pub to: String,
+    pub kind: AgentMessageKind,
+    pub body: String,
+    pub about_snapshot: String,
+    pub reply_to: Option<String>,
+}
+
+/// Sender-side input for `Workspace::send_message`.
+///
+/// `from` is optional: CLI callers derive it from `FEANORFS_AGENT` (falling
+/// back to `human`); embeddings may supply an explicit validated sender.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessageInput {
+    pub to: String,
+    pub kind: AgentMessageKind,
+    pub body: String,
+    pub about_snapshot: Option<String>,
+    pub reply_to: Option<String>,
+    pub from: Option<String>,
+}
+
+/// Result of publishing one agent signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSendResult {
+    pub message_id: String,
+    pub about_snapshot: String,
+}
+
+/// One typed agent signal returned by inbox reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessage {
+    pub message_id: String,
+    pub from: String,
+    pub to: String,
+    pub kind: AgentMessageKind,
+    pub body: String,
+    pub about_snapshot: String,
+    pub reply_to: Option<String>,
+    pub created_at_ms: i64,
+}
+
+/// Inbox read query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInboxQuery {
+    pub recipient: String,
+    /// Previous workspace-head cursor; reads the graph delta when present.
+    pub after: Option<String>,
+    pub limit: usize,
+}
+
+/// Result of one inbox read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInboxResult {
+    /// Workspace head observed by this read; pass back as the next `after`.
+    pub cursor: String,
+    /// True when the supplied cursor was unreachable or a traversal/result
+    /// bound omitted history: older signals may have been missed and only a
+    /// bounded recent view is returned.
+    pub cursor_reset: bool,
+    pub messages: Vec<AgentMessage>,
+}
+
+/// Encodes one signal envelope as `ffmsg1:` followed by canonical compact JSON.
+///
+/// # Errors
+/// Returns an error when the recipient is not a valid agent name or broadcast,
+/// the body is empty or exceeds 8 KiB, or a snapshot reference is not a full
+/// 64-hex id.
+pub fn encode_agent_message(payload: &AgentMessagePayload) -> anyhow::Result<String> {
+    let body = payload.body.trim();
+    anyhow::ensure!(
+        !body.is_empty() && payload.body.len() <= AGENT_MESSAGE_MAX_BODY_BYTES,
+        "signal body must be non-empty UTF-8 of at most 8 KiB"
+    );
+    let valid_recipient = payload.to == "*"
+        || (!payload.to.is_empty()
+            && !payload.to.chars().any(char::is_control)
+            && !payload.to.contains('/')
+            && !payload.to.contains('\\')
+            && payload.to != "."
+            && payload.to != "..");
+    anyhow::ensure!(
+        valid_recipient,
+        "signal recipient must be a valid agent name or '*'"
+    );
+    anyhow::ensure!(
+        crate::is_valid_hash(&payload.about_snapshot),
+        "signal about_snapshot must be a full snapshot id"
+    );
+    if let Some(reply_to) = &payload.reply_to {
+        anyhow::ensure!(
+            crate::is_valid_hash(reply_to),
+            "signal reply_to must be a full snapshot id"
+        );
+    }
+    Ok(format!(
+        "{AGENT_MESSAGE_DISCRIMINATOR}:{}",
+        serde_json::to_string(payload)?
+    ))
+}
+
+/// Parses an `ffmsg1` signal envelope.
+///
+/// Returns `None` for unknown message versions, malformed payloads, or
+/// payloads outside the canonical bounds. Unknown/malformed messages remain
+/// visible in raw history but are ignored by typed inbox reads.
+pub fn parse_agent_message(message: &str) -> Option<AgentMessagePayload> {
+    let json = message.strip_prefix(AGENT_MESSAGE_DISCRIMINATOR)?;
+    let json = json.strip_prefix(':')?;
+    let payload: AgentMessagePayload = serde_json::from_str(json).ok()?;
+    // Canonical compact JSON: a payload that does not re-encode to the exact
+    // same bytes (whitespace, reordered or unknown fields) is not canonical.
+    if serde_json::to_string(&payload).ok()? != json {
+        return None;
+    }
+    if encode_agent_message(&payload).is_err() {
+        return None;
+    }
+    Some(payload)
+}
+
 fn sample_file_state(path: &str) -> FileState {
     FileState {
         path: path.to_string(),
@@ -232,5 +402,271 @@ pub mod fixtures {
 
     pub fn undo_json() -> String {
         serde_json::to_string(&undo_result()).unwrap()
+    }
+
+    pub fn agent_send_result() -> AgentSendResult {
+        AgentSendResult {
+            message_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            about_snapshot: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                .to_string(),
+        }
+    }
+
+    pub fn agent_message() -> AgentMessage {
+        AgentMessage {
+            message_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            from: "linux-dev".to_string(),
+            to: "mac-test".to_string(),
+            kind: AgentMessageKind::Request,
+            body: "Run iOS simulator tests".to_string(),
+            about_snapshot: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                .to_string(),
+            reply_to: None,
+            created_at_ms: 1_785_852_000_000,
+        }
+    }
+
+    pub fn agent_inbox_result() -> AgentInboxResult {
+        AgentInboxResult {
+            cursor: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            cursor_reset: false,
+            messages: vec![agent_message()],
+        }
+    }
+
+    pub fn agent_send_json() -> String {
+        serde_json::to_string(&agent_send_result()).unwrap()
+    }
+
+    pub fn agent_message_json() -> String {
+        serde_json::to_string(&agent_message()).unwrap()
+    }
+
+    pub fn agent_inbox_json() -> String {
+        serde_json::to_string(&agent_inbox_result()).unwrap()
+    }
+}
+
+/// Canonical integrator-assignment fixture types (SDK-1 additive).
+pub mod integrator_fixtures {
+    use crate::{
+        IntegratorAssignResult, IntegratorAssignmentState, IntegratorAttemptState,
+        IntegratorAttemptStatus, IntegratorDigest, IntegratorOutcomeState, IntegratorStatusResult,
+        VerificationStatus, VerificationSummary,
+    };
+
+    fn hex64(byte: u8) -> String {
+        std::iter::repeat_n(byte as char, 64).collect()
+    }
+
+    fn hex32(byte: u8) -> String {
+        std::iter::repeat_n(byte as char, 32).collect()
+    }
+
+    pub fn integrator_assign_result() -> IntegratorAssignResult {
+        IntegratorAssignResult {
+            assignment_id: hex32(b'a'),
+            about_snapshot: hex64(b'b'),
+            selected: "agent-b".to_string(),
+            fallback_order: vec!["agent-a".to_string()],
+            neutral_integrator: true,
+            roster_fingerprint: hex64(b'c'),
+            attempt: 0,
+            request_message_id: hex64(b'd'),
+            state: IntegratorAssignmentState::Offered,
+            task_summary: "Integrate parser implementation and tests".to_string(),
+        }
+    }
+
+    pub fn integrator_digest() -> IntegratorDigest {
+        IntegratorDigest {
+            assignment_id: hex32(b'a'),
+            integrator: "agent-b".to_string(),
+            about_snapshot: hex64(b'b'),
+            inspected_snapshot: hex64(b'b'),
+            state: IntegratorOutcomeState::Completed,
+            landed_paths: 12,
+            resolved_conflicts: 3,
+            remaining_conflicts: 0,
+            verification: VerificationSummary {
+                status: VerificationStatus::Passed,
+                summary: "84 tests passed".to_string(),
+            },
+            outcome: "Integrated parser implementation and tests.".to_string(),
+            risks: vec![],
+            decision_required: None,
+        }
+    }
+
+    pub fn integrator_status_result() -> IntegratorStatusResult {
+        IntegratorStatusResult {
+            assignment_id: hex32(b'a'),
+            about_snapshot: hex64(b'b'),
+            state: IntegratorAssignmentState::Accepted,
+            selected: Some("agent-b".to_string()),
+            attempt: 0,
+            neutral_integrator: true,
+            roster_fingerprint: hex64(b'c'),
+            fallback_order: vec!["agent-a".to_string()],
+            task_summary: "Integrate parser implementation and tests".to_string(),
+            created_at_ms: 1_785_852_000_000,
+            updated_at_ms: 1_785_852_000_000,
+            attempts: vec![IntegratorAttemptStatus {
+                attempt: 0,
+                selected: "agent-b".to_string(),
+                state: IntegratorAttemptState::Accepted,
+                offered_at_ms: 1_785_852_000_000,
+                request_message_id: Some(hex64(b'd')),
+                terminal_message_id: None,
+                reason: None,
+            }],
+            digest: None,
+            inbox_cursor: Some(hex64(b'e')),
+        }
+    }
+
+    pub fn integrator_assign_json() -> String {
+        serde_json::to_string(&integrator_assign_result()).unwrap()
+    }
+
+    pub fn integrator_digest_json() -> String {
+        serde_json::to_string(&integrator_digest()).unwrap()
+    }
+
+    pub fn integrator_status_json() -> String {
+        serde_json::to_string(&integrator_status_result()).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(body: &str) -> AgentMessagePayload {
+        AgentMessagePayload {
+            to: "mac-test".to_string(),
+            kind: AgentMessageKind::Request,
+            body: body.to_string(),
+            about_snapshot: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                .to_string(),
+            reply_to: None,
+        }
+    }
+
+    #[test]
+    fn envelope_roundtrips_through_canonical_json() {
+        let encoded = encode_agent_message(&payload("Run iOS simulator tests")).unwrap();
+        assert!(encoded.starts_with("ffmsg1:"));
+        let parsed = parse_agent_message(&encoded).unwrap();
+        assert_eq!(parsed, payload("Run iOS simulator tests"));
+        assert_eq!(parsed.kind.as_str(), "request");
+    }
+
+    #[test]
+    fn envelope_is_exact_canonical_compact_json() {
+        let encoded = encode_agent_message(&payload("hello")).unwrap();
+        assert_eq!(
+            encoded,
+            concat!(
+                "ffmsg1:{\"to\":\"mac-test\",\"kind\":\"request\",\"body\":\"hello\",",
+                "\"about_snapshot\":\"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\",",
+                "\"reply_to\":null}"
+            )
+        );
+    }
+
+    #[test]
+    fn unknown_discriminators_and_malformed_payloads_parse_to_none() {
+        assert!(parse_agent_message("ffmsg2:{\"to\":\"x\"}").is_none());
+        assert!(parse_agent_message("ffmsg1:not-json").is_none());
+        assert!(parse_agent_message("ffmsg1:{\"to\":\"x\"}").is_none());
+        assert!(
+            parse_agent_message("ffmsg1:{\"to\":\"x\",\"kind\":\"chat\",\"body\":\"b\"}").is_none()
+        );
+        assert!(parse_agent_message("plain history message").is_none());
+        // Whitespace or reordered fields are not canonical compact JSON.
+        let encoded = encode_agent_message(&payload("hello")).unwrap();
+        assert!(parse_agent_message(&format!("ffmsg1:{}", " {",)).is_none());
+        let spaced = encoded.replacen('"', " ", 1);
+        assert!(parse_agent_message(&spaced).is_none());
+        assert!(parse_agent_message("").is_none());
+    }
+
+    #[test]
+    fn missing_about_snapshot_is_malformed() {
+        let mut p = payload("hello");
+        p.about_snapshot = "short".to_string();
+        assert!(encode_agent_message(&p).is_err());
+        let mut p = payload("hello");
+        p.about_snapshot.clear();
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(parse_agent_message(&format!("ffmsg1:{json}")).is_none());
+    }
+
+    #[test]
+    fn invalid_reply_to_is_rejected() {
+        let mut p = payload("hello");
+        p.reply_to = Some("not-a-hash".to_string());
+        assert!(encode_agent_message(&p).is_err());
+        let mut p = payload("hello");
+        p.reply_to =
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
+        assert!(encode_agent_message(&p).is_ok());
+    }
+
+    #[test]
+    fn body_bounds_are_enforced() {
+        assert!(encode_agent_message(&payload("")).is_err());
+        assert!(encode_agent_message(&payload("   ")).is_err());
+        let big = "x".repeat(AGENT_MESSAGE_MAX_BODY_BYTES + 1);
+        assert!(encode_agent_message(&payload(&big)).is_err());
+        let ok = "x".repeat(AGENT_MESSAGE_MAX_BODY_BYTES);
+        assert!(encode_agent_message(&payload(&ok)).is_ok());
+        let whitespace_wrapped = format!(" {ok} ");
+        assert!(
+            encode_agent_message(&payload(&whitespace_wrapped)).is_err(),
+            "trimming must not let an oversized encoded body bypass the byte bound"
+        );
+        assert!(encode_agent_message(&payload(&"é".repeat(4096))).is_ok());
+        assert!(encode_agent_message(&payload(&"é".repeat(4097))).is_err());
+        // Whitespace-only bodies are rejected both at encode and at parse.
+        let whitespace_only = format!("ffmsg1:{}", serde_json::to_string(&payload("   ")).unwrap());
+        assert!(parse_agent_message(&whitespace_only).is_none());
+    }
+
+    #[test]
+    fn invalid_recipients_are_rejected() {
+        for recipient in ["", ".", "..", "nested/name", "nested\\name", "bad\nname"] {
+            let mut p = payload("hello");
+            p.to = recipient.to_string();
+            assert!(
+                encode_agent_message(&p).is_err(),
+                "recipient {recipient:?} must be rejected"
+            );
+            let json = serde_json::to_string(&p).unwrap();
+            assert!(parse_agent_message(&format!("ffmsg1:{json}")).is_none());
+        }
+
+        let mut broadcast = payload("hello");
+        broadcast.to = "*".into();
+        assert!(encode_agent_message(&broadcast).is_ok());
+    }
+
+    #[test]
+    fn enum_wire_names_are_stable() {
+        assert_eq!(AgentMessageKind::Request.as_str(), "request");
+        assert_eq!(AgentMessageKind::Status.as_str(), "status");
+        assert_eq!(AgentMessageKind::Result.as_str(), "result");
+        assert_eq!(AgentMessageKind::Blocked.as_str(), "blocked");
+        for (kind, name) in [
+            (AgentMessageKind::Request, "request"),
+            (AgentMessageKind::Status, "status"),
+            (AgentMessageKind::Result, "result"),
+            (AgentMessageKind::Blocked, "blocked"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(name));
+        }
     }
 }

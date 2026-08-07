@@ -807,6 +807,8 @@ fn doctor_label(name: &str) -> &str {
         "server" => "Mirror connection",
         "remote_workspace" => "Remote workspace",
         "local_state" => "Local sync state",
+        "executable_version" => "Executable version",
+        "update_available" => "Release awareness",
         _ => name,
     }
 }
@@ -995,10 +997,143 @@ fn run_migration_report(current_dir: &Path, json: bool) -> anyhow::Result<()> {
     }
 }
 
+fn registered_program_paths(current_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(state) = feanorfs_agent_core::ensure_workspace_state(current_dir) {
+        paths.extend(
+            super::util::read_service_identity(&state.join("service-program"))
+                .into_iter()
+                .map(std::path::PathBuf::from),
+        );
+    }
+    if let Ok(root) = feanorfs_agent_core::global_state_root() {
+        paths.extend(
+            super::util::read_service_identity(&root.join("supervisor-service-program"))
+                .into_iter()
+                .map(std::path::PathBuf::from),
+        );
+        // Legacy markers from pre-supervisor installs; removed by migration.
+        paths.extend(
+            super::util::read_service_identity(&root.join("hub-data/service-program"))
+                .into_iter()
+                .map(std::path::PathBuf::from),
+        );
+        paths.extend(
+            super::util::read_service_identity(&root.join("tray-service-program"))
+                .into_iter()
+                .map(std::path::PathBuf::from),
+        );
+    }
+    paths
+}
+
+const EXECUTABLE_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn executable_version_with_timeout(
+    program: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<semver::Version> {
+    let mut command = tokio::process::Command::new(program);
+    command.arg("--version").kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let token = stdout.split_whitespace().nth(1)?;
+    semver::Version::parse(token).ok()
+}
+
+async fn executable_version(program: &std::path::Path) -> Option<semver::Version> {
+    executable_version_with_timeout(program, EXECUTABLE_VERSION_TIMEOUT).await
+}
+
+async fn check_executable_versions(result: &mut DoctorResult, current_dir: &Path) {
+    let programs = registered_program_paths(current_dir);
+    if programs.is_empty() {
+        result.add(
+            "executable_version",
+            DoctorCheckStatus::Info,
+            "no background jobs registered; nothing to compare",
+            None,
+        );
+        return;
+    }
+    let own = env!("CARGO_PKG_VERSION");
+    let mut divergent = Vec::new();
+    for program in programs {
+        match executable_version(&program).await {
+            Some(version) if version.to_string() != own => {
+                divergent.push(format!("{} runs {}", program.display(), version));
+            }
+            Some(_) => {}
+            None => divergent.push(format!(
+                "{} does not report a version within {} seconds",
+                program.display(),
+                EXECUTABLE_VERSION_TIMEOUT.as_secs()
+            )),
+        }
+    }
+    if divergent.is_empty() {
+        result.add(
+            "executable_version",
+            DoctorCheckStatus::Ok,
+            format!("all registered background-job executables report this version ({own})"),
+            None,
+        );
+    } else {
+        result.add(
+            "executable_version",
+            DoctorCheckStatus::Failure,
+            format!(
+                "registered background-job executables report mixed versions: {}",
+                divergent.join("; ")
+            ),
+            Some("Run `feanorfs start <folder>` (or `feanorfs service refresh-installation`) to move every login job and running process to one executable version."),
+        );
+    }
+}
+
+/// Surfaces the last throttled update check without making a network request.
+fn check_release_awareness(result: &mut DoctorResult) {
+    match super::update::last_periodic_result() {
+        Some(check) => match check.status {
+            super::update::UpdateStatus::UpdateAvailable => result.add(
+                "update_available",
+                DoctorCheckStatus::Warning,
+                format!(
+                    "FeanorFS {} is available; this computer has {}",
+                    check.latest_version, check.current_version
+                ),
+                Some("Run `feanorfs update` or open the verified release page."),
+            ),
+            _ => result.add(
+                "update_available",
+                DoctorCheckStatus::Ok,
+                format!(
+                    "FeanorFS {} is the latest checked stable release",
+                    check.current_version
+                ),
+                None,
+            ),
+        },
+        None => result.add(
+            "update_available",
+            DoctorCheckStatus::Info,
+            "no periodic release check has completed on this machine yet",
+            None,
+        ),
+    }
+}
+
 async fn run_doctor(current_dir: &Path, json: bool) -> anyhow::Result<()> {
     use super::service::BackgroundStatus;
 
     let mut result = DoctorResult::new();
+    check_release_awareness(&mut result);
     if global_config_is_present() {
         match load_global_config() {
             Ok(global) => result.add(
@@ -1146,6 +1281,8 @@ async fn run_doctor(current_dir: &Path, json: bool) -> anyhow::Result<()> {
             Some("Back up and repair `~/.feanorfs/recent.json`, then run `feanorfs start`."),
         ),
     }
+
+    check_executable_versions(&mut result, current_dir).await;
 
     match super::hub_service::status_for_workspace(&config) {
         Ok(Some(super::hub_service::HubStatus::Running)) => result.add(
@@ -1505,5 +1642,51 @@ mod doctor_tests {
         assert_eq!(report.format_v3, 1);
         assert!(!report.recent_registry_readable);
         assert!(!report.legacy_xor_retirement_ready);
+    }
+
+    #[tokio::test]
+    async fn executable_version_returns_none_when_program_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("definitely-not-an-executable");
+
+        assert_eq!(executable_version(&missing).await, None);
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, source: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, source).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_version_parses_fast_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("version-program");
+        write_executable_script(&program, "#!/bin/sh\nprintf 'feanorfs 1.2.3\\n'\n");
+
+        assert_eq!(
+            executable_version(&program).await,
+            Some(semver::Version::new(1, 2, 3))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_version_kills_a_probe_after_its_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("hanging-program");
+        write_executable_script(&program, "#!/bin/sh\nexec sleep 60\n");
+        let started = tokio::time::Instant::now();
+
+        let version =
+            executable_version_with_timeout(&program, std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(version, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

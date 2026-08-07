@@ -15,9 +15,11 @@ mod head;
 pub mod history;
 pub mod hub;
 mod hub_state;
+pub mod integrator;
 pub mod large_file;
 pub mod local;
 pub mod lock;
+pub mod messages;
 mod object_gc;
 pub mod objects;
 pub mod paths;
@@ -28,13 +30,14 @@ mod state;
 pub mod sync_pass;
 mod tree_reconcile;
 pub mod tunnel;
+mod upload_registry;
 pub mod workspace_layout;
 
 pub use agent::{
     check_agent, clean_agent, commit_agent, land_agent, list_agents, refresh_agent,
     refresh_agent_with_options, spawn_agent, RefreshOptions,
 };
-pub use api::ApiClient;
+pub use api::{ApiClient, MIN_SUPPORTED_SERVER_VERSION};
 pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
 pub use conflicts::{resolve_conflict, ResolveKeep};
 pub use ctx::SyncCtx;
@@ -47,11 +50,17 @@ pub use feanorfs_common::{
 pub use head::SwapHeadResult;
 pub use history::{log, undo};
 pub use hub::LocalHub;
+pub use integrator::{
+    integrator_assign, integrator_observe, integrator_resume, integrator_revoke, integrator_status,
+    materialize_conflicts, IntegratorObserveOptions, IntegratorStateFile, IntegratorStore,
+    PersistedIntegratorAssignment,
+};
 pub use local::{
     load_config, load_global_config, save_config, save_config_secure, save_global_config,
     save_global_config_secure, validate_e2ee_key, ClientDb, Config, CredentialProtection,
     GlobalConfig, LOCAL_HUB_URL,
 };
+pub use messages::{inbox, send_message, signals_since};
 pub use objects::ObjectStore;
 pub use paths::legacy_policy_for_config;
 pub use paths::{agent_dir, agents_dir, conflicts_dir, validate_name};
@@ -137,6 +146,7 @@ impl Workspace {
         let state = ensure_workspace_state(&root)?;
         let db = rt.block_on(ClientDb::new(state))?;
         let api = rt.block_on(ApiClient::from_config(&root, &config))?;
+        rt.block_on(api.ensure_server_compatible())?;
         Ok(Self {
             root,
             rt: Arc::clone(rt),
@@ -259,5 +269,77 @@ impl Workspace {
     pub fn undo(&self, snapshot_id: &str) -> Result<feanorfs_common::UndoResult> {
         let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
         self.rt.block_on(history::undo(&ctx, snapshot_id))
+    }
+
+    /// Publishes one encrypted agent signal as a no-file-change snapshot.
+    pub fn send_message(
+        &self,
+        input: feanorfs_common::AgentMessageInput,
+    ) -> Result<feanorfs_common::AgentSendResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(messages::send_message(&ctx, input))
+    }
+
+    /// Reads signals addressed to a recipient from reachable snapshot history.
+    pub fn inbox(
+        &self,
+        query: feanorfs_common::AgentInboxQuery,
+    ) -> Result<feanorfs_common::AgentInboxResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(messages::inbox(&ctx, query))
+    }
+
+    /// Assigns one bounded batch to a randomly ranked integrator.
+    pub fn integrator_assign(
+        &self,
+        input: feanorfs_common::IntegratorAssignInput,
+    ) -> Result<feanorfs_common::IntegratorAssignResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(integrator::integrator_assign(&ctx, input))
+    }
+
+    /// Reads the current integrator assignment status.
+    pub fn integrator_status(
+        &self,
+        assignment_id: Option<&str>,
+    ) -> Result<feanorfs_common::IntegratorStatusResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(integrator::integrator_status(&ctx, assignment_id))
+    }
+
+    /// Explicitly revokes the active integrator assignment.
+    pub fn integrator_revoke(
+        &self,
+        assignment_id: &str,
+        reason: &str,
+    ) -> Result<feanorfs_common::IntegratorStatusResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(integrator::integrator_revoke(&ctx, assignment_id, reason))
+    }
+
+    /// Resumes dispatcher observation after a restart (crash-safe).
+    pub fn integrator_resume(
+        &self,
+        options: IntegratorObserveOptions,
+    ) -> Result<feanorfs_common::IntegratorObserveResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(integrator::integrator_resume(&ctx, options))
+    }
+
+    /// Materializes the encrypted conflict triple for a snapshot (read-only).
+    pub fn materialize_conflicts(
+        &self,
+        about_snapshot: &str,
+        paths: &[String],
+    ) -> Result<feanorfs_common::ConflictMaterializeResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(integrator::materialize_conflicts(
+            &ctx,
+            about_snapshot,
+            paths,
+        ))
     }
 }

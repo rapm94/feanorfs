@@ -2777,8 +2777,9 @@ async fn agent_land_advances_snapshot_base() {
     .await
     .unwrap();
 
+    let pre_land_head = server.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
     write_workspace_file(&agent_path(base, "snap"), "doc.txt", b"agent-v1").await;
-    land_agent(
+    let first_land = land_agent(
         base,
         &main.db,
         &server.api,
@@ -2790,6 +2791,33 @@ async fn agent_land_advances_snapshot_base() {
     )
     .await
     .unwrap();
+
+    let ctx = feanorfs_agent_core::SyncCtx::new(
+        &server.api,
+        &main.db,
+        base,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        feanorfs_common::LegacyPolicy::Reject,
+    );
+    let landed_snapshot = feanorfs_agent_core::SnapshotEngine::new(&ctx)
+        .load_snapshot(first_land.snapshot_id.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(landed_snapshot.parents, vec![pre_land_head]);
+
+    let status = feanorfs_client::do_status(
+        &server.api,
+        &main.db,
+        base,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    assert!(status.upload_required.is_empty());
+    assert!(status.download_required.is_empty());
+    assert!(status.delete_local.is_empty());
 
     let check = check_agent(
         base,
@@ -3133,7 +3161,7 @@ async fn format_v3_syncs_file_above_100_mib_through_authenticated_chunks() {
 
 #[tokio::test]
 async fn tray_status_and_pause() {
-    use feanorfs_client::{do_tray_status, is_paused, set_paused};
+    use feanorfs_client::{do_tray_status_with, is_paused, set_paused};
 
     let server = spawn_test_server().await;
     let client = spawn_test_client_with_server(&server).await;
@@ -3142,7 +3170,7 @@ async fn tray_status_and_pause() {
     set_paused(base, true).unwrap();
     assert!(is_paused(base));
 
-    let status = do_tray_status(base).await.unwrap();
+    let status = do_tray_status_with(base, true).await.unwrap();
     assert!(status.paused);
     assert_eq!(status.mirror_state, "idle");
     assert!(status.pending_conflicts.is_empty());
@@ -3153,7 +3181,7 @@ async fn tray_status_and_pause() {
 
 #[tokio::test]
 async fn tray_status_lists_working_agent() {
-    use feanorfs_client::{do_tray_status, spawn_agent};
+    use feanorfs_client::{do_tray_status_with, spawn_agent};
 
     let server = spawn_test_server().await;
     let client = spawn_test_client_with_server(&server).await;
@@ -3186,7 +3214,7 @@ async fn tray_status_lists_working_agent() {
 
     write_workspace_file(&agent_path(base, "ci1"), "task.txt", b"agent edit").await;
 
-    let status = do_tray_status(base).await.unwrap();
+    let status = do_tray_status_with(base, true).await.unwrap();
     assert!(
         status.agents.working >= 1,
         "expected at least one working agent: {:?}",

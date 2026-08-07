@@ -12,6 +12,8 @@ pub struct TrayStatusResult {
     pub workspace_path: String,
     pub workspace_id: String,
     pub workspace_label: String,
+    /// Total pending conflicts, including entries omitted from the bounded list.
+    pub pending_conflict_count: u32,
     pub pending_conflicts: Vec<TrayConflictEntry>,
     pub agents: TrayAgentsSummary,
 }
@@ -24,6 +26,21 @@ pub struct TrayConflictEntry {
     /// Plain-language one-liner for humans (tray menu header).
     pub label: String,
     pub choices: Vec<String>,
+}
+
+/// Bounded, secret-free status snapshot published by the managed sync worker
+/// after each sync. Routine tray refreshes read this file instead of scanning
+/// the project or taking the sync lock, so tray polling cannot delay
+/// file-change synchronization even in very large workspaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStatusSnapshot {
+    /// `idle` | `out_of_sync` | `offline` | `conflict` | `error` | `syncing`
+    pub mirror_state: String,
+    /// Total pending conflicts, including entries omitted from the bounded list.
+    pub pending_conflict_count: u32,
+    pub pending_conflicts: Vec<TrayConflictEntry>,
+    pub published_at_ms: i64,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +106,7 @@ pub mod fixtures {
             workspace_path: "/Users/dev/project".into(),
             workspace_id: "my-workspace".into(),
             workspace_label: "my-workspace".into(),
+            pending_conflict_count: 1,
             pending_conflicts: vec![TrayConflictEntry {
                 path: "notes.txt".into(),
                 kind: "edit_edit".into(),
@@ -162,5 +180,24 @@ pub mod fixtures {
 
     pub fn conflict_show_json() -> String {
         serde_json::to_string(&conflict_show_result()).unwrap()
+    }
+
+    pub fn worker_status() -> WorkerStatusSnapshot {
+        WorkerStatusSnapshot {
+            mirror_state: "idle".into(),
+            pending_conflict_count: 1,
+            pending_conflicts: vec![TrayConflictEntry {
+                path: "notes.txt".into(),
+                kind: "edit_edit".into(),
+                label: "Both sides changed notes.txt".into(),
+                choices: vec!["local".into(), "cloud".into(), "both".into()],
+            }],
+            published_at_ms: 1_719_500_000_000,
+            version: "0.7.11".into(),
+        }
+    }
+
+    pub fn worker_status_json() -> String {
+        serde_json::to_string(&worker_status()).unwrap()
     }
 }

@@ -120,6 +120,56 @@ jobs:
           cargo test --workspace --exclude feanorfs-tray
           --all-features --locked
 
+  upgrade-smoke:
+    name: Upgrade state smoke (previous release -> current bytes)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build current CLI
+        run: cargo build -p feanorfs-client --bin feanorfs --locked
+      - name: Checkout previous release
+        run: |
+          PREV=$(git tag --sort=-v:refname | head -n 1)
+          test -n "$PREV"
+          git worktree add "$RUNNER_TEMP/previous" "$PREV"
+      - name: Build previous CLI
+        working-directory: ${{ runner.temp }}/previous
+        run: cargo build -p feanorfs-client --bin feanorfs --locked
+      - name: Run upgrade smoke
+        run: >-
+          scripts/smoke-upgrade.sh
+          "$RUNNER_TEMP/previous/target/debug/feanorfs"
+          target/debug/feanorfs
+
+  source-smoke:
+    name: Source smoke (live E2E)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run source product smoke
+        run: bash scripts/smoke-test.sh
+
   docs:
     name: Documentation
     if: ${{ github.event_name != 'pull_request' }}
@@ -527,6 +577,8 @@ jobs:
       - msrv
       - test
       - cross-platform
+      - upgrade-smoke
+      - source-smoke
       - docs
       - build
       - sdk
@@ -552,6 +604,8 @@ jobs:
           (
             needs.msrv.result != 'success' ||
             needs.cross-platform.result != 'success' ||
+            needs.upgrade-smoke.result != 'success' ||
+            needs.source-smoke.result != 'success' ||
             needs.docs.result != 'success' ||
             needs.build.result != 'success' ||
             needs.sdk.result != 'success' ||

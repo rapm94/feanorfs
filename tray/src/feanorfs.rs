@@ -198,7 +198,17 @@ fn health_args() -> [&'static str; 2] {
 }
 
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
-    let out = run_in(&home_dir(), &update_args()).map_err(|_| {
+    run_update_check(&update_args(false))
+}
+
+/// Throttled periodic check: the CLI reuses its per-machine cached result
+/// until the interval elapses, so the tray never hammers the release API.
+pub fn check_for_updates_periodic() -> Result<UpdateCheckResult, String> {
+    run_update_check(&update_args(true))
+}
+
+fn run_update_check(args: &[&str]) -> Result<UpdateCheckResult, String> {
+    let out = run_in(&home_dir(), args).map_err(|_| {
         "Updates could not be checked because the FeanorFS command is unavailable. The installed app was not changed. Reinstall FeanorFS and try again."
             .to_string()
     })?;
@@ -221,8 +231,12 @@ pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
     Ok(result)
 }
 
-fn update_args() -> [&'static str; 2] {
-    ["--json", "update"]
+fn update_args(periodic: bool) -> Vec<&'static str> {
+    if periodic {
+        vec!["--json", "update", "--periodic"]
+    } else {
+        vec!["--json", "update"]
+    }
 }
 
 fn official_release_result(result: &UpdateCheckResult) -> bool {
@@ -1004,7 +1018,8 @@ mod tests {
             start_args("--folder-that-looks-like-a-flag"),
             ["start", "--", "--folder-that-looks-like-a-flag"]
         );
-        assert_eq!(update_args(), ["--json", "update"]);
+        assert_eq!(update_args(false), ["--json", "update"]);
+        assert_eq!(update_args(true), ["--json", "update", "--periodic"]);
     }
 
     #[test]

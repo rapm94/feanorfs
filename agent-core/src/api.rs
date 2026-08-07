@@ -1,10 +1,11 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use feanorfs_common::{RelayConfig, SyncRequest, SyncResponse};
 use reqwest::{Certificate, Client};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::hub::LocalHub;
 use crate::local::{load_config, Config};
@@ -28,6 +29,17 @@ pub struct ApiClient {
 struct WorkspaceFormatResponse {
     format_version: u32,
 }
+
+#[derive(Deserialize)]
+struct VersionResponse {
+    version: String,
+}
+
+/// Oldest hub version whose advertised protocol this client accepts.
+pub const MIN_SUPPORTED_SERVER_VERSION: &str = "0.7.0";
+
+const MAX_VERSION_RESPONSE_BYTES: usize = 1024;
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 impl ApiClient {
     pub fn new(server_url: &str, server_password: Option<&str>) -> Self {
@@ -389,6 +401,67 @@ impl ApiClient {
         Ok(response.format_version)
     }
 
+    /// Returns the hub's advertised version, or `None` when the hub predates
+    /// the version endpoint. Embedded local hubs always report this build.
+    pub async fn server_version(&self) -> Result<Option<String>> {
+        match &self.backend {
+            Backend::Local(_) => Ok(Some(env!("CARGO_PKG_VERSION").to_string())),
+            Backend::Http {
+                client, server_url, ..
+            } => {
+                let mut request = client
+                    .get(format!("{server_url}/api/version"))
+                    .timeout(VERSION_PROBE_TIMEOUT)
+                    .header("X-FeanorFS-Format", "3");
+                if let Some(password) = &self.server_password {
+                    request = request.bearer_auth(password);
+                }
+                let mut response = request.send().await.context("probe hub version")?;
+                if response.status() == http::StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                let status = response.status();
+                if status == http::StatusCode::UNAUTHORIZED {
+                    bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
+                }
+                if !status.is_success() {
+                    bail!("GET /api/version failed with status {status}");
+                }
+                if let Some(length) = response.content_length() {
+                    ensure!(
+                        length <= MAX_VERSION_RESPONSE_BYTES as u64,
+                        "hub version response is unexpectedly large"
+                    );
+                }
+                let mut body = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .context("read hub version response")?
+                {
+                    ensure!(
+                        chunk.len() <= MAX_VERSION_RESPONSE_BYTES.saturating_sub(body.len()),
+                        "hub version response is unexpectedly large"
+                    );
+                    body.extend_from_slice(&chunk);
+                }
+                let response: VersionResponse =
+                    serde_json::from_slice(&body).context("parse hub version response")?;
+                Ok(Some(response.version))
+            }
+        }
+    }
+
+    /// Fails closed when an authenticated hub advertises an unsupported
+    /// protocol version. A 404 remains compatible with the previous release,
+    /// which predates the version endpoint.
+    pub async fn ensure_server_compatible(&self) -> Result<()> {
+        let Some(advertised) = self.server_version().await? else {
+            return Ok(());
+        };
+        check_server_version(&advertised)
+    }
+
     pub async fn begin_migration(&self, workspace_id: &str) -> Result<()> {
         let query = format!("workspace_id={}", urlencoding_path(workspace_id));
         self.post_bytes("/api/workspace/migration", &query, Vec::new())
@@ -436,4 +509,79 @@ fn url_is_loopback(value: &str) -> bool {
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|address| address.is_loopback())
         })
+}
+
+fn check_server_version(advertised: &str) -> Result<()> {
+    let server = semver::Version::parse(advertised)
+        .map_err(|_| anyhow::anyhow!("hub advertised an unparsable version"))?;
+    let floor = semver::Version::parse(MIN_SUPPORTED_SERVER_VERSION)?;
+    if server < floor {
+        bail!(
+            "hub version {advertised} is below the minimum supported protocol \
+             version {MIN_SUPPORTED_SERVER_VERSION}. Upgrade the hub to the current release \
+             (run `feanorfs serve` or `feanorfs start --host` with the new binary) before syncing."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::{check_server_version, ApiClient};
+
+    async fn serve(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[test]
+    fn server_version_check_fails_closed_below_minimum() {
+        let error = check_server_version("0.6.9").unwrap_err();
+        assert!(error.to_string().contains("minimum supported"));
+        assert!(error.to_string().contains("0.7.0"));
+    }
+
+    #[test]
+    fn server_version_check_accepts_minimum_and_newer() {
+        check_server_version("0.7.0").unwrap();
+        check_server_version("0.7.11").unwrap();
+        check_server_version("0.8.0").unwrap();
+        check_server_version("1.0.0").unwrap();
+    }
+
+    #[test]
+    fn server_version_check_rejects_unparsable_advertisements() {
+        let error = check_server_version("not-a-version").unwrap_err();
+        assert!(error.to_string().contains("unparsable"));
+    }
+
+    #[tokio::test]
+    async fn incompatible_advertised_hub_fails_over_real_http() {
+        let router = axum::Router::new().route(
+            "/api/version",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "version": "0.6.9" })) }),
+        );
+        let (url, task) = serve(router).await;
+        let error = ApiClient::new(&url, Some("test-token"))
+            .ensure_server_compatible()
+            .await
+            .unwrap_err();
+        task.abort();
+        assert!(error.to_string().contains("hub version 0.6.9"));
+        assert!(error.to_string().contains("Upgrade the hub"));
+    }
+
+    #[tokio::test]
+    async fn endpointless_hub_404_remains_explicitly_compatible() {
+        let (url, task) = serve(axum::Router::new()).await;
+        ApiClient::new(&url, Some("test-token"))
+            .ensure_server_compatible()
+            .await
+            .unwrap();
+        task.abort();
+    }
 }

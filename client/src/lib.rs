@@ -21,6 +21,7 @@ pub mod tray;
 pub mod tray_state;
 pub mod watch;
 
+pub use agent::{inbox, send_message, signals_since};
 pub use api::ApiClient;
 pub use commands::{
     do_cat, do_hydrate, do_pull_only, do_push_only, do_status, do_sync, prune_ignored, CatResult,
@@ -31,9 +32,11 @@ pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
 pub use conflicts::{resolve_conflict, ResolveKeep};
 pub use ctx::SyncCtx;
 pub use feanorfs_agent_core::{
-    check_agent, clean_agent, commit_agent, land_agent, list_agents, refresh_agent,
-    refresh_agent_with_options, spawn_agent, LandOptions, RefreshOptions, Runtime, SpawnOptions,
-    Workspace,
+    check_agent, clean_agent, commit_agent, integrator_assign, integrator_observe,
+    integrator_resume, integrator_revoke, integrator_status, land_agent, list_agents,
+    materialize_conflicts, refresh_agent, refresh_agent_with_options, spawn_agent,
+    IntegratorObserveOptions, LandOptions, RefreshOptions, Runtime, SpawnOptions, Workspace,
+    MIN_SUPPORTED_SERVER_VERSION,
 };
 pub use feanorfs_common::{
     decode_invite, encode_invite, looks_like_invite, WorkspaceInvite, INVITE_PREFIX,
@@ -47,8 +50,19 @@ pub use feanorfs_common::{
     AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, SpawnResult,
 };
 pub use feanorfs_common::{
+    AgentInboxQuery, AgentInboxResult, AgentMessage, AgentMessageInput, AgentMessageKind,
+    AgentSendResult,
+};
+pub use feanorfs_common::{
     ConflictKeepResult, ConflictShowResult, RecentWorkspaceEntry, RecentWorkspacesResult,
-    TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayStatusResult,
+    TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayStatusResult, WorkerStatusSnapshot,
+};
+pub use feanorfs_common::{
+    ConflictMaterializeEntry, ConflictMaterializeResult, EligibilityResult, IntegratorAssignInput,
+    IntegratorAssignResult, IntegratorAssignmentState, IntegratorAttempt, IntegratorAttemptState,
+    IntegratorAttemptStatus, IntegratorCandidate, IntegratorDigest, IntegratorDraw,
+    IntegratorObserveResult, IntegratorOutcomeState, IntegratorProfile, IntegratorStatusResult,
+    VerificationStatus, VerificationSummary,
 };
 pub use hub_transfer::{transfer_hub, HubTransferResult};
 pub use join_preflight::{preview_join, JoinPathGroup, JoinPreflight};
@@ -64,6 +78,7 @@ pub use recent::{
 };
 pub use recovery::{export_recovery_kit, open_recovery_kit};
 pub use tray::{build_conflict_show, do_tray_status, invalidate_agent_cache};
+pub use tray::{do_tray_status_with, invalidate_worker_status, publish_worker_status};
 pub use tray_state::{
     clear_watch_pid, is_paused, is_syncing, is_watching, set_paused, write_watch_pid,
 };
@@ -88,7 +103,9 @@ pub async fn open_api_client(
     config: &crate::local::Config,
 ) -> Result<feanorfs_agent_core::ApiClient> {
     crate::migrate_sqlite::migrate_workspace_stores(workspace_root).await?;
-    crate::endpoint::open(workspace_root, config).await
+    let api = crate::endpoint::open(workspace_root, config).await?;
+    api.ensure_server_compatible().await?;
+    Ok(api)
 }
 
 /// Open the configured relay transport directly after running mandatory local
@@ -102,7 +119,9 @@ pub async fn open_relay_api_client(
         anyhow::bail!("workspace has no opaque relay configured");
     }
     crate::migrate_sqlite::migrate_workspace_stores(workspace_root).await?;
-    feanorfs_agent_core::ApiClient::from_config(workspace_root, config).await
+    let api = feanorfs_agent_core::ApiClient::from_config(workspace_root, config).await?;
+    api.ensure_server_compatible().await?;
+    Ok(api)
 }
 
 // Back-compat type alias

@@ -15,7 +15,7 @@ CLIENT_A="$SMOKE_ROOT/client-a"
 CLIENT_B="$SMOKE_ROOT/client-b"
 PORT=13030
 TOKEN="smoke-server-token"
-E2EE="smoke-e2ee-0123456789abcdef0123456789abcdef0123456789abcdef01"
+E2EE="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 WS="smoke-ws"
 SERVER_PID=""
 

@@ -1,13 +1,14 @@
 use anyhow::Context as _;
 use clap::Subcommand;
 use serde::Serialize;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::start::{finish_sync_watch, WatchMode};
-use super::util::{output_json, record_service_identity, service_identity_matches};
+use super::supervisor::{self};
+use super::util::output_json;
 
-const LABEL_PREFIX: &str = "com.feanorfs.sync";
+/// Background state of a managed component (workspace, hub, tray, supervisor).
+pub(crate) use supervisor::ServiceState as BackgroundStatus;
 
 #[derive(Subcommand)]
 pub enum ServiceAction {
@@ -42,17 +43,12 @@ pub enum ServiceAction {
     /// Run the supervised private hub
     #[command(hide = true)]
     HubRun { data_dir: PathBuf },
+    /// Run the single background supervisor job that owns every worker
+    #[command(hide = true)]
+    Supervise,
     /// Refresh managed jobs after replacing the installed executables
     #[command(hide = true)]
     RefreshInstallation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum BackgroundStatus {
-    NotInstalled,
-    Running,
-    Stopped,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,15 +70,10 @@ struct InstallationRefreshResult {
     tray: Option<BackgroundStatus>,
 }
 
-fn installation_changed(status: BackgroundStatus, installed_program_matches: bool) -> bool {
-    status == BackgroundStatus::NotInstalled || !installed_program_matches
-}
-
 #[derive(Debug, Clone)]
 struct ServiceSpec {
     workspace: PathBuf,
     program: PathBuf,
-    label: String,
 }
 
 impl ServiceSpec {
@@ -96,36 +87,10 @@ impl ServiceSpec {
                 workspace.display()
             )
         })?;
-        let digest = blake3::hash(workspace.to_string_lossy().as_bytes());
-        let encoded_digest = digest.to_hex();
-        let suffix = &encoded_digest.as_str()[..16];
         Ok(Self {
             workspace,
             program: std::env::current_exe().context("locate the feanorfs executable")?,
-            label: format!("{LABEL_PREFIX}-{suffix}"),
         })
-    }
-
-    fn worker_args(&self) -> Vec<OsString> {
-        vec![
-            OsString::from("service"),
-            OsString::from("run"),
-            self.workspace.as_os_str().to_owned(),
-        ]
-    }
-
-    fn marker_path(&self) -> anyhow::Result<PathBuf> {
-        Ok(feanorfs_agent_core::ensure_workspace_state(&self.workspace)?.join("service-program"))
-    }
-
-    fn installed_program_matches(&self) -> bool {
-        self.marker_path()
-            .is_ok_and(|path| service_identity_matches(&path, &[&self.program]))
-    }
-
-    fn record_installed_program(&self) -> anyhow::Result<()> {
-        record_service_identity(&self.marker_path()?, &[&self.program])
-            .context("record automatic sync executable")
     }
 }
 
@@ -138,32 +103,30 @@ pub async fn run(current_dir: &Path, action: ServiceAction, json: bool) -> anyho
             let workspace = std::env::current_dir()?;
             finish_sync_watch(&workspace, WatchMode::Foreground).await
         }
+        ServiceAction::Supervise => supervisor::run_supervisor().await,
         ServiceAction::Install { folder } => {
             let result = install_result(&folder.unwrap_or_else(|| current_dir.to_path_buf()))?;
             print_result(&result, json)
         }
         ServiceAction::Status { folder } => {
             let spec = ServiceSpec::load(&folder.unwrap_or_else(|| current_dir.to_path_buf()))?;
-            let result = result("status", &spec, platform_status(&spec)?);
-            print_result(&result, json)
+            let status = supervisor::status_for_workspace(&spec.workspace)?;
+            print_result(&result("status", &spec, status), json)
         }
         ServiceAction::Start { folder } => {
             let spec = ServiceSpec::load(&folder.unwrap_or_else(|| current_dir.to_path_buf()))?;
-            let status = platform_start(&spec)?;
-            let result = result("start", &spec, status);
-            print_result(&result, json)
+            let status = supervisor::start_workspace(&spec.workspace)?;
+            print_result(&result("start", &spec, status), json)
         }
         ServiceAction::Stop { folder } => {
             let spec = ServiceSpec::load(&folder.unwrap_or_else(|| current_dir.to_path_buf()))?;
-            let status = platform_stop(&spec)?;
-            let result = result("stop", &spec, status);
-            print_result(&result, json)
+            let status = supervisor::stop_workspace(&spec.workspace)?;
+            print_result(&result("stop", &spec, status), json)
         }
         ServiceAction::Uninstall { folder } => {
             let spec = ServiceSpec::load(&folder.unwrap_or_else(|| current_dir.to_path_buf()))?;
-            let status = platform_uninstall(&spec)?;
-            let result = result("uninstall", &spec, status);
-            print_result(&result, json)
+            let status = supervisor::uninstall_workspace(&spec.workspace)?;
+            print_result(&result("uninstall", &spec, status), json)
         }
         ServiceAction::RefreshInstallation => {
             let result = refresh_installation().await?;
@@ -194,13 +157,14 @@ pub async fn run(current_dir: &Path, action: ServiceAction, json: bool) -> anyho
 
 async fn refresh_installation() -> anyhow::Result<InstallationRefreshResult> {
     let recent = feanorfs_client::list_recent_workspaces()?;
-    let mut workspaces_restarted = 0;
     let mut unavailable_workspaces_skipped = 0;
     let mut private_hub_restarted = false;
     let mut tray_spec = None;
 
-    for entry in recent.workspaces {
-        let workspace = PathBuf::from(entry.path);
+    // Legacy per-component jobs are converted by ensure_supervisor_running()
+    // below, but only after the supervisor job is proven running.
+    for entry in &recent.workspaces {
+        let workspace = PathBuf::from(&entry.path);
         if !workspace.is_dir() {
             unavailable_workspaces_skipped += 1;
             continue;
@@ -208,12 +172,32 @@ async fn refresh_installation() -> anyhow::Result<InstallationRefreshResult> {
         if !feanorfs_agent_core::workspace_is_configured(&workspace) {
             continue;
         }
-        let config = feanorfs_client::load_config(&workspace).with_context(|| {
-            format!(
-                "load existing workspace while refreshing {}",
-                workspace.display()
-            )
-        })?;
+        supervisor::add_workspace(&workspace)?;
+        let spec = ServiceSpec::load(&workspace)?;
+        tray_spec.get_or_insert(spec);
+    }
+
+    // The supervisor job is the only background item; restart it when the
+    // installed executable changed, then ensure the owned private hub and the
+    // tray are managed by it.
+    let supervisor_restarted = supervisor::ensure_supervisor_running()?;
+    let tray = match tray_spec.as_ref() {
+        Some(spec) => install_tray_if_available(spec)?,
+        None => {
+            let fallback = ServiceSpec {
+                workspace: std::env::current_dir().context("locate installer working directory")?,
+                program: std::env::current_exe().context("locate the feanorfs executable")?,
+            };
+            install_tray_if_available(&fallback)?
+        }
+    };
+
+    for entry in &recent.workspaces {
+        let workspace = PathBuf::from(&entry.path);
+        if !workspace.is_dir() || !feanorfs_agent_core::workspace_is_configured(&workspace) {
+            continue;
+        }
+        let config = feanorfs_client::load_config(&workspace)?;
         if !private_hub_restarted
             && config.tls_ca_pem.is_some()
             && super::hub_service::owns_workspace(&config)
@@ -223,28 +207,18 @@ async fn refresh_installation() -> anyhow::Result<InstallationRefreshResult> {
                 .context("refresh automatic private hub after installation")?;
             private_hub_restarted = true;
         }
-
-        let spec = ServiceSpec::load(&workspace)?;
-        let status = platform_status(&spec)?;
-        if !installation_changed(status, spec.installed_program_matches()) {
-            tray_spec.get_or_insert(spec);
-            continue;
-        }
-        if status == BackgroundStatus::Running {
-            platform_stop(&spec).context("stop previous automatic sync executable")?;
-        }
-        platform_install_and_start(&spec).context("refresh automatic sync executable")?;
-        workspaces_restarted += 1;
-        tray_spec.get_or_insert(spec);
+    }
+    if supervisor_restarted {
+        private_hub_restarted = true;
     }
 
-    let fallback_spec = ServiceSpec {
-        workspace: std::env::current_dir().context("locate installer working directory")?,
-        program: std::env::current_exe().context("locate the feanorfs executable")?,
-        label: "com.feanorfs.installation-refresh".into(),
-    };
-    let tray = install_tray_if_available(tray_spec.as_ref().unwrap_or(&fallback_spec))
-        .context("refresh system tray executable")?;
+    let mut workspaces_restarted = 0;
+    for workspace in supervisor::registered_workspaces()? {
+        if supervisor::wait_for_workspace_child(&workspace, supervisor::READY_TIMEOUT).is_ok() {
+            workspaces_restarted += 1;
+        }
+    }
+
     Ok(InstallationRefreshResult {
         workspaces_restarted,
         unavailable_workspaces_skipped,
@@ -255,7 +229,8 @@ async fn refresh_installation() -> anyhow::Result<InstallationRefreshResult> {
 
 fn install_result(workspace: &Path) -> anyhow::Result<ServiceResult> {
     let spec = ServiceSpec::load(workspace)?;
-    let status = platform_install_and_start(&spec).context("install automatic background sync")?;
+    let status = supervisor::install_workspace(&spec.workspace)
+        .context("install automatic background sync")?;
     let mut result = result("install", &spec, status);
     result.tray = install_tray_if_available(&spec).context("install the FeanorFS system tray")?;
     Ok(result)
@@ -263,7 +238,7 @@ fn install_result(workspace: &Path) -> anyhow::Result<ServiceResult> {
 
 pub(crate) fn install_and_start(workspace: &Path) -> anyhow::Result<()> {
     let spec = ServiceSpec::load(workspace)?;
-    let status = platform_install_and_start(&spec).map_err(|error| {
+    let status = supervisor::install_workspace(&spec.workspace).map_err(|error| {
         anyhow::anyhow!(
             "Initial sync completed, but automatic background sync could not be installed. Rerun `feanorfs start -- {}` to retry this stage; the completed sync and encrypted workspace identity will be preserved. Details: {error:#}",
             spec.workspace.display()
@@ -279,7 +254,7 @@ pub(crate) fn install_and_start(workspace: &Path) -> anyhow::Result<()> {
     let result = ServiceResult {
         action: "install",
         workspace: spec.workspace.display().to_string(),
-        service: spec.label,
+        service: supervisor::LABEL.into(),
         status,
         tray,
     };
@@ -294,42 +269,29 @@ pub(crate) fn install_and_start(workspace: &Path) -> anyhow::Result<()> {
 
 pub(crate) fn stop_for_start(workspace: &Path) -> anyhow::Result<bool> {
     let spec = ServiceSpec::load(workspace)?;
-    if platform_status(&spec)? != BackgroundStatus::Running {
+    if supervisor::status_for_workspace(&spec.workspace)? != BackgroundStatus::Running {
         return Ok(false);
     }
-    platform_stop(&spec)?;
+    supervisor::stop_workspace(&spec.workspace)?;
     Ok(true)
 }
 
 pub(crate) fn restore_after_failed_start(workspace: &Path) -> anyhow::Result<()> {
     let spec = ServiceSpec::load(workspace)?;
-    let _ = platform_install_and_start(&spec)?;
+    let _ = supervisor::start_workspace(&spec.workspace)?;
     Ok(())
 }
 
 pub(crate) fn status_for_workspace(workspace: &Path) -> anyhow::Result<BackgroundStatus> {
     let spec = ServiceSpec::load(workspace)?;
-    platform_status(&spec)
-}
-
-fn wait_for_managed_service_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if platform_status(spec)? == BackgroundStatus::Running {
-            return Ok(BackgroundStatus::Running);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    anyhow::bail!(
-        "automatic sync did not reach the running state within 5 seconds; check `feanorfs service status` and retry `feanorfs start`"
-    );
+    supervisor::status_for_workspace(&spec.workspace)
 }
 
 /// Stop and uninstall automatic sync for the consumer-facing `feanorfs stop` flow.
 /// The workspace metadata stays in place so `feanorfs start` can resume later.
 pub(crate) fn uninstall_for_workspace_stop(workspace: &Path) -> anyhow::Result<()> {
     let spec = ServiceSpec::load(workspace)?;
-    let status = platform_status(&spec)?;
+    let status = supervisor::status_for_workspace(&spec.workspace)?;
     let active = feanorfs_client::is_watching(&spec.workspace)
         || feanorfs_client::lock::is_sync_lock_active(&spec.workspace);
     if active && status != BackgroundStatus::Running {
@@ -338,17 +300,12 @@ pub(crate) fn uninstall_for_workspace_stop(workspace: &Path) -> anyhow::Result<(
         );
     }
 
-    let _ = platform_uninstall(&spec)?;
+    let _ = supervisor::uninstall_workspace(&spec.workspace)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if !feanorfs_client::is_watching(&spec.workspace)
             && !feanorfs_client::lock::is_sync_lock_active(&spec.workspace)
         {
-            match std::fs::remove_file(spec.marker_path()?) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("remove automatic sync identity marker"),
-            }
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -362,7 +319,7 @@ fn result(action: &'static str, spec: &ServiceSpec, status: BackgroundStatus) ->
     ServiceResult {
         action,
         workspace: spec.workspace.display().to_string(),
-        service: spec.label.clone(),
+        service: supervisor::LABEL.into(),
         status,
         tray: None,
     }
@@ -384,6 +341,29 @@ fn print_result(result: &ServiceResult, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Locate the desktop tray executable for a FeanorFS installation, preferring
+/// the explicit override, then the directory containing `feanorfs_program`,
+/// then the packaged macOS app bundle, then `PATH`.
+pub(crate) fn find_tray_program(feanorfs_program: &Path) -> Option<PathBuf> {
+    let binary_name = format!("feanorfs-tray{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("FEANORFS_TRAY_BIN") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(parent) = feanorfs_program.parent() {
+        candidates.push(parent.join(&binary_name));
+    }
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from(
+        "/Applications/FeanorFS.app/Contents/MacOS/feanorfs-tray",
+    ));
+    if let Ok(path) = which::which(&binary_name) {
+        candidates.push(path);
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(target_os = "windows")]
 #[derive(Debug, Clone)]
 struct TrayServiceSpec {
     program: PathBuf,
@@ -391,24 +371,10 @@ struct TrayServiceSpec {
     marker: PathBuf,
 }
 
+#[cfg(target_os = "windows")]
 impl TrayServiceSpec {
     fn find(spec: &ServiceSpec) -> anyhow::Result<Option<Self>> {
-        let binary_name = format!("feanorfs-tray{}", std::env::consts::EXE_SUFFIX);
-        let mut candidates = Vec::new();
-        if let Some(path) = std::env::var_os("FEANORFS_TRAY_BIN") {
-            candidates.push(PathBuf::from(path));
-        }
-        if let Some(parent) = spec.program.parent() {
-            candidates.push(parent.join(&binary_name));
-        }
-        #[cfg(target_os = "macos")]
-        candidates.push(PathBuf::from(
-            "/Applications/FeanorFS.app/Contents/MacOS/feanorfs-tray",
-        ));
-        if let Ok(path) = which::which(&binary_name) {
-            candidates.push(path);
-        }
-        let Some(program) = candidates.into_iter().find(|path| path.is_file()) else {
+        let Some(program) = find_tray_program(&spec.program) else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -419,107 +385,39 @@ impl TrayServiceSpec {
     }
 
     fn installed_programs_match(&self) -> bool {
-        service_identity_matches(&self.marker, &[&self.program, &self.feanorfs_program])
+        super::util::service_identity_matches(
+            &self.marker,
+            &[&self.program, &self.feanorfs_program],
+        )
     }
 
     fn record_installed_programs(&self) -> anyhow::Result<()> {
-        record_service_identity(&self.marker, &[&self.program, &self.feanorfs_program])
+        super::util::record_service_identity(&self.marker, &[&self.program, &self.feanorfs_program])
             .context("record tray service executables")
     }
 }
 
 fn install_tray_if_available(spec: &ServiceSpec) -> anyhow::Result<Option<BackgroundStatus>> {
-    let Some(tray) = TrayServiceSpec::find(spec)? else {
-        return Ok(None);
-    };
-    install_tray_service(&tray).map(Some)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn install_tray_service(spec: &TrayServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    use service_manager::{
-        RestartPolicy, ServiceInstallCtx, ServiceStartCtx, ServiceStatus, ServiceStatusCtx,
-    };
-
-    let manager = manager()?;
-    let label: service_manager::ServiceLabel = "com.feanorfs.tray"
-        .parse()
-        .context("build tray service label")?;
-    let status = manager
-        .status(ServiceStatusCtx {
-            label: label.clone(),
-        })
-        .context("read tray service status")?;
-    let install_required = status == ServiceStatus::NotInstalled
-        || !tray_service_configuration_matches(&spec.program, &spec.feanorfs_program)
-        || !spec.installed_programs_match();
-    if install_required {
-        if status == ServiceStatus::Running {
-            manager
-                .stop(service_manager::ServiceStopCtx {
-                    label: label.clone(),
-                })
-                .context("stop the previous FeanorFS tray during upgrade")?;
+    #[cfg(target_os = "windows")]
+    {
+        let Some(tray) = TrayServiceSpec::find(spec)? else {
+            return Ok(None);
+        };
+        return install_tray_service(&tray).map(Some);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS and Linux run the tray inside the single supervisor job, so
+        // there is no separate tray background item to install.
+        if find_tray_program(&spec.program).is_none() {
+            return Ok(None);
         }
-        manager
-            .install(ServiceInstallCtx {
-                label: label.clone(),
-                program: spec.program.clone(),
-                args: Vec::new(),
-                contents: None,
-                username: None,
-                working_directory: None,
-                environment: Some(vec![(
-                    "FEANORFS_BIN".into(),
-                    spec.feanorfs_program.display().to_string(),
-                )]),
-                autostart: true,
-                restart_policy: RestartPolicy::OnFailure {
-                    delay_secs: None,
-                    max_retries: None,
-                    reset_after_secs: None,
-                },
-            })
-            .context("install FeanorFS tray at login")?;
-        spec.record_installed_programs()?;
-    }
-    if install_required || status != ServiceStatus::Running {
-        manager
-            .start(ServiceStartCtx { label })
-            .context("start FeanorFS tray")?;
-    }
-    Ok(BackgroundStatus::Running)
-}
-
-#[cfg(target_os = "macos")]
-fn tray_service_configuration_matches(tray_program: &Path, feanorfs_program: &Path) -> bool {
-    let Some(home) = std::env::var_os("HOME") else {
-        return false;
-    };
-    let plist = PathBuf::from(home).join("Library/LaunchAgents/com.feanorfs.tray.plist");
-    let installed_tray = launchd_plist_string(&plist, "ProgramArguments.0");
-    let installed_feanorfs = launchd_plist_string(&plist, "EnvironmentVariables.FEANORFS_BIN");
-    match (installed_tray, installed_feanorfs) {
-        (Some(tray), Some(feanorfs)) => {
-            paths_equivalent(Path::new(&tray), tray_program)
-                && paths_equivalent(Path::new(&feanorfs), feanorfs_program)
+        if supervisor::supervisor_job_running()? {
+            Ok(Some(BackgroundStatus::Running))
+        } else {
+            Ok(Some(BackgroundStatus::Stopped))
         }
-        _ => false,
     }
-}
-
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-fn tray_service_configuration_matches(_tray_program: &Path, _feanorfs_program: &Path) -> bool {
-    true
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_tray_task_action(spec: &TrayServiceSpec) -> anyhow::Result<(String, String)> {
-    let program = spec.program.display().to_string();
-    if program.contains('"') {
-        anyhow::bail!("Windows paths containing double quotes cannot be installed as tasks");
-    }
-    Ok((program, String::new()))
 }
 
 #[cfg(target_os = "windows")]
@@ -548,222 +446,13 @@ fn install_tray_service(spec: &TrayServiceSpec) -> anyhow::Result<BackgroundStat
     Ok(BackgroundStatus::Running)
 }
 
-#[cfg(target_os = "macos")]
-fn launchd_plist_string(plist: &Path, key: &str) -> Option<String> {
-    let output = std::process::Command::new("/usr/bin/plutil")
-        .args(["-extract", key, "raw", "-o", "-"])
-        .arg(plist)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-#[cfg(target_os = "macos")]
-fn paths_equivalent(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn manager() -> anyhow::Result<Box<dyn service_manager::ServiceManager>> {
-    use service_manager::{ServiceLevel, ServiceManager};
-    let mut manager =
-        <dyn ServiceManager>::native().context("detect operating-system service manager")?;
-    manager
-        .set_level(ServiceLevel::User)
-        .context("select per-user service management")?;
-    Ok(manager)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn native_label(spec: &ServiceSpec) -> anyhow::Result<service_manager::ServiceLabel> {
-    spec.label.parse().context("build background service label")
-}
-
-#[cfg(target_os = "macos")]
-fn launchd_plist_path(spec: &ServiceSpec) -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join("Library/LaunchAgents")
-        .join(format!("{}.plist", spec.label)))
-}
-
-#[cfg(target_os = "macos")]
-fn launchctl_plist(command: &str, spec: &ServiceSpec) -> anyhow::Result<()> {
-    let plist = launchd_plist_path(spec)?;
-    let output = std::process::Command::new("launchctl")
-        .arg(command)
-        .arg(&plist)
-        .output()
-        .with_context(|| format!("launchctl {command} {}", plist.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "launchctl {command}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn platform_status(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    use service_manager::{ServiceStatus, ServiceStatusCtx};
-    let status = manager()?
-        .status(ServiceStatusCtx {
-            label: native_label(spec)?,
-        })
-        .context("read background service status")?;
-    Ok(match status {
-        #[cfg(target_os = "macos")]
-        ServiceStatus::NotInstalled if launchd_plist_path(spec)?.is_file() => {
-            BackgroundStatus::Stopped
-        }
-        ServiceStatus::NotInstalled => BackgroundStatus::NotInstalled,
-        ServiceStatus::Running => BackgroundStatus::Running,
-        ServiceStatus::Stopped(_) => BackgroundStatus::Stopped,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn start_managed_service(spec: &ServiceSpec) -> anyhow::Result<()> {
-    use service_manager::{ServiceStartCtx, ServiceStatus, ServiceStatusCtx};
-    let manager = manager()?;
-    let label = native_label(spec)?;
-    let status = manager
-        .status(ServiceStatusCtx {
-            label: label.clone(),
-        })
-        .context("read automatic sync status")?;
-    if status == ServiceStatus::NotInstalled && launchd_plist_path(spec)?.is_file() {
-        return launchctl_plist("load", spec).context("load automatic sync");
-    }
-    manager
-        .start(ServiceStartCtx { label })
-        .context("start automatic sync")
-}
-
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-fn start_managed_service(spec: &ServiceSpec) -> anyhow::Result<()> {
-    use service_manager::ServiceStartCtx;
-    manager()?
-        .start(ServiceStartCtx {
-            label: native_label(spec)?,
-        })
-        .context("start automatic sync")
-}
-
-#[cfg(not(target_os = "windows"))]
-fn platform_install_and_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    use service_manager::{RestartPolicy, ServiceInstallCtx, ServiceStartCtx};
-    let manager = manager()?;
-    let label = native_label(spec)?;
-    let status = platform_status(spec)?;
-    let install_required =
-        status == BackgroundStatus::NotInstalled || !spec.installed_program_matches();
-    if install_required {
-        manager
-            .install(ServiceInstallCtx {
-                label: label.clone(),
-                program: spec.program.clone(),
-                args: spec.worker_args(),
-                contents: None,
-                username: None,
-                working_directory: Some(spec.workspace.clone()),
-                environment: None,
-                autostart: true,
-                restart_policy: RestartPolicy::OnFailure {
-                    delay_secs: None,
-                    max_retries: None,
-                    reset_after_secs: None,
-                },
-            })
-            .context("install automatic sync")?;
-        spec.record_installed_program()?;
-        manager
-            .start(ServiceStartCtx { label })
-            .context("start automatic sync")?;
-    } else if status == BackgroundStatus::Stopped {
-        start_managed_service(spec)?;
-    }
-    wait_for_managed_service_start(spec)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn platform_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    if platform_status(spec)? == BackgroundStatus::NotInstalled {
-        anyhow::bail!("Automatic sync is not installed; run `feanorfs service install`");
-    }
-    start_managed_service(spec)?;
-    wait_for_managed_service_start(spec)
-}
-
-#[cfg(target_os = "macos")]
-fn platform_stop(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    match platform_status(spec)? {
-        BackgroundStatus::NotInstalled => return Ok(BackgroundStatus::NotInstalled),
-        BackgroundStatus::Stopped => return Ok(BackgroundStatus::Stopped),
-        BackgroundStatus::Running => {}
-    }
-    launchctl_plist("unload", spec).context("stop automatic sync")?;
-    wait_for_managed_service_stop(spec)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn wait_for_managed_service_stop(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if platform_status(spec)? != BackgroundStatus::Running
-            && !feanorfs_client::lock::is_sync_lock_active(&spec.workspace)
-        {
-            return Ok(BackgroundStatus::Stopped);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    anyhow::bail!(
-        "automatic sync did not stop within 5 seconds; retry after the current sync finishes"
-    );
-}
-
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-fn platform_stop(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    use service_manager::ServiceStopCtx;
-    match platform_status(spec)? {
-        BackgroundStatus::NotInstalled => return Ok(BackgroundStatus::NotInstalled),
-        BackgroundStatus::Stopped => return Ok(BackgroundStatus::Stopped),
-        BackgroundStatus::Running => {}
-    }
-    manager()?
-        .stop(ServiceStopCtx {
-            label: native_label(spec)?,
-        })
-        .context("stop automatic sync")?;
-    wait_for_managed_service_stop(spec)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn platform_uninstall(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    use service_manager::ServiceUninstallCtx;
-    if platform_status(spec)? == BackgroundStatus::NotInstalled {
-        return Ok(BackgroundStatus::NotInstalled);
-    }
-    let _ = platform_stop(spec)?;
-    manager()?
-        .uninstall(ServiceUninstallCtx {
-            label: native_label(spec)?,
-        })
-        .context("uninstall automatic sync")?;
-    Ok(BackgroundStatus::NotInstalled)
-}
-
 #[cfg(target_os = "windows")]
-fn task_name(spec: &ServiceSpec) -> String {
-    format!("FeanorFS\\{}", spec.label)
+fn windows_tray_task_action(spec: &TrayServiceSpec) -> anyhow::Result<(String, String)> {
+    let program = spec.program.display().to_string();
+    if program.contains('"') {
+        anyhow::bail!("Windows paths containing double quotes cannot be installed as tasks");
+    }
+    Ok((program, String::new()))
 }
 
 #[cfg(target_os = "windows")]
@@ -781,86 +470,12 @@ fn windows_task_status(
     )
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn windows_task_action(spec: &ServiceSpec) -> anyhow::Result<(String, String)> {
-    let program = spec.program.display().to_string();
-    let workspace = spec.workspace.display().to_string();
-    if program.contains('"') || workspace.contains('"') {
-        anyhow::bail!("Windows paths containing double quotes cannot be installed as tasks");
-    }
-    Ok((program, format!("service run \"{workspace}\"")))
-}
-
 #[cfg(target_os = "windows")]
 fn schtasks(args: &[&str]) -> anyhow::Result<std::process::Output> {
-    let output = std::process::Command::new("schtasks.exe")
+    std::process::Command::new("schtasks.exe")
         .args(args)
         .output()
-        .context("run Windows Task Scheduler")?;
-    Ok(output)
-}
-
-#[cfg(target_os = "windows")]
-fn platform_status(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    windows_task_status("\\FeanorFS\\", &spec.label, &task_name(spec))
-}
-
-#[cfg(target_os = "windows")]
-fn platform_install_and_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    if platform_status(spec)? == BackgroundStatus::NotInstalled || !spec.installed_program_matches()
-    {
-        let (program, arguments) = windows_task_action(spec)?;
-        super::util::windows_register_task(
-            "\\FeanorFS\\",
-            &spec.label,
-            &program,
-            &arguments,
-            false,
-        )
-        .context("install automatic sync")?;
-        spec.record_installed_program()?;
-    }
-    platform_start(spec)
-}
-
-#[cfg(target_os = "windows")]
-fn platform_start(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    if platform_status(spec)? == BackgroundStatus::NotInstalled {
-        anyhow::bail!("Automatic sync is not installed; run `feanorfs service install`");
-    }
-    let output = schtasks(&["/Run", "/TN", &task_name(spec)])?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "start automatic sync: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    wait_for_managed_service_start(spec)
-}
-
-#[cfg(target_os = "windows")]
-fn platform_stop(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    if platform_status(spec)? == BackgroundStatus::NotInstalled {
-        return Ok(BackgroundStatus::NotInstalled);
-    }
-    let _ = schtasks(&["/End", "/TN", &task_name(spec)]);
-    Ok(BackgroundStatus::Stopped)
-}
-
-#[cfg(target_os = "windows")]
-fn platform_uninstall(spec: &ServiceSpec) -> anyhow::Result<BackgroundStatus> {
-    if platform_status(spec)? == BackgroundStatus::NotInstalled {
-        return Ok(BackgroundStatus::NotInstalled);
-    }
-    let _ = platform_stop(spec)?;
-    let output = schtasks(&["/Delete", "/TN", &task_name(spec), "/F"])?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "uninstall automatic sync: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(BackgroundStatus::NotInstalled)
+        .context("run Windows Task Scheduler")
 }
 
 #[cfg(test)]
@@ -868,71 +483,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn installation_refresh_skips_unchanged_jobs() {
-        assert!(!installation_changed(BackgroundStatus::Running, true));
-        assert!(!installation_changed(BackgroundStatus::Stopped, true));
-        assert!(installation_changed(BackgroundStatus::Running, false));
-        assert!(installation_changed(BackgroundStatus::Stopped, false));
-        assert!(installation_changed(BackgroundStatus::NotInstalled, true));
+    fn supervisor_job_is_the_single_background_label() {
+        assert_eq!(supervisor::LABEL, "com.feanorfs.agent");
     }
 
     #[test]
-    fn worker_command_contains_only_workspace_location() {
+    fn tray_discovery_prefers_override_then_colocated_then_app_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_tray = dir.path().join("feanorfs-tray");
+        std::fs::write(&fake_tray, "binary").unwrap();
+        std::env::set_var("FEANORFS_TRAY_BIN", &fake_tray);
+        let found = find_tray_program(Path::new("/usr/local/bin/feanorfs"));
+        std::env::remove_var("FEANORFS_TRAY_BIN");
+        assert_eq!(found, Some(fake_tray));
+    }
+
+    #[test]
+    fn service_result_reports_the_supervisor_label() {
         let spec = ServiceSpec {
             workspace: PathBuf::from("/tmp/feanor workspace"),
             program: PathBuf::from("/usr/local/bin/feanorfs"),
-            label: "com.feanorfs.sync-test".into(),
         };
-        assert_eq!(
-            spec.worker_args(),
-            vec!["service", "run", "/tmp/feanor workspace"]
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>()
-        );
-        let (program, arguments) = windows_task_action(&spec).unwrap();
-        assert_eq!(program, "/usr/local/bin/feanorfs");
-        assert_eq!(arguments, "service run \"/tmp/feanor workspace\"");
-
-        let tray = TrayServiceSpec {
-            program: PathBuf::from("C:\\Program Files\\FeanorFS\\feanorfs-tray.exe"),
-            feanorfs_program: PathBuf::from("C:\\Program Files\\FeanorFS\\feanorfs.exe"),
-            marker: PathBuf::from("C:\\Users\\test\\.feanorfs\\tray-service-program"),
-        };
-        let (tray_program, tray_arguments) = windows_tray_task_action(&tray).unwrap();
-        assert_eq!(
-            tray_program,
-            "C:\\Program Files\\FeanorFS\\feanorfs-tray.exe"
-        );
-        assert!(tray_arguments.is_empty());
-        let tray_action = format!("{tray_program} {tray_arguments}");
-        assert!(!tray_action.contains("token"));
-        assert!(!tray_action.contains("key"));
-        assert!(!tray_action.contains("invite"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn launchd_tray_fields_are_read_without_shell_parsing() {
-        let dir = tempfile::tempdir().unwrap();
-        let plist = dir.path().join("tray.plist");
-        std::fs::write(
-            &plist,
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-<key>ProgramArguments</key><array><string>/Applications/FeanorFS.app/Contents/MacOS/feanorfs-tray</string></array>
-<key>EnvironmentVariables</key><dict><key>FEANORFS_BIN</key><string>/usr/local/bin/feanorfs</string></dict>
-</dict></plist>"#,
-        )
-        .unwrap();
-        assert_eq!(
-            launchd_plist_string(&plist, "ProgramArguments.0").as_deref(),
-            Some("/Applications/FeanorFS.app/Contents/MacOS/feanorfs-tray")
-        );
-        assert_eq!(
-            launchd_plist_string(&plist, "EnvironmentVariables.FEANORFS_BIN").as_deref(),
-            Some("/usr/local/bin/feanorfs")
-        );
-        assert!(launchd_plist_string(&plist, "Missing").is_none());
+        let result = result("status", &spec, BackgroundStatus::Running);
+        assert_eq!(result.service, "com.feanorfs.agent");
+        assert_eq!(result.status, BackgroundStatus::Running);
+        assert_eq!(result.workspace, "/tmp/feanor workspace");
     }
 }

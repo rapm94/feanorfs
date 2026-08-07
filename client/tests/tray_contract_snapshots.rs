@@ -22,3 +22,4 @@ contract_snapshot!(recent_workspaces_json, fixtures::recent_workspaces_json());
 contract_snapshot!(tray_pause_json, fixtures::tray_pause_json());
 contract_snapshot!(conflict_keep_json, fixtures::conflict_keep_json());
 contract_snapshot!(conflict_show_json, fixtures::conflict_show_json());
+contract_snapshot!(worker_status_json, fixtures::worker_status_json());

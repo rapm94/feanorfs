@@ -1,4 +1,4 @@
-use super::util::output_json;
+use super::util::{output_json, terminal_line};
 use feanorfs_client::{load_config, SyncCtx};
 use std::path::Path;
 
@@ -16,17 +16,35 @@ pub async fn log(current_dir: &Path, limit: usize, json: bool) -> anyhow::Result
     for entry in result.entries {
         let id = &entry.snapshot_id[..8];
         let age = relative_age(now.saturating_sub(entry.created_at_ms));
+        let author = terminal_line(&entry.author);
         let message = entry.message.unwrap_or_default();
-        println!(
-            "{id} {age} {} {} path(s){}",
-            entry.author,
-            entry.changed_paths.len(),
-            if message.is_empty() {
-                String::new()
-            } else {
-                format!(" — {message}")
-            }
-        );
+        if let Some(payload) = feanorfs_common::parse_agent_message(&message) {
+            let about = &payload.about_snapshot[..8];
+            let reply = payload
+                .reply_to
+                .as_deref()
+                .map(|id| format!(" reply {}", &id[..8]))
+                .unwrap_or_default();
+            println!(
+                "{id} {age} signal {} -> {} {} about {}{reply}: {}",
+                author,
+                payload.to,
+                payload.kind.as_str(),
+                about,
+                terminal_line(&payload.body)
+            );
+        } else {
+            println!(
+                "{id} {age} {} {} path(s){}",
+                author,
+                entry.changed_paths.len(),
+                if message.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", terminal_line(&message))
+                }
+            );
+        }
     }
     Ok(())
 }

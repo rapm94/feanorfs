@@ -1,12 +1,32 @@
 use anyhow::{Context, Result};
 use feanorfs_common::is_valid_hash;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::fs;
 
 const KEEP_LAST: usize = 50;
+/// Local object cache hygiene runs at most this often per workspace; it is a
+/// bounded cleanup, not a correctness gate.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+static LAST_PRUNE: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
 
 pub(crate) async fn prune(base: &Path) -> Result<()> {
+    {
+        let mut last = LAST_PRUNE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("prune throttle poisoned");
+        let now = Instant::now();
+        if let Some(previous) = last.get(base) {
+            if now.duration_since(*previous) < PRUNE_INTERVAL {
+                return Ok(());
+            }
+        }
+        last.insert(base.to_path_buf(), now);
+    }
     let retention = crate::workspace_layout::retention_age();
     let state = crate::workspace_layout::ensure_workspace_state(base)?;
     let manifests_dir = state.join("manifests");

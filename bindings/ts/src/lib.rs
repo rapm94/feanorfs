@@ -174,6 +174,34 @@ pub async fn undo(root: String, snapshot_id: String) -> Result<String> {
     .await
 }
 
+/// Send an encrypted agent signal. JSON in: `AgentMessageInput`; JSON out: `AgentSendResult`.
+#[napi]
+pub async fn agent_send(root: String, input_json: String) -> Result<String> {
+    run(move || {
+        let input: feanorfs_common::AgentMessageInput = serde_json::from_str(&input_json)
+            .map_err(|error| Error::from_reason(format!("invalid agent_send input: {error}")))?;
+        let result = open(&root)?
+            .send_message(input)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
+    })
+    .await
+}
+
+/// Read agent signals. JSON in: `AgentInboxQuery`; JSON out: `AgentInboxResult`.
+#[napi]
+pub async fn agent_inbox(root: String, query_json: String) -> Result<String> {
+    run(move || {
+        let query: feanorfs_common::AgentInboxQuery = serde_json::from_str(&query_json)
+            .map_err(|error| Error::from_reason(format!("invalid agent_inbox input: {error}")))?;
+        let result = open(&root)?
+            .inbox(query)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
+    })
+    .await
+}
+
 /// keep: 0=local, 1=cloud, 2=both, 3=file (requires filePath)
 #[napi]
 pub async fn conflicts_keep(
@@ -202,6 +230,116 @@ pub async fn conflicts_keep(
             .resolve(&path, keep, file_ref.as_deref())
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(())
+    })
+    .await
+}
+/// Assign one batch to a randomly ranked integrator.
+/// JSON in: `IntegratorAssignInput`; JSON out: `IntegratorAssignResult`.
+#[napi]
+pub async fn integrator_assign(root: String, input_json: String) -> Result<String> {
+    run(move || {
+        let input: feanorfs_common::IntegratorAssignInput = serde_json::from_str(&input_json)
+            .map_err(|error| {
+                Error::from_reason(format!("invalid integrator_assign input: {error}"))
+            })?;
+        let result = open(&root)?
+            .integrator_assign(input)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
+    })
+    .await
+}
+
+/// Read the active integrator assignment (or one by id).
+/// JSON out: `IntegratorStatusResult`.
+#[napi]
+pub async fn integrator_status(root: String, assignment_id: Option<String>) -> Result<String> {
+    run(move || {
+        let result = open(&root)?
+            .integrator_status(assignment_id.as_deref())
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
+    })
+    .await
+}
+
+/// Explicitly revoke the active integrator assignment.
+/// JSON out: `IntegratorStatusResult`.
+#[napi]
+pub async fn integrator_revoke(
+    root: String,
+    assignment_id: String,
+    reason: String,
+) -> Result<String> {
+    run(move || {
+        let result = open(&root)?
+            .integrator_revoke(&assignment_id, &reason)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
+    })
+    .await
+}
+
+/// Resume dispatcher observation after a restart.
+/// Options JSON: object with optional `ack_timeout_ms` and `fallback_on_blocked`;
+/// JSON out: `IntegratorObserveResult`.
+#[napi]
+pub async fn integrator_resume(root: String, options_json: Option<String>) -> Result<String> {
+    run(move || {
+        let (ack_timeout_ms, fallback_on_blocked) = match options_json {
+            None => (None, false),
+            Some(json) => {
+                let value: serde_json::Value = serde_json::from_str(&json).map_err(|error| {
+                    Error::from_reason(format!("invalid integrator_resume options: {error}"))
+                })?;
+                (
+                    value.get("ack_timeout_ms").and_then(|v| v.as_u64()),
+                    value
+                        .get("fallback_on_blocked")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                )
+            }
+        };
+        let result = open(&root)?
+            .integrator_resume(feanorfs_agent_core::IntegratorObserveOptions {
+                ack_timeout_ms,
+                fallback_on_blocked,
+            })
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
+    })
+    .await
+}
+
+/// Materialize the encrypted conflict triple for a snapshot.
+/// JSON in: object with `about_snapshot` and optional `paths`;
+/// JSON out: `ConflictMaterializeResult`.
+#[napi]
+pub async fn conflict_materialize(root: String, input_json: String) -> Result<String> {
+    run(move || {
+        let value: serde_json::Value = serde_json::from_str(&input_json).map_err(|error| {
+            Error::from_reason(format!("invalid conflict_materialize input: {error}"))
+        })?;
+        let about = value
+            .get("about_snapshot")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::from_reason("conflict_materialize requires about_snapshot"))?
+            .to_string();
+        let paths: Vec<String> = value
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let result = open(&root)?
+            .materialize_conflicts(&about, &paths)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
     })
     .await
 }

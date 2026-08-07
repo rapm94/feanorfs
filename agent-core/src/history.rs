@@ -26,19 +26,20 @@ pub async fn log(ctx: &SyncCtx<'_>, limit: usize) -> Result<LogResult> {
             continue;
         }
         let snapshot = snapshots.load_snapshot(&id).await?;
-        let changed_paths = match snapshot.parents.first() {
-            Some(parent) => snapshots
-                .diff_snapshots(parent, &id)
-                .await?
-                .changes
-                .into_iter()
-                .map(|change| change.path)
-                .collect(),
-            None => {
-                let mut paths: Vec<_> = snapshots.load_files(&id).await?.into_keys().collect();
-                paths.sort();
-                paths
+        let changed_paths = if snapshot.parents.is_empty() {
+            let mut paths: Vec<_> = snapshots.load_files(&id).await?.into_keys().collect();
+            paths.sort();
+            paths
+        } else {
+            // Union the diffs across all parents so merge/undo snapshots
+            // report second-parent deltas too.
+            let mut paths = std::collections::BTreeSet::new();
+            for parent in &snapshot.parents {
+                for change in snapshots.diff_snapshots(parent, &id).await?.changes {
+                    paths.insert(change.path);
+                }
             }
+            paths.into_iter().collect()
         };
         pending.extend(snapshot.parents.iter().rev().cloned());
         entries.push(LogEntry {
@@ -68,13 +69,17 @@ pub async fn undo(ctx: &SyncCtx<'_>, selector: &str) -> Result<UndoResult> {
     let restored_snapshot_id = resolve_reachable(&snapshots, &expected, selector).await?;
     let target = snapshots.load_state(&restored_snapshot_id).await?;
     let local_before = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    let state_dir = ctx.state_dir()?;
     for state in local_before.values().filter(|state| !state.deleted) {
         let content = tokio::fs::read(ctx.base.join(&state.path)).await?;
         let (hash, ciphertext) = crate::crypto::seal(&content, ctx.password_str(), &state.path)?;
         anyhow::ensure!(hash == state.hash, "worktree changed during undo");
-        ctx.api
-            .upload_object(ctx.workspace_id(), &hash, ciphertext)
-            .await?;
+        if !crate::upload_registry::known(&state_dir, &hash).await {
+            ctx.api
+                .upload_object(ctx.workspace_id(), &hash, ciphertext)
+                .await?;
+            crate::upload_registry::remember(&state_dir, &hash);
+        }
     }
     let backup = snapshots
         .write(SnapshotInput {
@@ -205,6 +210,7 @@ async fn materialize_and_project(
             delete_local: Vec::new(),
         },
         &projection,
+        false,
     )
     .await?;
     Ok(())

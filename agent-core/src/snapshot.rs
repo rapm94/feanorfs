@@ -262,10 +262,24 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
             .snapshot_reachability(&id, upload_manifest)
             .await?;
         if upload_manifest {
-            self.ctx
+            if let Err(error) = self
+                .ctx
                 .api
                 .upload_manifest(self.ctx.workspace_id(), &id, &hashes)
-                .await?;
+                .await
+            {
+                // The hub validated every referenced blob; a rejection means
+                // some skipped upload is genuinely missing (fresh/restored hub
+                // data or a GC race). Drop the registry so the retry re-uploads
+                // instead of skipping forever, then surface the failure.
+                if let Ok(state_dir) = self.ctx.state_dir() {
+                    let _ = crate::upload_registry::clear(&state_dir).await;
+                }
+                return Err(error);
+            }
+            if let Ok(state_dir) = self.ctx.state_dir() {
+                let _ = crate::upload_registry::record_many(&state_dir, &hashes).await;
+            }
         }
         self.objects.cache_manifest(&id, &hashes).await?;
         Ok(id)

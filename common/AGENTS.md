@@ -2,12 +2,13 @@
 
 ## Purpose
 
-Shared data models, canonical Merkle tree/snapshot objects, sync delta (`compute_sync_delta`), three-way conflict classification (`detect_concurrent_edits`), and crypto (`pack_bytes`/`unpack_bytes` AEAD + legacy `crypt_bytes`) used by both server and client.
+Shared data models, canonical Merkle tree/snapshot objects, sync delta (`compute_sync_delta`), three-way conflict classification (`detect_concurrent_edits`), the canonical integrator-assignment contract (`integrator_contract.rs`: eligibility, auditable ranking, `ffint1` profiles, digest bounds), and crypto (`pack_bytes`/`unpack_bytes` AEAD + legacy `crypt_bytes`) used by both server and client.
 
 ## Ownership
 
 - Crate: `feanorfs-common` (library only; no binary).
 - `release-product-state.txt` is a content-only release-selection carrier maintained by `scripts/update-release-product-state.sh`; it is not compiled or read at runtime.
+- `integrator_contract.rs` — canonical randomized-integrator contract (candidates, eligibility/neutrality, length-prefixed Blake3 ranking, `ffint1` encode/parse, bounded digest). Pure and testable; reused verbatim by CLI, SDK, FFI, TS, and MCP.
 - Public surface: every item in `src/lib.rs` is `pub` and re-exported through downstream crates. Treat the wire types as a binding contract — changing field names or types requires server AND client releases in lockstep.
 - No file system, network, or sqlite dependencies. This crate must remain leaf-only so it can be embedded in both server and client without pulling their heaviest transitive deps.
 

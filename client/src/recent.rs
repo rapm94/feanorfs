@@ -125,12 +125,29 @@ fn remove_workspace(store: &mut RecentStore, path: &str) {
 }
 
 fn workspace_is_available(workspace: &RecentWorkspaceEntry) -> bool {
-    feanorfs_agent_core::workspace_is_configured(Path::new(&workspace.path))
+    workspace_is_available_with(workspace, feanorfs_agent_core::workspace_is_configured)
+}
+
+fn workspace_is_available_with(
+    workspace: &RecentWorkspaceEntry,
+    is_configured: impl Fn(&Path) -> bool,
+) -> bool {
+    // The folder must actually exist: a deleted folder cannot be started even
+    // when its global workspace state (config.json under ~/.feanorfs) survived.
+    let path = Path::new(&workspace.path);
+    path.is_dir() && is_configured(path)
 }
 
 fn forget_unavailable_from_store(store: &mut RecentStore) -> usize {
+    forget_unavailable_from_store_with(store, workspace_is_available)
+}
+
+fn forget_unavailable_from_store_with(
+    store: &mut RecentStore,
+    is_available: impl Fn(&RecentWorkspaceEntry) -> bool,
+) -> usize {
     let before = store.workspaces.len();
-    store.workspaces.retain(workspace_is_available);
+    store.workspaces.retain(is_available);
     if store.active.as_ref().is_some_and(|active| {
         !store
             .workspaces
@@ -196,7 +213,9 @@ pub fn list_recent_workspaces() -> Result<RecentWorkspacesResult> {
     Ok(result_from_store(&load_store(&path)?))
 }
 
-/// Explicitly remove tray entries whose workspace config is unavailable.
+/// Explicitly remove tray entries whose folder is missing or whose workspace
+/// config is unavailable. A deleted folder is always unavailable, even when
+/// its global workspace state survives under `~/.feanorfs`.
 ///
 /// This changes only the recent-workspace registry; it never touches workspace
 /// files, credentials, services, hubs, or remote snapshots.
@@ -270,6 +289,46 @@ mod tests {
 
         assert!(error.to_string().contains("parse recent workspaces"));
         assert_eq!(fs::read(&path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn forgetting_missing_folder_removes_entry_even_when_state_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("deleted");
+        fs::create_dir_all(&folder).unwrap();
+        // The folder is now gone, but simulate surviving global workspace
+        // state: the availability check must still treat it as unavailable
+        // (a checker that claims the path is configured).
+        fs::remove_dir_all(&folder).unwrap();
+        let mut store = RecentStore {
+            active: None,
+            workspaces: vec![entry(&folder.to_string_lossy())],
+        };
+
+        let removed = forget_unavailable_from_store_with(&mut store, |workspace| {
+            workspace_is_available_with(workspace, |_| true)
+        });
+
+        assert_eq!(removed, 1);
+        assert!(store.workspaces.is_empty());
+    }
+
+    #[test]
+    fn forgetting_existing_folder_keeps_configured_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("present");
+        fs::create_dir_all(&folder).unwrap();
+        let mut store = RecentStore {
+            active: None,
+            workspaces: vec![entry(&folder.to_string_lossy())],
+        };
+
+        let removed = forget_unavailable_from_store_with(&mut store, |workspace| {
+            workspace_is_available_with(workspace, |_| true)
+        });
+
+        assert_eq!(removed, 0);
+        assert_eq!(store.workspaces.len(), 1);
     }
 
     #[test]

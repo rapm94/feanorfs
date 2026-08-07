@@ -3,8 +3,8 @@ use clap::Subcommand;
 use feanorfs_client::{
     build_conflict_show,
     conflict_artifacts::{is_binary_content, resolve_artifact, ArtifactRole},
-    conflicts, invalidate_agent_cache, load_config, ClientDb, ConflictKeepResult, ConflictRecord,
-    ConflictResolution, ResolveKeep, SyncCtx,
+    conflicts, invalidate_agent_cache, invalidate_worker_status, load_config, ClientDb,
+    ConflictKeepResult, ConflictRecord, ConflictResolution, ResolveKeep, SyncCtx,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,12 +46,32 @@ pub enum ConflictsAction {
         #[arg(long)]
         open: bool,
     },
+    /// Materialize the encrypted conflict triple for a snapshot on this
+    /// machine (read-only; writes artifacts under private global state and
+    /// registers local pending rows without changing the shared head).
+    Materialize {
+        /// Full reachable format-v3 snapshot whose first-class conflict
+        /// entries are materialized; defaults to the current workspace head.
+        #[arg(long)]
+        about: Option<String>,
+        /// Restrict materialization to these paths (repeatable).
+        #[arg(long = "path")]
+        path: Vec<String>,
+    },
     /// Show resolution history
     #[command(hide = true)]
     History,
     /// Open compare view (legacy — prefer `conflicts show --open`)
     #[command(hide = true)]
     Open { path: String },
+}
+
+fn availability(available: bool) -> &'static str {
+    if available {
+        "available"
+    } else {
+        "absent"
+    }
 }
 
 fn parse_keep_flags(
@@ -111,6 +131,7 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
                     _ => anyhow::bail!("--all requires --local or --cloud"),
                 };
                 invalidate_agent_cache(current_dir);
+                invalidate_worker_status(current_dir);
                 if json {
                     let results: Vec<ConflictKeepResult> = paths
                         .into_iter()
@@ -128,6 +149,7 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
                 let path = path.context("conflict path is required unless --all is used")?;
                 conflicts::resolve_conflict(&ctx, &path, keep, file_path.as_deref()).await?;
                 invalidate_agent_cache(current_dir);
+                invalidate_worker_status(current_dir);
                 if json {
                     output_json(&ConflictKeepResult { resolved: path })?;
                 } else {
@@ -147,6 +169,44 @@ pub async fn run(current_dir: &Path, action: ConflictsAction, json: bool) -> any
         }
         ConflictsAction::Open { path } => {
             open_conflict_compare(&db, &path).await?;
+        }
+        ConflictsAction::Materialize { about, path } => {
+            let about = match about {
+                Some(snapshot) => snapshot,
+                None => api
+                    .get_head(&config.workspace_id)
+                    .await?
+                    .context("workspace has no snapshot to materialize conflicts from")?,
+            };
+            let result = feanorfs_client::materialize_conflicts(&ctx, &about, &path).await?;
+            if json {
+                output_json(&result)?;
+            } else {
+                println!(
+                    "Materialized {} conflict(s) from {} into {}.",
+                    result.entries.len(),
+                    &result.about_snapshot[..8],
+                    result.conflict_dir
+                );
+                for entry in &result.entries {
+                    println!(
+                        "  {} ({:?}) — original {}, local {}, cloud {}{}",
+                        entry.path,
+                        entry.kind,
+                        availability(entry.original_available),
+                        availability(entry.local_available),
+                        availability(entry.cloud_available),
+                        if entry.already_materialized {
+                            " [already pending locally]"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                println!(
+                    "Resolve with `feanorfs conflicts keep <path> --local|--cloud|--both|--file <reconciled>`."
+                );
+            }
         }
         ConflictsAction::History => {
             let history = db.list_conflict_resolutions().await?;

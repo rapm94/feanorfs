@@ -96,6 +96,7 @@ fn build_router_inner(state: AppState, relay: bool) -> Router {
         )
         .route("/api/download/{hash}", get(handle_download))
         .route("/api/workspaces", get(handle_get_workspaces))
+        .route("/api/version", get(handle_version))
         .layer(DefaultBodyLimit::max(crate::MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -116,6 +117,10 @@ fn build_router_inner(state: AppState, relay: bool) -> Router {
             ),
         )
         .with_state(state)
+}
+
+async fn handle_version() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
 pub async fn auth_middleware(

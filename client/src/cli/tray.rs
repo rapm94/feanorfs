@@ -1,7 +1,7 @@
 use clap::Subcommand;
 use feanorfs_client::{
-    do_tray_status, forget_unavailable_workspaces, list_recent_workspaces, load_config,
-    register_workspace, set_active_workspace, set_paused,
+    do_tray_status_with, forget_unavailable_workspaces, invalidate_worker_status,
+    list_recent_workspaces, load_config, register_workspace, set_active_workspace, set_paused,
 };
 use feanorfs_common::TrayPauseResult;
 use std::io::BufRead;
@@ -24,7 +24,11 @@ struct JoinPreviewEvent<'a> {
 #[derive(Subcommand)]
 pub enum TrayAction {
     /// Aggregate dashboard for the menu-bar tray (`TrayStatusResult`).
-    Status,
+    Status {
+        /// Force a fresh scan instead of reading the worker status snapshot.
+        #[arg(long)]
+        fresh: bool,
+    },
     /// Stop automatic sync until `tray resume`.
     Pause,
     /// Resume automatic sync.
@@ -49,8 +53,8 @@ pub enum TrayAction {
 
 pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::Result<()> {
     match action {
-        TrayAction::Status => {
-            let result = do_tray_status(current_dir).await?;
+        TrayAction::Status { fresh } => {
+            let result = do_tray_status_with(current_dir, fresh).await?;
             if json {
                 output_json(&result)?;
             } else {
@@ -72,6 +76,7 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
         TrayAction::Pause => {
             load_config(current_dir)?;
             set_paused(current_dir, true)?;
+            invalidate_worker_status(current_dir);
             if json {
                 output_json(&TrayPauseResult { paused: true })?;
             } else {
@@ -81,6 +86,7 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
         TrayAction::Resume => {
             load_config(current_dir)?;
             set_paused(current_dir, false)?;
+            invalidate_worker_status(current_dir);
             if json {
                 output_json(&TrayPauseResult { paused: false })?;
             } else {

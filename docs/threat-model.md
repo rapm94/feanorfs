@@ -121,8 +121,68 @@ exchange. Can race legitimate clients or open connections to the pairing port.
 **Goal:** Recover the server token/E2EE key, substitute an invite, or prevent
 pairing.
 
+### Agent signals and workspace participants
+
+Named agents coordinate through encrypted signals stored in snapshot history
+(`ffmsg1` envelopes in `Snapshot.message`; see
+[agent-communication.md](agent-communication.md)). Their privacy and integrity
+limits follow from the shared-workspace trust model:
+
+- **Shared reader access.** Every workspace participant holds the workspace
+  E2EE key, so every participant can decrypt and read every signal, including
+  messages addressed to another agent. Recipient routing is **not an
+  access-control boundary**; signals must never carry secrets intended for
+  fewer than all participants (credentials, recovery kits, pairing codes,
+  `.env` values).
+- **Advisory attribution.** `Snapshot.author` is a claimed agent name; v1
+  provides no per-agent signatures, so any participant can impersonate another
+  name. Treat sender identity as advisory coordination metadata, not
+  authentication.
+- **No wakeup, no complete-delivery guarantee after bounds reset.** Signals
+  cannot start an inactive model; inbox reads never publish read receipts, may
+  redeliver, and explicitly set `cursor_reset` when cursor, scan, or result
+  bounds mean older signals may have been missed. These are availability
+  properties of the coordination protocol, not confidentiality boundaries.
+- **Hub opacity is unchanged.** The hub stores only ordinary ciphertext
+  objects, manifests, and heads; it never sees signal bodies, routing, or
+  snapshot context in plaintext.
+
 **Result:** **Defended against for passive capture and wrong-code substitution;
 denial of service remains possible.**
+
+### Random integrator assignment (dispatcher)
+
+The consumer-layer orchestrator that randomly picks one temporary integrator
+per batch (`agent integrator`; `ffint1` profiles inside `ffmsg1` bodies) adds
+these limits to the shared-workspace model:
+
+- **Dual dispatchers are unsupported and fail closed.** The workspace
+  orchestration lock (`orchestrator/dispatcher.lock`) rejects a second local
+  dispatcher; cross-machine dual dispatchers are prevented only by runner
+  ownership discipline and fail-safe documentation. Losing the dispatcher
+  state file never authorizes a new integrator automatically.
+- **Spoofed integrator replies.** A participant can claim another agent name
+  and send `accepted`/`result`/`blocked` profiles. The dispatcher matches
+  `assignment_id`, attempt, and `reply_to` and treats identity as advisory;
+  safety comes from cooperative lifecycle checks, not cryptography. A
+  malicious participant with the workspace key can read and forge all
+  coordination traffic — the workspace key is the trust boundary.
+- **Stale or superseded integrators.** Re-check-before-mutate, immutable
+  fallback order, and stale-attempt rejection limit (but cannot cryptographically
+  prevent) an accepted agent acting after revocation; the dispatcher must stop
+  the controlled agent process or ask the user before an ambiguous fallback.
+- **Code-dump and prompt-leak boundaries.** `ffint1` bodies and digests are
+  bounded summaries; the NDJSON wakeup events omit bodies, task details, and
+  paths. Signals must never carry patches, file contents, raw logs, private
+  prompts, credentials, `.env` values, or recovery material.
+- **Random selection is not an election.** The auditable draw is reproducible
+  from the recorded nonce and roster, but it does not prove liveness, identity,
+  or authority. Presence must come from the dispatcher's own runner control,
+  never from signal recency.
+
+**Result:** **Defended against for passive capture and wrong-code substitution;
+denial of service remains possible.** Assignment and identity are advisory
+coordination metadata, not access control.
 
 - The displayed `fnp1` code contains a public 20-bit session tag plus a random
   80-bit single-use code; 60 bits remain secret after its 20-bit rendezvous

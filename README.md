@@ -14,6 +14,22 @@ It is designed for one specific situation: you write code on more than one machi
 
 FeanorFS mirrors the current contents of a working directory to a blob server. It is **not version control**: no staging, branches, tags, rebase, or merge UI. Its bounded snapshot log supports transport recovery and undo. Use a version control system for project history.
 
+Think of a synchronized folder as one **shared work-in-progress overlay** on
+top of independently managed Git baselines:
+
+```text
+working tree = local Git baseline + shared FeanorFS WIP
+```
+
+Both machines keep normal Git clones. When one machine or agent edits a
+tracked file, Git correctly shows that file as modified on every synchronized
+clone — that dirty state is the shared WIP, not corruption. FeanorFS never
+reads or writes `.git`/`.jj`, never runs Git commands, and never stages,
+commits, resets, or merges. Git remains the publication and history layer;
+you publish the WIP by committing on one machine and advancing the baseline on
+the others. See [docs/usage.md](docs/usage.md) for the guarded publication
+flow and branch guidance.
+
 It syncs files on disk (including gitignored/untracked paths — often the point), skips `.git/`, `.jj/`, and legacy FeanorFS metadata, and blocks common artifact trees (`target/`, `node_modules/`, …) by default. It creates no metadata or ignore file in the project. See [docs/sync-scope.md](docs/sync-scope.md).
 
 ## Features
@@ -29,7 +45,7 @@ It syncs files on disk (including gitignored/untracked paths — often the point
 - **Reversible folder lifecycle** — `feanorfs stop [folder]`, or **Stop Mirroring This Folder…** in the tray, removes automatic sync and the tray entry while preserving ordinary files and encrypted setup for a later `start`.
 - **Recoverable workspace list** — moved, deleted, or disconnected folders are labeled unavailable instead of failing when clicked; the tray can explicitly remove only those list entries after warning about offline external drives.
 - **Truthful diagnostics and repair** — `feanorfs doctor` verifies encryption, format-v3 trees, automatic workspace/hub services, tray registration, authenticated mirror reachability, and local state; `--json` exposes the same non-secret checks to automation. **Check System Health…** presents redacted native results in the tray and offers explicit repair through the ordinary secure `start` lifecycle instead of sending desktop users to Terminal.
-- **Safe release awareness** — `feanorfs update` and the tray's **Check for Updates…** compare the installed semantic version with GitHub's official stable release through a bounded HTTPS-only request. Results must point to the exact matching `github.com/rapm94/feanorfs` tag; FeanorFS never downloads, installs, or executes update code automatically.
+- **Safe release awareness** — `feanorfs update` and the tray's **Check for Updates…** compare the installed semantic version with GitHub's official stable release through a bounded HTTPS-only request. `update --periodic` throttles per machine (24 h window) so scheduled checks and `doctor` report the same typed result. Results must point to the exact matching `github.com/rapm94/feanorfs` tag; FeanorFS never downloads, installs, or executes update code automatically.
 - **Native lifecycle** — the private hub and each workspace restart at login through launchd on macOS, the available user service manager on Linux, or Task Scheduler on Windows; no `nohup`, PID files, or manual reboot setup.
 - **Native credential protection** — unattended keys and tokens live in macOS Keychain for signed releases, Windows Credential Manager, or Linux Secret Service; config JSON keeps only a random reference, with a private-file fallback for unsigned macOS/source builds or unavailable stores.
 - **Native secure transport** — the automatic private hub and advanced `feanorfs serve` path use Rustls HTTPS, a durable private CA, generated bearer authentication, and normal certificate verification. Fresh automatic hubs prefer port 3030 but persist a different available port when it is occupied; their stable CA-bound `.local` name also survives DHCP changes without router reservations.
@@ -41,6 +57,7 @@ It syncs files on disk (including gitignored/untracked paths — often the point
 - **Deployable opaque relay** — trusted tags publish a non-root amd64/arm64 OCI image with a read-only runtime, protected persistent identity, authenticated health check, SBOM, and provenance. It runs the same `feanorfs serve --relay` binary behind an operator-owned TLS proxy; see [deploy-relay.md](docs/deploy-relay.md).
 - **Single binary** — install `feanorfs` once; `start` owns the normal client/hub lifecycle, `serve` remains the advanced foreground/server path, and `start --local` keeps the non-portable in-process mode.
 - **Agent loop** — `spawn` → `status` → `refresh` → `land` → `conflicts keep`. Data isolation, not process sandboxing.
+- **Encrypted agent signals** — agents on different machines exchange bounded `request`/`status`/`result`/`blocked` signals tied to exact snapshots through `feanorfs agent send` / `agent inbox`, MCP `agent_send`/`agent_inbox`, the Rust/C/TypeScript SDKs, and NDJSON `agent_message` wakeups. Signals live in encrypted snapshot history, never in project files, and the hub stays opaque. See [docs/agent-communication.md](docs/agent-communication.md) and the `feanorfs-collaboration` skill.
 - **Conflict surfacing** — `.original`/`.local`/`.cloud` triples; bare `feanorfs conflicts` lists pending paths.
 - **Operational history** — `feanorfs log` inspects reachable snapshots and `feanorfs undo` records a restored tree without rewriting history.
 - **Crash-safe migration** — durable client journal and server write fence make format-v3 migration and rekey resumable.

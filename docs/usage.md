@@ -76,6 +76,89 @@ FeanorFS is a working-directory mirror for developers who use more than one mach
 **It is not version control.** It has append-only recovery history, but no branches,
 commits, or content-merge UI. Use a VCS for intentional history and collaboration.
 
+A synchronized folder is best understood as one **shared work-in-progress
+overlay** on top of independently managed Git baselines:
+
+```text
+working tree = local Git baseline + shared FeanorFS WIP
+```
+
+Both machines keep normal Git clones. When Linux edits a tracked file, Git on
+macOS correctly shows that same file as modified — both clones are looking at
+the same unfinished change. That dirty state is expected, not a synchronization
+error. FeanorFS never hides, stages, commits, resets, pulls, merges, or
+synchronizes Git metadata; `.git`/`.jj` stay hard-excluded. Git remains the
+publication and history layer.
+
+## Git across machines
+
+FeanorFS transports unfinished working state; Git publishes it. The two
+boundaries stay separate.
+
+### Both clones stay normal Git repositories
+
+A build-only replica is allowed, but the primary model keeps a full Git clone
+on every machine: local history, blame, diff, editor integration, and the
+ability to become the publication machine. Removing `.git` from a secondary
+machine would prevent it from naturally becoming the active development
+environment.
+
+### Changing the active editing machine
+
+1. Let FeanorFS synchronization settle.
+2. Stop editing on the previous active machine.
+3. Continue editing the already-dirty shared WIP on the other machine.
+4. Do not create a handoff commit merely to change machines.
+
+### Publishing the shared WIP to Git
+
+1. Let agents finish or explicitly report that they are blocked.
+2. Choose **one** machine as the Git-history writer for this publication
+   boundary.
+3. Review the complete shared WIP and resolve FeanorFS conflicts.
+4. Commit and push through ordinary Git.
+5. On the other machines, fetch and advance the corresponding Git baseline
+   through ordinary Git.
+
+If the synchronized tracked files exactly match the published commit and the
+remote commit is a fast-forward, you may perform a metadata-only mixed reset
+after verifying those conditions. Use the guarded form, substituting your real
+remote and branch for `origin/main`:
+
+```bash
+if git fetch origin &&
+   git merge-base --is-ancestor HEAD origin/main &&
+   git diff --quiet origin/main --; then
+  git reset --mixed origin/main
+else
+  printf '%s\n' 'Baseline not advanced: inspect the Git divergence first.' >&2
+fi
+```
+
+The reset is appropriate only when both checks succeed: the published commit
+is a fast-forward from your local `HEAD`, and your tracked working tree
+already equals that published commit. `--mixed` advances `HEAD` and the index
+while preserving working files and ignored/untracked files (`.env` stays in
+place). If either check fails, inspect the divergence with Git — FeanorFS
+never performs or suggests a destructive reset, and it never marks leftover
+tracked WIP clean or discards it.
+
+### Changing Git branches
+
+A FeanorFS workspace is **not a branch selector**. Independent branch switches
+would make one clone's files appear as a large remote WIP change on the other
+clones. Before changing the shared baseline:
+
+1. Settle or preserve the current shared WIP.
+2. Pause editing and automatic synchronization as needed.
+3. Use Git to align the intended branch/commit on every participating clone.
+4. Resume FeanorFS only after the participating clones share the same
+   baseline.
+
+Teams that intentionally maintain simultaneous branch work should use
+separate folders and FeanorFS workspace identities; FeanorFS does not model
+Git branches.
+
 ## Dedicated server and advanced self-hosting
 
 ### Start the secure blob hub
@@ -404,6 +487,13 @@ These are recovery and diagnostics commands; normal setup and offboarding use
 automatic startup without changing tray registration or deleting the workspace,
 encryption key, or mirrored files.
 
+FeanorFS runs exactly one per-user background job (macOS/Linux
+`com.feanorfs.agent`, Windows Task Scheduler `FeanorFS\Agent`) that supervises
+the private hub, every registered workspace watcher, and the tray, so consumer
+background-item lists show a single entry. `service install|start` registers a
+folder with that job; `service stop` pauses it; `service uninstall` forgets it.
+Upgrades migrate legacy per-component jobs into the supervisor automatically.
+
 **Machine A — create and host privately:**
 ```bash
 feanorfs start ~/projects/my-project --workspace my-project
@@ -534,7 +624,9 @@ FeanorFS never resolves conflicts automatically.
 
 Runs non-destructive health checks for workspace/global config, E2EE,
 format-v3 encrypted Merkle snapshots, the automatic workspace service, tray
-registration, authenticated mirror reachability, local sync state, and—when
+registration, authenticated mirror reachability, local sync state, executable
+version coherence (all registered background-job executables must report the
+same version as the CLI), throttled release awareness, and—when
 this computer owns the private hub—the hub login service. It therefore catches
 a workspace that is reachable but no longer syncing automatically, or a hub
 that works only because a manual process happens to be running.
@@ -561,20 +653,30 @@ includes `"report_version": 1` so collectors can reject incompatible schemas.
 ```bash
 feanorfs update
 feanorfs --json update
+feanorfs update --periodic        # throttled: reuse the last result for 24 h
 ```
 
 The command makes one bounded, eight-second, HTTPS-only, no-redirect request to GitHub's
-official latest-release API. It caps the response at 64 KiB, parses versions
+official latest-release API. It caps the response at 256 KiB, parses versions
 with the standard `semver` crate, rejects drafts, prereleases, malformed tags,
 and every release URL except the exact matching
 `github.com/rapm94/feanorfs/releases/tag/v…` page. JSON returns `status`
 (`up_to_date`, `update_available`, or `development_build`), current/latest
 versions, and the validated public release URL.
 
+`update --periodic` stores the typed result in the secret-free per-machine
+`~/.feanorfs/update-state.json` and reuses it for 24 hours, so scheduled checks
+never hammer the release API. The tray's periodic offer and `doctor`'s
+`update_available` check read the same cached result and report the same
+version. `doctor` also reports executable-version divergence across registered
+background jobs with one repair action.
+
 The tray's **Check for Updates…** delegates to this command and repeats the
-exact URL check before offering **Open Release Page**. Neither surface
-downloads, installs, or executes an artifact. Package signatures, checksums,
-attestations, and the platform installers remain the release trust boundary.
+exact URL check before offering **Open Release Page**; its periodic daily check
+uses `--periodic` and only ever opens that page after an explicit choice.
+Neither surface downloads, installs, or executes an artifact. Package
+signatures, checksums, attestations, and the platform installers remain the
+release trust boundary.
 
 ### `status` — show local vs. remote differences
 
@@ -635,7 +737,7 @@ feanorfs log [--limit 20]
 feanorfs undo snapshot_id
 ```
 
-`log` prints the short ID, age, author, changed-path count, and message. Add `--json` for full IDs and structured paths. `undo` accepts a reachable full ID or an unambiguous prefix with at least eight characters, then records the restored tree as a new snapshot.
+`log` prints the short ID, age, author, changed-path count, and message. Add `--json` for full IDs and structured paths. Recognized agent signals render concisely (`signal <from> -> <to> <kind> about <short-id>: <body>`) instead of raw protocol JSON; the `--json` history shape is unchanged. `undo` accepts a reachable full ID or an unambiguous prefix with at least eight characters, then records the restored tree as a new snapshot.
 
 ### Global flags
 
@@ -653,6 +755,8 @@ feanorfs agent refresh <NAME> [--replace]
 feanorfs agent land <NAME> [--clean] [--propose]
 feanorfs agent clean <NAME>
 feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
+feanorfs agent send <TO> --kind <request|status|result|blocked> [--about <SNAPSHOT>] [--reply-to <MSG-ID>] [--from <NAME>] "<BODY>"
+feanorfs agent inbox [--for <NAME>] [--after <HEAD>] [--limit <N>]
 ```
 
 | Subcommand | Description |
@@ -663,8 +767,15 @@ feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
 | `land` | Apply clean work, upload, register conflicts |
 | `clean` | Remove agent dir and snapshot rows |
 | `run` | Run a command in the agent dir — not a sandbox |
+| `send` | Publish one encrypted signal tied to a snapshot; sender defaults to `FEANORFS_AGENT`, then `human` |
+| `inbox` | Read signals addressed to you (or `*` broadcasts); pass `--after` the previous cursor for new-signal deltas; a reset cursor means older signals may have been missed |
 
 **Isolation caveat:** data isolation only — see [threat-model.md](threat-model.md).
+
+Agent signals are encrypted snapshots with no file-tree changes: they create
+no project files, never dirty Git, and keep the hub opaque. See
+[agent-communication.md](agent-communication.md) for the protocol, JSON
+contracts, and safety rules.
 
 ### `conflicts` — list, compare, resolve
 
@@ -682,17 +793,58 @@ Version files use `.original`/`.local`/`.cloud` suffixes.
 | (bare) / `list` | Pending paths blocked from sync |
 | `keep` | Resolve by keeping local, cloud, both, or a reconciled file |
 | `show` | Unified diff; `--open` launches editor compare |
+| `materialize` | Read-only cross-machine conflict triple materialization (`--about <snapshot>` selects the snapshot; `--path` restricts) |
+
+### Multi-agent authority: `agent integrator` (dispatcher)
+
+When several agents produce overlapping work, one authorized **dispatcher**
+orchestrator picks one temporary **integrator** per batch by auditable random
+draw and coordinates through encrypted signals. Assignment is advisory, not a
+security claim; the hub never selects an integrator; FeanorFS never merges
+file content.
+
+```bash
+feanorfs agent integrator assign --about <SNAPSHOT> \
+  --candidate <AGENT>... [--require <CAP>...] [--exclude <AGENT>...] \
+  [--exclude-author <AGENT>...] [--ack-timeout <DURATION>] "<TASK SUMMARY>"
+feanorfs agent integrator status [<ASSIGNMENT-ID>]
+feanorfs agent integrator revoke <ASSIGNMENT-ID> --reason "<SUMMARY>"
+feanorfs agent integrator resume [--ack-timeout <DURATION>] [--fallback-on-blocked]
+```
+
+| Subcommand | Description |
+|---|---|
+| `assign` | Filter the explicit roster (capabilities, availability, exclusions, neutral-author preference), draw 128-bit assignment id + 256-bit nonce from the OS CSPRNG, rank with domain-separated Blake3, offer the winner an `ffint1` request |
+| `status` | Active assignment state, selected agent, fallback order, attempt audit trail, optional digest |
+| `revoke` | Explicitly stop an integrator and record the reason; replaces an accepted/active integrator with the next recorded candidate when one remains |
+| `resume` | Crash-safe observation pass: processes `ffint1` replies since the persisted cursor; never re-sends a recorded request; cursor reset stops automatic mutation |
+
+Pre-acceptance timeout may advance to the next recorded candidate; after
+acceptance, timeout alone never activates a fallback. A second dispatcher
+fails closed on the workspace orchestration lock. Dispatcher state lives in
+`~/.feanorfs/workspaces/<opaque-id>/orchestrator/integrator-state.json`
+(schema-versioned, atomic, no secrets). See
+[agent-communication.md](agent-communication.md) for the lifecycle,
+troubleshooting, and `ffint1` details.
 
 ### Orchestrator surfaces (hidden)
 
 ```bash
-feanorfs events    # NDJSON: sync_state, folder_changed, conflict_risk, …
-feanorfs mcp       # MCP protocol + tools (agent_*, conflicts_*, sync_status, workspace_log, workspace_undo)
+feanorfs events    # NDJSON: sync_state, folder_changed, conflict_risk, conflict_registered,
+                   #        agent_message, integrator_assigned/accepted/completed/blocked/requires_human, …
+feanorfs mcp       # MCP protocol + tools (agent_*, conflicts_*, sync_status, workspace_log,
+                   #        workspace_undo, integrator_assign/status/revoke/resume, conflict_materialize)
 ```
 
 File contents never leave the machine on either surface. MCP `sync_status`
 returns counts plus actionable pending paths instead of the complete local file
 map, keeping routine agent checks small even in large workspaces.
+
+`agent_message` wakeup records carry only `message_id`, `from`, `to`, `kind`,
+and `about_snapshot` — never the body. An orchestrator that sees one calls
+`feanorfs --json agent inbox` for the typed message. Wakeups are cursor-based
+and deduplicated by snapshot ID within a bounded in-process cache. A reported
+reset or overflow means older wakeups may have been missed.
 
 ## Examples
 

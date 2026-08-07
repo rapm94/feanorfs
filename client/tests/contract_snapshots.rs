@@ -26,3 +26,21 @@ contract_snapshot!(agent_refresh_json, fixtures::agent_refresh_json());
 contract_snapshot!(agent_clean_json, fixtures::agent_clean_json());
 contract_snapshot!(log_json, fixtures::log_json());
 contract_snapshot!(undo_json, fixtures::undo_json());
+contract_snapshot!(agent_send_json, fixtures::agent_send_json());
+contract_snapshot!(agent_message_json, fixtures::agent_message_json());
+contract_snapshot!(agent_inbox_json, fixtures::agent_inbox_json());
+
+use feanorfs_common::agent_contract::integrator_fixtures;
+
+contract_snapshot!(
+    integrator_assign_json,
+    integrator_fixtures::integrator_assign_json()
+);
+contract_snapshot!(
+    integrator_digest_json,
+    integrator_fixtures::integrator_digest_json()
+);
+contract_snapshot!(
+    integrator_status_json,
+    integrator_fixtures::integrator_status_json()
+);

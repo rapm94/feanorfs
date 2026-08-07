@@ -13,7 +13,8 @@ tests used by local verification and GitHub release workflows.
 - `smoke-macos-product.sh`, `smoke-macos-keychain.sh`, `smoke-linux-packages.sh`, `smoke-windows-installer.ps1`, and `smoke-windows-product.ps1` — installed-product lifecycle, signed-credential, clean-distribution, and native-installer proof.
 - `smoke-relay-container.sh` — hardened opaque-relay image proof.
 - `test-install-routing.sh` and `test-install-routing.ps1` — fail-closed installer routing tests.
-- `smoke-test.sh` and `demo-agent-loop.sh` — source-product and agent SDK demonstrations.
+- `smoke-test.sh` and `demo-agent-loop.sh` — source-product and agent SDK demonstrations; `smoke-test.sh` is wired into CI as the non-PR `source-smoke` job and requires a valid 64-lowercase-hex E2EE test key (v3 rejects human passphrases).
+- `smoke-upgrade.sh` — source-level previous-release state-compatibility smoke: create with old CLI bytes, replace the same CLI path, resume with current bytes, and assert identity/encrypted-config/files/reachable-history preservation plus E2EE readability. It deliberately does not claim worker restart coverage and remains partial AI-1 evidence, not the required native installed-product hub/worker/tray/login-job matrix (wired into CI as the non-PR `upgrade-smoke` job).
 
 ## Local Contracts
 
@@ -41,6 +42,7 @@ tests used by local verification and GitHub release workflows.
 
 - `shellcheck scripts/*.sh`
 - `scripts/test-install-routing.sh`
+- `scripts/smoke-upgrade.sh OLD_BIN NEW_BIN` (CI: `upgrade-smoke` job builds the previous release tag as OLD_BIN)
 - `scripts/test-install-routing.ps1` on Windows
 - `scripts/smoke-linux-packages.sh FEANORFS_DEB FEANORFS_RPM FEANORFS_ARCH_PACKAGE` on a Docker/Podman host
 - `scripts/smoke-windows-installer.ps1 SETUP_EXE FEANORFS_BIN FEANORFS_TRAY_BIN` on Windows; add `-RequireAuthenticode` for publication

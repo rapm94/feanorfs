@@ -8,7 +8,7 @@ use feanorfs_common::is_valid_hash;
 use super::guards::{ensure_client_format, ensure_migration_access};
 use super::{AppState, FormatQuery, HeadQuery, ManifestQuery};
 
-const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) async fn handle_manifest(
     State(state): State<AppState>,

@@ -40,6 +40,12 @@ pub struct TestServer {
     _handle: tokio::task::JoinHandle<()>,
 }
 
+impl TestServer {
+    pub fn data_dir(&self) -> &Path {
+        self._data_dir.path()
+    }
+}
+
 pub async fn spawn_test_server() -> TestServer {
     let data_dir = TempDir::new().unwrap();
     let state = init_app_state(data_dir.path().to_path_buf(), None)

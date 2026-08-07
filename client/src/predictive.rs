@@ -106,17 +106,27 @@ pub async fn prefetch_related(
 }
 
 async fn hydrate_one(ctx: &crate::SyncCtx<'_>, entry: &CacheEntry) -> Result<bool> {
-    let Ok(materialized) = feanorfs_agent_core::large_file::materialize(
+    let full_path = ctx.base.join(&entry.path);
+    // Placeholders are write-protected; clear the bit before the atomic
+    // rename so Windows can replace the sentinel (POSIX renames ignore it).
+    if let Err(error) = crate::fs_util::set_readonly(&full_path, false).await {
+        tracing::warn!("failed to clear readonly for {}: {error}", entry.path);
+    }
+    let materialized = match feanorfs_agent_core::large_file::materialize(
         ctx,
         &entry.path,
         &entry.encrypted_hash,
         entry.size,
     )
     .await
-    else {
-        return Ok(false);
+    {
+        Ok(materialized) => materialized,
+        Err(error) => {
+            tracing::warn!("predictive hydration failed for {}: {error:#}", entry.path);
+            return Ok(false);
+        }
     };
-    apply_executable_mode(&ctx.base.join(&entry.path), entry.mode).await?;
+    apply_executable_mode(&full_path, entry.mode).await?;
 
     let actual_mtime = file_mtime_ms(&ctx.base.join(&entry.path))
         .await

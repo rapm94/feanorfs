@@ -7,6 +7,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/rapm94/feanorfs/compare/v0.7.11...v0.8.0) - 2026-08-07
+
+### Added
+
+- **Randomized integrator assignment** for multi-agent workspaces
+  (`prd-random-integrator-assignment.md`): one authorized dispatcher filters an
+  explicit candidate roster by capability/availability/exclusions, prefers
+  neutral candidates, and draws one temporary integrator per batch with an
+  auditable OS-CSPRNG nonce and domain-separated Blake3 ranking. `ffint1`
+  assignment/reply profiles travel inside existing encrypted `ffmsg1` signals
+  (no new message kinds, hub endpoints, or tables); a crash-safe
+  `orchestrator/integrator-state.json` state machine enforces one accepted
+  integrator per batch, pre-acceptance timeout fallback, explicit revocation,
+  and cursor-reset fail-closed. A selected integrator can materialize the
+  encrypted `.original`/`.local`/`.cloud` conflict triple read-only on another
+  computer (`conflicts materialize`) and reconcile only through the existing
+  explicit `conflicts keep` operations. New surfaces: `agent integrator
+  assign|status|revoke|resume`, MCP `integrator_*`/`conflict_materialize`
+  tools, metadata-only `integrator_*` NDJSON wakeups, C FFI
+  `ffs_integrator_*`/`ffs_conflict_materialize`, and TypeScript wrappers.
+  Docs: `docs/agent-communication.md`, `docs/agent-api.md`, `docs/usage.md`,
+  `docs/threat-model.md`, and the `feanorfs-collaboration` skill.
+
+### Fixed
+
+- The tray no longer dies when a menu/status handler panics: the event loop
+  catches handler panics, writes the message and backtrace to
+  `~/.feanorfs/tray-panic.log`, resets in-flight flags, and keeps running.
+  Fatal `expect` calls on the status/recent serialization path were replaced
+  with non-panicking fallbacks, so the tray can no longer be aborted by a
+  transient state problem (for example during folder switching). The recovered
+  menu/status flow was verified with real folder switches.
+- The tray's "Remove unavailable folders…" action now actually removes entries
+  whose folder no longer exists. It previously kept them whenever their global
+  workspace state survived under `~/.feanorfs`, so deleted folders (for
+  example temporary SDK demo workspaces) stayed in the tray forever.
+- Downloads no longer skip updating files that already exist locally: the
+  stale-local guard compared the disk mtime against the server mtime (always
+  0 for format-v3 tree files), so updates were silently skipped, the stale
+  copy was pushed back, and the updater's edit could be reverted. The guard now
+  compares against the scan-time disk fingerprint, lazy placeholders always
+  refresh, and `undo` restores files again.
+- Conflict legs reloaded from a snapshot head now carry only the visible leg's
+  size (other legs are size-unknown), so non-representative versions no longer
+  fail size verification, and EditDelete conflicts flatten as present files to
+  match the tree's visible-leg semantics.
+- `log` now reports changed paths across every snapshot parent instead of only
+  the first.
+- Reachability manifests accepted up to 64 MiB (was 8 MiB, ~130k objects), so
+  large workspaces no longer hard-fail publication.
+
+### Fixed
+
+- Sync/land/dispatcher locks held by a live process are no longer broken out
+  after 10 minutes: a second sync could previously run concurrently with a
+  legitimate long-running chunked upload, and tray sync state could be
+  misreported. Dead-process locks are still broken immediately; a 24-hour
+  guard covers PID reuse, and same-process re-acquire refreshes the lock
+  timestamp.
+- Predictive hydration clears the placeholder read-only bit before writing, so
+  prefetch works on Windows too, and it logs failures instead of silently
+  skipping.
+- `summary --summarize` falls back to the plain path listing when the summary
+  tool exits without reading its input, instead of failing the whole command.
+- Reachability manifests keep the chunks of hidden conflict legs: a large
+  chunked version behind a small visible conflict leg (for example from agent
+  land) is no longer omitted, so server GC cannot delete chunks that
+  `conflicts keep --cloud` later needs.
+- Status-publish failures no longer kill the supervised background job:
+  a failed status write (for example a full disk) is logged and the
+  supervisor keeps supervising its children instead of exiting into a
+  launchd restart loop.
+- The supervised background job reaps its previous instance's orphaned
+  children on startup (identity-checked), so a supervisor restart can no
+  longer leave the private hub wedged by the old process's runtime lock and
+  port, and it publishes an initial status snapshot so readers never see a
+  stale previous instance.
+- The supervised background job is cross-platform and resilient: the tray
+  child is no longer spawned on Windows (which keeps its own scheduled task),
+  a transient or corrupt supervisor registry no longer kills the supervisor
+  and orphans its children (it logs and retries), and legacy-job migration
+  now reads the correct plist argument index for the workspace path.
+- The supervised background job honors the restart policy: children that
+  exit cleanly with restart-on-zero disabled (for example the tray after the
+  user quits it) stay stopped instead of being relaunched within half a
+  second, and clean-exit children no longer spin without backoff. Status is
+  published on every state change instead of only every five seconds, so
+  `service install|start|stop` no longer races its own timeouts. Legacy
+  per-component launchd jobs are migrated only after the supervisor job is
+  proven running, so a supervisor startup failure can no longer leave the
+  machine without background services.
+- The supervised background job no longer kills arbitrary processes: stray
+  watcher detection requires a fresh `watch.pid` marker and verifies the
+  target's command line belongs to this workspace's FeanorFS watcher before
+  signaling, and the supervisor takes an exclusive `supervisor.lock` so two
+  instances can never race to spawn the hub and workers.
+- The C ABI (`ffs_*`) rejects NULL required string arguments instead of
+  dereferencing them (undefined behavior); the generated `feanorfs.h` now
+  declares the agent-signal and integrator functions it was missing.
+- The change watcher ignores only FeanorFS's own numeric temp-file names
+  (`.feanorfs-tmp-<pid>-<seq>-<attempt>`); user files that merely share the
+  prefix now trigger syncs again.
+
+### Performance
+
+- A durable per-workspace uploaded-object registry skips re-uploading tree,
+  snapshot, chunk, and undo blobs the hub already accepts; unchanged subtrees
+  no longer re-upload byte-identical ciphertext on every sync. A rejected
+  manifest clears the registry and retries once with full uploads.
+- Large-file reads (hydrate/cat/reachability) check the verified local object
+  cache before the network, chunk uploads skip unchanged chunks and run with
+  bounded concurrency, and local object-cache pruning is throttled to once per
+  minute per workspace.
+
 ## [0.7.11](https://github.com/rapm94/feanorfs/compare/v0.7.10...v0.7.11) - 2026-08-04
 
 ### Fixed

@@ -21,6 +21,8 @@ Canonical fixtures live in `common/src/agent_contract.rs`. Snapshot tests in `cl
 | Resolve | `conflicts keep <path> …` | `resolve(path, keep, file?)` | exit 0 / FFI `-1` / TS throw |
 | History | `log [--limit N]` | `log(limit)` | `LogResult` |
 | Undo | `undo <snapshot_id>` | `undo(snapshot_id)` | `UndoResult` |
+| Send signal | `agent send <to> --kind <k> [--about <id>] [--reply-to <id>] [--from <name>] <body>` | `send_message(AgentMessageInput)` | `AgentSendResult` |
+| Inbox | `agent inbox [--for <name>] [--after <head>] [--limit <n>]` | `inbox(AgentInboxQuery)` | `AgentInboxResult` |
 
 ---
 
@@ -111,6 +113,57 @@ Undo accepts a reachable full ID or an unambiguous prefix of at least eight hexa
 {"snapshot_id":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","restored_snapshot_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","changed_paths":["src/main.rs"]}
 ```
 
+### `AgentSendResult`
+
+One signal publication. `message_id` is the immutable signal snapshot ID;
+`about_snapshot` is the caller-selected context (defaults to the head observed
+when sending started). Sending appends one encrypted no-file-change snapshot
+whose parent is the latest head and whose root equals the latest head's root.
+
+```json
+{"message_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","about_snapshot":"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"}
+```
+
+### `AgentMessage`
+
+One typed signal. `kind`: `request` | `status` | `result` | `blocked`.
+`reply_to`, when present, references another signal snapshot.
+
+```json
+{"message_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","from":"linux-dev","to":"mac-test","kind":"request","body":"Run iOS simulator tests","about_snapshot":"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210","reply_to":null,"created_at_ms":1785852000000}
+```
+
+### `AgentInboxResult`
+
+`cursor` is the workspace head observed by the read; pass it back as
+`after` to read the graph delta. `cursor_reset=true` means the supplied cursor
+was unreachable, the scan bound was exhausted, or the requested result limit
+omitted older matches. Older signals may therefore have been missed; the
+returned view is bounded. Reads may redeliver and never publish
+acknowledgements.
+
+```json
+{"cursor":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","cursor_reset":false,"messages":[{"message_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","from":"linux-dev","to":"mac-test","kind":"request","body":"Run iOS simulator tests","about_snapshot":"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210","reply_to":null,"created_at_ms":1785852000000}]}
+```
+
+Input shapes (same names across Rust/FFI/TS):
+
+```json
+{"to":"mac-test","kind":"request","body":"Run iOS simulator tests","about_snapshot":null,"reply_to":null,"from":"linux-dev"}
+```
+
+```json
+{"recipient":"mac-test","after":null,"limit":50}
+```
+
+Validation: `from`/`to` are agent names (`to="*"` broadcasts); CLI and MCP
+callers default the sender to `FEANORFS_AGENT`, then `human`, while embeddings
+use their explicit `from` value or `human`; `body` is non-empty UTF-8 after
+trimming and at most 8 KiB; `about_snapshot`/`reply_to` must be full reachable
+snapshot IDs, with `reply_to` required to reference a real signal. The
+envelope wire format is `ffmsg1:` plus canonical compact JSON in
+`Snapshot.message`; see [agent-communication.md](agent-communication.md).
+
 ### `FileState`
 
 ```json
@@ -185,6 +238,37 @@ Thread model:
 - `ffs_conflicts_keep`: **0 = success**, **-1 = error**.
 - `ffs_log(root, limit)` returns `LogResult` JSON.
 - `ffs_undo(root, snapshot_id)` returns `UndoResult` JSON.
+- `ffs_agent_send(root, input_json)` takes an `AgentMessageInput` JSON string
+  and returns an `AgentSendResult` JSON string.
+- `ffs_agent_inbox(root, query_json)` takes an `AgentInboxQuery` JSON string
+  and returns an `AgentInboxResult` JSON string.
+
+## TypeScript (`@feanorfs/agent`)
+
+Typed wrappers in `api.mjs` over the native module:
+
+- `sendMessage(root, input)` → `AgentSendResult` (input is `AgentMessageInput`).
+- `inbox(root, query)` → `AgentInboxResult` (query is `AgentInboxQuery`).
+
+Low-level JSON variants `agentSend(root, inputJson)` and
+`agentInbox(root, queryJson)` are exported by the native module. Declarations
+live in `contract.d.ts`; shapes match this document and
+`common/src/agent_contract.rs`.
+
+## MCP
+
+`agent_send` and `agent_inbox` delegate to agent-core:
+
+- `agent_send(from?, to, kind, body, about_snapshot?, reply_to?)` with
+  `kind` restricted to `request | status | result | blocked` and `body`
+  bounded at 8192 UTF-8 bytes (the JSON schema's `maxLength` is an additional
+  character-count preflight; agent-core enforces the byte limit).
+- `agent_inbox(for?, after?, limit?)` with `limit` bounded 0–1000.
+
+Tool descriptions state that all workspace participants can read messages,
+identity is advisory, and requests/results should carry exact snapshot context.
+The NDJSON `events` stream emits `agent_message` wakeup records (bounded
+metadata, never the body) when new signals appear.
 
 `keep` values for `ffs_conflicts_keep(root, path, keep, file_path)`:
 
@@ -200,3 +284,187 @@ Call `ffs_runtime_init()` once before any other `ffs_*` function.
 Panics inside Rust are caught and reported as `"internal panic"` via `ffs_last_error`.
 
 Generated header: `feanorfs-ffi/feanorfs.h` (regenerated on build when signatures change).
+---
+
+## Randomized integrator assignment (SDK-1 additive)
+
+Canonical types and logic live in `common/src/integrator_contract.rs`
+(selection, ranking, `ffint1` profiles, digest bounds) and
+`agent-core/src/integrator.rs` (state machine, persistence, materialization).
+Adapters (CLI, FFI, TypeScript, MCP) are thin wrappers over the same
+canonical implementation.
+
+### Operations
+
+| Operation | CLI | Rust (`Workspace`) | JSON result type |
+|-----------|-----|-------------------|------------------|
+| Assign | `agent integrator assign --about <id> --candidate <name>… [--require <cap>…] [--exclude <name>…] [--exclude-author <name>…] [--ack-timeout <d>] <task>` | `integrator_assign(IntegratorAssignInput)` | `IntegratorAssignResult` |
+| Status | `agent integrator status [<assignment-id>]` | `integrator_status(Option<&str>)` | `IntegratorStatusResult` |
+| Revoke | `agent integrator revoke <id> --reason <summary>` | `integrator_revoke(id, reason)` | `IntegratorStatusResult` |
+| Resume | `agent integrator resume [--ack-timeout <d>] [--fallback-on-blocked]` | `integrator_resume(IntegratorObserveOptions)` | `IntegratorObserveResult` |
+| Materialize | `conflicts materialize [--about <id>] [--path <p>]…` | `materialize_conflicts(about, paths)` | `ConflictMaterializeResult` |
+
+MCP tools: `integrator_assign`, `integrator_status`, `integrator_revoke`,
+`integrator_resume`, `conflict_materialize`. FFI: `ffs_integrator_assign`,
+`ffs_integrator_status`, `ffs_integrator_revoke`, `ffs_integrator_resume`,
+`ffs_conflict_materialize`. TypeScript: `integratorAssign`, `integratorStatus`,
+`integratorRevoke`, `integratorResume`, `conflictMaterialize`.
+
+### `IntegratorAssignInput`
+
+```json
+{
+  "about_snapshot": "<64-hex>",
+  "candidates": [
+    {"name":"mac-test","capabilities":["ios","rust"],"enabled":true,"available":true}
+  ],
+  "required_capabilities": ["rust"],
+  "conflict_authors": ["agent-a"],
+  "excluded": [],
+  "task_summary": "Integrate parser implementation and tests",
+  "ack_timeout_ms": 300000
+}
+```
+
+Validation: names use FeanorFS agent-name rules; capabilities are lowercase
+ASCII identifiers (≤ 32 bytes, ≤ 64 per list); rosters are bounded at 64
+candidates; duplicate names/capabilities are rejected; `about_snapshot` must
+be a full reachable format-v3 snapshot id; `task_summary` is bounded at 1024
+bytes.
+
+### `IntegratorAssignResult`
+
+```json
+{
+  "assignment_id": "0123456789abcdef0123456789abcdef",
+  "about_snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "selected": "agent-b",
+  "fallback_order": ["agent-a"],
+  "neutral_integrator": true,
+  "roster_fingerprint": "26a359d7aceb46c7bfa48880140bf6624163e47098d2478cb8ee43f32408d9d1",
+  "attempt": 0,
+  "request_message_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "state": "offered",
+  "task_summary": "Integrate parser implementation and tests"
+}
+```
+
+`assignment_id` is 128 bits of OS CSPRNG (32 hex); `selection_nonce` is 256
+bits (64 hex). The ranking is
+
+```text
+score = BLAKE3("feanorfs-integrator-selection-v1" ‖ len(workspace_id) ‖
+       workspace_id ‖ about_snapshot ‖ assignment_id ‖ selection_nonce ‖
+       roster_fingerprint ‖ len(agent_name) ‖ agent_name)
+```
+
+every variable-width value length-prefixed, sorted ascending by the 32-byte
+score with agent-name bytes as the collision tie-breaker. The first candidate
+is selected; the rest is the immutable fallback order. `roster_fingerprint`
+is the Blake3 of the canonical JSON array of the sorted final pool. The
+workspace id never leaves the trusted client process. Fixed nonces are
+injectable only through test/internal APIs; production always uses the OS
+CSPRNG.
+
+### `IntegratorStatusResult`
+
+```json
+{
+  "assignment_id": "0123456789abcdef0123456789abcdef",
+  "about_snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "state": "offered",
+  "selected": "agent-b",
+  "attempt": 0,
+  "neutral_integrator": true,
+  "roster_fingerprint": "26a359d7aceb46c7bfa48880140bf6624163e47098d2478cb8ee43f32408d9d1",
+  "fallback_order": ["agent-a"],
+  "task_summary": "Integrate parser implementation and tests",
+  "created_at_ms": 1785852000000,
+  "updated_at_ms": 1785852000000,
+  "attempts": [
+    {"attempt":0,"selected":"agent-b","state":"offered","offered_at_ms":1785852000000,
+     "request_message_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "terminal_message_id":null,"reason":null}
+  ],
+  "digest": null,
+  "inbox_cursor": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}
+```
+
+`state` transitions: `created → offered → accepted → active → completed |
+blocked`; `accepted → revoked → offered(next)`; `offered → timed_out →
+offered(next)`. Terminal states are `completed`, `blocked`, `requires_human`,
+and `cancelled`. A timed-out pre-acceptance attempt is terminal for that
+candidate only. Post-acceptance, timeout alone never activates a fallback:
+the dispatcher must stop/revoke the accepted integrator or receive a
+`blocked` reply first.
+
+### `IntegratorObserveResult` (`integrator resume`)
+
+```json
+{"assignment_id":"0123456789abcdef0123456789abcdef","state":"accepted",
+ "messages_processed":1,"cursor":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+ "cursor_reset":false,"action":"accepted"}
+```
+
+`cursor_reset=true` fails closed into `requires_human`; automatic mutation
+stops until state is recovered. Resume never re-sends a recorded request.
+
+### `IntegratorDigest` and bounds
+
+```json
+{
+  "assignment_id": "0123456789abcdef0123456789abcdef",
+  "integrator": "agent-b",
+  "about_snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "inspected_snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "state": "completed",
+  "landed_paths": 12,
+  "resolved_conflicts": 3,
+  "remaining_conflicts": 0,
+  "verification": {"status": "passed", "summary": "84 tests passed"},
+  "outcome": "Integrated parser implementation and tests.",
+  "risks": [],
+  "decision_required": null
+}
+```
+
+Bounds: outcome ≤ 512 UTF-8 bytes; verification summary ≤ 512 bytes; risks
+≤ 10 entries of 256 bytes; at most one decision question of 512 bytes; paths
+are counts by default. No patch, file content, raw log, or reasoning field
+exists.
+
+### `ConflictMaterializeResult` (`conflicts materialize`)
+
+Read-only materialization of first-class encrypted conflict entries:
+
+```json
+{
+  "about_snapshot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "conflict_dir": "~/.feanorfs/workspaces/<opaque>/conflicts/materialize_1719500000000",
+  "entries": [
+    {"path":"src/main.rs","kind":"edit_edit","original_available":true,
+     "local_available":true,"cloud_available":true,"is_binary":false,
+     "already_materialized":false}
+  ]
+}
+```
+
+Artifacts `.original`/`.local`/`.cloud` are written only under protected
+global FeanorFS state with existing deletion sentinels; a local pending row
+is registered without publishing a new head; stale or already-resolved
+conflicts are refused; project files and Git/Jujutsu state are untouched.
+
+### `ffint1` profiles
+
+Assignment/reply profiles travel inside ordinary `ffmsg1` bodies and use the
+existing `request`/`status`/`result`/`blocked` kinds:
+
+```text
+ffint1:{"type":"assignment","assignment_id":"0123456789abcdef0123456789abcdef","attempt":0,"selected":"agent-b","about_snapshot":"…","roster_fingerprint":"…","neutral_integrator":true,"task":"Integrate parser implementation and tests"}
+```
+
+`accepted` (status), `result` (with a digest), and `blocked` profiles carry
+the same `assignment_id`/`attempt`; terminal replies reference the original
+assignment request through `reply_to`. Unknown `ffint` versions remain
+ordinary signal text and cannot break typed inbox reads.

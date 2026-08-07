@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 use crate::hub_state::HubDb;
 
 const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
-const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 
 type CacheKey = (PathBuf, Option<String>);
 

@@ -19,6 +19,25 @@ FeanorFS mirrors the **current contents** of a workspace folder. This document r
 - All files under the workspace root, including hidden files and paths that `.gitignore` would exclude (e.g. `.env`, `.vscode/`, local overrides).
 - Non-git workspaces (`feanorfs start ~/notes`) behave the same.
 
+## `.env` and shared tracked WIP
+
+A representative multi-machine flow mirrors `.env` and tracked edits together:
+
+| Machine | After FeanorFS sync |
+|---|---|
+| Linux (development) | `.env` with local keys; `src/app.rs` edited but uncommitted |
+| macOS (build/test) | the same `.env` and `src/app.rs`; Git reports `src/app.rs` as modified |
+
+Both machines show the tracked edit as uncommitted relative to their own local
+Git baseline. That dirty state is the shared work-in-progress — the working
+tree is `local Git baseline + shared FeanorFS WIP` — not a synchronization
+error. FeanorFS mirrors file contents and lets each clone's Git report them
+truthfully; it never stages, commits, resets, or touches `.git`/`.jj`.
+`.env` syncs because it is a normal file on disk (gitignored or not).
+Machine-generated build output is handled by `DEFAULT_IGNORES` or explicit
+`feanorfs ignore` rules, never by honoring `.gitignore`. See
+[usage.md](usage.md) for the guarded Git publication flow.
+
 ## What never syncs (hardcoded)
 
 | Path | Reason |

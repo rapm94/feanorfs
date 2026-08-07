@@ -102,6 +102,10 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
                         );
                     }
                     TreeEntryKind::Conflict { base, ours, theirs } => {
+                        // The tree stores only the visible leg's size and
+                        // content id; the visible leg is always a live blob
+                        // (insert_conflict refuses all-deleted conflicts), so
+                        // the flattened file is present in the working copy.
                         state.files.insert(
                             path.clone(),
                             FileState {
@@ -109,15 +113,37 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
                                 hash: entry.hash,
                                 size: entry.size,
                                 mtime: 0,
-                                deleted: theirs.is_none(),
+                                deleted: false,
                                 mode: 0,
                             },
                         );
+                        // Non-visible legs carry size 0 ("unknown"): their
+                        // sizes are not part of the tree format.
+                        let visible_hash = theirs
+                            .clone()
+                            .or_else(|| ours.clone())
+                            .or_else(|| base.clone());
+                        let size_of = |hash: &str| {
+                            if Some(hash) == visible_hash.as_deref() {
+                                entry.size
+                            } else {
+                                0
+                            }
+                        };
                         state.conflicts.push(ConcurrentEdit::new(
                             path.clone(),
-                            base.map(|hash| conflict_leg(&path, hash, entry.size)),
-                            ours.map(|hash| conflict_leg(&path, hash, entry.size)),
-                            theirs.map(|hash| conflict_leg(&path, hash, entry.size)),
+                            base.map(|hash| {
+                                let size = size_of(&hash);
+                                conflict_leg(&path, hash, size)
+                            }),
+                            ours.map(|hash| {
+                                let size = size_of(&hash);
+                                conflict_leg(&path, hash, size)
+                            }),
+                            theirs.map(|hash| {
+                                let size = size_of(&hash);
+                                conflict_leg(&path, hash, size)
+                            }),
                         ));
                     }
                 }
@@ -171,14 +197,14 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
                                     self.ctx,
                                     &path,
                                     &entry.hash,
-                                    entry.size,
+                                    Some(entry.size),
                                 )
                                 .await?,
                             );
                         }
                     }
                     TreeEntryKind::Conflict { base, ours, theirs } => {
-                        let mut legs = vec![entry.hash];
+                        let mut legs = vec![entry.hash.clone()];
                         legs.extend(base);
                         legs.extend(ours);
                         legs.extend(theirs);
@@ -187,9 +213,14 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
                         for leg in legs {
                             hashes.insert(leg.clone());
                             if expand_chunked_files {
+                                // Only the visible leg's size is stored in the
+                                // tree; hidden legs are size-unknown, so their
+                                // chunks must be discovered from the blob
+                                // itself or server GC could delete them.
+                                let size = (leg == entry.hash).then_some(entry.size);
                                 hashes.extend(
                                     crate::large_file::reachable_chunks(
-                                        self.ctx, &path, &leg, entry.size,
+                                        self.ctx, &path, &leg, size,
                                     )
                                     .await?,
                                 );
@@ -217,10 +248,17 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
         let ciphertext = pack_bytes(bytes, self.ctx.password_str(), OBJECT_DOMAIN)?;
         let id = hash_bytes(&ciphertext);
         self.cache(&id, &ciphertext).await?;
-        self.ctx
-            .api
-            .upload_object(self.ctx.workspace_id(), &id, ciphertext)
-            .await?;
+        // Tree/snapshot ids are deterministic: unchanged subtrees keep their
+        // id across syncs, so skip blobs the hub already accepted instead of
+        // re-uploading byte-identical ciphertext on every pass.
+        let state_dir = self.ctx.state_dir()?;
+        if !crate::upload_registry::known(&state_dir, &id).await {
+            self.ctx
+                .api
+                .upload_object(self.ctx.workspace_id(), &id, ciphertext)
+                .await?;
+            crate::upload_registry::remember(&state_dir, &id);
+        }
         Ok(id)
     }
 
@@ -275,6 +313,21 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     }
 }
 
+/// Reads a verified ciphertext object from the local object cache when
+/// present, without touching the network. Corrupt cache entries are dropped.
+pub(crate) async fn cached_object(ctx: &SyncCtx<'_>, id: &str) -> Result<Option<Vec<u8>>> {
+    let cache_path = ctx.state_dir()?.join("objects").join(id);
+    match fs::read(&cache_path).await {
+        Ok(bytes) if hash_bytes(&bytes) == id => Ok(Some(bytes)),
+        Ok(_) => {
+            let _ = fs::remove_file(&cache_path).await;
+            Ok(None)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read object cache"),
+    }
+}
+
 fn conflict_leg(path: &str, hash: String, size: u64) -> FileState {
     FileState {
         path: path.to_string(),
@@ -283,5 +336,200 @@ fn conflict_leg(path: &str, hash: String, size: u64) -> FileState {
         mtime: 0,
         deleted: false,
         mode: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ApiClient;
+    use crate::ctx::SyncCtx;
+    use crate::hub::LocalHub;
+    use crate::local::ClientDb;
+    use feanorfs_common::{ConcurrentEdit, Snapshot};
+    use std::collections::HashMap;
+    use std::io::{Seek as _, Write as _};
+
+    const TEST_PASSWORD: &str = "unit-test-password";
+
+    /// A conflict entry's hidden (non-visible) leg may be a chunked file while
+    /// the visible leg is small. Its chunk hashes must still be included in
+    /// snapshot reachability or server GC can delete them.
+    #[tokio::test]
+    async fn reachability_expands_hidden_chunked_conflict_leg() {
+        const SIZE: u64 = 65 * 1024 * 1024 + 5;
+        const CHUNK_BYTES: usize = crate::large_file::CHUNK_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws");
+        std::fs::create_dir_all(&base).unwrap();
+        let state = crate::workspace_layout::ensure_workspace_state(&base).unwrap();
+        let hub = LocalHub::open(dir.path().join("hub-data"), None)
+            .await
+            .unwrap();
+        let api = ApiClient::local(hub, None);
+        let db = ClientDb::new(state).await.unwrap();
+        let ctx = SyncCtx::new(
+            &api,
+            &db,
+            &base,
+            "test-ws",
+            Some(TEST_PASSWORD),
+            feanorfs_common::LegacyPolicy::Reject,
+        );
+
+        // Chunked file with a deterministic first chunk.
+        let path = base.join("large.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len(SIZE).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.write_all(b"A-LARGEMK").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let fingerprint =
+            crate::large_file::fingerprint(&path, TEST_PASSWORD, "large.bin").unwrap();
+        crate::large_file::upload(&ctx, "large.bin", &fingerprint.encrypted_hash)
+            .await
+            .unwrap();
+
+        // Visible leg = theirs (small); hidden leg = ours (the chunked file).
+        let small_hash = feanorfs_common::hash_bytes(b"tiny");
+        let conflict = ConcurrentEdit::new(
+            "large.bin".to_string(),
+            None,
+            Some(FileState {
+                path: "large.bin".into(),
+                hash: fingerprint.encrypted_hash.clone(),
+                size: SIZE,
+                mtime: 0,
+                deleted: false,
+                mode: 0,
+            }),
+            Some(FileState {
+                path: "large.bin".into(),
+                hash: small_hash,
+                size: 4,
+                mtime: 0,
+                deleted: false,
+                mode: 0,
+            }),
+        );
+        let bundle =
+            feanorfs_common::flat_to_tree_with_conflicts(&HashMap::new(), &[conflict]).unwrap();
+        let objects = ObjectStore::new(&ctx);
+        let root = objects.put_bundle(&bundle).await.unwrap();
+        let id = objects
+            .put_snapshot(&Snapshot {
+                root,
+                parents: Vec::new(),
+                author: "test".into(),
+                created_at_ms: 0,
+                message: None,
+            })
+            .await
+            .unwrap();
+        let hashes = objects.snapshot_reachability(&id, true).await.unwrap();
+
+        // Chunk 0 of the hidden leg, sealed exactly like the engine seals it.
+        let mut chunk0 = vec![0_u8; CHUNK_BYTES];
+        chunk0[..9].copy_from_slice(b"A-LARGEMK");
+        let sealed0 = feanorfs_common::pack_bytes(
+            &chunk0,
+            TEST_PASSWORD,
+            &format!("feanorfs-file-chunk-v1\0large.bin\0{index}", index = 0),
+        )
+        .unwrap();
+        let chunk0_hash = feanorfs_common::hash_bytes(&sealed0);
+        assert!(
+            hashes.contains(&chunk0_hash),
+            "hidden chunked conflict leg chunks must be reachable"
+        );
+    }
+
+    /// The visible leg keeps its fast path: a small visible leg is not fetched
+    /// for chunk expansion, and a chunked visible leg still expands.
+    #[tokio::test]
+    async fn reachability_visible_leg_chunk_expansion_uses_stored_size() {
+        const SIZE: u64 = 65 * 1024 * 1024 + 5;
+        const CHUNK_BYTES: usize = crate::large_file::CHUNK_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws");
+        std::fs::create_dir_all(&base).unwrap();
+        let state = crate::workspace_layout::ensure_workspace_state(&base).unwrap();
+        let hub = LocalHub::open(dir.path().join("hub-data"), None)
+            .await
+            .unwrap();
+        let api = ApiClient::local(hub, None);
+        let db = ClientDb::new(state).await.unwrap();
+        let ctx = SyncCtx::new(
+            &api,
+            &db,
+            &base,
+            "test-ws",
+            Some(TEST_PASSWORD),
+            feanorfs_common::LegacyPolicy::Reject,
+        );
+
+        let path = base.join("large.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len(SIZE).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.write_all(b"B-LARGEMK").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let fingerprint =
+            crate::large_file::fingerprint(&path, TEST_PASSWORD, "large.bin").unwrap();
+        crate::large_file::upload(&ctx, "large.bin", &fingerprint.encrypted_hash)
+            .await
+            .unwrap();
+
+        // Visible leg = theirs = the chunked file itself.
+        let conflict = ConcurrentEdit::new(
+            "large.bin".to_string(),
+            None,
+            Some(FileState {
+                path: "large.bin".into(),
+                hash: fingerprint.encrypted_hash.clone(),
+                size: SIZE,
+                mtime: 0,
+                deleted: false,
+                mode: 0,
+            }),
+            Some(FileState {
+                path: "large.bin".into(),
+                hash: fingerprint.encrypted_hash.clone(),
+                size: SIZE,
+                mtime: 0,
+                deleted: false,
+                mode: 0,
+            }),
+        );
+        let bundle =
+            feanorfs_common::flat_to_tree_with_conflicts(&HashMap::new(), &[conflict]).unwrap();
+        let objects = ObjectStore::new(&ctx);
+        let root = objects.put_bundle(&bundle).await.unwrap();
+        let id = objects
+            .put_snapshot(&Snapshot {
+                root,
+                parents: Vec::new(),
+                author: "test".into(),
+                created_at_ms: 0,
+                message: None,
+            })
+            .await
+            .unwrap();
+        let hashes = objects.snapshot_reachability(&id, true).await.unwrap();
+
+        let mut chunk0 = vec![0_u8; CHUNK_BYTES];
+        chunk0[..9].copy_from_slice(b"B-LARGEMK");
+        let sealed0 = feanorfs_common::pack_bytes(
+            &chunk0,
+            TEST_PASSWORD,
+            &format!("feanorfs-file-chunk-v1\0large.bin\0{index}", index = 0),
+        )
+        .unwrap();
+        let chunk0_hash = feanorfs_common::hash_bytes(&sealed0);
+        assert!(hashes.contains(&chunk0_hash));
     }
 }

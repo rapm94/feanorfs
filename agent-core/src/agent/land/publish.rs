@@ -101,11 +101,16 @@ pub(super) async fn publish_land(
             diff = compute_agent_diff(input.ctx, input.name).await?;
             continue;
         }
+        let parents = if input.agent_base == diff.current_head {
+            vec![diff.current_head.clone()]
+        } else {
+            vec![input.agent_base.to_string(), diff.current_head.clone()]
+        };
         let candidate = snapshots
             .write(SnapshotInput {
                 files: &candidate_state.files,
                 conflicts: &candidate_state.conflicts,
-                parents: vec![input.agent_base.to_string(), diff.current_head.clone()],
+                parents,
                 author: input.name,
                 message: None,
             })

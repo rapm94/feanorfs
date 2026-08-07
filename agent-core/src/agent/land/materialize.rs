@@ -8,7 +8,7 @@ use super::super::diff::AgentDiff;
 use super::publish::inject_land_failure;
 use crate::crypto::seal;
 use crate::ctx::SyncCtx;
-use crate::fs_util::atomic_write;
+use crate::fs_util::{apply_executable_mode, atomic_write};
 use crate::snapshot::SnapshotEngine;
 
 pub(super) struct MaterializeInput<'a, 'ctx> {
@@ -80,6 +80,7 @@ pub(super) async fn materialize_land(
         } else {
             let bytes = fs::read(input.agent_path.join(&change.path)).await?;
             atomic_write(input.ctx.base, &change.path, &bytes).await?;
+            apply_executable_mode(&main_path, change.mode).await?;
             landed.push(LandedPath {
                 path: change.path.clone(),
                 action: "updated".to_string(),
@@ -100,7 +101,7 @@ pub(super) async fn materialize_land(
         for change in landed_states.values().filter(|change| change.deleted) {
             local_after.insert(change.path.clone(), change.clone());
         }
-        crate::sync_pass::process_uploads(input.ctx, &upload_response, &local_after).await?;
+        crate::sync_pass::process_uploads(input.ctx, &upload_response, &local_after, false).await?;
         SnapshotEngine::new(input.ctx)
             .record_last_synced(&local_after, "land")
             .await?;

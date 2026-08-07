@@ -195,6 +195,22 @@ pub fn output_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     output_json_to(stdout.lock(), value)
 }
 
+/// Makes untrusted text safe and single-line for a human terminal while JSON
+/// output retains the exact structured value.
+pub(crate) fn terminal_line(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => rendered.push_str("\\n"),
+            '\r' => rendered.push_str("\\r"),
+            '\t' => rendered.push_str("\\t"),
+            control if control.is_control() => rendered.extend(control.escape_unicode()),
+            printable => rendered.push(printable),
+        }
+    }
+    rendered
+}
+
 fn output_json_to<T: serde::Serialize>(
     mut writer: impl std::io::Write,
     value: &T,
@@ -235,6 +251,18 @@ pub(crate) fn service_identity_matches(marker: &Path, programs: &[&Path]) -> boo
         return false;
     };
     service_identity(programs).is_ok_and(|current| installed == current)
+}
+
+/// Reads the recorded program paths from a `service-program` identity marker.
+pub(crate) fn read_service_identity(marker: &Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(marker) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<Vec<String>>>(&content)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| entry.first().cloned())
+        .collect()
 }
 
 pub(crate) fn record_service_identity(marker: &Path, programs: &[&Path]) -> anyhow::Result<()> {
@@ -734,7 +762,7 @@ fn confirm_join_preflight() -> anyhow::Result<()> {
 mod tests {
     use super::{
         output_json_to, record_service_identity, resolve_connection_token,
-        service_identity_matches, truncate_password_for_display,
+        service_identity_matches, terminal_line, truncate_password_for_display,
     };
 
     struct ClosedPipe;
@@ -755,6 +783,14 @@ mod tests {
     }
 
     #[test]
+    fn terminal_line_escapes_controls_but_preserves_unicode() {
+        assert_eq!(
+            terminal_line("hello\n\t\u{1b}[31m café"),
+            "hello\\n\\t\\u{1b}[31m café"
+        );
+    }
+
+    #[test]
     fn service_identity_detects_same_path_binary_upgrades() {
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join("feanorfs");
@@ -765,6 +801,30 @@ mod tests {
 
         std::fs::write(&program, b"version two").unwrap();
         assert!(!service_identity_matches(&marker, &[&program]));
+    }
+
+    #[test]
+    fn read_service_identity_returns_recorded_program_paths() {
+        use super::read_service_identity;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("service-program");
+        assert!(read_service_identity(&marker).is_empty());
+        assert!(read_service_identity(&dir.path().join("missing")).is_empty());
+
+        let program = dir.path().join("feanorfs");
+        std::fs::write(&program, b"bytes").unwrap();
+        record_service_identity(&marker, &[&program]).unwrap();
+        let paths = read_service_identity(&marker);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0],
+            program.canonicalize().unwrap().to_string_lossy(),
+            "marker stores the canonical executable path"
+        );
+
+        std::fs::write(&marker, b"not json").unwrap();
+        assert!(read_service_identity(&marker).is_empty());
     }
 
     #[test]

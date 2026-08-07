@@ -71,15 +71,10 @@ cleanup() {
   printf '' | /usr/bin/pbcopy 2>/dev/null || true
   "$FEANORFS" service uninstall "$WORKSPACE" >/dev/null 2>&1 || true
   "$FEANORFS" service uninstall "$JOINED_WORKSPACE" >/dev/null 2>&1 || true
-  for plist in "$HOME"/Library/LaunchAgents/com.feanorfs.{tray,hub}.plist; do
-    if [[ -f "$plist" ]]; then
-      /bin/launchctl unload "$plist" >/dev/null 2>&1 || true
-    fi
-  done
-  rm -f \
-    "$HOME"/Library/LaunchAgents/com.feanorfs.sync-*.plist \
-    "$HOME/Library/LaunchAgents/com.feanorfs.tray.plist" \
-    "$HOME/Library/LaunchAgents/com.feanorfs.hub.plist"
+  if [[ -f "$HOME/Library/LaunchAgents/com.feanorfs.agent.plist" ]]; then
+    /bin/launchctl unload "$HOME/Library/LaunchAgents/com.feanorfs.agent.plist" >/dev/null 2>&1 || true
+  fi
+  rm -f "$HOME"/Library/LaunchAgents/com.feanorfs.*.plist
   rm -rf "$HOME/.feanorfs"
   rm -rf "$ROOT"
 }
@@ -160,23 +155,26 @@ jq -e --arg port "$HUB_PORT" \
 "$FEANORFS" start "$WORKSPACE" >/dev/null
 "$FEANORFS" service status "$WORKSPACE" | grep -q 'Automatic sync is running'
 
-HUB_PLIST="$HOME/Library/LaunchAgents/com.feanorfs.hub.plist"
-TRAY_PLIST="$HOME/Library/LaunchAgents/com.feanorfs.tray.plist"
-SYNC_PLIST="$(find "$HOME/Library/LaunchAgents" -maxdepth 1 -name 'com.feanorfs.sync-*.plist' -print -quit)"
-[[ -f "$HUB_PLIST" && -f "$TRAY_PLIST" && -n "$SYNC_PLIST" ]]
+# One single supervisor launch agent owns every worker: exactly one
+# background item on macOS, working unsigned.
+AGENT_PLIST="$HOME/Library/LaunchAgents/com.feanorfs.agent.plist"
+[[ -f "$AGENT_PLIST" ]]
+[[ ! -e "$HOME/Library/LaunchAgents/com.feanorfs.hub.plist" ]]
+[[ ! -e "$HOME/Library/LaunchAgents/com.feanorfs.tray.plist" ]]
+[[ -z "$(find "$HOME/Library/LaunchAgents" -maxdepth 1 -name 'com.feanorfs.sync-*.plist' -print -quit)" ]]
+agent_json="$(/usr/bin/plutil -convert json -o - "$AGENT_PLIST")"
+jq -e --arg bin "$FEANORFS"   '.ProgramArguments == [$bin, "service", "supervise"]'   <<<"$agent_json" >/dev/null
 
-hub_json="$(/usr/bin/plutil -convert json -o - "$HUB_PLIST")"
-sync_json="$(/usr/bin/plutil -convert json -o - "$SYNC_PLIST")"
-tray_json="$(/usr/bin/plutil -convert json -o - "$TRAY_PLIST")"
-jq -e --arg bin "$FEANORFS" --arg data "$HOME/.feanorfs/hub-data" \
-  '.ProgramArguments == [$bin, "service", "hub-run", $data] and (.EnvironmentVariables == null)' \
-  <<<"$hub_json" >/dev/null
-jq -e --arg bin "$FEANORFS" --arg workspace "$WORKSPACE" \
-  '.ProgramArguments == [$bin, "service", "run", $workspace]' \
-  <<<"$sync_json" >/dev/null
-jq -e --arg bin "$FEANORFS" --arg tray "$FEANORFS_TRAY" \
-  '.ProgramArguments == [$tray] and .EnvironmentVariables.FEANORFS_BIN == $bin' \
-  <<<"$tray_json" >/dev/null
+# The supervisor spawns the hub worker, the workspace watcher, and the tray.
+for _ in {1..40}; do
+  if pgrep -f "$FEANORFS service hub-run $HOME/.feanorfs/hub-data" >/dev/null     && pgrep -f "$FEANORFS service run $WORKSPACE" >/dev/null     && pgrep -f "$FEANORFS_TRAY" >/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+pgrep -f "$FEANORFS service hub-run $HOME/.feanorfs/hub-data" >/dev/null
+pgrep -f "$FEANORFS service run $WORKSPACE" >/dev/null
+pgrep -f "$FEANORFS_TRAY" >/dev/null
 
 for private_file in \
   "$HOME/.feanorfs/hub-data/auth-token" \
@@ -188,11 +186,10 @@ for private_file in \
 done
 
 jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
-  "$HOME/.feanorfs/hub-data/service-program" >/dev/null
-jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
-  "$WORKSPACE_STATE/service-program" >/dev/null
-jq -e 'length == 2 and all(.[][1]; length == 64)' \
-  "$HOME/.feanorfs/tray-service-program" >/dev/null
+  "$HOME/.feanorfs/supervisor-service-program" >/dev/null
+[[ ! -e "$HOME/.feanorfs/hub-data/service-program" ]]
+[[ ! -e "$WORKSPACE_STATE/service-program" ]]
+[[ ! -e "$HOME/.feanorfs/tray-service-program" ]]
 
 CA="$HOME/.feanorfs/hub-data/tls/ca-cert.pem"
 [[ "$(curl --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://127.0.0.1:$HUB_PORT/api/workspaces")" == "401" ]]
@@ -234,7 +231,7 @@ if [[ "$tray_ready" != true ]]; then
   echo "Tray did not reach idle, watching, and unpaused state within the bounded readiness window." >&2
   exit 1
 fi
-/bin/launchctl print "gui/$(id -u)/com.feanorfs.tray" >/dev/null
+/bin/launchctl print "gui/$(id -u)/com.feanorfs.agent" >/dev/null
 
 echo "Smoke: TLS, doctor, tray status, and MCP"
 MCP_OUT="$ROOT/mcp.jsonl"
@@ -469,7 +466,7 @@ echo "Smoke: reversible consumer stop and resume"
 "$FEANORFS" --json tray recent | jq -e '
   .active == null and (.workspaces | length) == 0
 ' >/dev/null
-/bin/launchctl print "gui/$(id -u)/com.feanorfs.hub" >/dev/null
+/bin/launchctl print "gui/$(id -u)/com.feanorfs.agent" >/dev/null
 [[ "$(curl --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://127.0.0.1:$HUB_PORT/api/workspaces")" == "401" ]]
 
 "$FEANORFS" start "$WORKSPACE" >/dev/null

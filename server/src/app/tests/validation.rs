@@ -8,6 +8,41 @@ use tower::util::ServiceExt;
 use super::{app_state, build_router};
 
 #[tokio::test]
+async fn version_probe_requires_auth_and_reports_this_build() {
+    let directory = TempDir::new().expect("create temp directory");
+    let state = crate::init_app_state(directory.path().to_path_buf(), Some("secret".into()))
+        .await
+        .expect("initialize app state");
+    let router = build_router(state);
+    let unauthenticated = router
+        .clone()
+        .oneshot(
+            Request::get("/api/version")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send request");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let response = router
+        .oneshot(
+            Request::get("/api/version")
+                .header("Authorization", "Bearer secret")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send authenticated request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("read version body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("parse version JSON");
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
 async fn upload_rejects_unsafe_path() {
     let request =
         Request::post("/api/upload?workspace_id=ws&path=../etc/passwd&hash=a&size=0&mtime=0")

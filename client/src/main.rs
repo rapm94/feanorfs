@@ -44,7 +44,12 @@ enum Commands {
     /// Restore a historical snapshot as a new snapshot.
     Undo { snapshot_id: String },
     /// Check the official stable release without downloading or installing it.
-    Update,
+    Update {
+        /// Respect the per-machine throttle: reuse the last result until the
+        /// interval elapses (used by the tray and scheduled checks).
+        #[arg(long)]
+        periodic: bool,
+    },
 }
 
 #[tokio::main]
@@ -72,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Undo { snapshot_id } => {
             cli::history::undo(&current_dir, &snapshot_id, cli.json).await?
         }
-        Commands::Update => cli::update::run(cli.json).await?,
+        Commands::Update { periodic } => cli::update::run(cli.json, periodic).await?,
     }
 
     Ok(())
@@ -90,6 +95,62 @@ mod cli_tests {
         Cli::try_parse_from(["feanorfs", "start", "https://x:3030"]).unwrap();
         Cli::try_parse_from(["feanorfs", "start", "fnr1-deadbeef"]).unwrap();
         Cli::try_parse_from(["feanorfs", "start", "fnp1-2345-6789-ABCD-EFGH"]).unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "agent",
+            "integrator",
+            "assign",
+            "--about",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--candidate",
+            "agent-a",
+            "--require",
+            "rust",
+            "--ack-timeout",
+            "5m",
+            "Integrate parser tests",
+        ])
+        .unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "agent",
+            "integrator",
+            "status",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "agent",
+            "integrator",
+            "revoke",
+            "0123456789abcdef0123456789abcdef",
+            "--reason",
+            "integrator went quiet",
+        ])
+        .unwrap();
+        Cli::try_parse_from(["feanorfs", "agent", "integrator", "resume"]).unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "agent",
+            "integrator",
+            "resume",
+            "--ack-timeout",
+            "60s",
+            "--fallback-on-blocked",
+        ])
+        .unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "conflicts",
+            "materialize",
+            "--about",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--path",
+            "src/main.rs",
+        ])
+        .unwrap();
+        Cli::try_parse_from(["feanorfs", "conflicts", "materialize"]).unwrap();
         Cli::try_parse_from(["feanorfs", "start", "fnh1-deadbeef"]).unwrap();
         Cli::try_parse_from(["feanorfs", "start", "fnr1-deadbeef", "/tmp/workspace"]).unwrap();
         Cli::try_parse_from(["feanorfs", "sync", "--no-watch"]).unwrap();
@@ -115,6 +176,7 @@ mod cli_tests {
         .unwrap();
         Cli::try_parse_from(["feanorfs", "service", "status"]).unwrap();
         Cli::try_parse_from(["feanorfs", "service", "hub-run", "/tmp/hub"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "service", "supervise"]).unwrap();
         Cli::try_parse_from(["feanorfs", "pair"]).unwrap();
         Cli::try_parse_from(["feanorfs", "pair", "--tray", "--expires", "300"]).unwrap();
         Cli::try_parse_from(["feanorfs", "pair", "--relay", "https://relay.example"]).unwrap();
@@ -162,6 +224,47 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["feanorfs", "start", "--encryption-key", "a-key"]).is_err());
         Cli::try_parse_from(["feanorfs", "agent"]).unwrap();
         Cli::try_parse_from(["feanorfs", "agent", "status"]).unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "agent",
+            "send",
+            "mac-test",
+            "--kind",
+            "request",
+            "--about",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "Run iOS simulator tests",
+        ])
+        .unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "--json",
+            "agent",
+            "send",
+            "*",
+            "--kind",
+            "blocked",
+            "--reply-to",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--from",
+            "ci1",
+            "cannot reach snapshot",
+        ])
+        .unwrap();
+        Cli::try_parse_from([
+            "feanorfs",
+            "agent",
+            "inbox",
+            "--for",
+            "mac-test",
+            "--after",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--limit",
+            "100",
+        ])
+        .unwrap();
+        Cli::try_parse_from(["feanorfs", "--json", "agent", "inbox"]).unwrap();
+        assert!(Cli::try_parse_from(["feanorfs", "agent", "send", "mac-test", "no kind"]).is_err());
         Cli::try_parse_from(["feanorfs", "conflicts"]).unwrap();
         Cli::try_parse_from(["feanorfs", "doctor", "--migration-report"]).unwrap();
         Cli::try_parse_from(["feanorfs", "folders"]).unwrap();
@@ -172,6 +275,7 @@ mod cli_tests {
         Cli::try_parse_from(["feanorfs", "--json", "folders"]).unwrap();
         Cli::try_parse_from(["feanorfs", "update"]).unwrap();
         Cli::try_parse_from(["feanorfs", "--json", "update"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "--json", "update", "--periodic"]).unwrap();
         Cli::try_parse_from(["feanorfs", "--json", "doctor", "--migration-report"]).unwrap();
         Cli::try_parse_from(["feanorfs", "setup", "--workspace", "w"]).unwrap();
         Cli::try_parse_from(["feanorfs", "init", "127.0.0.1:3030", "--workspace", "w"]).unwrap();

@@ -96,11 +96,24 @@ pub fn render_via_summary_tool(summary: &SummaryResult) -> Result<String> {
         .and_then(|mut child| {
             use std::io::Write;
             if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(json.as_bytes())?;
+                if let Err(error) = stdin.write_all(json.as_bytes()) {
+                    // A tool that exits without reading its input is broken;
+                    // fall back to the plain path listing instead of failing
+                    // the whole summary. The dead child is still reaped by
+                    // wait_with_output below.
+                    if error.kind() != std::io::ErrorKind::BrokenPipe {
+                        return Err(error);
+                    }
+                }
             }
             child.wait_with_output()
         })?;
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if stdout.is_empty() {
+        Ok(render_plain(summary))
+    } else {
+        Ok(stdout)
+    }
 }
 
 fn render_plain(s: &SummaryResult) -> String {

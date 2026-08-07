@@ -6,8 +6,8 @@ mod ui;
 use feanorfs::feanorfs_bin;
 use feanorfs::{
     agent_land, background_service_managed, background_service_start, background_service_stop,
-    check_for_updates, clear_pairing_clipboard, conflicts_keep, conflicts_keep_all,
-    copy_pairing_clipboard, export_recovery_kit, forget_unavailable_workspaces,
+    check_for_updates, check_for_updates_periodic, clear_pairing_clipboard, conflicts_keep,
+    conflicts_keep_all, copy_pairing_clipboard, export_recovery_kit, forget_unavailable_workspaces,
     graceful_stop_child, import_recovery_kit, join_workspace, run_pairing_session, start_workspace,
     stop_workspace, sync_once, system_health, tray_activate, tray_pause, tray_recent, tray_status,
     workspace_has_config, HealthReport, HealthStatus, PairSessionEvent, UpdateCheckResult,
@@ -32,6 +32,9 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 use ui::{dialog_text, menu_label, menu_label_with_suffix};
 
 const REFRESH_SECS: u64 = 10;
+/// Daily cadence for the throttled periodic update offer (the CLI enforces
+/// its own per-machine throttle window as well).
+const PERIODIC_UPDATE_SECS: u64 = 24 * 60 * 60;
 const RECENT_CACHE_SECS: u64 = 30;
 const MAX_WATCH_FAILURES: u32 = 3;
 const FAST_EXIT_SECS: u64 = 10;
@@ -100,6 +103,7 @@ enum Action {
         report: Result<HealthReport, String>,
     },
     UpdateReady(Result<UpdateCheckResult, String>),
+    PeriodicUpdateCheck,
     MenuClick(String),
     TaskDone {
         error: Option<String>,
@@ -596,6 +600,11 @@ fn first_run_requested(args: &[OsString]) -> bool {
         .any(|argument| argument == OsStr::new("--first-run"))
 }
 
+fn version_requested(args: &[OsString]) -> bool {
+    args.iter()
+        .any(|argument| argument == OsStr::new("--version") || argument == OsStr::new("-V"))
+}
+
 fn should_prompt_first_run(requested: bool, workspace: Option<&Path>) -> bool {
     requested && workspace.is_none()
 }
@@ -633,7 +642,7 @@ fn show_first_run_choice() -> FirstRunChoice {
         rfd::MessageDialog::new()
             .set_title("Welcome to FeanorFS")
             .set_description(dialog_text(
-                "Add a folder from this computer, or securely join one shared from another computer. FeanorFS will keep it synced automatically.",
+                "Add a folder from this computer, or securely join one shared from another computer. FeanorFS keeps your shared working files — including uncommitted work-in-progress — in sync automatically.",
             ))
             .set_level(rfd::MessageLevel::Info)
             .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
@@ -770,7 +779,7 @@ fn header_label(status: &TrayStatusResult) -> String {
         return format!("FeanorFS — {} (paused)", status.workspace_label);
     }
     let state = match status.mirror_state.as_str() {
-        "idle" => "up to date",
+        "idle" => "in sync with your shared WIP",
         "out_of_sync" => "has changes",
         "offline" => "offline",
         "conflict" => "needs attention",
@@ -1159,19 +1168,27 @@ fn build_menu(state: &AppState) -> Menu {
             None,
         ));
 
-        if !s.pending_conflicts.is_empty() {
+        if s.pending_conflict_count > 0 {
             let _ = menu.append(&PredefinedMenuItem::separator());
-            let title = format!("Needs attention ({})", s.pending_conflicts.len());
+            let visible = u32::try_from(s.pending_conflicts.len()).unwrap_or(u32::MAX);
+            let title = if s.pending_conflict_count > visible {
+                format!(
+                    "Needs attention ({}; showing {visible})",
+                    s.pending_conflict_count
+                )
+            } else {
+                format!("Needs attention ({})", s.pending_conflict_count)
+            };
             let conflict_menu = Submenu::with_id(muda::MenuId::new("conflicts"), title, true);
             let _ = conflict_menu.append(&MenuItem::with_id(
                 muda::MenuId::new("keep-all-local"),
-                format!("Keep all {} local versions…", s.pending_conflicts.len()),
+                format!("Keep all {} local versions…", s.pending_conflict_count),
                 actions_enabled,
                 None,
             ));
             let _ = conflict_menu.append(&MenuItem::with_id(
                 muda::MenuId::new("keep-all-cloud"),
-                format!("Keep all {} mirror versions…", s.pending_conflicts.len()),
+                format!("Keep all {} mirror versions…", s.pending_conflict_count),
                 actions_enabled,
                 None,
             ));
@@ -1192,6 +1209,15 @@ fn build_menu(state: &AppState) -> Menu {
                     ));
                 }
                 let _ = conflict_menu.append(&PredefinedMenuItem::separator());
+            }
+            if s.pending_conflict_count > visible {
+                let hidden = s.pending_conflict_count - visible;
+                let _ = conflict_menu.append(&MenuItem::with_id(
+                    muda::MenuId::new("conflicts-truncated"),
+                    format!("…and {hidden} more conflict(s)"),
+                    false,
+                    None,
+                ));
             }
             let _ = menu.append(&conflict_menu);
         }
@@ -1452,14 +1478,14 @@ fn menu_revision(state: &AppState) -> u64 {
     state.health_inflight.hash(&mut hasher);
     state.update_inflight.hash(&mut hasher);
     if let Some(status) = state.last_status.as_ref() {
-        serde_json::to_vec(status)
-            .expect("tray status is serializable")
-            .hash(&mut hasher);
+        if let Ok(encoded) = serde_json::to_vec(status) {
+            encoded.hash(&mut hasher);
+        }
     }
     if let Some(recent) = state.recent.as_ref() {
-        serde_json::to_vec(recent)
-            .expect("recent workspace state is serializable")
-            .hash(&mut hasher);
+        if let Ok(encoded) = serde_json::to_vec(recent) {
+            encoded.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -1992,7 +2018,7 @@ fn handle_menu_action(
             let count = state
                 .last_status
                 .as_ref()
-                .map_or(0, |status| status.pending_conflicts.len());
+                .map_or(0, |status| status.pending_conflict_count);
             if count == 0 {
                 return;
             }
@@ -2010,7 +2036,7 @@ fn handle_menu_action(
             let confirmed = rfd::MessageDialog::new()
                 .set_title(title)
                 .set_description(dialog_text(format!(
-                    "This applies one choice to {count} paths.\n\n{consequence}\n\nFeanorFS will not merge file contents. Choose OK only if this single policy is correct for every listed conflict."
+                    "This applies one choice to all {count} conflicting paths, including any omitted from the bounded menu.\n\n{consequence}\n\nFeanorFS will not merge file contents. Choose OK only if this single policy is correct for every conflict."
                 )))
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::OkCancel)
@@ -2085,7 +2111,66 @@ fn handle_menu_action(
     }
 }
 
+/// Writes one main-thread handler panic to a private log file so a recovered
+/// tray crash stays diagnosable without affecting the UI thread.
+fn log_handler_panic(panic: Box<dyn std::any::Any + Send>) {
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic payload");
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    let root = std::env::var_os("FEANORFS_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| std::path::PathBuf::from(home).join(".feanorfs"))
+        });
+    if let Some(root) = root {
+        let _ = std::fs::create_dir_all(&root);
+        let path = root.join("tray-panic.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(
+                file,
+                "t={now} tray handler panicked: {message}\n{backtrace}\n"
+            );
+        }
+    }
+}
+
+/// Runs one event-loop handler step inside `catch_unwind` so a panic in any
+/// handler (including UI-framework internals) can never abort the tray: the
+/// panic is logged, volatile in-flight flags are reset, and the loop keeps
+/// running with a fresh menu.
+fn catch_handler(step: impl FnOnce()) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)) {
+        Ok(()) => true,
+        Err(panic) => {
+            log_handler_panic(panic);
+            eprintln!(
+                "feanorfs-tray recovered from a handler panic; see ~/.feanorfs/tray-panic.log"
+            );
+            false
+        }
+    }
+}
+
 fn main() {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if version_requested(&arguments) {
+        println!("feanorfs-tray {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let _instance_guard = match acquire_tray_instance_lock() {
         Ok(Some(guard)) => guard,
         Ok(None) => return,
@@ -2095,7 +2180,6 @@ fn main() {
         }
     };
     let workspace = resolve_initial_workspace();
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let prompt_first_run =
         should_prompt_first_run(first_run_requested(&arguments), workspace.as_deref());
 
@@ -2135,6 +2219,12 @@ fn main() {
         let _ = refresh_proxy.send_event(Action::Refresh);
     });
 
+    let update_proxy = proxy.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(PERIODIC_UPDATE_SECS));
+        let _ = update_proxy.send_event(Action::PeriodicUpdateCheck);
+    });
+
     let shared = Rc::new(Mutex::new(state));
     let mut visual = initial_visual;
 
@@ -2165,8 +2255,47 @@ fn main() {
             return;
         };
 
-        let mut st = shared.lock().unwrap();
+        let shared_ref = Rc::clone(&shared);
+        let tray_ref = Rc::clone(&tray);
+        let proxy_ref = proxy.clone();
+        let visual_ref = &mut visual;
+        let recovered = !catch_handler(move || {
+            let mut st = match shared_ref.lock() {
+                Ok(st) => st,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            handle_user_event(&mut st, &tray_ref, visual_ref, &proxy_ref, action);
+        });
+        if recovered {
+            // A handler panicked. Reset volatile flags so the tray stays
+            // usable, then rebuild the UI from the (still valid) state.
+            let mut st = match shared.lock() {
+                Ok(st) => st,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            st.status_inflight = false;
+            st.setup_inflight = false;
+            st.stop_inflight = false;
+            st.switch_inflight = false;
+            st.pair_inflight = false;
+            st.recovery_inflight = false;
+            st.health_inflight = false;
+            st.update_inflight = false;
+            st.error_message = Some(
+                "FeanorFS Tray recovered from an unexpected error. The error was written to ~/.feanorfs/tray-panic.log; your files were not changed.".into(),
+            );
+            apply_ui(&st, &tray, &mut visual);
+            request_status_fetch(&mut st, &proxy);
+        }
+    });
 
+    fn handle_user_event(
+        st: &mut AppState,
+        tray: &Rc<TrayIcon>,
+        visual: &mut TrayVisual,
+        proxy: &tao::event_loop::EventLoopProxy<Action>,
+        action: Action,
+    ) {
         match action {
             Action::FirstRun => {
                 let menu_action = match show_first_run_choice() {
@@ -2175,9 +2304,9 @@ fn main() {
                     FirstRunChoice::Later => None,
                 };
                 if let Some(menu_action) = menu_action {
-                    handle_menu_action(&mut st, menu_action, &proxy);
+                    handle_menu_action(st, menu_action, proxy);
                 }
-                apply_ui(&st, &tray, &mut visual);
+                apply_ui(st, tray, visual);
             }
             Action::Refresh => {
                 // Other CLI processes can add or stop folders while the tray is
@@ -2188,8 +2317,8 @@ fn main() {
                 if st.adopt_recent_if_unconfigured() {
                     st.last_status = None;
                 }
-                request_periodic_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_periodic_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
             }
             Action::StatusReady {
                 generation,
@@ -2203,7 +2332,7 @@ fn main() {
                         st.status_inflight = false;
                         if st.status_pending {
                             st.status_pending = false;
-                            request_status_fetch(&mut st, &proxy);
+                            request_status_fetch(st, proxy);
                         }
                     }
                     return;
@@ -2223,16 +2352,16 @@ fn main() {
                 }
                 st.check_watch_alive();
                 st.cached_recent();
-                apply_ui(&st, &tray, &mut visual);
+                apply_ui(st, tray, visual);
                 if st.status_pending {
                     st.status_pending = false;
-                    request_status_fetch(&mut st, &proxy);
+                    request_status_fetch(st, proxy);
                 }
             }
             Action::HealthReady { workspace, report } => {
                 st.health_inflight = false;
                 if st.workspace.as_ref() != Some(&workspace) {
-                    apply_ui(&st, &tray, &mut visual);
+                    apply_ui(st, tray, visual);
                     return;
                 }
                 match report {
@@ -2283,14 +2412,14 @@ fn main() {
                         }
                         let choice = dialog.show();
                         if needs_repair && health_choice_requests_repair(&choice) {
-                            begin_workspace_repair(&mut st, workspace, &proxy);
+                            begin_workspace_repair(st, workspace, proxy);
                         } else {
                             st.error_message = needs_repair
                                 .then(|| "System health found issues that need attention.".into());
                         }
                     }
                 }
-                apply_ui(&st, &tray, &mut visual);
+                apply_ui(st, tray, visual);
             }
             Action::UpdateReady(result) => {
                 st.update_inflight = false;
@@ -2336,7 +2465,16 @@ fn main() {
                         }
                     }
                 }
-                apply_ui(&st, &tray, &mut visual);
+                apply_ui(st, tray, visual);
+            }
+            Action::PeriodicUpdateCheck => {
+                if !st.update_inflight {
+                    st.update_inflight = true;
+                    let proxy = proxy.clone();
+                    std::thread::spawn(move || {
+                        let _ = proxy.send_event(Action::UpdateReady(check_for_updates_periodic()));
+                    });
+                }
             }
             Action::MenuClick(id) => {
                 if let Some(menu_action) = parse_menu_action(&id) {
@@ -2354,9 +2492,9 @@ fn main() {
                             | MenuAction::ForgetUnavailable
                             | MenuAction::SwitchWorkspace(_)
                     );
-                    handle_menu_action(&mut st, menu_action, &proxy);
+                    handle_menu_action(st, menu_action, proxy);
                     if needs_ui {
-                        apply_ui(&st, &tray, &mut visual);
+                        apply_ui(st, tray, visual);
                     }
                 }
             }
@@ -2390,8 +2528,8 @@ fn main() {
                 if restart_watch && !st.is_paused() && !st.external_watcher_active() {
                     st.start_watch();
                 }
-                request_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
             }
             Action::SwitchDone {
                 generation,
@@ -2412,8 +2550,8 @@ fn main() {
                     st.reset_watch_policy();
                     st.last_status = None;
                 }
-                request_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
             }
             Action::ForgetUnavailableDone {
                 generation,
@@ -2426,9 +2564,8 @@ fn main() {
                 st.switch_inflight = false;
                 match result {
                     Ok(recent) => {
-                        let removed = before.min(
-                            before.saturating_sub(unavailable_workspace_count(&recent)),
-                        );
+                        let removed =
+                            before.min(before.saturating_sub(unavailable_workspace_count(&recent)));
                         st.recent = Some(recent);
                         st.recent_fetched_at = Some(Instant::now());
                         st.error_message = None;
@@ -2447,8 +2584,8 @@ fn main() {
                     }
                     Err(error) => st.error_message = Some(error),
                 }
-                request_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
             }
             Action::SetupDone {
                 generation,
@@ -2463,8 +2600,7 @@ fn main() {
                 st.setup_kind = None;
                 let dialog = if let Some(error) = error {
                     let configured = workspace_has_config(&path);
-                    let (title, description) =
-                        setup_failure_copy(kind, &path, configured, &error);
+                    let (title, description) = setup_failure_copy(kind, &path, configured, &error);
                     st.error_message = Some(format!(
                         "{} Your files were not changed.",
                         title.trim_end_matches('.')
@@ -2472,8 +2608,7 @@ fn main() {
                     Some((title, description, false))
                 } else if !workspace_has_config(&path) {
                     let error = "Setup ended before FeanorFS could save the encrypted folder configuration.";
-                    let (title, description) =
-                        setup_failure_copy(kind, &path, false, error);
+                    let (title, description) = setup_failure_copy(kind, &path, false, error);
                     st.error_message = Some(format!(
                         "{} Your files were not changed.",
                         title.trim_end_matches('.')
@@ -2489,8 +2624,8 @@ fn main() {
                     let (title, description) = setup_success_copy(kind, &path);
                     Some((title, description, true))
                 };
-                request_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
                 if let Some((title, description, success)) = dialog {
                     show_setup_result_dialog(title, description, success);
                 }
@@ -2502,8 +2637,8 @@ fn main() {
                 st.setup_inflight = false;
                 st.setup_kind = None;
                 st.error_message = None;
-                request_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
             }
             Action::StopDone {
                 generation,
@@ -2524,8 +2659,8 @@ fn main() {
                     st.cached_recent();
                     let _ = st.adopt_recent_if_unconfigured();
                 }
-                request_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
             }
             Action::PairReady {
                 generation,
@@ -2537,7 +2672,7 @@ fn main() {
                     return;
                 }
                 st.error_message = Some("Waiting for the other computer…".into());
-                apply_ui(&st, &tray, &mut visual);
+                apply_ui(st, tray, visual);
                 let description = pairing_dialog_description(&code, expires_in_seconds);
                 copy_pairing_clipboard(&code);
                 let _ = rfd::MessageDialog::new()
@@ -2549,7 +2684,7 @@ fn main() {
                 clear_pairing_clipboard(&code);
                 st.cancel_pairing();
                 st.error_message = Some("Closing secure pairing…".into());
-                apply_ui(&st, &tray, &mut visual);
+                apply_ui(st, tray, visual);
             }
             Action::PairDone {
                 generation,
@@ -2578,8 +2713,8 @@ fn main() {
                     st.stop_watch();
                     std::process::exit(0);
                 }
-                request_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
             }
             Action::RecoveryDone {
                 generation,
@@ -2625,16 +2760,40 @@ fn main() {
                         .set_buttons(rfd::MessageButtons::Ok)
                         .show();
                 }
-                request_status_fetch(&mut st, &proxy);
-                apply_ui(&st, &tray, &mut visual);
+                request_status_fetch(st, proxy);
+                apply_ui(st, tray, visual);
             }
         }
-    });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catch_handler_contains_panics_and_logs_them() {
+        let home = std::env::temp_dir().join(format!(
+            "feanorfs-tray-panic-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe {
+            std::env::set_var("FEANORFS_HOME", &home);
+        }
+        let caught = catch_handler(|| panic!("injected tray handler panic"));
+        assert!(!caught, "a panicking handler must be contained, not abort");
+        let log = home.join("tray-panic.log");
+        let content = std::fs::read_to_string(&log).expect("panic log must be written");
+        assert!(content.contains("injected tray handler panic"));
+        // A healthy handler keeps returning true.
+        assert!(catch_handler(|| {}));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     use feanorfs_common::tray_contract::{
         RecentWorkspaceEntry, TrayAgentsSummary, TrayStatusResult,
     };
@@ -2648,6 +2807,7 @@ mod tests {
             workspace_path: "/tmp/test".into(),
             workspace_id: "test-workspace".into(),
             workspace_label: "test".into(),
+            pending_conflict_count: 0,
             pending_conflicts: vec![],
             agents: TrayAgentsSummary {
                 working: 0,
@@ -2796,6 +2956,13 @@ mod tests {
             Some(Path::new("/configured"))
         ));
         assert!(!should_prompt_first_run(false, None));
+    }
+
+    #[test]
+    fn version_probe_is_explicit() {
+        assert!(version_requested(&[OsString::from("--version")]));
+        assert!(version_requested(&[OsString::from("-V")]));
+        assert!(!version_requested(&[OsString::from("--first-run")]));
     }
 
     #[test]
@@ -3173,7 +3340,7 @@ mod tests {
     #[test]
     fn header_label_idle() {
         let s = make_status("idle", false);
-        assert!(header_label(&s).contains("up to date"));
+        assert!(header_label(&s).contains("in sync with your shared WIP"));
     }
 
     #[test]

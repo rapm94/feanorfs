@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feanorfs collaboration"
+  short_description: "Coordinate agents through encrypted signals"
+  default_prompt: "Use $feanorfs-collaboration to coordinate a snapshot-tied request and result between FeanorFS agents."

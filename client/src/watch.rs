@@ -8,6 +8,19 @@ use notify::{Event, EventKind, Watcher};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// True when a path component is a FeanorFS temp file. The atomic-write and
+/// large-file temp names are `.feanorfs-tmp-<pid>-<seq>-<attempt>` (numeric
+/// segments only), so a real user file merely sharing the prefix is still
+/// watched.
+fn is_feanorfs_temp_component(part: &str) -> bool {
+    part.strip_prefix(".feanorfs-tmp-").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .split('-')
+                .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 pub fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
     for path in paths {
         let Some(path_str) = path.to_str() else {
@@ -16,7 +29,7 @@ pub fn event_paths_warrant_sync(paths: &[PathBuf]) -> bool {
         let normalized = normalize_path(path_str);
         let ignored_component = normalized.split('/').any(|part| {
             matches!(part, ".feanorfs" | ".feanorfsignore" | ".git" | ".jj")
-                || part.starts_with(".feanorfs-tmp-")
+                || is_feanorfs_temp_component(part)
         });
         if !ignored_component {
             return true;
@@ -97,6 +110,7 @@ pub async fn run_watch(
         .await
         {
             consecutive_errors = consecutive_errors.saturating_add(1);
+            publish_sync_failure(current_dir, db).await;
             tracing::error!("Initial sync failed: {:?}", e);
             eprintln!("Initial sync failed: {e:?}");
             eprintln!("Offline — changes will sync when the server is reachable.");
@@ -135,6 +149,7 @@ pub async fn run_watch(
                     Ok(()) => consecutive_errors = 0,
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
+                        publish_sync_failure(current_dir, db).await;
                         tracing::error!("Auto-sync failed: {:?}", e);
                         eprintln!("Auto-sync failed: {e:?}");
                     }
@@ -162,6 +177,7 @@ pub async fn run_watch(
                 .await
                 {
                     consecutive_errors = consecutive_errors.saturating_add(1);
+                    publish_sync_failure(current_dir, db).await;
                     tracing::error!("Periodic sync failed: {:?}", e);
                 }
             }
@@ -169,6 +185,14 @@ pub async fn run_watch(
     }
 
     Ok(())
+}
+
+async fn publish_sync_failure(current_dir: &Path, db: &ClientDb) {
+    // Keep routine tray reads truthful without copying error text (which may
+    // contain paths or endpoints) into the bounded secret-free snapshot.
+    let _ =
+        crate::tray::publish_worker_status(current_dir, &crate::commands::MirrorState::Offline, db)
+            .await;
 }
 
 async fn sync_once(
@@ -193,6 +217,9 @@ async fn sync_once(
         result.deletes_local,
         result.deletes_remote
     );
+    // Publish the bounded secret-free tray status snapshot so routine tray
+    // refreshes never scan the project or take the sync lock.
+    let _ = crate::tray::publish_worker_status(current_dir, &result.mirror_state, db).await;
     Ok(())
 }
 
@@ -234,6 +261,23 @@ mod tests {
         )]));
         assert!(!event_paths_warrant_sync(&[PathBuf::from(
             "/workspace/.feanorfs/agents/ci1/foo.txt"
+        )]));
+    }
+
+    #[test]
+    fn ignores_only_numeric_feanorfs_temp_files() {
+        assert!(!event_paths_warrant_sync(&[PathBuf::from(
+            "/workspace/.feanorfs-tmp-123-0"
+        )]));
+        assert!(!event_paths_warrant_sync(&[PathBuf::from(
+            "/workspace/.feanorfs-tmp-84583-2-1"
+        )]));
+        // A user file merely sharing the prefix must still be watched.
+        assert!(event_paths_warrant_sync(&[PathBuf::from(
+            "/workspace/.feanorfs-tmp-notes.txt"
+        )]));
+        assert!(event_paths_warrant_sync(&[PathBuf::from(
+            "/workspace/.feanorfs-tmp-final"
         )]));
     }
 

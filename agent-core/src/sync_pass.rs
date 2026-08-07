@@ -195,6 +195,12 @@ pub async fn run_sync_pass(
     run_sync_pass_locked(ctx, mode, lazy).await
 }
 
+/// When the server metadata regressed to an older mtime than the last agreed
+/// state while the local file still matches that agreed state (restored server
+/// backup, clock skew), restore the agreed bytes instead of mass-downloading
+/// the stale version. Format-v3 snapshots flatten mtimes to 0 on both sides so
+/// this is a no-op there; hash-based reconciliation and the conflict gate own
+/// v3 rollback protection.
 fn promote_rollback_restores(
     response: &mut SyncResponse,
     local_files: &HashMap<String, FileState>,
@@ -220,10 +226,37 @@ fn promote_rollback_restores(
     response.upload_required.dedup();
 }
 
+/// True when a hub rejected a reachability manifest because a referenced blob
+/// is missing (fresh/restored hub data or a GC race). Recovery re-uploads all
+/// objects, so this must only be treated as recoverable for this exact error.
+fn is_manifest_rejection(error: &anyhow::Error) -> bool {
+    error.to_string().contains("references missing blob")
+}
+
 pub(crate) async fn run_sync_pass_locked(
     ctx: &SyncCtx<'_>,
     mode: SyncMode,
     lazy: bool,
+) -> Result<(SyncPassOutcome, HashSet<String>)> {
+    match run_sync_pass_once(ctx, mode, lazy, false).await {
+        Err(error) if is_manifest_rejection(&error) => {
+            tracing::warn!(
+                "Hub rejected a reachability manifest; clearing the uploaded-object registry and retrying with full uploads"
+            );
+            if let Ok(state_dir) = ctx.state_dir() {
+                let _ = crate::upload_registry::clear(&state_dir).await;
+            }
+            run_sync_pass_once(ctx, mode, lazy, true).await
+        }
+        result => result,
+    }
+}
+
+async fn run_sync_pass_once(
+    ctx: &SyncCtx<'_>,
+    mode: SyncMode,
+    lazy: bool,
+    force_upload_all: bool,
 ) -> Result<(SyncPassOutcome, HashSet<String>)> {
     let label = match mode {
         SyncMode::Push => "Push",
@@ -292,7 +325,7 @@ pub(crate) async fn run_sync_pass_locked(
     }
 
     if mode != SyncMode::Pull {
-        outcome.uploads = process_uploads(ctx, &response, &local_files).await?;
+        outcome.uploads = process_uploads(ctx, &response, &local_files, force_upload_all).await?;
         outcome.deletes_remote = cleanup_deleted_cache(&local_files, ctx.db).await?;
 
         if ctx.format_version() < 3 && !response.upload_required.is_empty() {
@@ -386,6 +419,10 @@ pub(crate) async fn process_downloads(
 ) -> Result<(u32, u32)> {
     let mut downloads = 0u32;
     let mut placeholders = 0u32;
+    // Scan-time disk fingerprints (mtime/size) for the stale-local guard below.
+    // `FileState.mtime` deliberately carries the server mtime, not the disk
+    // mtime, so it cannot be used to detect mid-sync local edits.
+    let cached_entries = ctx.db.get_cache_entries().await?;
     for replica_file in &response.download_required {
         let path = &replica_file.path;
         if !is_safe_rel_path(path) {
@@ -413,19 +450,28 @@ pub(crate) async fn process_downloads(
                 deleted_at: None,
             };
             ctx.db.upsert_cache_entry(&cache_entry).await?;
+            crate::upload_registry::remember(&ctx.state_dir()?, &replica_file.hash);
             placeholders += 1;
         } else {
             let full_path = ctx.base.join(path);
             let stale_local = match local_files.get(path) {
                 None => false,
                 Some(local) if local.deleted || !full_path.exists() => false,
-                Some(local) => match fs::metadata(&full_path).await {
-                    Ok(meta) => {
-                        let current_mtime = file_mtime_ms(&full_path).await?;
-                        current_mtime != local.mtime || meta.len() != local.size
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(e) => return Err(e.into()),
+                Some(_) => match cached_entries.get(path) {
+                    // A lazy placeholder is a 0-byte sentinel; always refresh it.
+                    Some(entry) if !entry.hydrated => false,
+                    // Compare the current disk fingerprint against the
+                    // scan-time disk fingerprint (cache entry), not the server
+                    // mtime, so server-origin files can still be updated.
+                    Some(entry) => match fs::metadata(&full_path).await {
+                        Ok(meta) => {
+                            let current_mtime = file_mtime_ms(&full_path).await?;
+                            current_mtime != entry.mtime || meta.len() != entry.size
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(e) => return Err(e.into()),
+                    },
+                    None => false,
                 },
             };
             if stale_local {
@@ -461,6 +507,7 @@ pub(crate) async fn process_downloads(
                 deleted_at: None,
             };
             ctx.db.upsert_cache_entry(&cache_entry).await?;
+            crate::upload_registry::remember(&ctx.state_dir()?, &replica_file.hash);
             downloads += 1;
         }
     }
@@ -497,10 +544,22 @@ pub(crate) async fn process_uploads(
     ctx: &SyncCtx<'_>,
     response: &SyncResponse,
     local_files: &HashMap<String, FileState>,
+    force_upload_all: bool,
 ) -> Result<u32> {
     let mut uploads = 0u32;
     let password_str = ctx.password_str();
-    for path in &response.upload_required {
+    // After a manifest rejection the registry is cleared; retrying with every
+    // live file restores a fresh/restored hub instead of skipping forever.
+    let paths: Vec<String> = if force_upload_all {
+        local_files
+            .iter()
+            .filter(|(_, file)| !file.deleted)
+            .map(|(path, _)| path.clone())
+            .collect()
+    } else {
+        response.upload_required.clone()
+    };
+    for path in &paths {
         if !is_safe_rel_path(path) {
             tracing::warn!("skipping upload of unsafe path: {path}");
             continue;

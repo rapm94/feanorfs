@@ -1,0 +1,1 @@
+{"mirror_state":"idle","pending_conflict_count":1,"pending_conflicts":[{"path":"notes.txt","kind":"edit_edit","label":"Both sides changed notes.txt","choices":["local","cloud","both"]}],"published_at_ms":1719500000000,"version":"0.8.0"}

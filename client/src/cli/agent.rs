@@ -1,12 +1,41 @@
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use feanorfs_client::{
     check_agent, clean_agent, invalidate_agent_cache, land_agent, list_agents, load_config,
-    refresh_agent_with_options, spawn_agent, AgentCleanResult, AgentListEntry,
-    AgentListOfflineResult, AgentListResult, ApiClient, ClientDb, RefreshOptions, SpawnResult,
+    refresh_agent_with_options, spawn_agent, AgentCleanResult, AgentInboxQuery, AgentListEntry,
+    AgentListOfflineResult, AgentListResult, AgentMessageInput, AgentMessageKind, ApiClient,
+    ClientDb, RefreshOptions, SpawnResult,
 };
 use std::path::Path;
 
-use super::util::output_json;
+use super::util::{output_json, terminal_line};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum MessageKindArg {
+    Request,
+    Status,
+    Result,
+    Blocked,
+}
+
+impl From<MessageKindArg> for AgentMessageKind {
+    fn from(value: MessageKindArg) -> Self {
+        match value {
+            MessageKindArg::Request => AgentMessageKind::Request,
+            MessageKindArg::Status => AgentMessageKind::Status,
+            MessageKindArg::Result => AgentMessageKind::Result,
+            MessageKindArg::Blocked => AgentMessageKind::Blocked,
+        }
+    }
+}
+
+struct SendSignalArgs {
+    recipient: String,
+    kind: MessageKindArg,
+    about: Option<String>,
+    reply_to: Option<String>,
+    from: Option<String>,
+    body: String,
+}
 
 #[derive(Subcommand)]
 pub enum AgentAction {
@@ -50,6 +79,42 @@ pub enum AgentAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Send an encrypted agent signal tied to a snapshot (no file changes).
+    Send {
+        /// Recipient agent name, or `*` to broadcast.
+        recipient: String,
+        /// Signal kind: request, status, result, or blocked.
+        #[arg(long)]
+        kind: MessageKindArg,
+        /// Snapshot this signal concerns; defaults to the current workspace head.
+        #[arg(long)]
+        about: Option<String>,
+        /// Signal snapshot being answered.
+        #[arg(long)]
+        reply_to: Option<String>,
+        /// Explicit sender for controlled automation; otherwise FEANORFS_AGENT or human.
+        #[arg(long)]
+        from: Option<String>,
+        /// Message body (bounded at 8 KiB).
+        body: String,
+    },
+    /// Read encrypted agent signals addressed to you.
+    Inbox {
+        /// Recipient identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_recipient: Option<String>,
+        /// Previous inbox cursor (workspace head) to read the delta after.
+        #[arg(long)]
+        after: Option<String>,
+        /// Bounded result count; default 50, maximum 1000.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Random integrator assignment (dispatcher-side orchestration).
+    Integrator {
+        #[command(subcommand)]
+        action: super::integrator::IntegratorAction,
+    },
     /// Preview agent changes (legacy — prefer `agent status <name>`)
     #[command(hide = true)]
     Check { name: String },
@@ -62,6 +127,9 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
     match action {
         AgentAction::Status { name: Some(name) } | AgentAction::Check { name } => {
             run_agent_check(current_dir, &name, json).await?
+        }
+        AgentAction::Integrator { action } => {
+            super::integrator::run(current_dir, action, json).await?
         }
         AgentAction::Status { name: None } => run_agent_status_list(current_dir, json).await?,
         AgentAction::List => run_agent_list_legacy(current_dir, json).await?,
@@ -174,6 +242,146 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 std::process::exit(status.code().unwrap_or(1));
             }
         }
+        AgentAction::Send {
+            recipient,
+            kind,
+            about,
+            reply_to,
+            from,
+            body,
+        } => {
+            run_agent_send(
+                current_dir,
+                json,
+                SendSignalArgs {
+                    recipient,
+                    kind,
+                    about,
+                    reply_to,
+                    from,
+                    body,
+                },
+            )
+            .await?
+        }
+        AgentAction::Inbox {
+            for_recipient,
+            after,
+            limit,
+        } => {
+            run_agent_inbox(
+                current_dir,
+                json,
+                for_recipient.as_deref(),
+                after.as_deref(),
+                limit,
+            )
+            .await?
+        }
+    }
+    Ok(())
+}
+
+fn agent_sender(explicit: Option<String>) -> String {
+    explicit
+        .or_else(|| std::env::var("FEANORFS_AGENT").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "human".to_string())
+}
+
+async fn run_agent_send(
+    current_dir: &Path,
+    json: bool,
+    args: SendSignalArgs,
+) -> anyhow::Result<()> {
+    let config = load_config(current_dir)?;
+    let db = crate::open_client_db(current_dir).await?;
+    let api = crate::open_api_client(current_dir, &config).await?;
+    let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, current_dir, &config)?;
+    let sender = agent_sender(args.from);
+    let result = feanorfs_client::send_message(
+        &ctx,
+        AgentMessageInput {
+            to: args.recipient.clone(),
+            kind: args.kind.into(),
+            body: args.body,
+            about_snapshot: args.about,
+            reply_to: args.reply_to,
+            from: Some(sender),
+        },
+    )
+    .await?;
+    if json {
+        output_json(&result)?;
+    } else {
+        let kind_name = AgentMessageKind::from(args.kind).as_str();
+        println!(
+            "Sent {kind_name} signal {} to '{}' (about {}).",
+            &result.message_id[..8],
+            args.recipient,
+            &result.about_snapshot[..8]
+        );
+    }
+    Ok(())
+}
+
+async fn run_agent_inbox(
+    current_dir: &Path,
+    json: bool,
+    for_recipient: Option<&str>,
+    after: Option<&str>,
+    limit: Option<usize>,
+) -> anyhow::Result<()> {
+    let config = load_config(current_dir)?;
+    let db = crate::open_client_db(current_dir).await?;
+    let api = crate::open_api_client(current_dir, &config).await?;
+    let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, current_dir, &config)?;
+    let recipient = agent_sender(for_recipient.map(str::to_string));
+    let result = feanorfs_client::inbox(
+        &ctx,
+        AgentInboxQuery {
+            recipient: recipient.clone(),
+            after: after.map(str::to_string),
+            limit: limit.unwrap_or(50),
+        },
+    )
+    .await?;
+    if json {
+        output_json(&result)?;
+        return Ok(());
+    }
+    if result.messages.is_empty() {
+        println!("No signals for '{recipient}'.");
+    } else {
+        for message in &result.messages {
+            let about = &message.about_snapshot[..8];
+            let reply = message
+                .reply_to
+                .as_deref()
+                .map(|id| format!(" reply {}", &id[..8]))
+                .unwrap_or_default();
+            println!(
+                "{} {} -> {} {} about {}{}: {}",
+                &message.message_id[..8],
+                message.from,
+                message.to,
+                message.kind.as_str(),
+                about,
+                reply,
+                terminal_line(&message.body)
+            );
+        }
+    }
+    if result.cursor_reset {
+        println!(
+            "Warning: the previous cursor or result bound could not cover all history; older signals may have been missed."
+        );
+    }
+    if !result.cursor.is_empty() {
+        println!(
+            "New signals since this read: run with --after {} ",
+            result.cursor
+        );
     }
     Ok(())
 }

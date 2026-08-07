@@ -49,6 +49,12 @@ fn read_lock_meta(path: &Path) -> Option<(u32, u64)> {
     Some((pid, ts))
 }
 
+/// Locks owned by a live process are never stale within this window. The age
+/// bound at call sites only guards against PID reuse after a crash; breaking a
+/// live process's lock would let a second sync run concurrently with a
+/// long-running chunked upload (which legitimately exceeds 10 minutes).
+const LIVE_PID_STALE_GRACE_SECS: u64 = 24 * 60 * 60;
+
 pub fn is_stale(path: &Path, max_age_secs: u64) -> bool {
     let Some((pid, ts)) = read_lock_meta(path) else {
         return true;
@@ -60,7 +66,7 @@ pub fn is_stale(path: &Path, max_age_secs: u64) -> bool {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    now.saturating_sub(ts) > max_age_secs
+    now.saturating_sub(ts) > max_age_secs.max(LIVE_PID_STALE_GRACE_SECS)
 }
 
 /// Check whether the sync lock is actively held (not stale) by another process.
@@ -106,7 +112,10 @@ impl SyncLock {
 
         if let Some((pid, _)) = read_lock_meta(&path) {
             if pid == self_pid {
-                let file = File::open(&path)?;
+                // Re-entrant for the owning process: refresh the timestamp so
+                // nested acquires keep the lock fresh for long-running syncs.
+                let mut file = OpenOptions::new().write(true).open(&path)?;
+                write_pid_ts(&mut file)?;
                 return Ok(Self {
                     path: None,
                     _file: file,
@@ -199,12 +208,101 @@ pub async fn try_acquire_sync_lock(base: &Path, wait: Duration) -> Result<SyncLo
     }
 }
 
+/// Orchestrator dispatcher lock serializes `agent integrator` operations and
+/// makes a second dispatcher fail closed on the workspace orchestration lock.
+pub struct DispatcherLock {
+    path: Option<PathBuf>,
+    _file: File,
+}
+
+impl DispatcherLock {
+    /// Acquire the per-workspace dispatcher lock; fails when another
+    /// dispatcher process holds it (stale locks are broken after 10 minutes).
+    pub fn acquire(base: &Path) -> Result<Self> {
+        const STALE_DISPATCHER_SECS: u64 = 600;
+        let dir = crate::workspace_layout::ensure_workspace_state(base)?;
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("dispatcher.lock");
+        let self_pid = std::process::id();
+
+        if let Some((pid, _)) = read_lock_meta(&path) {
+            if pid == self_pid {
+                let file = File::open(&path)?;
+                return Ok(Self {
+                    path: None,
+                    _file: file,
+                });
+            }
+        }
+
+        break_stale(&path, STALE_DISPATCHER_SECS, "dispatcher");
+
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        match opts.open(&path) {
+            Ok(mut file) => {
+                write_pid_ts(&mut file)?;
+                Ok(Self {
+                    path: Some(path),
+                    _file: file,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!(
+                    "another integrator dispatcher is active for this workspace;                      one dispatcher per batch is required (or remove {})",
+                    path.display()
+                )
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for DispatcherLock {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::pid_alive;
+    use super::{is_stale, pid_alive};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn current_process_is_alive() {
         assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn lock_of_live_process_is_not_stale_within_grace() {
+        let directory = tempfile::tempdir().unwrap();
+        let path: PathBuf = directory.path().join("live.lock");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // A lock older than the call-site cap (600s) but held by a live
+        // process must not be treated as stale.
+        fs::write(&path, format!("{}\n{}\n", std::process::id(), now - 3600)).unwrap();
+        assert!(!is_stale(&path, 600));
+
+        // A dead pid is stale immediately, regardless of age. i32::MAX maps
+        // to a positive pid that cannot exist (pid_max is ~4 million), so
+        // kill(pid, 0) returns ESRCH instead of special -1/group semantics.
+        fs::write(&path, format!("{}\n{}\n", i32::MAX, now)).unwrap();
+        assert!(is_stale(&path, 600));
+    }
+
+    #[test]
+    fn unparsable_lock_is_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("garbage.lock");
+        fs::write(&path, b"not-a-lock").unwrap();
+        assert!(is_stale(&path, 600));
     }
 }

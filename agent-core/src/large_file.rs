@@ -1,6 +1,6 @@
 //! Authenticated chunked file transport over the existing opaque CAS API.
 
-use crate::{ApiClient, SyncCtx};
+use crate::SyncCtx;
 use anyhow::{bail, Context as _, Result};
 use feanorfs_common::{hash_bytes, is_valid_hash, pack_bytes, unpack_bytes_with_policy};
 use serde::{Deserialize, Serialize};
@@ -77,19 +77,38 @@ pub async fn upload(ctx: &SyncCtx<'_>, relative_path: &str, expected_hash: &str)
     let mut file = std::fs::File::open(&path)
         .with_context(|| format!("open large file {relative_path} for upload"))?;
     let mut buffer = vec![0_u8; CHUNK_BYTES];
+    let state_dir = ctx.state_dir()?;
+    let mut pending = Vec::new();
     for (index, expected) in plan.manifest.chunks.iter().enumerate() {
+        // Always read the chunk so the file cursor advances and mid-sync
+        // changes to skipped chunks are still detected by length.
         let read = read_chunk(&mut file, &mut buffer)?;
         if read != expected.plaintext_size as usize {
             bail!("{relative_path} changed while uploading chunk {index}; retry sync");
+        }
+        if crate::upload_registry::known(&state_dir, &expected.hash).await {
+            continue;
         }
         let ciphertext = seal_chunk(&buffer[..read], password, relative_path, index)?;
         let hash = hash_bytes(&ciphertext);
         if hash != expected.hash {
             bail!("{relative_path} changed while uploading chunk {index}; retry sync");
         }
-        ctx.api
-            .upload_object(ctx.workspace_id(), &hash, ciphertext)
-            .await?;
+        pending.push((expected.hash.clone(), ciphertext));
+    }
+    // Upload remaining chunks with bounded concurrency (4 in flight) so a
+    // large file no longer costs one HTTP round trip per 8 MiB chunk.
+    for batch in pending.chunks(4) {
+        let futures = batch.iter().map(|(hash, ciphertext)| {
+            ctx.api
+                .upload_object(ctx.workspace_id(), hash, ciphertext.clone())
+        });
+        for result in futures_util::future::join_all(futures).await {
+            result?;
+        }
+        for (hash, _) in batch {
+            crate::upload_registry::remember(&state_dir, hash);
+        }
     }
     ctx.api
         .upload_object(ctx.workspace_id(), &plan.hash, plan.ciphertext)
@@ -102,11 +121,11 @@ pub async fn materialize(
     encrypted_hash: &str,
     expected_size: u64,
 ) -> Result<MaterializedFile> {
-    let root = download_verified(ctx.api, encrypted_hash).await?;
+    let root = download_verified(ctx, encrypted_hash).await?;
     if root.first() != Some(&CHUNKED_PREFIX_BYTE) {
         let plaintext =
             unpack_bytes_with_policy(&root, ctx.password_str(), relative_path, ctx.policy)?;
-        if plaintext.len() as u64 != expected_size {
+        if expected_size != 0 && plaintext.len() as u64 != expected_size {
             bail!("downloaded file size mismatch for {relative_path}");
         }
         crate::fs_util::atomic_write(ctx.base, relative_path, &plaintext).await?;
@@ -117,7 +136,7 @@ pub async fn materialize(
     }
 
     let manifest = open_manifest(&root, ctx.password_str(), relative_path)?;
-    if manifest.plaintext_size != expected_size {
+    if expected_size != 0 && manifest.plaintext_size != expected_size {
         bail!("chunk manifest size mismatch for {relative_path}");
     }
     let destination = ctx.base.join(relative_path);
@@ -129,7 +148,7 @@ pub async fn materialize(
     let mut plaintext_hasher = blake3::Hasher::new();
     let mut total = 0_u64;
     for (index, chunk) in manifest.chunks.iter().enumerate() {
-        let ciphertext = download_verified(ctx.api, &chunk.hash).await?;
+        let ciphertext = download_verified(ctx, &chunk.hash).await?;
         let plaintext = open_chunk(&ciphertext, ctx.password_str(), relative_path, index)?;
         if plaintext.len() != chunk.plaintext_size as usize {
             bail!("chunk size mismatch for {relative_path} at index {index}");
@@ -162,45 +181,54 @@ pub async fn read_bytes(
     encrypted_hash: &str,
     expected_size: u64,
 ) -> Result<Vec<u8>> {
-    let root = download_verified(ctx.api, encrypted_hash).await?;
+    let root = download_verified(ctx, encrypted_hash).await?;
     if root.first() != Some(&CHUNKED_PREFIX_BYTE) {
         let plaintext =
             unpack_bytes_with_policy(&root, ctx.password_str(), relative_path, ctx.policy)?;
-        if plaintext.len() as u64 != expected_size {
+        if expected_size != 0 && plaintext.len() as u64 != expected_size {
             bail!("downloaded file size mismatch for {relative_path}");
         }
         return Ok(plaintext);
     }
     let manifest = open_manifest(&root, ctx.password_str(), relative_path)?;
-    if manifest.plaintext_size != expected_size {
+    if expected_size != 0 && manifest.plaintext_size != expected_size {
         bail!("chunk manifest size mismatch for {relative_path}");
     }
     let capacity = usize::try_from(expected_size).context("file is too large for memory")?;
     let mut output = Vec::with_capacity(capacity);
     for (index, chunk) in manifest.chunks.iter().enumerate() {
-        let ciphertext = download_verified(ctx.api, &chunk.hash).await?;
+        let ciphertext = download_verified(ctx, &chunk.hash).await?;
         let plaintext = open_chunk(&ciphertext, ctx.password_str(), relative_path, index)?;
         if plaintext.len() != chunk.plaintext_size as usize {
             bail!("chunk size mismatch for {relative_path} at index {index}");
         }
         output.extend_from_slice(&plaintext);
     }
-    if output.len() as u64 != expected_size || hash_bytes(&output) != manifest.plaintext_hash {
+    if (expected_size != 0 && output.len() as u64 != expected_size)
+        || hash_bytes(&output) != manifest.plaintext_hash
+    {
         bail!("chunked file integrity check failed for {relative_path}");
     }
     Ok(output)
 }
 
+/// Lists the chunk hashes of a chunked file, or nothing for plain files.
+///
+/// `size` is the caller's knowledge of the file size: `Some` keeps the
+/// fast path that skips blobs known to be below the chunk threshold; `None`
+/// means the size is unknown (conflict legs other than the visible one are
+/// not stored in the tree) and the blob itself must be inspected so a large
+/// hidden leg's chunks are still included in reachability manifests.
 pub async fn reachable_chunks(
     ctx: &SyncCtx<'_>,
     relative_path: &str,
     encrypted_hash: &str,
-    size: u64,
+    size: Option<u64>,
 ) -> Result<Vec<String>> {
-    if !uses_chunk_transport(size) {
+    if size.is_some_and(|size| !uses_chunk_transport(size)) {
         return Ok(Vec::new());
     }
-    let root = download_verified(ctx.api, encrypted_hash).await?;
+    let root = download_verified(ctx, encrypted_hash).await?;
     if root.first() != Some(&CHUNKED_PREFIX_BYTE) {
         return Ok(Vec::new());
     }
@@ -337,11 +365,16 @@ fn read_chunk(reader: &mut impl std::io::Read, buffer: &mut [u8]) -> Result<usiz
     Ok(filled)
 }
 
-async fn download_verified(api: &ApiClient, hash: &str) -> Result<Vec<u8>> {
+async fn download_verified(ctx: &SyncCtx<'_>, hash: &str) -> Result<Vec<u8>> {
     if !is_valid_hash(hash) {
         bail!("invalid encrypted object hash");
     }
-    let bytes = api.download_file(hash).await?;
+    // Prefer the verified local object cache over a network fetch so hydrating,
+    // reading, and reachability passes do not re-download cached blobs.
+    if let Some(cached) = crate::objects::cached_object(ctx, hash).await? {
+        return Ok(cached);
+    }
+    let bytes = ctx.api.download_file(hash).await?;
     if hash_bytes(&bytes) != hash {
         bail!("downloaded encrypted object failed its ciphertext hash check");
     }

@@ -131,9 +131,9 @@ if /bin/launchctl print "gui/$console_uid" >/dev/null 2>&1; then
   fi
   if [ "$existing_setup" = false ] || [ "$refresh_succeeded" = false ]; then
     # A fresh install needs the one-time native Start/Join choice. Stop the
-    # just-registered login job for this session so the hinted launch wins the
-    # singleton race; the job remains installed for the next login.
-    /bin/launchctl bootout "gui/$console_uid/com.feanorfs.tray" >/dev/null 2>&1 || true
+    # just-registered supervisor job for this session so the hinted launch wins
+    # the singleton race; the job remains installed for the next login.
+    /bin/launchctl bootout "gui/$console_uid/com.feanorfs.agent" >/dev/null 2>&1 || true
     # Terminal/headless installers perform their own interactive handoff. The
     # flag suppresses only that UI; migration and service refresh still run.
     if [ "${FEANORFS_NO_LAUNCH:-}" != 1 ]; then

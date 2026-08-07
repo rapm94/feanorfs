@@ -6,19 +6,12 @@ use feanorfs_client::{
 use feanorfs_server::{
     acquire_hub_runtime, prepare_tls, resolve_or_create_auth_token, run_http_server, ServeOptions,
 };
-#[cfg(not(target_os = "windows"))]
-use service_manager::{
-    RestartPolicy, ServiceInstallCtx, ServiceLevel, ServiceManager, ServiceStartCtx, ServiceStatus,
-    ServiceStatusCtx,
-};
-use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::util::{record_service_identity, service_identity_matches, HubConnection};
+use super::util::HubConnection;
 
-const LABEL: &str = "com.feanorfs.hub";
 const DEFAULT_PORT: u16 = 3030;
 const FALLBACK_PORT_SPAN: u16 = 100;
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -26,17 +19,12 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const RELAY_CONFIG_FILE: &str = "relay.json";
 const LISTEN_PORT_FILE: &str = "listen-port";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HubStatus {
-    NotInstalled,
-    Running,
-    Stopped,
-}
+/// Private-hub state as seen through the single supervisor job.
+pub(crate) use crate::cli::supervisor::ServiceState as HubStatus;
 
 #[derive(Debug, Clone)]
 struct HubServiceSpec {
     data_dir: PathBuf,
-    program: PathBuf,
 }
 
 impl HubServiceSpec {
@@ -50,36 +38,18 @@ impl HubServiceSpec {
         let data_dir = data_dir
             .canonicalize()
             .with_context(|| format!("resolve private hub directory {}", data_dir.display()))?;
-        Ok(Self {
-            data_dir,
-            program: std::env::current_exe().context("locate the feanorfs executable")?,
-        })
-    }
-
-    fn worker_args(&self) -> Vec<OsString> {
-        vec![
-            OsString::from("service"),
-            OsString::from("hub-run"),
-            self.data_dir.as_os_str().to_owned(),
-        ]
-    }
-
-    fn marker_path(&self) -> PathBuf {
-        self.data_dir.join("service-program")
-    }
-
-    fn installed_program_matches(&self) -> bool {
-        service_identity_matches(&self.marker_path(), &[&self.program])
-    }
-
-    fn record_installed_program(&self) -> anyhow::Result<()> {
-        record_service_identity(&self.marker_path(), &[&self.program])
-            .context("record private hub service executable")
+        Ok(Self { data_dir })
     }
 }
 
-fn default_data_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn default_data_dir() -> anyhow::Result<PathBuf> {
     Ok(feanorfs_agent_core::global_state_root()?.join("hub-data"))
+}
+
+/// True when a private hub data directory exists with provisioned state, so
+/// the supervisor should run its hub worker.
+pub(crate) fn hub_data_present() -> bool {
+    default_data_dir().is_ok_and(|dir| hub_state_already_exists(&dir))
 }
 
 fn listen_port_path(data_dir: &Path) -> PathBuf {
@@ -240,7 +210,7 @@ pub(crate) fn status_for_workspace(config: &Config) -> anyhow::Result<Option<Hub
     if !owns_workspace(config) {
         return Ok(None);
     }
-    platform_status().map(Some)
+    super::supervisor::hub_status().map(Some)
 }
 
 fn url_targets_this_machine(url: &str) -> bool {
@@ -420,7 +390,7 @@ async fn ensure_private_hub_inner(
         relay: load_hub_relay(&spec.data_dir)?,
     };
 
-    let status = platform_status()?;
+    let status = super::supervisor::supervisor_job_state()?;
     let managed_endpoint_ready = endpoint_ready(&connection).await;
     if managed_endpoint_ready {
         if status == HubStatus::NotInstalled {
@@ -429,7 +399,7 @@ async fn ensure_private_hub_inner(
                 spec.data_dir.display()
             );
         }
-        if spec.installed_program_matches() && !refresh_tls {
+        if super::supervisor::installed_program_matches() && !refresh_tls {
             return Ok(connection);
         }
     }
@@ -450,18 +420,22 @@ async fn ensure_private_hub_inner(
         }
     }
 
-    let install_status = if refresh_tls || (status == HubStatus::Running && !managed_endpoint_ready)
-    {
-        HubStatus::NotInstalled
+    // The single supervisor job owns the hub worker. It detects the fresh hub
+    // data directory and every relay/port change within its reconcile cycle.
+    super::supervisor::ensure_supervisor_running()?;
+    if refresh_tls {
+        wait_for_hub_restart(&connection).await.with_context(|| {
+            format!(
+                "automatic private hub did not restart on port {port}; another application may be using that port"
+            )
+        })?;
     } else {
-        status
-    };
-    platform_install_and_start(&spec, install_status)?;
-    wait_until_ready(&connection).await.with_context(|| {
-        format!(
-            "automatic private hub did not become ready on port {port}; another application may be using that port"
-        )
-    })?;
+        wait_until_ready(&connection).await.with_context(|| {
+            format!(
+                "automatic private hub did not become ready on port {port}; another application may be using that port"
+            )
+        })?;
+    }
     Ok(connection)
 }
 
@@ -543,150 +517,43 @@ async fn wait_until_ready(connection: &HubConnection) -> anyhow::Result<()> {
     anyhow::bail!("timed out waiting for the private hub")
 }
 
-#[cfg(not(target_os = "windows"))]
-fn manager() -> anyhow::Result<Box<dyn ServiceManager>> {
-    let mut manager = <dyn ServiceManager>::native().context("detect service manager")?;
-    manager
-        .set_level(ServiceLevel::User)
-        .context("select per-user service management")?;
-    Ok(manager)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn native_label() -> anyhow::Result<service_manager::ServiceLabel> {
-    LABEL.parse().context("build private hub service label")
-}
-
-#[cfg(not(target_os = "windows"))]
-fn platform_status() -> anyhow::Result<HubStatus> {
-    let status = manager()?
-        .status(ServiceStatusCtx {
-            label: native_label()?,
-        })
-        .context("read private hub service status")?;
-    Ok(match status {
-        ServiceStatus::NotInstalled => HubStatus::NotInstalled,
-        ServiceStatus::Running => HubStatus::Running,
-        ServiceStatus::Stopped(_) => HubStatus::Stopped,
-    })
+/// After a relay or port change the supervisor restarts the hub worker: first
+/// wait for the old process to stop serving, then for the replacement to
+/// become ready again.
+async fn wait_for_hub_restart(connection: &HubConnection) -> anyhow::Result<()> {
+    let deadline = Instant::now() + super::supervisor::STOP_GRACE;
+    while Instant::now() < deadline {
+        if !endpoint_ready(connection).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    wait_until_ready(connection).await
 }
 
 #[cfg(not(target_os = "windows"))]
-fn platform_install_and_start(spec: &HubServiceSpec, status: HubStatus) -> anyhow::Result<()> {
-    let manager = manager()?;
-    let label = native_label()?;
-    let install_required = status == HubStatus::NotInstalled || !spec.installed_program_matches();
-    if install_required {
-        manager
-            .install(ServiceInstallCtx {
-                label: label.clone(),
-                program: spec.program.clone(),
-                args: spec.worker_args(),
-                contents: None,
-                username: None,
-                working_directory: spec
-                    .data_dir
-                    .parent()
-                    .and_then(Path::parent)
-                    .map(Path::to_path_buf),
-                environment: None,
-                autostart: true,
-                restart_policy: RestartPolicy::OnFailure {
-                    delay_secs: None,
-                    max_retries: None,
-                    reset_after_secs: None,
-                },
-            })
-            .context("install automatic private hub")?;
-        spec.record_installed_program()?;
-    }
-    if install_required || status != HubStatus::Running {
-        manager
-            .start(ServiceStartCtx { label })
-            .context("start automatic private hub")?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn task_name() -> String {
-    format!("FeanorFS\\{LABEL}")
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_task_action(spec: &HubServiceSpec) -> anyhow::Result<(String, String)> {
-    let program = spec.program.display().to_string();
-    let data_dir = spec.data_dir.display().to_string();
-    if program.contains('"') || data_dir.contains('"') {
-        anyhow::bail!("Windows paths containing double quotes cannot be installed as tasks");
-    }
-    Ok((program, format!("service hub-run \"{data_dir}\"")))
-}
-
-#[cfg(target_os = "windows")]
-fn schtasks(args: &[&str]) -> anyhow::Result<std::process::Output> {
-    std::process::Command::new("schtasks.exe")
-        .args(args)
-        .output()
-        .context("run Windows Task Scheduler")
-}
-
-#[cfg(target_os = "windows")]
-fn platform_status() -> anyhow::Result<HubStatus> {
-    Ok(hub_status_from_windows_task(
-        super::util::windows_task_running("\\FeanorFS\\", LABEL, &task_name())?,
-    ))
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn hub_status_from_windows_task(running: Option<bool>) -> HubStatus {
-    match running {
-        None => HubStatus::NotInstalled,
-        Some(true) => HubStatus::Running,
-        Some(false) => HubStatus::Stopped,
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn platform_install_and_start(spec: &HubServiceSpec, status: HubStatus) -> anyhow::Result<()> {
-    let name = task_name();
-    if status == HubStatus::NotInstalled || !spec.installed_program_matches() {
-        let (program, arguments) = windows_task_action(spec)?;
-        super::util::windows_register_task("\\FeanorFS\\", LABEL, &program, &arguments, false)
-            .context("install automatic private hub")?;
-        spec.record_installed_program()?;
-    }
-    let output = schtasks(&["/Run", "/TN", &name])?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "start automatic private hub: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn worker_command_contains_only_internal_command_and_data_directory() {
-        let spec = HubServiceSpec {
-            data_dir: PathBuf::from("/tmp/private hub"),
-            program: PathBuf::from("/usr/local/bin/feanorfs"),
-        };
-        assert_eq!(
-            spec.worker_args(),
-            vec!["service", "hub-run", "/tmp/private hub"]
-                .into_iter()
-                .map(OsString::from)
+    fn hub_worker_command_contains_only_internal_command_and_data_directory() {
+        let mut command = tokio::process::Command::new("/usr/local/bin/feanorfs");
+        command.args(["service", "hub-run", "/tmp/private hub"]);
+        let action = format!(
+            "{} {}",
+            command.as_std().get_program().to_string_lossy(),
+            command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
+                .join(" ")
         );
-        let (program, arguments) = windows_task_action(&spec).unwrap();
-        assert_eq!(program, "/usr/local/bin/feanorfs");
-        assert_eq!(arguments, "service hub-run \"/tmp/private hub\"");
-        let action = format!("{program} {arguments}");
+        assert_eq!(
+            action,
+            "/usr/local/bin/feanorfs service hub-run /tmp/private hub"
+        );
         assert!(!action.contains("token"));
         assert!(!action.contains("key"));
         assert!(!action.contains("invite"));
@@ -786,13 +653,19 @@ mod tests {
     }
 
     #[test]
-    fn windows_hub_task_state_distinguishes_running_stopped_and_missing() {
-        assert_eq!(hub_status_from_windows_task(Some(true)), HubStatus::Running);
+    fn hub_status_aliases_the_supervisor_state() {
         assert_eq!(
-            hub_status_from_windows_task(Some(false)),
-            HubStatus::Stopped
+            HubStatus::Running,
+            crate::cli::supervisor::ServiceState::Running
         );
-        assert_eq!(hub_status_from_windows_task(None), HubStatus::NotInstalled);
+        assert_eq!(
+            HubStatus::Stopped,
+            crate::cli::supervisor::ServiceState::Stopped
+        );
+        assert_eq!(
+            HubStatus::NotInstalled,
+            crate::cli::supervisor::ServiceState::NotInstalled
+        );
     }
 
     #[test]

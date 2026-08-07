@@ -2,6 +2,9 @@
 /* eslint-disable */
 export declare function agentClean(root: string, name: string): Promise<string>
 
+/** Read agent signals. JSON in: `AgentInboxQuery`; JSON out: `AgentInboxResult`. */
+export declare function agentInbox(root: string, queryJson: string): Promise<string>
+
 export declare function agentLand(root: string, name: string, opts?: LandOptionsJs | undefined | null): Promise<string>
 
 export declare function agentList(root: string): Promise<string>
@@ -10,14 +13,49 @@ export declare function agentPath(root: string, name: string): Promise<string>
 
 export declare function agentRefresh(root: string, name: string): Promise<string>
 
+/** Send an encrypted agent signal. JSON in: `AgentMessageInput`; JSON out: `AgentSendResult`. */
+export declare function agentSend(root: string, inputJson: string): Promise<string>
+
 export declare function agentSpawn(root: string, name: string, opts?: SpawnOptionsJs | undefined | null): Promise<string>
 
 export declare function agentStatus(root: string, name: string): Promise<string>
+
+/**
+ * Materialize the encrypted conflict triple for a snapshot.
+ * JSON in: object with `about_snapshot` and optional `paths`;
+ * JSON out: `ConflictMaterializeResult`.
+ */
+export declare function conflictMaterialize(root: string, inputJson: string): Promise<string>
 
 /** keep: 0=local, 1=cloud, 2=both, 3=file (requires filePath) */
 export declare function conflictsKeep(root: string, path: string, keep: number, filePath?: string | undefined | null): Promise<void>
 
 export declare function historyLog(root: string, limit?: number | undefined | null): Promise<string>
+
+/**
+ * Assign one batch to a randomly ranked integrator.
+ * JSON in: `IntegratorAssignInput`; JSON out: `IntegratorAssignResult`.
+ */
+export declare function integratorAssign(root: string, inputJson: string): Promise<string>
+
+/**
+ * Resume dispatcher observation after a restart.
+ * Options JSON: object with optional `ack_timeout_ms` and `fallback_on_blocked`;
+ * JSON out: `IntegratorObserveResult`.
+ */
+export declare function integratorResume(root: string, optionsJson?: string | undefined | null): Promise<string>
+
+/**
+ * Explicitly revoke the active integrator assignment.
+ * JSON out: `IntegratorStatusResult`.
+ */
+export declare function integratorRevoke(root: string, assignmentId: string, reason: string): Promise<string>
+
+/**
+ * Read the active integrator assignment (or one by id).
+ * JSON out: `IntegratorStatusResult`.
+ */
+export declare function integratorStatus(root: string, assignmentId?: string | undefined | null): Promise<string>
 
 export interface LandOptionsJs {
   clean?: boolean

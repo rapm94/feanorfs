@@ -41,7 +41,7 @@ pub fn is_binary_content(content: &[u8]) -> bool {
     content.is_empty() || content.contains(&0)
 }
 
-fn sentinel(label: &str) -> Vec<u8> {
+pub(crate) fn sentinel(label: &str) -> Vec<u8> {
     format!("{SENTINEL_PREFIX}{label}>\n").into_bytes()
 }
 

@@ -1,4 +1,5 @@
 pub mod agent_contract;
+pub mod integrator_contract;
 pub mod invite;
 pub mod sync_delta;
 pub mod three_way;
@@ -9,8 +10,11 @@ mod tree_convert;
 mod tree_diff;
 
 pub use agent_contract::{
-    AgentCleanResult, AgentListEntry, AgentListOfflineResult, AgentListResult, LogEntry, LogResult,
-    SpawnResult, UndoResult,
+    encode_agent_message, parse_agent_message, AgentCleanResult, AgentInboxQuery, AgentInboxResult,
+    AgentListEntry, AgentListOfflineResult, AgentListResult, AgentMessage, AgentMessageInput,
+    AgentMessageKind, AgentMessagePayload, AgentSendResult, LogEntry, LogResult, SpawnResult,
+    UndoResult, AGENT_INBOX_DEFAULT_LIMIT, AGENT_INBOX_MAX_LIMIT, AGENT_MESSAGE_DISCRIMINATOR,
+    AGENT_MESSAGE_MAX_BODY_BYTES,
 };
 pub use invite::{
     decode_hub_invite, decode_invite, encode_hub_invite, encode_invite, hub_ca_fingerprint,
@@ -20,6 +24,23 @@ pub use invite::{
 pub use tray_contract::{
     ConflictKeepResult, ConflictShowResult, RecentWorkspaceEntry, RecentWorkspacesResult,
     TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayPauseResult, TrayStatusResult,
+    WorkerStatusSnapshot,
+};
+
+pub use integrator_contract::{
+    encode_integrator_profile, filter_eligible, generate_assignment_id, generate_selection_nonce,
+    is_valid_agent_name, is_valid_hex_id, normalize_capabilities, normalize_capability,
+    parse_integrator_profile, rank_candidates, roster_fingerprint, validate_integrator_digest,
+    validate_path_list, ConflictMaterializeEntry, ConflictMaterializeResult, EligibilityResult,
+    IntegratorAssignInput, IntegratorAssignResult, IntegratorAssignmentState, IntegratorAttempt,
+    IntegratorAttemptState, IntegratorAttemptStatus, IntegratorCandidate, IntegratorDigest,
+    IntegratorDraw, IntegratorObserveResult, IntegratorOutcomeState, IntegratorProfile,
+    IntegratorStatusResult, VerificationStatus, VerificationSummary, INTEGRATOR_ALGORITHM_VERSION,
+    INTEGRATOR_CAPABILITY_MAX_BYTES, INTEGRATOR_DEFAULT_ACK_TIMEOUT_MS,
+    INTEGRATOR_DIGEST_FIELD_BYTES, INTEGRATOR_MAX_AUTHORS, INTEGRATOR_MAX_CANDIDATES,
+    INTEGRATOR_MAX_CAPABILITIES, INTEGRATOR_MAX_HISTORY, INTEGRATOR_MAX_PATHS,
+    INTEGRATOR_MAX_RISKS, INTEGRATOR_MAX_TASK_SUMMARY_BYTES, INTEGRATOR_PROFILE_DISCRIMINATOR,
+    INTEGRATOR_RISK_BYTES,
 };
 
 pub use sync_delta::compute_sync_delta;

@@ -47,8 +47,41 @@ export async function undo(root, snapshotId) {
   return JSON.parse(await native.undo(root, snapshotId))
 }
 
+export async function sendMessage(root, input) {
+  return JSON.parse(await native.agentSend(root, JSON.stringify(input)))
+}
+
+export async function inbox(root, query) {
+  return JSON.parse(await native.agentInbox(root, JSON.stringify(query)))
+}
+
 export async function conflictsKeep(root, path, keep, filePath) {
   await native.conflictsKeep(root, path, keep, filePath ?? null)
+}
+
+/** Assign one batch to a randomly ranked integrator. */
+export async function integratorAssign(root, input) {
+  return JSON.parse(await native.integratorAssign(root, JSON.stringify(input)))
+}
+
+/** Read the active integrator assignment (or one by id). */
+export async function integratorStatus(root, assignmentId) {
+  return JSON.parse(await native.integratorStatus(root, assignmentId ?? null))
+}
+
+/** Explicitly revoke the active integrator assignment. */
+export async function integratorRevoke(root, assignmentId, reason) {
+  return JSON.parse(await native.integratorRevoke(root, assignmentId, reason))
+}
+
+/** Resume dispatcher observation after a restart. */
+export async function integratorResume(root, options = {}) {
+  return JSON.parse(await native.integratorResume(root, JSON.stringify(options)))
+}
+
+/** Materialize the encrypted conflict triple for a snapshot (read-only). */
+export async function conflictMaterialize(root, input) {
+  return JSON.parse(await native.conflictMaterialize(root, JSON.stringify(input)))
 }
 
 export { native }
