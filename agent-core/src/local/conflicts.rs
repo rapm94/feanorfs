@@ -141,7 +141,10 @@ impl ClientDb {
                     resolver: record.resolver.clone(),
                 })
                 .collect::<Vec<_>>();
-            records.sort_by_key(|record| std::cmp::Reverse(record.resolved_at));
+            // Stable ascending sort plus reverse keeps most-recent-first order
+            // and breaks equal-millisecond ties by latest insertion first.
+            records.sort_by_key(|record| record.resolved_at);
+            records.reverse();
             Ok(records)
         })
     }
