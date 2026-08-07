@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/rapm94/feanorfs/compare/v0.8.0...v0.8.1) - 2026-08-07
+
+### Fixed
+
+- Windows builds compile again: parsing the scheduled-task workspace held a
+  borrow of a temporary `Cow` (E0716) on the `cfg(windows)` path, which
+  macOS/Linux builds never caught.
+- Conflict resolution history now breaks equal-millisecond timestamp ties by
+  latest record first, so the most recent resolution always lists first.
+- The Windows product smoke asserts the supervised lifecycle (one Agent task
+  running `service supervise` plus the Tray task) instead of the removed
+  per-component scheduled tasks.
+
 ## [0.8.0](https://github.com/rapm94/feanorfs/compare/v0.7.11...v0.8.0) - 2026-08-07
 
 ### Added
