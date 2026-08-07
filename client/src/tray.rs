@@ -499,7 +499,7 @@ mod tests {
                 choices: vec!["local".into(), "cloud".into()],
             }],
             published_at_ms: 42,
-            version: "0.7.11".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
         };
         let path = worker_status_path(root).expect("state dir must exist after publish");
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(loaded.pending_conflicts.len(), 1);
         assert_eq!(loaded.pending_conflicts[0].path, "a.txt");
         assert_eq!(loaded.published_at_ms, 42);
-        assert_eq!(loaded.version, "0.7.11");
+        assert_eq!(loaded.version, env!("CARGO_PKG_VERSION"));
 
         invalidate_worker_status(root);
         assert!(load_worker_status(root).is_none());
