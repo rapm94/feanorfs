@@ -79,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a failed status write (for example a full disk) is logged and the
   supervisor keeps supervising its children instead of exiting into a
   launchd restart loop.
+- The Windows product smoke now validates the supervised lifecycle
+  (supervisor + tray scheduled tasks with hub/workspace children verified via
+  the supervisor status file) instead of the legacy per-component tasks.
 - The supervised background job reaps its previous instance's orphaned
   children on startup (identity-checked), so a supervisor restart can no
   longer leave the private hub wedged by the old process's runtime lock and

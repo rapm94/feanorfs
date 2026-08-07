@@ -167,18 +167,44 @@ function Assert-TaskAction([object]$Task, [string]$ExpectedProgram, [string]$Arg
     }
 }
 
+function Get-SupervisedChildState([string]$Key) {
+    $statusPath = Join-Path $profileState "supervisor-status.json"
+    if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+    if ($Key -eq "hub") {
+        $hubProperty = $status.PSObject.Properties["hub"]
+        if (-not $hubProperty -or -not $hubProperty.Value) { return $null }
+        return [string]$hubProperty.Value.state
+    }
+    $workspacesProperty = $status.PSObject.Properties["workspaces"]
+    if (-not $workspacesProperty -or -not $workspacesProperty.Value) { return $null }
+    $workspaceKey = @($workspacesProperty.Value.PSObject.Properties.Name | Where-Object {
+            (Normalize-WindowsPath $_) -ieq (Normalize-WindowsPath $workspace)
+        } | Select-Object -First 1)
+    if ($workspaceKey.Count -eq 0) { return $null }
+    $child = $workspacesProperty.Value.PSObject.Properties[$workspaceKey[0]].Value
+    if (-not $child) { return $null }
+    return [string]$child.state
+}
+
 function Assert-HealthyProduct {
     Wait-For {
         $tasks = @(Get-SmokeTasks)
-        $tasks.Count -eq 3 -and @($tasks | Where-Object State -ne "Running").Count -eq 0
-    } "hub, workspace, and tray tasks to run" 30
+        $tasks.Count -eq 2 -and @($tasks | Where-Object State -ne "Running").Count -eq 0
+    } "supervisor and tray tasks to run" 30
 
     $tasks = @(Get-SmokeTasks)
-    $hubTask = $tasks | Where-Object TaskName -eq "com.feanorfs.hub"
+    $supervisorTask = $tasks | Where-Object TaskName -eq "Agent"
     $trayTask = $tasks | Where-Object TaskName -eq "Tray"
-    $workspaceTasks = @($tasks | Where-Object TaskName -notin @("com.feanorfs.hub", "Tray"))
-    if (-not $hubTask -or -not $trayTask -or $workspaceTasks.Count -ne 1) {
-        throw "Windows product did not install exactly one hub, workspace, and tray task."
+    if (-not $supervisorTask -or -not $trayTask -or $tasks.Count -ne 2) {
+        throw "Windows product did not install exactly one supervisor and tray task."
     }
 
     $listenPortPath = Join-Path $profileHome ".feanorfs\hub-data\listen-port"
@@ -189,14 +215,20 @@ function Assert-HealthyProduct {
         throw "Windows automatic private hub did not persist a valid listen port."
     }
 
-    Assert-TaskAction $hubTask $cli '^service hub-run ".+"$'
-    Assert-TaskAction $workspaceTasks[0] $cli '^service run ".+"$'
+    Assert-TaskAction $supervisorTask $cli '^service supervise$'
     Assert-TaskAction $trayTask $tray '^$'
     $trayTaskXml = [xml](Export-ScheduledTask -TaskPath $trayTask.TaskPath -TaskName $trayTask.TaskName)
     $trayLogonType = [string]$trayTaskXml.Task.Principals.Principal.LogonType
     if ($trayLogonType -ne "InteractiveToken") {
         throw "Windows tray task is not registered in the interactive user session."
     }
+
+    # The hub and the workspace watcher are children of the supervisor task;
+    # verify them through the supervisor's published status file.
+    Wait-For {
+        (Get-SupervisedChildState "hub") -eq "running" -and
+            (Get-SupervisedChildState $workspace) -eq "running"
+    } "supervised hub and workspace children to run" 30
 
     Assert-RedactedCredentialConfig (Join-Path $profileState "global.json")
     Assert-RedactedCredentialConfig $workspaceConfigPath
@@ -291,8 +323,8 @@ try {
         throw "Windows stop did not preserve the working file and encrypted setup."
     }
     Wait-For {
-        @(Get-SmokeTasks | Where-Object TaskName -notin @("com.feanorfs.hub", "Tray")).Count -eq 0
-    } "workspace task removal"
+        (Get-SupervisedChildState $workspace) -ne "running"
+    } "workspace removal from the supervisor"
 
     Invoke-Start
     Assert-HealthyProduct
