@@ -1411,7 +1411,8 @@ fn windows_task_workspace(name: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let line = String::from_utf8_lossy(&output.stdout)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
         .lines()
         .find(|line| line.starts_with("Task To Run:"))?;
     let value = line["Task To Run:".len()..].trim();
