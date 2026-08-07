@@ -26,7 +26,7 @@ semver = "1.0.28"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 # SQLx 0.9 requires Rust 1.94; 0.8 is the newest line compatible with MSRV 1.88.
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 reqwest = { version = "0.13.4", features = ["json", "multipart", "stream"] }
 ignore = "0.4"
