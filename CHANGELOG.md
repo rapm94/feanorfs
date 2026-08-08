@@ -70,9 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the first.
 - Reachability manifests accepted up to 64 MiB (was 8 MiB, ~130k objects), so
   large workspaces no longer hard-fail publication.
-
-### Fixed
-
 - Sync/land/dispatcher locks held by a live process are no longer broken out
   after 10 minutes: a second sync could previously run concurrently with a
   legitimate long-running chunked upload, and tray sync state could be
