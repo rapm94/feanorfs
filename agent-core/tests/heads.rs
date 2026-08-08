@@ -1,3 +1,5 @@
+feanorfs_test_support::isolate_test_process!();
+
 use feanorfs_agent_core::{ApiClient, LocalHub, SwapHeadResult};
 use std::sync::Arc;
 

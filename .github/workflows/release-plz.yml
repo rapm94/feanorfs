@@ -31,17 +31,21 @@ jobs:
   release-plz-release:
     name: Release
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      github.repository == 'rapm94/feanorfs' &&
       (
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        github.event.workflow_run.head_repository.full_name == github.repository
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     environment: prod
     permissions:
+      actions: read
       contents: write
       pull-requests: read
     steps:
@@ -63,14 +67,92 @@ jobs:
           persist-credentials: false
           ref: main
 
-      - name: Verify CI-tested commit
-        if: ${{ github.event_name == 'workflow_run' }}
+      - name: Verify exact trusted CI and Security commit
         env:
-          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+          TRIGGER_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TRIGGER_EVENT: ${{ github.event.workflow_run.event }}
+          TRIGGER_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
         run: |
-          ACTUAL_SHA="$(git rev-parse HEAD)"
-          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            echo "::error::main advanced to $ACTUAL_SHA after CI tested $EXPECTED_SHA."
+          set -euo pipefail
+          if [ "$REPOSITORY" != "rapm94/feanorfs" ]; then
+            echo "::error::Release automation runs only in rapm94/feanorfs."
+            exit 1
+          fi
+
+          actual_sha="$(git rev-parse HEAD)"
+          if [ "$actual_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::main is $actual_sha, but this run expected $EXPECTED_SHA."
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = workflow_run ]; then
+            if [ "$TRIGGER_EVENT" != push ] || [ "$TRIGGER_BRANCH" != main ] || \
+              [ "$TRIGGER_REPOSITORY" != "$REPOSITORY" ]; then
+              echo "::error::Automatic release requires a trusted main-push CI run."
+              exit 1
+            fi
+          elif [ "$EVENT_NAME" != workflow_dispatch ] || [ "$REF" != refs/heads/main ]; then
+            echo "::error::Manual release recovery must be dispatched from main."
+            exit 1
+          fi
+
+          trusted_run_id() {
+            local workflow_file="$1"
+            local workflow_name="$2"
+            local runs
+            runs="$(gh api --method GET \
+              "repos/$REPOSITORY/actions/workflows/$workflow_file/runs" \
+              -f branch=main \
+              -f head_sha="$EXPECTED_SHA" \
+              -f event=push \
+              -f status=completed \
+              -f per_page=100)"
+            jq -r \
+              --arg repository "$REPOSITORY" \
+              --arg sha "$EXPECTED_SHA" \
+              --arg workflow "$workflow_name" \
+              '[.workflow_runs[] | select(
+                .name == $workflow and
+                .conclusion == "success" and
+                .event == "push" and
+                .head_branch == "main" and
+                .head_sha == $sha and
+                .head_repository.full_name == $repository and
+                .repository.full_name == $repository
+              )] | first | .id // empty' <<<"$runs"
+          }
+
+          ci_run_id="$(trusted_run_id ci.yml CI)"
+          if [ -z "$ci_run_id" ]; then
+            echo "::error::No successful trusted main-push CI run exists for $EXPECTED_SHA."
+            exit 1
+          fi
+
+          security_run_id=''
+          for attempt in $(seq 1 100); do
+            candidate="$(trusted_run_id security.yml Security)"
+            if [ -n "$candidate" ]; then
+              jobs="$(gh api --method GET \
+                "repos/$REPOSITORY/actions/runs/$candidate/jobs?filter=latest&per_page=100")"
+              if jq -e --arg sha "$EXPECTED_SHA" \
+                'any(.jobs[];
+                  .name == "Security success" and
+                  .conclusion == "success" and
+                  .head_sha == $sha)' <<<"$jobs" >/dev/null; then
+                security_run_id="$candidate"
+                break
+              fi
+            fi
+            echo "Waiting for exact-SHA Security success ($attempt/100)..."
+            sleep 15
+          done
+          if [ -z "$security_run_id" ]; then
+            echo "::error::No successful trusted Security aggregator exists for $EXPECTED_SHA."
             exit 1
           fi
 
@@ -115,9 +197,10 @@ jobs:
     needs: release-plz-release
     if: ${{ needs.release-plz-release.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment: prod
     permissions:
+      actions: read
       contents: write
       pull-requests: write
     steps:
@@ -139,14 +222,92 @@ jobs:
           persist-credentials: false
           ref: main
 
-      - name: Verify CI-tested commit
-        if: ${{ github.event_name == 'workflow_run' }}
+      - name: Verify exact trusted CI and Security commit
         env:
-          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+          TRIGGER_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TRIGGER_EVENT: ${{ github.event.workflow_run.event }}
+          TRIGGER_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
         run: |
-          ACTUAL_SHA="$(git rev-parse HEAD)"
-          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            echo "::error::main advanced to $ACTUAL_SHA after CI tested $EXPECTED_SHA."
+          set -euo pipefail
+          if [ "$REPOSITORY" != "rapm94/feanorfs" ]; then
+            echo "::error::Release automation runs only in rapm94/feanorfs."
+            exit 1
+          fi
+
+          actual_sha="$(git rev-parse HEAD)"
+          if [ "$actual_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::main is $actual_sha, but this run expected $EXPECTED_SHA."
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = workflow_run ]; then
+            if [ "$TRIGGER_EVENT" != push ] || [ "$TRIGGER_BRANCH" != main ] || \
+              [ "$TRIGGER_REPOSITORY" != "$REPOSITORY" ]; then
+              echo "::error::Automatic release requires a trusted main-push CI run."
+              exit 1
+            fi
+          elif [ "$EVENT_NAME" != workflow_dispatch ] || [ "$REF" != refs/heads/main ]; then
+            echo "::error::Manual release recovery must be dispatched from main."
+            exit 1
+          fi
+
+          trusted_run_id() {
+            local workflow_file="$1"
+            local workflow_name="$2"
+            local runs
+            runs="$(gh api --method GET \
+              "repos/$REPOSITORY/actions/workflows/$workflow_file/runs" \
+              -f branch=main \
+              -f head_sha="$EXPECTED_SHA" \
+              -f event=push \
+              -f status=completed \
+              -f per_page=100)"
+            jq -r \
+              --arg repository "$REPOSITORY" \
+              --arg sha "$EXPECTED_SHA" \
+              --arg workflow "$workflow_name" \
+              '[.workflow_runs[] | select(
+                .name == $workflow and
+                .conclusion == "success" and
+                .event == "push" and
+                .head_branch == "main" and
+                .head_sha == $sha and
+                .head_repository.full_name == $repository and
+                .repository.full_name == $repository
+              )] | first | .id // empty' <<<"$runs"
+          }
+
+          ci_run_id="$(trusted_run_id ci.yml CI)"
+          if [ -z "$ci_run_id" ]; then
+            echo "::error::No successful trusted main-push CI run exists for $EXPECTED_SHA."
+            exit 1
+          fi
+
+          security_run_id=''
+          for attempt in $(seq 1 100); do
+            candidate="$(trusted_run_id security.yml Security)"
+            if [ -n "$candidate" ]; then
+              jobs="$(gh api --method GET \
+                "repos/$REPOSITORY/actions/runs/$candidate/jobs?filter=latest&per_page=100")"
+              if jq -e --arg sha "$EXPECTED_SHA" \
+                'any(.jobs[];
+                  .name == "Security success" and
+                  .conclusion == "success" and
+                  .head_sha == $sha)' <<<"$jobs" >/dev/null; then
+                security_run_id="$candidate"
+                break
+              fi
+            fi
+            echo "Waiting for exact-SHA Security success ($attempt/100)..."
+            sleep 15
+          done
+          if [ -z "$security_run_id" ]; then
+            echo "::error::No successful trusted Security aggregator exists for $EXPECTED_SHA."
             exit 1
           fi
 
@@ -231,11 +392,11 @@ jobs:
           npm --prefix bindings/ts run assemble-metadata
           npm --prefix bindings/ts run verify-metadata
           git diff --check
-          if git diff --quiet -- bindings/ts/package.json bindings/ts/package-lock.json bindings/ts/npm; then
+          if git diff --quiet -- bindings/ts/package.json bindings/ts/package-lock.json bindings/ts/index.js bindings/ts/npm; then
             exit 0
           fi
           git config user.name "release-plz[bot]"
           git config user.email "release-plz[bot]@users.noreply.github.com"
-          git add bindings/ts/package.json bindings/ts/package-lock.json bindings/ts/npm/*/package.json
+          git add bindings/ts/package.json bindings/ts/package-lock.json bindings/ts/index.js bindings/ts/npm/*/package.json
           git commit -m "chore(release): sync npm package versions"
           git push

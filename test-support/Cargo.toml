@@ -1,0 +1,13 @@
+[package]
+name = "feanorfs-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Process-wide profile isolation for FeanorFS tests"
+
+[dependencies]
+tempfile = { workspace = true }
+ctor = { workspace = true }
+dtor = { workspace = true }

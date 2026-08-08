@@ -5,7 +5,8 @@ use std::collections::HashMap;
 pub fn compute_sync_delta(client_files: &[FileState], server_files: &[FileState]) -> SyncResponse {
     let server_map: HashMap<String, FileState> = server_files
         .iter()
-        .map(|f| (f.path.clone(), f.clone()))
+        .filter(|file| is_safe_rel_path(&file.path))
+        .map(|file| (file.path.clone(), file.clone()))
         .collect();
 
     let mut upload_required = Vec::new();
@@ -33,7 +34,15 @@ pub fn compute_sync_delta(client_files: &[FileState], server_files: &[FileState]
                 } else {
                     download_required.push(server_file.clone());
                 }
-            } else if client_file.hash != server_file.hash && !client_file.deleted {
+            } else if client_file.deleted != server_file.deleted
+                || (!client_file.deleted
+                    && (client_file.hash != server_file.hash
+                        || client_file.mode != server_file.mode))
+            {
+                // Equal mtimes are ambiguous across filesystems. Preserve the
+                // established client-wins tie break for every semantic state,
+                // including deletes and executable intent, so the pair cannot
+                // remain permanently divergent.
                 upload_required.push(path.clone());
             }
         } else {
@@ -116,6 +125,51 @@ mod tests {
             &[file("a.txt", 100, "hash_b")],
         );
         assert_eq!(resp.upload_required, vec!["a.txt"]);
+    }
+
+    #[test]
+    fn equal_mtime_client_delete_uploads() {
+        let resp = compute_sync_delta(
+            &[deleted("gone.txt", 100)],
+            &[file("gone.txt", 100, "hash_a")],
+        );
+        assert_eq!(resp.upload_required, vec!["gone.txt"]);
+    }
+
+    #[test]
+    fn equal_mtime_live_client_over_same_hash_server_tombstone_uploads() {
+        let client = file("restored.txt", 100, "same_hash");
+        let mut server = deleted("restored.txt", 100);
+        server.hash = "same_hash".into();
+        let resp = compute_sync_delta(&[client], &[server]);
+        assert_eq!(resp.upload_required, vec!["restored.txt"]);
+    }
+
+    #[test]
+    fn equal_mtime_both_deleted_is_already_converged() {
+        let mut client = deleted("gone.txt", 100);
+        client.hash = "client_tombstone".into();
+        client.mode = crate::EXECUTABLE_MODE;
+        let mut server = deleted("gone.txt", 100);
+        server.hash = "server_tombstone".into();
+        let resp = compute_sync_delta(&[client], &[server]);
+        assert!(resp.upload_required.is_empty());
+        assert!(resp.download_required.is_empty());
+        assert!(resp.delete_local.is_empty());
+    }
+
+    #[test]
+    fn equal_mtime_executable_intent_uploads() {
+        let mut client = file("script.sh", 100, "same_hash");
+        client.mode = crate::EXECUTABLE_MODE;
+        let resp = compute_sync_delta(&[client], &[file("script.sh", 100, "same_hash")]);
+        assert_eq!(resp.upload_required, vec!["script.sh"]);
+    }
+
+    #[test]
+    fn unsafe_server_paths_are_ignored() {
+        let resp = compute_sync_delta(&[], &[file("../escape", 100, "hash")]);
+        assert!(resp.download_required.is_empty());
     }
 
     #[test]

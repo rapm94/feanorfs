@@ -49,6 +49,52 @@ pub(crate) fn atomic_private_write(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn atomic_private_create_new(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).context("canonicalize destination directory")?;
+    let name = path.file_name().context("destination must name a file")?;
+    let destination = parent.join(name);
+
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| anyhow::anyhow!("generate temp name: {error}"))?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary = parent.join(format!(".feanorfs-recovery-{suffix}.tmp"));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .context("create private recovery temporary file")?;
+    let result = (|| -> Result<()> {
+        file.write_all(content)?;
+        file.sync_all()?;
+        fs::hard_link(&temporary, &destination).with_context(|| {
+            format!(
+                "publish recovery bundle without replacing {}",
+                destination.display()
+            )
+        })?;
+        fs::remove_file(&temporary)?;
+        #[cfg(unix)]
+        File::open(&parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 pub(crate) fn durable_remove_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}

@@ -1,4 +1,6 @@
 use anyhow::{bail, Context as _, Result};
+#[cfg(test)]
+use rcgen::date_time_ymd;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -93,18 +95,19 @@ fn prepare_auto_tls(data_dir: &Path) -> Result<TlsIdentity> {
         atomic_private_write(&ca_key_path, key.as_bytes())?;
         key
     });
-    let ca_key_pair = KeyPair::from_pem(&ca_key).context("parse TLS CA key")?;
     let ca_cert = if ca_cert_path.exists() {
         fs::read_to_string(&ca_cert_path)
             .with_context(|| format!("read TLS CA certificate {}", ca_cert_path.display()))?
     } else {
+        let generated_key = KeyPair::from_pem(&ca_key).context("parse generated TLS CA key")?;
         let cert = ca_params()
-            .self_signed(&ca_key_pair)
+            .self_signed(&generated_key)
             .context("generate TLS CA certificate")?
             .pem();
         atomic_private_write(&ca_cert_path, cert.as_bytes())?;
         cert
     };
+    let ca_key_pair = validate_private_ca(&ca_cert, &ca_key)?;
     let issuer =
         Issuer::from_ca_cert_pem(&ca_cert, ca_key_pair).context("parse TLS CA certificate")?;
     let mdns_hostname = feanorfs_common::hub_mdns_hostname(&ca_cert);
@@ -136,6 +139,47 @@ fn prepare_auto_tls(data_dir: &Path) -> Result<TlsIdentity> {
         fingerprint: Some(certificate_fingerprint(&ca_cert)),
         mdns_hostname: Some(mdns_hostname),
     })
+}
+
+pub(crate) fn validate_private_ca(cert_pem: &str, key_pem: &str) -> Result<KeyPair> {
+    let key = KeyPair::from_pem(key_pem).context("parse TLS CA private key")?;
+    let (pem_remainder, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|_| anyhow::anyhow!("parse TLS CA certificate"))?;
+    anyhow::ensure!(
+        pem_remainder.iter().all(u8::is_ascii_whitespace) && pem.label == "CERTIFICATE",
+        "TLS CA contains unexpected PEM data"
+    );
+    let (der_remainder, certificate) = x509_parser::parse_x509_certificate(&pem.contents)
+        .map_err(|_| anyhow::anyhow!("parse TLS CA certificate"))?;
+    anyhow::ensure!(
+        der_remainder.is_empty(),
+        "TLS CA contains trailing DER data"
+    );
+    anyhow::ensure!(certificate.is_ca(), "TLS certificate is not a CA");
+    let key_usage = certificate
+        .key_usage()
+        .context("parse TLS CA key usage")?
+        .context("TLS CA is missing key usage")?;
+    anyhow::ensure!(
+        key_usage.value.key_cert_sign(),
+        "TLS CA cannot sign certificates"
+    );
+    anyhow::ensure!(
+        certificate.tbs_certificate.subject == certificate.tbs_certificate.issuer,
+        "TLS CA is not self-issued"
+    );
+    certificate
+        .verify_signature(None)
+        .context("TLS CA self-signature is invalid")?;
+    anyhow::ensure!(
+        certificate.validity().is_valid(),
+        "TLS CA is not currently valid"
+    );
+    anyhow::ensure!(
+        certificate.public_key().subject_public_key.data.as_ref() == key.public_key_raw(),
+        "TLS CA certificate does not match its private key"
+    );
+    Ok(key)
 }
 
 pub(crate) fn generate_private_ca() -> Result<(String, Zeroizing<String>)> {
@@ -204,6 +248,52 @@ mod tests {
         assert!(server_names(first.mdns_hostname.as_deref())
             .unwrap()
             .contains(first.mdns_hostname.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn auto_tls_rejects_a_mismatched_durable_ca_key_before_replacing_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = prepare_auto_tls(dir.path()).unwrap();
+        let original_leaf = fs::read(&identity.cert_path).unwrap();
+        let wrong_key = KeyPair::generate().unwrap().serialize_pem();
+        atomic_private_write(&dir.path().join(TLS_DIR).join(CA_KEY), wrong_key.as_bytes()).unwrap();
+
+        let error = prepare_auto_tls(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("does not match its private key"));
+        assert_eq!(fs::read(&identity.cert_path).unwrap(), original_leaf);
+    }
+
+    #[test]
+    fn auto_tls_rejects_non_ca_and_expired_durable_identities() {
+        for expired in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            prepare_auto_tls(dir.path()).unwrap();
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Invalid CA");
+            if expired {
+                params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+                params.not_before = date_time_ymd(2000, 1, 1);
+                params.not_after = date_time_ymd(2001, 1, 1);
+            } else {
+                params.is_ca = IsCa::NoCa;
+                params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            }
+            let cert = params.self_signed(&key).unwrap().pem();
+            let tls_dir = dir.path().join(TLS_DIR);
+            atomic_private_write(&tls_dir.join(CA_CERT), cert.as_bytes()).unwrap();
+            atomic_private_write(&tls_dir.join(CA_KEY), key.serialize_pem().as_bytes()).unwrap();
+
+            let error = prepare_auto_tls(dir.path()).unwrap_err().to_string();
+            if expired {
+                assert!(error.contains("not currently valid"), "{error}");
+            } else {
+                assert!(error.contains("not a CA"), "{error}");
+            }
+        }
     }
 
     #[cfg(unix)]

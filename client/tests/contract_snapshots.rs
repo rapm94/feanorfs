@@ -1,5 +1,7 @@
 //! SDK-1: JSON contract snapshots — fail when serialized agent API shapes change.
 
+feanorfs_test_support::isolate_test_process!();
+
 use feanorfs_common::agent_contract::fixtures;
 
 macro_rules! contract_snapshot {

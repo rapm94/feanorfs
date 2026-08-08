@@ -4,6 +4,8 @@
 //! stale-reply safety, cross-machine conflict materialization, hub-storage
 //! privacy, and project-path isolation.
 
+feanorfs_test_support::isolate_test_process!();
+
 mod support;
 
 use feanorfs_agent_core::{inbox, send_message};
@@ -50,10 +52,15 @@ fn assign_input(about: &str, task: &str) -> IntegratorAssignInput {
     }
 }
 
-fn digest(assignment_id: &str, about: &str, state: IntegratorOutcomeState) -> IntegratorDigest {
+fn digest(
+    assignment_id: &str,
+    integrator: &str,
+    about: &str,
+    state: IntegratorOutcomeState,
+) -> IntegratorDigest {
     IntegratorDigest {
         assignment_id: assignment_id.to_string(),
-        integrator: "agent-b".to_string(),
+        integrator: integrator.to_string(),
         about_snapshot: about.to_string(),
         inspected_snapshot: about.to_string(),
         state,
@@ -168,7 +175,7 @@ async fn dispatcher_lifecycle_completes_over_http_hub() {
             kind: AgentMessageKind::Status,
             body: accepted,
             about_snapshot: Some(head.clone()),
-            reply_to: None,
+            reply_to: Some(assigned.request_message_id.clone()),
             from: Some(assigned.selected.clone()),
         },
     )
@@ -198,6 +205,7 @@ async fn dispatcher_lifecycle_completes_over_http_hub() {
         about_snapshot: head.clone(),
         digest: digest(
             &assigned.assignment_id,
+            &assigned.selected,
             &head,
             IntegratorOutcomeState::Completed,
         ),
@@ -247,6 +255,141 @@ async fn dispatcher_lifecycle_completes_over_http_hub() {
     );
 }
 
+/// Accepted and Result may arrive before one dispatcher poll; causal staging
+/// must apply both instead of losing the newer terminal message.
+#[tokio::test]
+async fn fast_acceptance_and_result_complete_in_one_observe_pass() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = seeded_v3_ctx(&server, &client).await;
+    let ctx = ctx_from(&server, &client, &config);
+    let head = ctx.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+    let assigned = integrator_assign(&ctx, assign_input(&head, "Integrate fast reply test"))
+        .await
+        .unwrap();
+
+    for (kind, body) in [
+        (
+            AgentMessageKind::Status,
+            encode_integrator_profile(&IntegratorProfile::Accepted {
+                assignment_id: assigned.assignment_id.clone(),
+                attempt: 0,
+                about_snapshot: head.clone(),
+            })
+            .unwrap(),
+        ),
+        (
+            AgentMessageKind::Result,
+            encode_integrator_profile(&IntegratorProfile::Result {
+                assignment_id: assigned.assignment_id.clone(),
+                attempt: 0,
+                about_snapshot: head.clone(),
+                digest: digest(
+                    &assigned.assignment_id,
+                    &assigned.selected,
+                    &head,
+                    IntegratorOutcomeState::Completed,
+                ),
+            })
+            .unwrap(),
+        ),
+    ] {
+        send_message(
+            &ctx,
+            AgentMessageInput {
+                to: "human".into(),
+                kind,
+                body,
+                about_snapshot: Some(head.clone()),
+                reply_to: Some(assigned.request_message_id.clone()),
+                from: Some(assigned.selected.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let observed = integrator_observe(&ctx, IntegratorObserveOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.state,
+        Some(feanorfs_common::IntegratorAssignmentState::Completed)
+    );
+    assert_eq!(observed.messages_processed, 2);
+    assert_eq!(observed.action, "completed");
+}
+
+#[tokio::test]
+async fn neutral_candidates_exclude_every_conflict_author_from_fallbacks() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = seeded_v3_ctx(&server, &client).await;
+    let ctx = ctx_from(&server, &client, &config);
+    let head = ctx.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+    let mut input = assign_input(&head, "Use only the neutral integrator");
+    input.candidates.push(candidate("agent-c"));
+    input.conflict_authors = vec!["agent-a".into(), "agent-b".into()];
+
+    let assigned = integrator_assign(&ctx, input).await.unwrap();
+    assert!(assigned.neutral_integrator);
+    assert_eq!(assigned.selected, "agent-c");
+    assert!(assigned.fallback_order.is_empty());
+}
+
+#[tokio::test]
+async fn resume_adopts_a_published_unrecorded_request_without_duplication() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = seeded_v3_ctx(&server, &client).await;
+    let ctx = ctx_from(&server, &client, &config);
+    let head = ctx.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+    let assigned = integrator_assign(&ctx, assign_input(&head, "Recover published request"))
+        .await
+        .unwrap();
+
+    let store = feanorfs_agent_core::IntegratorStore::open(client.workspace.path()).unwrap();
+    store
+        .update(|state| {
+            let active = state.active.as_mut().unwrap();
+            active.attempts.last_mut().unwrap().request_message_id = None;
+            active.inbox_cursor = None;
+            Ok(())
+        })
+        .unwrap();
+
+    let resumed = integrator_resume(&ctx, IntegratorObserveOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(resumed.action, "recovered_offer");
+    assert_eq!(
+        resumed.state,
+        Some(feanorfs_common::IntegratorAssignmentState::Offered)
+    );
+    let candidate_inbox = inbox(
+        &ctx,
+        AgentInboxQuery {
+            recipient: assigned.selected,
+            after: None,
+            limit: 50,
+        },
+    )
+    .await
+    .unwrap();
+    let requests = candidate_inbox
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                parse_integrator_profile(&message.body),
+                Some(IntegratorProfile::Assignment { ref assignment_id, .. })
+                    if assignment_id == &assigned.assignment_id
+            )
+        })
+        .count();
+    assert_eq!(requests, 1, "resume must adopt rather than republish");
+}
+
 /// A missing acknowledgement advances to the next recorded candidate; the
 /// timed-out attempt stays in the audit trail.
 #[tokio::test]
@@ -263,15 +406,9 @@ async fn pre_acceptance_timeout_advances_to_next_candidate() {
     let first = assigned.selected.clone();
     let second = assigned.fallback_order[0].clone();
 
-    let observed = integrator_observe(
-        &ctx,
-        IntegratorObserveOptions {
-            ack_timeout_ms: Some(0),
-            fallback_on_blocked: false,
-        },
-    )
-    .await
-    .unwrap();
+    let observed = integrator_observe(&ctx, IntegratorObserveOptions::default())
+        .await
+        .unwrap();
     assert_eq!(observed.action, "offered_next");
 
     let status = integrator_status(&ctx, Some(&assigned.assignment_id))
@@ -351,7 +488,7 @@ async fn post_acceptance_timeout_never_silently_falls_back() {
             kind: AgentMessageKind::Status,
             body: accepted,
             about_snapshot: Some(head.clone()),
-            reply_to: None,
+            reply_to: Some(assigned.request_message_id.clone()),
             from: Some(assigned.selected.clone()),
         },
     )
@@ -522,16 +659,22 @@ async fn late_acceptance_after_supersession_is_rejected_end_to_end() {
             kind: AgentMessageKind::Status,
             body: late,
             about_snapshot: Some(head.clone()),
-            reply_to: None,
+            reply_to: Some(assigned.request_message_id.clone()),
             from: Some(first.clone()),
         },
     )
     .await
     .unwrap();
 
-    let observed = integrator_observe(&ctx, IntegratorObserveOptions::default())
-        .await
-        .unwrap();
+    let observed = integrator_observe(
+        &ctx,
+        IntegratorObserveOptions {
+            ack_timeout_ms: Some(u64::MAX),
+            fallback_on_blocked: false,
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(
         observed.state,
         Some(feanorfs_common::IntegratorAssignmentState::Offered),
@@ -557,7 +700,7 @@ async fn late_acceptance_after_supersession_is_rejected_end_to_end() {
             kind: AgentMessageKind::Status,
             body: accepted,
             about_snapshot: Some(head.clone()),
-            reply_to: None,
+            reply_to: status.attempts[1].request_message_id.clone(),
             from: Some(second),
         },
     )
@@ -766,7 +909,7 @@ async fn hub_storage_contains_no_plaintext_assignment_traffic() {
             kind: AgentMessageKind::Status,
             body: accepted,
             about_snapshot: Some(head.clone()),
-            reply_to: None,
+            reply_to: Some(assigned.request_message_id.clone()),
             from: Some(assigned.selected.clone()),
         },
     )
@@ -848,7 +991,7 @@ async fn resume_after_restart_completes_without_duplicate_request() {
             kind: AgentMessageKind::Status,
             body: accepted,
             about_snapshot: Some(head.clone()),
-            reply_to: None,
+            reply_to: Some(assigned.request_message_id.clone()),
             from: Some(assigned.selected.clone()),
         },
     )

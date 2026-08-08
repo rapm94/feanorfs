@@ -7,12 +7,15 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub(crate) use durable::read_local_state_text;
 pub use durable::{check_no_legacy_db, DurableState};
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 pub const ACCESS_LOG_MAX_ENTRIES: usize = 10_000;
 pub const ACCESS_LOG_MIN_WEIGHT: f64 = 0.001;
+pub(crate) const MAX_LOCAL_STATE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_LOCAL_STATE_RECORDS: usize = feanorfs_common::MAX_TREE_OUTPUT_PATHS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalStateV1 {
@@ -57,18 +60,30 @@ impl LocalStateV1 {
     }
 
     pub fn to_json(&self) -> Result<String> {
+        self.validate_bounds()?;
         let mut sorted = self.clone();
         sorted.sort_for_serialize();
-        serde_json::to_string_pretty(&sorted).context("serialize local state")
+        let json = serde_json::to_string_pretty(&sorted).context("serialize local state")?;
+        if json.len() > MAX_LOCAL_STATE_BYTES {
+            bail!("local_state.json exceeds {MAX_LOCAL_STATE_BYTES} byte limit");
+        }
+        Ok(json)
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
-        let raw: serde_json::Value =
-            serde_json::from_str(json).context("parse local state JSON")?;
-        let version = raw
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
+        if json.len() > MAX_LOCAL_STATE_BYTES {
+            bail!("local_state.json exceeds {MAX_LOCAL_STATE_BYTES} byte limit");
+        }
+        #[derive(Deserialize)]
+        struct VersionOnly {
+            #[serde(default)]
+            schema_version: u64,
+        }
+        // Read the version without first allocating a generic JSON value that
+        // duplicates every attacker-controlled key and string in memory.
+        let version = serde_json::from_str::<VersionOnly>(json)
+            .context("parse local state JSON (deserialize local state schema version)")?
+            .schema_version;
         if version == 0 {
             bail!(
                 "local_state.json has invalid schema version 0. \
@@ -81,7 +96,8 @@ impl LocalStateV1 {
                  (max {CURRENT_SCHEMA_VERSION}). Upgrade feanorfs to open this workspace."
             );
         }
-        let state: Self = serde_json::from_value(raw).context("deserialize local state")?;
+        let state: Self = serde_json::from_str(json).context("deserialize local state")?;
+        state.validate_bounds()?;
         for entry in &state.file_access_log {
             if !entry.weight.is_finite() {
                 bail!(
@@ -93,6 +109,23 @@ impl LocalStateV1 {
             }
         }
         Ok(state)
+    }
+
+    fn validate_bounds(&self) -> Result<()> {
+        for (label, count) in [
+            ("local files", self.local_files.len()),
+            ("session entries", self.last_session.len()),
+            ("conflicts", self.conflict_registry.len()),
+            ("conflict resolutions", self.conflict_resolutions.len()),
+        ] {
+            if count > MAX_LOCAL_STATE_RECORDS {
+                bail!("local_state.json contains too many {label}");
+            }
+        }
+        if self.file_access_log.len() > ACCESS_LOG_MAX_ENTRIES {
+            bail!("local_state.json contains too many access-log entries");
+        }
+        Ok(())
     }
 
     pub fn prune_access_log(&mut self) {

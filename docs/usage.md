@@ -766,7 +766,7 @@ feanorfs agent inbox [--for <NAME>] [--after <HEAD>] [--limit <N>]
 | `refresh` | Pull cloud changes the agent hasn't touched. `--replace` discards agent-local edits after preserving them as a parent snapshot. |
 | `land` | Apply clean work, upload, register conflicts |
 | `clean` | Remove agent dir and snapshot rows |
-| `run` | Run a command in the agent dir — not a sandbox |
+| `run` | Run a command in the agent dir — not a sandbox. Sets `FEANORFS_AGENT`, `FEANORFS_AGENT_DIR`, and the absolute shared control root in `FEANORFS_WORKSPACE_ROOT`. |
 | `send` | Publish one encrypted signal tied to a snapshot; sender defaults to `FEANORFS_AGENT`, then `human` |
 | `inbox` | Read signals addressed to you (or `*` broadcasts); pass `--after` the previous cursor for new-signal deltas; a reset cursor means older signals may have been missed |
 
@@ -776,6 +776,158 @@ Agent signals are encrypted snapshots with no file-tree changes: they create
 no project files, never dirty Git, and keep the hub opaque. See
 [agent-communication.md](agent-communication.md) for the protocol, JSON
 contracts, and safety rules.
+
+### Agent runner
+
+The optional agent runner is the local delivery path for one already-spawned
+agent. This is the canonical operator runbook. It does not replace `ffmsg1`
+signal transport: an ordinary signal remains passive until an external
+orchestrator polls it or an operator explicitly configures and starts this
+local runner. See [agent communication](agent-communication.md#local-runner-delivery)
+for the delivery sequence and [agent API](agent-api.md#agent-runner-cli-only-current-projection)
+for its current JSON projection.
+
+Run the controller from the configured workspace root:
+
+```bash
+feanorfs agent runner setup <agent> [--timeout <seconds>] -- <program> [args...]
+feanorfs agent runner start [--foreground]
+feanorfs agent runner stop
+feanorfs agent runner status
+feanorfs agent runner reset --discard-pending
+feanorfs agent runner remove --discard-pending
+```
+
+Before the first `setup`, the workspace must already be a configured
+format-v3 workspace with a current snapshot head, and `<agent>` must be a
+real agent already created by `feanorfs agent spawn` with its base snapshot.
+There is exactly one configured runner per workspace. `setup` resolves
+`<program>` through `PATH` to a canonical executable, records that executable
+and its fixed arguments, and, for a new runner, checks the current head. It
+leaves the runner disabled and unregistered and does not launch a child. The
+default timeout is 3600 seconds; accepted values are 60 through 86400 seconds.
+
+Run `setup` again with the same agent to replace the program, fixed arguments,
+or timeout while preserving runtime state such as queued request IDs and
+checkpoints. It first disables and unregisters supervised execution, and it
+refuses to reconfigure a launching or running request. It still does not
+launch work. To configure a different agent, first run `remove
+--discard-pending` for the existing runner.
+
+#### Start, foreground, stop, and status
+
+Normal `start` enables the runner, registers it with the existing FeanorFS
+supervisor, and waits for that supervised worker to be running. The supervisor
+owns restart of an idle worker; an idle worker restart is not itself an
+attention condition.
+
+`start --foreground` first disables and unregisters background execution, then
+runs the same loop in the invoking terminal. That foreground runner is
+terminal-owned: `feanorfs agent runner stop` controls the supervised runner and
+does not terminate a foreground loop. On Unix, Ctrl-C or `SIGTERM` to the
+foreground process requests shutdown; on Windows, Ctrl-C or Ctrl-Break does
+the same. The runner then tears down the current child and its descendants,
+publishes a correlated cancellation fallback when it can, and exits. A signal
+or terminal event does not make a request eligible for automatic replay.
+
+`stop` disables supervised admission and removes the runner from the
+supervisor registry while preserving its configuration, queued request IDs,
+active checkpoint, and agent workspace. `status` reports the redacted local
+runner and supervisor state; it is safe to use while the hub is unavailable.
+
+When a supervisor has authority for this workspace, `stop` waits for a durable
+workspace-scoped reconciliation acknowledgement: the current registry
+generation/digest must show this runner removed, and the acknowledgement must
+belong to the live supervisor's exact native process identity. If the
+supervisor has crashed, recovery uses the recorded native process-start
+identity and, where the platform exposes it for orphan matching, the exact
+executable and worker arguments before touching an orphan. An identity that
+cannot be proved is left alone and the operation fails closed;
+retry after repairing the supervisor state. A fresh or already-disabled,
+unregistered runner with no supervisor authority has no child that could
+acknowledge the change, so an unregistered, authority-free idempotent `stop`
+and fresh `setup` skip this impossible acknowledgement wait.
+A stale registry entry, status, or acknowledgement authority is not treated as
+fresh and remains fail-closed.
+
+The supervisor restarts hub, watcher, and runner workers after clean exits or
+crashes with bounded backoff. On a new runner session, a persisted
+`launching`/`running` checkpoint is marked `ambiguous_execution`; the request
+is not relaunched. Stop/restart recovery therefore preserves the checkpoint
+and asks for explicit inspection and discard rather than guessing whether a
+child ran.
+
+#### What the runner executes
+
+The runner reads the normal agent inbox, so an operator can still read
+broadcasts with `agent inbox`. For execution, however, it admits only a
+`request` whose recipient exactly equals the configured agent. Broadcasts,
+other message kinds, duplicate request IDs, and already-completed request IDs
+are ignored by the runner. Accepted requests run one at a time.
+
+For each accepted request, the runner refreshes the agent worktree and starts a
+fresh child with the fixed configured executable and arguments. The child runs
+in that agent's worktree, inherits the normal environment plus
+`FEANORFS_AGENT`, `FEANORFS_AGENT_DIR`, and `FEANORFS_WORKSPACE_ROOT`, and
+receives one bounded `RunnerInvocation` JSON document on stdin followed by EOF.
+Its stdout and stderr are discarded, and its exit status is not a terminal
+reply.
+
+The child must publish one terminal `result` or `blocked` signal from the
+configured agent to the requester's `from` identity, with `reply_to` set to
+the request message ID. Set `about_snapshot` to the snapshot actually
+inspected; do not claim a different snapshot. A `status` signal is optional.
+The one-terminal child contract is not an exactly-once transport guarantee.
+When a child process cannot start, its invocation cannot be delivered, it exits
+without a correlated terminal, it times out, or it is cancelled, the runner
+tries to publish a generic correlated `blocked` fallback. If it cannot
+establish that one correlated terminal was observed or published, it stops for
+attention instead of replaying the request.
+
+Every child is owned as a process tree. Unix (including macOS) starts it in a
+fresh process group and uses bounded `TERM` then `KILL` teardown. Windows
+creates it suspended, assigns it to a private Job Object configured for
+kill-on-close, verifies membership, and only then resumes it. Timeout,
+cancellation, and direct-child exit all tear down admitted descendants before
+the runner reports the cycle complete. This is process ownership, not process
+sandboxing; `agent run` still isolates data only.
+
+#### Attention and recovery
+
+Runner runtime checkpoints retain cursors, request/session IDs, phases,
+timestamps, and terminal IDs—not request bodies or child output. Public status
+also redacts configured command/arguments and process metadata.
+
+The runner stops and requires operator recovery for exactly these attention
+reasons:
+
+| Attention reason | Meaning | Recovery |
+|---|---|---|
+| `cursor_reset` | The bounded inbox delta may have omitted older signals. | Inspect the agent worktree, stop the supervised runner, then reset with explicit discard. |
+| `pending_overflow` | A bounded direct-request queue could not admit the batch. | Inspect, stop, then reset with explicit discard. |
+| `ambiguous_execution` | A persisted `launching` or `running` execution was found after its worker/session stopped, so it may already have run. | Inspect, stop, then reset with explicit discard; do not relaunch it. |
+| `delivery_unknown` | The runner could not establish a correlated terminal result or blocked delivery. | Inspect, stop, then reset with explicit discard; do not retry it automatically. |
+| `preparation_failed` | Local refresh/preparation failed before the child launch. No child was started, but the pending request and cursor checkpoint remain preserved. | Repair or inspect local workspace/agent state, stop the runner, then run `reset --discard-pending` (or remove with explicit discard) if the request should be abandoned; there is no automatic replay. |
+
+Generic child failures do not automatically require attention when the runner
+can publish and observe its generic `blocked` fallback. In contrast, only a
+persisted `launching` or `running` execution becomes
+`ambiguous_execution` after interruption; an idle worker can be restarted by
+the supervisor.
+
+`reset --discard-pending` is available only when the runner is stopped. It
+reads the current workspace head, advances the runner cursor to that head, and
+discards pending, active, and attention state. Discarded requests are never
+replayed. `remove --discard-pending` also requires the explicit discard flag;
+it removes runner state only and preserves the agent worktree, base snapshot,
+and runtime. Remove a configured runner before `agent clean`, `agent spawn
+--replace`, or `agent land --clean` for that agent.
+
+There is no exactly-once delivery guarantee: inbox reads can redeliver, signal
+history can be bounded or reset, and a terminal can be published but not be
+observed by this runner. Durable IDs suppress ordinary duplicate admission;
+they do not prove that an external child ran once. Treat every attention reason
+as a human decision point and use explicit discard/reset before resuming.
 
 ### `conflicts` — list, compare, resolve
 
@@ -831,7 +983,8 @@ troubleshooting, and `ffint1` details.
 
 ```bash
 feanorfs events    # NDJSON: sync_state, folder_changed, conflict_risk, conflict_registered,
-                   #        agent_message, integrator_assigned/accepted/completed/blocked/requires_human, …
+                   #        agent_message, agent_message_cursor_reset,
+                   #        integrator_assigned/accepted/completed/blocked/requires_human, …
 feanorfs mcp       # MCP protocol + tools (agent_*, conflicts_*, sync_status, workspace_log,
                    #        workspace_undo, integrator_assign/status/revoke/resume, conflict_materialize)
 ```
@@ -843,8 +996,10 @@ map, keeping routine agent checks small even in large workspaces.
 `agent_message` wakeup records carry only `message_id`, `from`, `to`, `kind`,
 and `about_snapshot` — never the body. An orchestrator that sees one calls
 `feanorfs --json agent inbox` for the typed message. Wakeups are cursor-based
-and deduplicated by snapshot ID within a bounded in-process cache. A reported
-reset or overflow means older wakeups may have been missed.
+and deduplicated by snapshot ID within a bounded in-process cache. A reset or
+overflow emits `agent_message_cursor_reset` with only the observed `cursor`
+and `cursor_reset: true` before the bounded wakeups; older wakeups may have
+been missed, so the orchestrator should re-read the typed inbox as needed.
 
 ## Examples
 
@@ -897,7 +1052,7 @@ Full rationale: [sync-scope.md](sync-scope.md).
 
 ## Agent loop and reconciliation (orchestrators)
 
-FeanorFS isolates **files**, not processes. An agent workspace is a normal worktree under the workspace's private global state — `feanorfs agent run` selects it without adding files to the project. It sets `FEANORFS_AGENT` and `FEANORFS_AGENT_DIR` on the child; it does **not** sandbox the process — absolute-path writes can escape the agent dir (see [threat-model.md](threat-model.md)).
+FeanorFS isolates **files**, not processes. An agent workspace is a normal worktree under the workspace's private global state — `feanorfs agent run` selects it without adding files to the project. It sets `FEANORFS_AGENT`, `FEANORFS_AGENT_DIR`, and the absolute shared control root in `FEANORFS_WORKSPACE_ROOT` on the child. Nested FeanorFS signal and MCP commands use that control root while the child remains cwd-scoped to the agent worktree. `agent run` does **not** sandbox the process — absolute-path writes can escape the agent dir (see [threat-model.md](threat-model.md)).
 
 ### Loop
 

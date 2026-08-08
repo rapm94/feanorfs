@@ -5,6 +5,24 @@ use napi_derive::napi;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+const MAX_ADAPTER_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_ROOT_BYTES: usize = 32 * 1024;
+
+fn ensure_bounded(value: &str, maximum: usize, label: &str) -> Result<()> {
+    if value.len() > maximum {
+        return Err(Error::from_reason(format!(
+            "{label} exceeds {maximum} UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_bounded_json<T: serde::de::DeserializeOwned>(json: &str, label: &str) -> Result<T> {
+    ensure_bounded(json, MAX_ADAPTER_INPUT_BYTES, label)?;
+    serde_json::from_str(json)
+        .map_err(|error| Error::from_reason(format!("invalid {label}: {error}")))
+}
+
 fn runtime() -> Result<Arc<Runtime>> {
     static RT: OnceLock<Mutex<Option<Arc<Runtime>>>> = OnceLock::new();
     let cell = RT.get_or_init(|| Mutex::new(None));
@@ -21,6 +39,7 @@ fn runtime() -> Result<Arc<Runtime>> {
 }
 
 fn open(root: &str) -> Result<Workspace> {
+    ensure_bounded(root, MAX_ROOT_BYTES, "workspace root")?;
     Workspace::open(&runtime()?, Path::new(root)).map_err(|e| Error::from_reason(e.to_string()))
 }
 
@@ -89,7 +108,9 @@ pub async fn agent_path(root: String, name: String) -> Result<String> {
         let path = open(&root)?
             .agent_path(&name)
             .map_err(|error| Error::from_reason(error.to_string()))?;
-        Ok(path.to_string_lossy().into_owned())
+        path.into_os_string()
+            .into_string()
+            .map_err(|_| Error::from_reason("agent path is not valid UTF-8"))
     })
     .await
 }
@@ -178,8 +199,8 @@ pub async fn undo(root: String, snapshot_id: String) -> Result<String> {
 #[napi]
 pub async fn agent_send(root: String, input_json: String) -> Result<String> {
     run(move || {
-        let input: feanorfs_common::AgentMessageInput = serde_json::from_str(&input_json)
-            .map_err(|error| Error::from_reason(format!("invalid agent_send input: {error}")))?;
+        let input: feanorfs_common::AgentMessageInput =
+            parse_bounded_json(&input_json, "agent_send input")?;
         let result = open(&root)?
             .send_message(input)
             .map_err(|error| Error::from_reason(error.to_string()))?;
@@ -192,8 +213,8 @@ pub async fn agent_send(root: String, input_json: String) -> Result<String> {
 #[napi]
 pub async fn agent_inbox(root: String, query_json: String) -> Result<String> {
     run(move || {
-        let query: feanorfs_common::AgentInboxQuery = serde_json::from_str(&query_json)
-            .map_err(|error| Error::from_reason(format!("invalid agent_inbox input: {error}")))?;
+        let query: feanorfs_common::AgentInboxQuery =
+            parse_bounded_json(&query_json, "agent_inbox input")?;
         let result = open(&root)?
             .inbox(query)
             .map_err(|error| Error::from_reason(error.to_string()))?;
@@ -238,10 +259,8 @@ pub async fn conflicts_keep(
 #[napi]
 pub async fn integrator_assign(root: String, input_json: String) -> Result<String> {
     run(move || {
-        let input: feanorfs_common::IntegratorAssignInput = serde_json::from_str(&input_json)
-            .map_err(|error| {
-                Error::from_reason(format!("invalid integrator_assign input: {error}"))
-            })?;
+        let input: feanorfs_common::IntegratorAssignInput =
+            parse_bounded_json(&input_json, "integrator_assign input")?;
         let result = open(&root)?
             .integrator_assign(input)
             .map_err(|error| Error::from_reason(error.to_string()))?;
@@ -289,16 +308,9 @@ pub async fn integrator_resume(root: String, options_json: Option<String>) -> Re
         let (ack_timeout_ms, fallback_on_blocked) = match options_json {
             None => (None, false),
             Some(json) => {
-                let value: serde_json::Value = serde_json::from_str(&json).map_err(|error| {
-                    Error::from_reason(format!("invalid integrator_resume options: {error}"))
-                })?;
-                (
-                    value.get("ack_timeout_ms").and_then(|v| v.as_u64()),
-                    value
-                        .get("fallback_on_blocked")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                )
+                let input: feanorfs_common::IntegratorObserveInput =
+                    parse_bounded_json(&json, "integrator_resume options")?;
+                (input.ack_timeout_ms, input.fallback_on_blocked)
             }
         };
         let result = open(&root)?
@@ -313,31 +325,18 @@ pub async fn integrator_resume(root: String, options_json: Option<String>) -> Re
 }
 
 /// Materialize the encrypted conflict triple for a snapshot.
-/// JSON in: object with `about_snapshot` and optional `paths`;
+/// JSON in: object with `about_snapshot` and exactly one of non-empty `paths` or `all: true`;
 /// JSON out: `ConflictMaterializeResult`.
 #[napi]
 pub async fn conflict_materialize(root: String, input_json: String) -> Result<String> {
     run(move || {
-        let value: serde_json::Value = serde_json::from_str(&input_json).map_err(|error| {
+        let input: feanorfs_common::ConflictMaterializeInput =
+            parse_bounded_json(&input_json, "conflict_materialize input")?;
+        let (about_snapshot, paths) = input.validate().map_err(|error| {
             Error::from_reason(format!("invalid conflict_materialize input: {error}"))
         })?;
-        let about = value
-            .get("about_snapshot")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::from_reason("conflict_materialize requires about_snapshot"))?
-            .to_string();
-        let paths: Vec<String> = value
-            .get("paths")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
         let result = open(&root)?
-            .materialize_conflicts(&about, &paths)
+            .materialize_conflicts(&about_snapshot, &paths)
             .map_err(|error| Error::from_reason(error.to_string()))?;
         serde_json::to_string(&result).map_err(|error| Error::from_reason(error.to_string()))
     })

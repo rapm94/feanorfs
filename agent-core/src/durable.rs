@@ -4,6 +4,33 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug)]
+struct CommitDurabilityUncertain {
+    message: String,
+}
+
+impl std::fmt::Display for CommitDurabilityUncertain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CommitDurabilityUncertain {}
+
+pub(crate) fn commit_durability_is_uncertain(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CommitDurabilityUncertain>().is_some()
+}
+
+fn durability_uncertain(parent: &Path, detail: impl std::fmt::Display) -> anyhow::Error {
+    CommitDurabilityUncertain {
+        message: format!(
+            "committed-but-durability-uncertain: new state written but directory sync failed for {}: {detail}",
+            parent.display()
+        ),
+    }
+    .into()
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AtomicFaults {
@@ -54,27 +81,32 @@ pub fn atomic_overwrite(path: &Path, data: &[u8]) -> Result<()> {
 
     awf.commit().context("commit atomic write")?;
 
+    #[cfg(debug_assertions)]
+    if let Some(parent) = path.parent() {
+        let marker = parent.join("test-atomic-post-commit-fault");
+        if path
+            .file_name()
+            .is_some_and(|name| name == "local_state.json")
+            && marker.exists()
+        {
+            let _ = fs::remove_file(marker);
+            return Err(durability_uncertain(parent, "injected debug fault"));
+        }
+    }
+
     #[cfg(test)]
     {
         let fail = TEST_ATOMIC_FAULTS.with(|f| f.borrow().fail_after_commit);
         if fail {
             let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            return Err(anyhow::anyhow!(
-                "committed-but-durability-uncertain: new state written but \
-                 directory sync failed for {}: injected fault",
-                parent.display()
-            ));
+            return Err(durability_uncertain(parent, "injected fault"));
         }
     }
 
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
             if let Err(e) = dir.sync_all() {
-                return Err(anyhow::anyhow!(
-                    "committed-but-durability-uncertain: new state written but \
-                     directory sync failed for {}: {e}",
-                    parent.display()
-                ));
+                return Err(durability_uncertain(parent, e));
             }
         }
     }

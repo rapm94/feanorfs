@@ -2,10 +2,12 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PAUSED_FILE: &str = "paused";
 const WATCH_PID_FILE: &str = "watch.pid";
+static WATCH_PROCESS_STARTED_AT: OnceLock<u64> = OnceLock::new();
 
 fn feanorfs_dir(base: &Path) -> std::io::Result<std::path::PathBuf> {
     feanorfs_agent_core::ensure_workspace_state(base)
@@ -46,7 +48,9 @@ pub fn write_watch_pid(base: &Path) {
     };
     let _ = fs::create_dir_all(&dir);
     let pid = std::process::id();
-    let content = format!("{pid}\n{}\n", now_secs());
+    let now = now_secs();
+    let started_at = *WATCH_PROCESS_STARTED_AT.get_or_init(|| now);
+    let content = format!("{pid}\n{now}\n{started_at}\n");
     let _ = fs::write(dir.join(WATCH_PID_FILE), content);
 }
 

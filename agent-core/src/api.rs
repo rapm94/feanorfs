@@ -1,5 +1,6 @@
 use anyhow::{bail, ensure, Context, Result};
 use feanorfs_common::{RelayConfig, SyncRequest, SyncResponse};
+use futures_util::StreamExt as _;
 use reqwest::{Certificate, Client};
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -39,13 +40,104 @@ struct VersionResponse {
 pub const MIN_SUPPORTED_SERVER_VERSION: &str = "0.7.0";
 
 const MAX_VERSION_RESPONSE_BYTES: usize = 1024;
+const MAX_API_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+const MAX_API_ERROR_BYTES: usize = 64 * 1024;
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Upper bound for establishing one hub connection (DNS + TCP + TLS).
+/// An unreachable or silently dropped hub must fail a sync instead of
+/// blocking on the OS connect timeout.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Idle bound for reading one hub response. The timer resets on every byte
+/// the hub sends, so slow-but-live transfers are never aborted; a peer that
+/// stops answering (blackholed network, paused hub process) fails within the
+/// bound instead of wedging sync, the watcher, and CLI commands forever.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct RequestStatusError {
+    method: &'static str,
+    path: String,
+    status: http::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for RequestStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {} failed with status {}: {}",
+            self.method, self.path, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for RequestStatusError {}
+
+fn bounded_error_body(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut output = String::new();
+    for character in text.chars().take(4096) {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+pub(crate) fn request_error_status(error: &anyhow::Error) -> Option<http::StatusCode> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<RequestStatusError>()
+            .map(|error| error.status)
+    })
+}
+
+/// Returns whether a failed HTTP operation may be retried as unavailable
+/// transport. Authentication, malformed responses, local I/O, and ordinary
+/// client errors remain fail-closed.
+pub fn is_retryable_transport_error(error: &anyhow::Error) -> bool {
+    request_error_status(error).is_some_and(retryable_server_status)
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                error.is_request() || error.is_connect() || error.is_timeout() || error.is_body()
+            })
+        })
+}
+
+const fn retryable_server_status(status: http::StatusCode) -> bool {
+    matches!(
+        status,
+        http::StatusCode::INTERNAL_SERVER_ERROR
+            | http::StatusCode::BAD_GATEWAY
+            | http::StatusCode::SERVICE_UNAVAILABLE
+            | http::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+pub(crate) fn request_status_error(
+    method: &'static str,
+    path: &str,
+    status: http::StatusCode,
+    body: &[u8],
+) -> anyhow::Error {
+    RequestStatusError {
+        method,
+        path: path.to_string(),
+        status,
+        body: bounded_error_body(body),
+    }
+    .into()
+}
 
 impl ApiClient {
     pub fn new(server_url: &str, server_password: Option<&str>) -> Self {
+        let client = Self::build_http_client(None, None)
+            .expect("build FeanorFS HTTP client with default transport timeouts");
         Self {
             backend: Backend::Http {
-                client: Client::new(),
+                client,
                 server_url: server_url.trim_end_matches('/').to_string(),
                 _tunnel: None,
             },
@@ -86,7 +178,30 @@ impl ApiClient {
         tls_ca_pem: Option<&str>,
         resolution: Option<(&str, &[SocketAddr])>,
     ) -> Result<Self> {
+        let client = Self::build_http_client(tls_ca_pem, resolution)
+            .context("build FeanorFS HTTP client")?;
+        Ok(Self {
+            backend: Backend::Http {
+                client,
+                server_url: server_url.trim_end_matches('/').to_string(),
+                _tunnel: None,
+            },
+            server_password: server_password.map(str::to_string),
+            migration_token: None,
+        })
+    }
+
+    /// Builds the shared hub HTTP client with bounded connect/read timeouts
+    /// so a silent or unreachable hub fails requests instead of hanging every
+    /// sync, watcher, and CLI command indefinitely.
+    fn build_http_client(
+        tls_ca_pem: Option<&str>,
+        resolution: Option<(&str, &[SocketAddr])>,
+    ) -> Result<Client> {
         let mut builder = Client::builder();
+        builder = builder
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .read_timeout(HTTP_READ_TIMEOUT);
         if let Some(pem) = tls_ca_pem {
             let certificate = Certificate::from_pem(pem.as_bytes())
                 .context("parse FeanorFS hub CA certificate")?;
@@ -95,7 +210,22 @@ impl ApiClient {
         if let Some((hostname, addresses)) = resolution {
             builder = builder.resolve_to_addrs(hostname, addresses);
         }
-        let client = builder.build().context("build FeanorFS HTTP client")?;
+        builder.build().context("build FeanorFS HTTP client")
+    }
+
+    /// Test-only constructor with explicit transport timeouts.
+    #[cfg(test)]
+    pub(crate) fn new_with_timeouts(
+        server_url: &str,
+        server_password: Option<&str>,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Result<Self> {
+        let mut builder = Client::builder();
+        builder = builder
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout);
+        let client = builder.build().context("build test FeanorFS HTTP client")?;
         Ok(Self {
             backend: Backend::Http {
                 client,
@@ -192,13 +322,12 @@ impl ApiClient {
             .raw_request(http::Method::GET, path, query, Vec::new(), None)
             .await?;
         if status == http::StatusCode::UNAUTHORIZED {
-            bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
+            bail!(
+                "Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`"
+            );
         }
         if !status.is_success() {
-            bail!(
-                "GET {path} failed with status {status}: {}",
-                String::from_utf8_lossy(&body)
-            );
+            return Err(request_status_error("GET", path, status, &body));
         }
         serde_json::from_slice(&body)
             .with_context(|| format!("Failed to parse GET {path} response"))
@@ -220,13 +349,12 @@ impl ApiClient {
             )
             .await?;
         if status == http::StatusCode::UNAUTHORIZED {
-            bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
+            bail!(
+                "Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`"
+            );
         }
         if !status.is_success() {
-            bail!(
-                "POST {path} failed with status {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
+            return Err(request_status_error("POST", path, status, &bytes));
         }
         serde_json::from_slice(&bytes)
             .with_context(|| format!("Failed to parse POST {path} response"))
@@ -237,13 +365,12 @@ impl ApiClient {
             .raw_request(http::Method::POST, path, query, body, None)
             .await?;
         if status == http::StatusCode::UNAUTHORIZED {
-            bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
+            bail!(
+                "Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`"
+            );
         }
         if !status.is_success() {
-            bail!(
-                "POST {path} failed with status {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
+            return Err(request_status_error("POST", path, status, &bytes));
         }
         Ok(())
     }
@@ -284,8 +411,32 @@ impl ApiClient {
                     .await
                     .with_context(|| format!("Failed to send request to {url}"))?;
                 let status = resp.status();
-                let bytes = resp.bytes().await.context("read HTTP response body")?;
-                Ok((status, bytes.to_vec()))
+                let limit = if status.is_success() {
+                    MAX_API_RESPONSE_BYTES
+                } else {
+                    MAX_API_ERROR_BYTES
+                };
+                if resp
+                    .content_length()
+                    .is_some_and(|length| length > limit as u64)
+                {
+                    bail!("HTTP response exceeds {limit} byte limit");
+                }
+                let mut bytes = Vec::with_capacity(
+                    resp.content_length()
+                        .and_then(|length| usize::try_from(length).ok())
+                        .unwrap_or(0)
+                        .min(limit),
+                );
+                let mut stream = resp.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.context("read HTTP response body")?;
+                    if bytes.len().saturating_add(chunk.len()) > limit {
+                        bail!("HTTP response exceeds {limit} byte limit");
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok((status, bytes))
             }
             Backend::Local(hub) => {
                 let resp = hub
@@ -301,7 +452,12 @@ impl ApiClient {
                         content_type,
                     )
                     .await?;
-                LocalHub::read_body(resp).await
+                let limit = if resp.status().is_success() {
+                    MAX_API_RESPONSE_BYTES
+                } else {
+                    MAX_API_ERROR_BYTES
+                };
+                LocalHub::read_body_bounded(resp, limit).await
             }
         }
     }
@@ -380,7 +536,8 @@ impl ApiClient {
             urlencoding_path(workspace_id),
             urlencoding_path(snapshot_id)
         );
-        let mut manifest = hashes.join("\n").into_bytes();
+        let canonical = feanorfs_common::canonical_manifest_hash_list(snapshot_id, hashes)?;
+        let mut manifest = canonical.join("\n").into_bytes();
         manifest.push(b'\n');
         self.post_bytes("/api/manifest", &query, manifest).await
     }
@@ -422,10 +579,12 @@ impl ApiClient {
                 }
                 let status = response.status();
                 if status == http::StatusCode::UNAUTHORIZED {
-                    bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
+                    bail!(
+                        "Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`"
+                    );
                 }
                 if !status.is_success() {
-                    bail!("GET /api/version failed with status {status}");
+                    return Err(request_status_error("GET", "/api/version", status, &[]));
                 }
                 if let Some(length) = response.content_length() {
                     ensure!(
@@ -469,23 +628,86 @@ impl ApiClient {
     }
 
     pub async fn download_file(&self, hash: &str) -> Result<Vec<u8>> {
-        let (status, body) = self
-            .raw_request(
-                http::Method::GET,
-                &format!("/api/download/{hash}"),
-                "",
-                Vec::new(),
-                None,
-            )
-            .await?;
+        self.download_file_bounded(hash, 100 * 1024 * 1024).await
+    }
+
+    pub async fn download_file_bounded(&self, hash: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let path = format!("/api/download/{hash}");
+        let (status, body) = match &self.backend {
+            Backend::Http {
+                client, server_url, ..
+            } => {
+                let url = format!("{server_url}{path}");
+                let mut request = client.get(&url).header("X-FeanorFS-Format", "3");
+                if let Some(password) = &self.server_password {
+                    request = request.bearer_auth(password);
+                }
+                if let Some(token) = &self.migration_token {
+                    request = request.header("X-FeanorFS-Migration", token);
+                }
+                let response = request
+                    .send()
+                    .await
+                    .with_context(|| format!("Failed to send request to {url}"))?;
+                let status = response.status();
+                let limit = if status.is_success() {
+                    max_bytes
+                } else {
+                    MAX_API_ERROR_BYTES
+                };
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > limit as u64)
+                {
+                    bail!("download response exceeds {limit} byte limit");
+                }
+                let mut body = Vec::with_capacity(
+                    response
+                        .content_length()
+                        .and_then(|length| usize::try_from(length).ok())
+                        .unwrap_or(0)
+                        .min(limit),
+                );
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.context("read HTTP response body")?;
+                    if body.len().saturating_add(chunk.len()) > limit {
+                        bail!("download response exceeds {limit} byte limit");
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                (status, body)
+            }
+            Backend::Local(hub) => {
+                let response = hub
+                    .request(
+                        http::Method::GET,
+                        &path,
+                        "",
+                        Vec::new(),
+                        (
+                            self.server_password.as_deref(),
+                            self.migration_token.as_deref(),
+                        ),
+                        None,
+                    )
+                    .await?;
+                let status = response.status();
+                let limit = if status.is_success() {
+                    max_bytes
+                } else {
+                    MAX_API_ERROR_BYTES
+                };
+                LocalHub::read_body_bounded(response, limit).await?
+            }
+        };
         if status == http::StatusCode::UNAUTHORIZED {
-            bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
+            bail!(
+                "Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`"
+            );
         }
         if !status.is_success() {
-            bail!(
-                "Download failed with status {status}: {}",
-                String::from_utf8_lossy(&body)
-            );
+            return Err(request_status_error("GET", &path, status, &body));
         }
         Ok(body)
     }
@@ -527,7 +749,10 @@ fn check_server_version(advertised: &str) -> Result<()> {
 
 #[cfg(test)]
 mod version_tests {
-    use super::{check_server_version, ApiClient};
+    use super::{
+        check_server_version, is_retryable_transport_error, request_status_error, ApiClient,
+    };
+    use std::time::Duration;
 
     async fn serve(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -576,6 +801,50 @@ mod version_tests {
     }
 
     #[tokio::test]
+    async fn silent_hub_fails_bounded_instead_of_hanging_forever() {
+        // A hub that accepts the connection but never sends a response must
+        // fail the request within the read timeout instead of wedging sync,
+        // the watcher, and every CLI command on a blackholed connection.
+        let router = axum::Router::new().route(
+            "/api/head",
+            axum::routing::get(|| async {
+                std::future::pending::<axum::response::Response>().await
+            }),
+        );
+        let (url, task) = serve(router).await;
+        let client = ApiClient::new_with_timeouts(
+            &url,
+            Some("test-token"),
+            Duration::from_secs(2),
+            Duration::from_millis(400),
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let error = client.get_head("ws-1").await.unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "request hung on a silent hub"
+        );
+        assert!(is_retryable_transport_error(&error), "{error:#}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn object_download_is_bounded_before_body_growth() {
+        let router = axum::Router::new().route(
+            "/api/download/{hash}",
+            axum::routing::get(|| async { vec![0_u8; 5] }),
+        );
+        let (url, task) = serve(router).await;
+        let error = ApiClient::new(&url, Some("test-token"))
+            .download_file_bounded(&"a".repeat(64), 4)
+            .await
+            .unwrap_err();
+        task.abort();
+        assert!(error.to_string().contains("exceeds 4 byte limit"));
+    }
+
+    #[tokio::test]
     async fn endpointless_hub_404_remains_explicitly_compatible() {
         let (url, task) = serve(axum::Router::new()).await;
         ApiClient::new(&url, Some("test-token"))
@@ -583,5 +852,79 @@ mod version_tests {
             .await
             .unwrap();
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn typed_head_status_errors_classify_only_retryable_server_failures() {
+        for status in [
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            http::StatusCode::BAD_GATEWAY,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            http::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(is_retryable_transport_error(&request_status_error(
+                "GET",
+                "/api/head",
+                status,
+                &[]
+            )));
+        }
+        assert!(!is_retryable_transport_error(&request_status_error(
+            "GET",
+            "/api/head",
+            http::StatusCode::NOT_IMPLEMENTED,
+            &[]
+        )));
+
+        let retryable = axum::Router::new().route(
+            "/api/head",
+            axum::routing::get(|| async {
+                (http::StatusCode::SERVICE_UNAVAILABLE, "temporary outage")
+            }),
+        );
+        let (url, task) = serve(retryable).await;
+        let error = ApiClient::new(&url, None)
+            .get_head("runner-test")
+            .await
+            .unwrap_err();
+        task.abort();
+        assert!(error
+            .to_string()
+            .contains("GET /api/head failed with status 503"));
+        assert!(is_retryable_transport_error(&error));
+
+        let unauthorized = axum::Router::new().route(
+            "/api/head",
+            axum::routing::get(|| async { http::StatusCode::UNAUTHORIZED }),
+        );
+        let (url, task) = serve(unauthorized).await;
+        let error = ApiClient::new(&url, None)
+            .get_head("runner-test")
+            .await
+            .unwrap_err();
+        task.abort();
+        assert!(error.to_string().contains("valid access token"));
+        assert!(!is_retryable_transport_error(&error));
+    }
+
+    #[tokio::test]
+    async fn typed_api_statuses_and_local_io_are_not_broadly_retryable() {
+        let router = axum::Router::new().route(
+            "/api/workspaces",
+            axum::routing::get(|| async { (http::StatusCode::BAD_REQUEST, "bad request") }),
+        );
+        let (url, task) = serve(router).await;
+        let error = ApiClient::new(&url, None)
+            .get_workspaces()
+            .await
+            .unwrap_err();
+        task.abort();
+        assert!(error
+            .to_string()
+            .contains("GET /api/workspaces failed with status 400"));
+        assert!(!is_retryable_transport_error(&error));
+        assert!(!is_retryable_transport_error(&anyhow::Error::from(
+            std::io::Error::other("local runner state failure")
+        )));
     }
 }

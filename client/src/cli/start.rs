@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use feanorfs_client::lock::try_acquire_sync_lock;
 use feanorfs_client::{
-    do_sync, load_config, load_global_config, register_workspace, save_config_secure,
+    load_config, load_global_config, register_workspace, save_config_secure,
     save_global_config_secure, watch, ApiClient, Config, GlobalConfig,
 };
 use feanorfs_common::{
@@ -163,13 +163,14 @@ pub(crate) async fn finish_sync_watch(
     let sync_result = async {
         let initial_sync_guard =
             try_acquire_sync_lock(work_dir, std::time::Duration::from_secs(10)).await?;
-        let result = do_sync(
+        let result = feanorfs_client::commands::do_sync_guarded(
             &api,
             &db,
             work_dir,
             &config.workspace_id,
             config.encryption_password.as_deref(),
             false,
+            &initial_sync_guard,
         )
         .await;
         drop(initial_sync_guard);

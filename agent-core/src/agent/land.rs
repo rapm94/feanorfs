@@ -5,9 +5,10 @@ use anyhow::{bail, Result};
 use feanorfs_common::{AgentLandResult, ConcurrentEdit};
 use std::path::{Path, PathBuf};
 
-use super::clean_agent;
+use super::clean_agent_with_runner_guard;
 use super::diff::{build_land_candidate, compute_agent_diff};
 use super::proposal::write_proposal_if_clean;
+use super::runner::RunnerOperationGuard;
 use crate::api::ApiClient;
 use crate::conflict_artifacts::{enrich_conflict_edit, enrich_conflict_edit_preview};
 use crate::conflicts::{
@@ -32,9 +33,15 @@ pub async fn land_agent(
     clean_after: bool,
     propose: bool,
 ) -> Result<AgentLandResult> {
+    let runner_guard = RunnerOperationGuard::acquire_async(base, name).await?;
+    if clean_after && runner_guard.protects_configured_runner() {
+        bail!(
+            "agent workspace '{name}' has a configured runner; remove the runner before landing with cleanup"
+        );
+    }
     let config = crate::local::load_config(base)?;
     let ctx = SyncCtx::from_config(api, db, base, &config)?;
-    land_agent_with_ctx(&ctx, name, clean_after, propose).await
+    land_agent_with_ctx(&ctx, name, clean_after, propose, &runner_guard).await
 }
 
 async fn land_agent_with_ctx(
@@ -42,6 +49,7 @@ async fn land_agent_with_ctx(
     name: &str,
     clean_after: bool,
     propose: bool,
+    runner_guard: &RunnerOperationGuard,
 ) -> Result<AgentLandResult> {
     let _land_guard = LandLock::acquire(ctx.base)?;
     let _sync_guard = SyncLock::acquire(ctx.base)?;
@@ -56,8 +64,18 @@ async fn land_agent_with_ctx(
     let agent_base = snapshots.read_agent_base(name).await?;
     let mut diff = compute_agent_diff(ctx, name).await?;
     let initial = build_land_candidate(&snapshots, &diff).await?;
-    let current_root = snapshots.load_snapshot(&diff.current_head).await?.root;
-    let recovering_committed_land = !diff.our_changes.is_empty() && initial.root == current_root;
+    let current_snapshot = snapshots.load_snapshot(&diff.current_head).await?;
+    let current_root = current_snapshot.root.clone();
+    let recovering_committed_land = !diff.our_changes.is_empty()
+        && initial.root == current_root
+        && current_snapshot.author == name
+        && current_snapshot
+            .parents
+            .iter()
+            .any(|parent| parent == &agent_base);
+    let recovery_gate_head = recovering_committed_land
+        .then(|| current_snapshot.parents.last().cloned())
+        .flatten();
     if !recovering_committed_land {
         let (_, blocked) =
             crate::sync_pass::run_sync_pass_locked(ctx, crate::sync_pass::SyncMode::Full, false)
@@ -71,9 +89,31 @@ async fn land_agent_with_ctx(
         diff = compute_agent_diff(ctx, name).await?;
     }
     let agent_path = agent_dir(ctx.base, name)?;
-    let gate_local = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    let gate_local = if let Some(previous_head) = recovery_gate_head.as_deref() {
+        let mut gate = snapshots.load_state(previous_head).await?.files;
+        let current = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+        // A crash may have happened either immediately after the head CAS or
+        // after some/all worktree paths were already activated. Adopt only
+        // paths that exactly equal the committed agent result; every other
+        // current value remains compared with the pre-land head so a later
+        // human edit is diverted rather than overwritten.
+        for change in &diff.our_changes {
+            if change.deleted {
+                if !current.contains_key(&change.path) {
+                    gate.remove(&change.path);
+                }
+            } else if let Some(actual) = current.get(&change.path).filter(|actual| {
+                !actual.deleted && actual.hash == change.hash && actual.mode == change.mode
+            }) {
+                gate.insert(change.path.clone(), actual.clone());
+            }
+        }
+        gate
+    } else {
+        crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?
+    };
     if !recovering_committed_land {
-        let (_, blocked) = negotiate_sync_with_conflict_gate(ctx, &gate_local, false).await?;
+        let (_, blocked, _) = negotiate_sync_with_conflict_gate(ctx, &gate_local, false).await?;
         if !blocked.is_empty() {
             bail!(
                 "Your folder changed during land and needs attention: {}",
@@ -81,6 +121,23 @@ async fn land_agent_with_ctx(
             );
         }
     }
+    let materialization = feanorfs_common::SyncResponse {
+        upload_required: Vec::new(),
+        download_required: diff
+            .our_changes
+            .iter()
+            .filter(|state| !state.deleted)
+            .cloned()
+            .collect(),
+        delete_local: diff
+            .our_changes
+            .iter()
+            .filter(|state| state.deleted)
+            .map(|state| state.path.clone())
+            .collect(),
+    };
+    crate::sync_pass::preflight_download_projection(ctx.base, &gate_local, &materialization)
+        .await?;
     let (diff, snapshot_id) = publish_land(
         PublishInput {
             ctx,
@@ -96,7 +153,6 @@ async fn land_agent_with_ctx(
         MaterializeInput {
             ctx,
             name,
-            agent_path: &agent_path,
             gate_local: &gate_local,
         },
         &diff,
@@ -130,7 +186,7 @@ async fn land_agent_with_ctx(
         }
     }
     if clean_after {
-        clean_agent(ctx.base, ctx.db, name).await?;
+        clean_agent_with_runner_guard(ctx.base, name, runner_guard).await?;
     } else {
         snapshots.write_agent_base(name, &snapshot_id).await?;
     }

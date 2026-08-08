@@ -58,13 +58,27 @@ pub(super) async fn handle_upload(
     {
         return Err(StatusCode::UPGRADE_REQUIRED);
     }
-    if !is_safe_rel_path(&params.path) {
-        tracing::warn!(path = %params.path, "rejected upload with unsafe path");
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let safe_path = is_safe_rel_path(&params.path);
     if params.deleted {
         if params.object || !is_valid_hash(&params.hash) {
             return Err(StatusCode::BAD_REQUEST);
+        }
+        if !safe_path {
+            let retired = state
+                .db
+                .tombstone_existing_file(
+                    &params.workspace_id,
+                    &params.path,
+                    &params.hash,
+                    params.mtime,
+                )
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if !retired {
+                tracing::warn!(path = %params.path, "rejected new unsafe tombstone path");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            return Ok(StatusCode::OK);
         }
         state
             .db
@@ -82,6 +96,10 @@ pub(super) async fn handle_upload(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Ok(StatusCode::OK);
+    }
+    if !safe_path {
+        tracing::warn!(path = %params.path, "rejected upload with unsafe path");
+        return Err(StatusCode::BAD_REQUEST);
     }
     if !is_valid_hash(&params.hash) {
         tracing::warn!(hash = %params.hash, "rejected upload with invalid hash");
@@ -131,7 +149,8 @@ pub(super) async fn handle_upload(
         .await
     {
         tracing::error!(?error, "failed to upsert file");
-        let _ = tokio::fs::remove_file(&blob_path).await;
+        // The verified immutable CAS object may already be referenced by another
+        // workspace or concurrent upload. Leave unreferenced objects for GC.
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     Ok(StatusCode::OK)

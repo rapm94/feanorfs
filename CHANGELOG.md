@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Optional local agent runner** — `feanorfs agent runner setup/start/stop/status/reset/remove` configures one explicit, fixed-command worker for one existing format-v3 agent workspace. It admits only direct `request` signals, supplies one bounded JSON invocation on stdin, and waits for one correlated `result` or `blocked` terminal; native process ownership tears down descendants on timeout/cancel/exit, and supervised stop waits for durable workspace reconciliation when authority exists. Cursor resets, queue overflow, ambiguous execution, unknown terminal delivery, and local preparation failures require inspect-and-discard/reset recovery and are never automatically replayed.
+
+### Fixed
+
+- The per-user tray instance guard now explicitly releases its operating-system
+  file lock before closing the handle, so a replacement tray can acquire the
+  singleton lock immediately and reliably after the prior tray exits.
+
+### Security
+
+- Workspace and agent-worktree reads now stay beneath descriptor-anchored roots on Unix: scanners, uploads, chunked files, spawn, land/refresh, undo, conflict choices, migration, hub transfer, hydration, and `cat` reject symlink/component substitution and verify stable opened descriptors before publication. Small uploads must reproduce the scanned encrypted hash, and large uploads retain only four pending chunks.
+- Release automation now pins cargo-dist-generated actions, attests CLI
+  checksums/manifests, blocks manual tagging without successful CI for the exact
+  main SHA, and binds desktop/relay builds plus uploads to the canonical tag's
+  immutable release commit and the `prod` environment boundary.
+- The Windows PowerShell installer no longer downloads ZIP payloads or executes
+  historical remote installer scripts. It requires a canonical stable tag and
+  native setup EXE, verifies its checksum, Authenticode signature, exact setup
+  ProductVersion, optional configured signer allowlist, and installed CLI
+  version, then verifies both installed executables.
+
 ## [0.8.1](https://github.com/rapm94/feanorfs/compare/v0.8.0...v0.8.1) - 2026-08-07
 
 ### Fixed

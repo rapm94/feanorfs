@@ -13,7 +13,9 @@ Own durable embedded-hub metadata, blob storage, and migration import/export. `.
 
 - Serialize metadata through `DurableJson` locking and atomic replacement.
 - Format-v3 stamping requires a manifested head and clears flat rows plus migration fence atomically.
+- Store each `(workspace_id, snapshot_id)` manifest once as a canonical closure containing its root and capped at `MANIFEST_MAX_ENTRIES` raw entries. Validate stored split lists directly without first joining an attacker-sized duplicate string. Same-set retries are idempotent; later expansion or shrinkage is rejected.
 - Blob writes recreate the blob directory if removed.
+- Unsafe legacy flat paths can transition only from an existing exact row to a tombstone; this cleanup path never inserts a row.
 
 ## Work Guidance
 

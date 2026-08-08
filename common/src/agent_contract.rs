@@ -74,6 +74,12 @@ pub const AGENT_MESSAGE_DISCRIMINATOR: &str = "ffmsg1";
 /// Maximum encoded UTF-8 body length for one agent signal.
 pub const AGENT_MESSAGE_MAX_BODY_BYTES: usize = 8 * 1024;
 
+/// Maximum canonical encoded envelope size, including JSON escaping.
+pub const AGENT_MESSAGE_MAX_ENCODED_BYTES: usize = 64 * 1024;
+
+/// Maximum UTF-8 byte length for one portable agent name.
+pub const AGENT_NAME_MAX_BYTES: usize = 255;
+
 /// Default result count for one inbox read.
 pub const AGENT_INBOX_DEFAULT_LIMIT: usize = 50;
 
@@ -125,6 +131,7 @@ pub struct AgentMessagePayload {
 /// `from` is optional: CLI callers derive it from `FEANORFS_AGENT` (falling
 /// back to `human`); embeddings may supply an explicit validated sender.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentMessageInput {
     pub to: String,
     pub kind: AgentMessageKind,
@@ -156,6 +163,7 @@ pub struct AgentMessage {
 
 /// Inbox read query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentInboxQuery {
     pub recipient: String,
     /// Previous workspace-head cursor; reads the graph delta when present.
@@ -187,13 +195,7 @@ pub fn encode_agent_message(payload: &AgentMessagePayload) -> anyhow::Result<Str
         !body.is_empty() && payload.body.len() <= AGENT_MESSAGE_MAX_BODY_BYTES,
         "signal body must be non-empty UTF-8 of at most 8 KiB"
     );
-    let valid_recipient = payload.to == "*"
-        || (!payload.to.is_empty()
-            && !payload.to.chars().any(char::is_control)
-            && !payload.to.contains('/')
-            && !payload.to.contains('\\')
-            && payload.to != "."
-            && payload.to != "..");
+    let valid_recipient = payload.to == "*" || crate::is_valid_agent_name(&payload.to);
     anyhow::ensure!(
         valid_recipient,
         "signal recipient must be a valid agent name or '*'"
@@ -208,10 +210,15 @@ pub fn encode_agent_message(payload: &AgentMessagePayload) -> anyhow::Result<Str
             "signal reply_to must be a full snapshot id"
         );
     }
-    Ok(format!(
+    let encoded = format!(
         "{AGENT_MESSAGE_DISCRIMINATOR}:{}",
         serde_json::to_string(payload)?
-    ))
+    );
+    anyhow::ensure!(
+        encoded.len() <= AGENT_MESSAGE_MAX_ENCODED_BYTES,
+        "encoded signal envelope exceeds 64 KiB"
+    );
+    Ok(encoded)
 }
 
 /// Parses an `ffmsg1` signal envelope.
@@ -220,6 +227,9 @@ pub fn encode_agent_message(payload: &AgentMessagePayload) -> anyhow::Result<Str
 /// payloads outside the canonical bounds. Unknown/malformed messages remain
 /// visible in raw history but are ignored by typed inbox reads.
 pub fn parse_agent_message(message: &str) -> Option<AgentMessagePayload> {
+    if message.len() > AGENT_MESSAGE_MAX_ENCODED_BYTES {
+        return None;
+    }
     let json = message.strip_prefix(AGENT_MESSAGE_DISCRIMINATOR)?;
     let json = json.strip_prefix(':')?;
     let payload: AgentMessagePayload = serde_json::from_str(json).ok()?;
@@ -637,6 +647,16 @@ mod tests {
     }
 
     #[test]
+    fn encoded_envelope_is_bounded_before_json_parsing() {
+        let oversized = format!(
+            "{AGENT_MESSAGE_DISCRIMINATOR}:{}",
+            "x".repeat(AGENT_MESSAGE_MAX_ENCODED_BYTES)
+        );
+        assert!(oversized.len() > AGENT_MESSAGE_MAX_ENCODED_BYTES);
+        assert!(parse_agent_message(&oversized).is_none());
+    }
+
+    #[test]
     fn invalid_recipients_are_rejected() {
         for recipient in ["", ".", "..", "nested/name", "nested\\name", "bad\nname"] {
             let mut p = payload("hello");
@@ -648,6 +668,10 @@ mod tests {
             let json = serde_json::to_string(&p).unwrap();
             assert!(parse_agent_message(&format!("ffmsg1:{json}")).is_none());
         }
+
+        let mut too_long = payload("hello");
+        too_long.to = "a".repeat(AGENT_NAME_MAX_BYTES + 1);
+        assert!(encode_agent_message(&too_long).is_err());
 
         let mut broadcast = payload("hello");
         broadcast.to = "*".into();
@@ -668,5 +692,17 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(name));
         }
+    }
+
+    #[test]
+    fn adapter_inputs_reject_unknown_fields() {
+        assert!(serde_json::from_str::<AgentMessageInput>(
+            r#"{"to":"a","kind":"request","body":"x","about_snapshot":null,"reply_to":null,"from":null,"replyto":"typo"}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<AgentInboxQuery>(
+            r#"{"recipient":"a","after":null,"limit":1,"cursor":"typo"}"#,
+        )
+        .is_err());
     }
 }

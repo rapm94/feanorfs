@@ -1,7 +1,9 @@
 use std::fs;
 use std::sync::{Arc, Barrier};
 
-use super::super::{check_no_legacy_db, DurableState, LocalStateV1, CURRENT_SCHEMA_VERSION};
+use super::super::{
+    check_no_legacy_db, DurableState, LocalStateV1, CURRENT_SCHEMA_VERSION, MAX_LOCAL_STATE_BYTES,
+};
 use super::cache_entry;
 
 #[test]
@@ -87,6 +89,18 @@ fn durable_state_read_sees_latest_commit() {
         .expect("read entries");
 
     assert_eq!(entries.len(), 2);
+}
+
+#[test]
+fn durable_state_rejects_oversized_json_before_reading_it() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let file = fs::File::create(dir.path().join("local_state.json")).expect("create sparse state");
+    file.set_len((MAX_LOCAL_STATE_BYTES + 1) as u64)
+        .expect("size sparse state");
+    fs::write(dir.path().join("local_state.lock"), b"").expect("create lock");
+
+    let error = DurableState::new(dir.path()).expect_err("oversized state should fail");
+    assert!(error.to_string().contains("exceeds"));
 }
 
 #[test]

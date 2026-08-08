@@ -82,6 +82,8 @@ If a candidate fails (3), it stays out of defaults even when gitignored in most 
 
 Use `feanorfs ignore <pattern>` for a project-specific artifact directory not in `DEFAULT_IGNORES` (for example, custom `out/`). Run `feanorfs ignore` to list rules, `feanorfs ignore --remove <pattern>` to remove one, or `feanorfs ignore --clear` to clear them. Rules use gitignore syntax and live under the workspace's opaque directory in `~/.feanorfs`; no file is added to the project.
 
+**Ignoring never deletes.** A path that was already tracked when a rule is added is *frozen*, not tombstoned: the scanner keeps reporting its cached identity, so the remote copy survives, nothing is re-downloaded, and local edits stay invisible to sync until the rule is removed. Only files that are genuinely absent from disk (and not covered by any rule) become deletions.
+
 - **Not required** for typical Rust/Node/Python projects — defaults cover the heavy dirs.
 - **Not a substitute for git** — duplicating an entire `.gitignore` defeats the product goal (sync what git ignores).
 - Pruning removes excluded paths from encrypted mirror state without deleting the local files. Hard-excluded VCS and legacy metadata are cleaned from transport/conflict state automatically.

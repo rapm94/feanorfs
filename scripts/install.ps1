@@ -1,6 +1,6 @@
-# FeanorFS Windows product installer. Installs the signed CLI and system tray
-# from one checksummed release bundle, with a truthful CLI-only fallback for
-# historical releases that predate the desktop package.
+# FeanorFS Windows product installer. Downloads only the canonical native
+# setup EXE, verifies its release checksum and Authenticode signature, and lets
+# that signed product own PATH, Start-menu, uninstall, and payload integration.
 [CmdletBinding()]
 param()
 
@@ -9,7 +9,13 @@ $ErrorActionPreference = "Stop"
 
 $repository = if ($env:FEANORFS_REPOSITORY) { $env:FEANORFS_REPOSITORY } else { "rapm94/feanorfs" }
 $releaseApi = if ($env:FEANORFS_RELEASE_API) { $env:FEANORFS_RELEASE_API } else { "https://api.github.com/repos/$repository/releases/latest" }
-$installDir = if ($env:FEANORFS_INSTALL_DIR) { $env:FEANORFS_INSTALL_DIR } else { Join-Path $HOME ".local\bin" }
+$defaultInstallDir = if ($env:LOCALAPPDATA) {
+    Join-Path $env:LOCALAPPDATA "Programs\FeanorFS"
+}
+else {
+    Join-Path $HOME "AppData\Local\Programs\FeanorFS"
+}
+$installDir = if ($env:FEANORFS_INSTALL_DIR) { $env:FEANORFS_INSTALL_DIR } else { $defaultInstallDir }
 
 function Get-ReleaseAsset([object]$release, [string]$name) {
     return $release.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
@@ -19,127 +25,140 @@ function Save-Url([string]$url, [string]$path) {
     Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $path
 }
 
+function Get-ProductVersion([string]$path) {
+    $value = (Get-Item -LiteralPath $path).VersionInfo.ProductVersion
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "$(Split-Path -Leaf $path) does not contain a Windows ProductVersion."
+    }
+    return $value.Trim()
+}
+
+function Assert-TrustedSignature([string]$path, [string]$label) {
+    $signature = Get-AuthenticodeSignature $path
+    if ($signature.Status -ne "Valid") {
+        throw "$label failed Authenticode verification: $($signature.Status)."
+    }
+    if ($env:FEANORFS_WINDOWS_SIGNER_SUBJECTS) {
+        $approved = @(
+            $env:FEANORFS_WINDOWS_SIGNER_SUBJECTS.Split(';') |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($approved.Count -eq 0) {
+            throw "The FeanorFS Windows signer policy is configured but empty."
+        }
+        $subject = $signature.SignerCertificate.Subject
+        if ([string]::IsNullOrWhiteSpace($subject) -or -not ($approved -ccontains $subject)) {
+            throw "$label was not signed by an approved FeanorFS identity."
+        }
+    }
+    return $signature
+}
+
+function Get-InstalledCliVersion([string]$path) {
+    $stdoutPath = [IO.Path]::GetTempFileName()
+    $stderrPath = [IO.Path]::GetTempFileName()
+    try {
+        $process = Start-Process -FilePath $path -ArgumentList @("--version") `
+            -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        if ($process.ExitCode -ne 0) {
+            throw "Installed feanorfs.exe could not report its version (status $($process.ExitCode))."
+        }
+        $text = (Get-Content -Raw $stdoutPath).Trim()
+        if ($text -notmatch '^feanorfs ([0-9]+\.[0-9]+\.[0-9]+)$') {
+            throw "Installed feanorfs.exe reported an invalid version."
+        }
+        return $Matches[1]
+    }
+    finally {
+        Remove-Item -Force $stdoutPath, $stderrPath -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host "Fetching latest FeanorFS release..."
 $release = Invoke-RestMethod -UseBasicParsing -Uri $releaseApi
 $version = $release.tag_name
 if ([string]::IsNullOrWhiteSpace($version)) {
     throw "Could not determine the latest FeanorFS version."
 }
+if ($version -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+    throw "The latest FeanorFS release does not use a canonical stable version tag."
+}
+$releaseVersion = $version.Substring(1)
 
-$assetName = "FeanorFS-windows-x86_64.zip"
-$bundle = Get-ReleaseAsset $release $assetName
+$assetName = "FeanorFS-windows-x86_64-setup.exe"
+$installerAsset = Get-ReleaseAsset $release $assetName
 $architecture = $env:PROCESSOR_ARCHITECTURE
 $supportsDesktop = $architecture -in @("AMD64", "x86_64")
 $installedTray = $null
 
-if ($bundle -and $supportsDesktop) {
-    $checksumAsset = Get-ReleaseAsset $release "$assetName.sha256"
-    if (-not $checksumAsset) {
-        throw "Release $version lists the Windows desktop bundle without its checksum."
-    }
-
-    $temp = Join-Path ([IO.Path]::GetTempPath()) ("feanorfs-install-" + [Guid]::NewGuid())
-    New-Item -ItemType Directory -Path $temp | Out-Null
-    try {
-        $archive = Join-Path $temp $assetName
-        $checksumFile = "$archive.sha256"
-        Write-Host "Downloading signed FeanorFS $version for Windows (CLI + system tray)..."
-        Save-Url $bundle.browser_download_url $archive
-        Save-Url $checksumAsset.browser_download_url $checksumFile
-
-        $checksumLine = (Get-Content -Raw $checksumFile).Trim()
-        if ($checksumLine -notmatch '^([0-9a-fA-F]{64})\s+FeanorFS-windows-x86_64\.zip$') {
-            throw "The Windows bundle checksum file has an invalid format."
-        }
-        $actualHash = (Get-FileHash -Algorithm SHA256 $archive).Hash
-        if ($actualHash -ne $Matches[1]) {
-            throw "The Windows bundle checksum does not match."
-        }
-
-        $expanded = Join-Path $temp "expanded"
-        Expand-Archive -Path $archive -DestinationPath $expanded
-        $archiveFiles = @(
-            Get-ChildItem -File -Recurse $expanded |
-                ForEach-Object {
-                    $_.FullName.Substring($expanded.Length).TrimStart('\').Replace('\', '/')
-                } |
-                Sort-Object
-        )
-        $expectedFiles = @("feanorfs-tray.exe", "feanorfs.exe")
-        if (Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $archiveFiles) {
-            throw "The Windows desktop bundle contains unexpected files."
-        }
-        $cli = Join-Path $expanded "feanorfs.exe"
-        $tray = Join-Path $expanded "feanorfs-tray.exe"
-        foreach ($binary in @($cli, $tray)) {
-            if (-not (Test-Path -PathType Leaf $binary)) {
-                throw "The Windows bundle is missing $(Split-Path -Leaf $binary)."
-            }
-            $signature = Get-AuthenticodeSignature $binary
-            if ($signature.Status -ne "Valid") {
-                throw "$(Split-Path -Leaf $binary) failed Authenticode verification: $($signature.Status)."
-            }
-        }
-
-        New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-        Copy-Item -Force $cli (Join-Path $installDir "feanorfs.exe")
-        Copy-Item -Force $tray (Join-Path $installDir "feanorfs-tray.exe")
-        $installedTray = Join-Path $installDir "feanorfs-tray.exe"
-    }
-    finally {
-        Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
-    }
-
-    if ($env:FEANORFS_INSTALLER_TEST_NO_PATH_UPDATE -ne "1") {
-        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        $pathParts = @($userPath -split ';' | Where-Object { $_ })
-        if (-not ($pathParts | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
-            $newPath = (@($pathParts) + $installDir) -join ';'
-            [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-        }
-        if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') })) {
-            $env:Path = "$installDir;$env:Path"
-        }
-    }
-
-    $programs = [Environment]::GetFolderPath("Programs")
-    if ($env:FEANORFS_INSTALLER_TEST_NO_SHORTCUT -ne "1" -and -not [string]::IsNullOrWhiteSpace($programs)) {
-        New-Item -ItemType Directory -Force -Path $programs | Out-Null
-        $shell = New-Object -ComObject WScript.Shell
-        try {
-            $shortcut = $shell.CreateShortcut((Join-Path $programs "FeanorFS.lnk"))
-            $shortcut.TargetPath = Join-Path $installDir "feanorfs-tray.exe"
-            $shortcut.WorkingDirectory = $HOME
-            $shortcut.Description = "FeanorFS encrypted working-directory sync"
-            $shortcut.IconLocation = Join-Path $installDir "feanorfs-tray.exe"
-            $shortcut.Save()
-        }
-        finally {
-            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
-        }
-    }
-
-    Write-Host "Installed signed feanorfs.exe and feanorfs-tray.exe to $installDir with a Start menu shortcut."
+if (-not $supportsDesktop) {
+    throw "Release $version does not contain a trusted Windows installer for $architecture; no legacy script was executed."
 }
-else {
-    $installerAsset = Get-ReleaseAsset $release "feanorfs-client-installer.ps1"
-    if (-not $installerAsset) {
-        throw "Release $version has neither a compatible desktop bundle nor the CLI installer."
-    }
-    $tempInstaller = Join-Path ([IO.Path]::GetTempPath()) ("feanorfs-cli-" + [Guid]::NewGuid() + ".ps1")
-    try {
-        Save-Url $installerAsset.browser_download_url $tempInstaller
-        $env:FEANORFS_CLIENT_INSTALL_DIR = $installDir
-        & $tempInstaller
-        if (-not $?) {
-            throw "The FeanorFS CLI installer failed."
-        }
-    }
-    finally {
-        Remove-Item -Force $tempInstaller -ErrorAction SilentlyContinue
-    }
-    Write-Warning "This release does not contain a signed tray for $architecture; the CLI was installed."
+if (-not $installerAsset) {
+    throw "Release $version does not contain the canonical signed Windows setup EXE; no legacy script was executed."
 }
+
+$checksumAsset = Get-ReleaseAsset $release "$assetName.sha256"
+if (-not $checksumAsset) {
+    throw "Release $version lists the Windows setup EXE without its checksum."
+}
+
+$temp = Join-Path ([IO.Path]::GetTempPath()) ("feanorfs-install-" + [Guid]::NewGuid())
+New-Item -ItemType Directory -Path $temp | Out-Null
+try {
+    $setup = Join-Path $temp $assetName
+    $checksumFile = "$setup.sha256"
+    Write-Host "Downloading signed FeanorFS $version for Windows (CLI + system tray)..."
+    Save-Url $installerAsset.browser_download_url $setup
+    Save-Url $checksumAsset.browser_download_url $checksumFile
+
+    $checksumLine = (Get-Content -Raw $checksumFile).Trim()
+    if ($checksumLine -notmatch '^([0-9a-fA-F]{64})\s+FeanorFS-windows-x86_64-setup\.exe$') {
+        throw "The Windows setup checksum file has an invalid format."
+    }
+    $actualHash = (Get-FileHash -Algorithm SHA256 $setup).Hash
+    if ($actualHash -ne $Matches[1]) {
+        throw "The Windows setup checksum does not match."
+    }
+
+    $null = Assert-TrustedSignature $setup "The Windows setup EXE"
+    $setupVersion = Get-ProductVersion $setup
+    if ($setupVersion -cne $releaseVersion) {
+        throw "The Windows setup ProductVersion $setupVersion does not match release $version."
+    }
+
+    $arguments = @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/SP-",
+        "/DIR=`"$installDir`""
+    )
+    $installProcess = Start-Process -FilePath $setup -ArgumentList $arguments -Wait -PassThru
+    if ($installProcess.ExitCode -ne 0) {
+        throw "The signed Windows installer exited with status $($installProcess.ExitCode)."
+    }
+
+    $installedCli = Join-Path $installDir "feanorfs.exe"
+    $installedTray = Join-Path $installDir "feanorfs-tray.exe"
+    foreach ($binary in @($installedCli, $installedTray)) {
+        if (-not (Test-Path -PathType Leaf $binary)) {
+            throw "The signed Windows installer did not install $(Split-Path -Leaf $binary)."
+        }
+        $null = Assert-TrustedSignature $binary "Installed $(Split-Path -Leaf $binary)"
+    }
+    $installedVersion = Get-InstalledCliVersion $installedCli
+    if ($installedVersion -cne $releaseVersion) {
+        throw "Installed feanorfs.exe version $installedVersion does not match release $version."
+    }
+}
+finally {
+    Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
+}
+
+Write-Host "Installed the signed FeanorFS setup product to $installDir with PATH, Start-menu, and uninstall integration."
 
 Write-Host ""
 if ($installedTray) {

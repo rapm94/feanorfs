@@ -11,7 +11,7 @@ fn default_format_version() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
     pub workspace_id: String,
@@ -29,6 +29,43 @@ pub struct Config {
     pub relay: Option<feanorfs_common::RelayConfig>,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("server_url", &self.server_url)
+            .field("workspace_id", &self.workspace_id)
+            .field(
+                "encryption_password",
+                &self.encryption_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "server_password",
+                &self.server_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("tls_ca_pem_present", &self.tls_ca_pem.is_some())
+            .field("format_version", &self.format_version)
+            .field("hub_local", &self.hub_local)
+            .field("relay", &self.relay)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for GlobalConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GlobalConfig")
+            .field("server_url", &self.server_url)
+            .field(
+                "server_password",
+                &self.server_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("tls_ca_pem_present", &self.tls_ca_pem.is_some())
+            .field("relay", &self.relay)
+            .finish()
+    }
+}
+
 pub const LOCAL_HUB_URL: &str = "feanorfs+local://hub";
 
 impl Config {
@@ -42,7 +79,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GlobalConfig {
     pub server_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,78 +204,5 @@ fn config_uses_os_store(path: &Path) -> Result<bool> {
         Ok(content) => credentials::has_marker(&content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error).context("read existing FeanorFS config"),
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    #[test]
-    fn workspace_credentials_are_private() {
-        let workspace = tempfile::tempdir().unwrap();
-        let config = Config {
-            server_url: "https://example.test".into(),
-            workspace_id: "private".into(),
-            encryption_password: Some("a".repeat(64)),
-            server_password: Some("server-token".into()),
-            tls_ca_pem: Some("public-ca".into()),
-            format_version: 3,
-            hub_local: false,
-            relay: None,
-        };
-
-        save_config(workspace.path(), &config).unwrap();
-
-        let fs_dir = crate::workspace_layout::ensure_workspace_state(workspace.path()).unwrap();
-        assert!(!workspace.path().join(".feanorfs").exists());
-        assert_eq!(
-            fs::metadata(&fs_dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(fs_dir.join("config.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-
-        fs::set_permissions(
-            fs_dir.join("config.json"),
-            fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
-        save_config(workspace.path(), &config).unwrap();
-        assert_eq!(
-            fs::metadata(fs_dir.join("config.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    #[test]
-    fn legacy_configs_without_tls_ca_still_decode() {
-        let workspace: Config = serde_json::from_str(
-            r#"{"server_url":"http://127.0.0.1:3030","workspace_id":"legacy","encryption_password":null}"#,
-        )
-        .unwrap();
-        assert_eq!(workspace.tls_ca_pem, None);
-        assert_eq!(workspace.format_version, 1);
-        assert!(!workspace.hub_local);
-        assert_eq!(workspace.relay, None);
-
-        let global: GlobalConfig = serde_json::from_str(
-            r#"{"server_url":"https://hub.example","server_password":"token"}"#,
-        )
-        .unwrap();
-        assert_eq!(global.tls_ca_pem, None);
-        assert_eq!(global.relay, None);
     }
 }

@@ -1,0 +1,9 @@
+# Release trust and product-distribution surfaces require founder review.
+/.github/ @rapm94
+/dist-workspace.toml @rapm94
+/release-plz.toml @rapm94
+/scripts/ @rapm94
+/Dockerfile.relay-binary @rapm94
+/Cargo.toml @rapm94
+/common/release-product-state.txt @rapm94
+/SECURITY.md @rapm94

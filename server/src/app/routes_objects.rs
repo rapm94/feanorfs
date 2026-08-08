@@ -6,7 +6,7 @@ use axum::{
 };
 use feanorfs_common::{is_valid_hash, HeadResponse, SwapHeadRequest};
 
-use super::guards::{client_format, ensure_client_format, ensure_migration_access};
+use super::guards::{ensure_client_format, ensure_migration_access};
 use super::{AppState, HeadQuery};
 use crate::db::HeadSwap;
 
@@ -75,15 +75,6 @@ pub(super) async fn handle_swap_head(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if client_format(&headers) >= 3
-        && !state
-            .db
-            .manifest_exists(&request.workspace_id, &request.new)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        return Err(StatusCode::PRECONDITION_FAILED);
-    }
     match state
         .db
         .swap_head(
@@ -105,5 +96,6 @@ pub(super) async fn handle_swap_head(
         HeadSwap::Conflict(snapshot_id) => {
             Ok((StatusCode::CONFLICT, Json(HeadResponse { snapshot_id })))
         }
+        HeadSwap::MissingManifest => Err(StatusCode::PRECONDITION_FAILED),
     }
 }

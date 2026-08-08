@@ -54,6 +54,13 @@ impl Default for WorkspaceMetaV1 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestStore {
+    Stored,
+    Unchanged,
+    Conflict,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestV1 {
     pub hashes: Vec<String>,
@@ -117,14 +124,32 @@ pub struct MigrationHubManifest {
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct MigrationHubFence {
     pub token: String,
     pub locked_at: i64,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for MigrationHubFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MigrationHubFence")
+            .field("token", &"<redacted>")
+            .field("locked_at", &self.locked_at)
+            .finish()
+    }
+}
+
 pub struct HubDb {
     state: DurableJson<HubStateV1>,
     storage_dir: PathBuf,
+}
+
+impl std::fmt::Debug for HubDb {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HubDb")
+            .field("storage_dir", &self.storage_dir)
+            .finish_non_exhaustive()
+    }
 }

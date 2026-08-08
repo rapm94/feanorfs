@@ -1,20 +1,16 @@
 use anyhow::Result;
 use feanorfs_common::{FileState, LandedPath, SyncResponse};
 use std::collections::HashMap;
-use std::path::Path;
-use tokio::fs;
 
 use super::super::diff::AgentDiff;
 use super::publish::inject_land_failure;
 use crate::crypto::seal;
 use crate::ctx::SyncCtx;
-use crate::fs_util::{apply_executable_mode, atomic_write};
 use crate::snapshot::SnapshotEngine;
 
 pub(super) struct MaterializeInput<'a, 'ctx> {
     pub(super) ctx: &'a SyncCtx<'ctx>,
     pub(super) name: &'a str,
-    pub(super) agent_path: &'a Path,
     pub(super) gate_local: &'a HashMap<String, FileState>,
 }
 
@@ -24,13 +20,14 @@ pub(super) async fn materialize_land(
 ) -> Result<Vec<LandedPath>> {
     let mut landed = Vec::new();
     let mut landed_states = HashMap::new();
+    let main_read_root = crate::workspace_read::WorkspaceReadRoot::open(input.ctx.base)?;
     for change in &diff.our_changes {
         let main_path = input.ctx.base.join(&change.path);
         if main_path.exists() && !change.deleted {
             if let Some(gate) = input.gate_local.get(&change.path) {
                 let current_hash = if crate::large_file::uses_chunk_transport(gate.size) {
                     match crate::large_file::fingerprint(
-                        &main_path,
+                        input.ctx.base,
                         input.ctx.password_str(),
                         &change.path,
                     ) {
@@ -45,8 +42,11 @@ pub(super) async fn materialize_land(
                         }
                     }
                 } else {
-                    let current = match fs::read(&main_path).await {
-                        Ok(bytes) => bytes,
+                    let current = match main_read_root
+                        .read_regular_stable(&change.path, crate::large_file::CHUNK_THRESHOLD_BYTES)
+                        .await
+                    {
+                        Ok((bytes, _)) => bytes,
                         Err(error) => {
                             tracing::warn!("failed to read {}: {error}", change.path);
                             landed.push(LandedPath {
@@ -58,7 +58,7 @@ pub(super) async fn materialize_land(
                     };
                     seal(&current, input.ctx.password_str(), &change.path)?.0
                 };
-                if current_hash != gate.hash || std::fs::metadata(&main_path)?.len() != gate.size {
+                if current_hash != gate.hash {
                     landed.push(LandedPath {
                         path: change.path.clone(),
                         action: "diverted: folder changed during land".to_string(),
@@ -67,26 +67,29 @@ pub(super) async fn materialize_land(
                 }
             }
         }
-        if change.deleted {
-            if main_path.exists() {
-                fs::remove_file(&main_path).await?;
-            }
-            input.ctx.db.delete_cache_entry(&change.path).await?;
-            landed.push(LandedPath {
-                path: change.path.clone(),
-                action: "deleted".to_string(),
-            });
-            landed_states.insert(change.path.clone(), change.clone());
-        } else {
-            let bytes = fs::read(input.agent_path.join(&change.path)).await?;
-            atomic_write(input.ctx.base, &change.path, &bytes).await?;
-            apply_executable_mode(&main_path, change.mode).await?;
-            landed.push(LandedPath {
-                path: change.path.clone(),
-                action: "updated".to_string(),
-            });
-            landed_states.insert(change.path.clone(), change.clone());
-        }
+        landed_states.insert(change.path.clone(), change.clone());
+    }
+
+    let response = SyncResponse {
+        upload_required: Vec::new(),
+        download_required: landed_states
+            .values()
+            .filter(|state| !state.deleted)
+            .cloned()
+            .collect(),
+        delete_local: landed_states
+            .values()
+            .filter(|state| state.deleted)
+            .map(|state| state.path.clone())
+            .collect(),
+    };
+    crate::sync_pass::process_downloads(input.ctx, &response, input.gate_local, false).await?;
+    crate::sync_pass::process_delete_local(&response, input.ctx.base, input.ctx.db).await?;
+    for change in landed_states.values() {
+        landed.push(LandedPath {
+            path: change.path.clone(),
+            action: if change.deleted { "deleted" } else { "updated" }.to_string(),
+        });
     }
     inject_land_failure(input.ctx.base, input.name, "after-materialize").await?;
     if !landed_states.is_empty() {

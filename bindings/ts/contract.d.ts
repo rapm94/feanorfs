@@ -8,6 +8,8 @@ export interface FileState {
   size: number
   mtime: number
   deleted: boolean
+  /** Portable executable intent; omitted for non-executable files. */
+  mode?: 1
 }
 
 export interface SpawnResult {
@@ -308,5 +310,14 @@ export interface ConflictMaterializeResult {
 export declare function integratorAssign(root: string, input: IntegratorAssignInput): Promise<IntegratorAssignResult>
 export declare function integratorStatus(root: string, assignmentId?: string | null): Promise<IntegratorStatusResult>
 export declare function integratorRevoke(root: string, assignmentId: string, reason: string): Promise<IntegratorStatusResult>
-export declare function integratorResume(root: string, options?: { ack_timeout_ms?: number; fallback_on_blocked?: boolean }): Promise<IntegratorObserveResult>
-export declare function conflictMaterialize(root: string, input: { about_snapshot: string; paths?: string[] }): Promise<ConflictMaterializeResult>
+export interface IntegratorObserveInput {
+  ack_timeout_ms?: number | null
+  fallback_on_blocked?: boolean
+}
+
+export type ConflictMaterializeInput =
+  | { about_snapshot: string; paths: [string, ...string[]]; all?: never }
+  | { about_snapshot: string; all: true; paths?: never }
+
+export declare function integratorResume(root: string, options?: IntegratorObserveInput): Promise<IntegratorObserveResult>
+export declare function conflictMaterialize(root: string, input: ConflictMaterializeInput): Promise<ConflictMaterializeResult>

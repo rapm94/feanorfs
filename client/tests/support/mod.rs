@@ -36,6 +36,7 @@ pub fn write_test_config(workspace: &Path, server_url: &str) {
 pub struct TestServer {
     pub api: ApiClient,
     pub url: String,
+    pub db: std::sync::Arc<feanorfs_server::db::Db>,
     _data_dir: TempDir,
     _handle: tokio::task::JoinHandle<()>,
 }
@@ -51,6 +52,7 @@ pub async fn spawn_test_server() -> TestServer {
     let state = init_app_state(data_dir.path().to_path_buf(), None)
         .await
         .unwrap();
+    let db = std::sync::Arc::clone(&state.db);
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -61,6 +63,7 @@ pub async fn spawn_test_server() -> TestServer {
     TestServer {
         api: ApiClient::new(&url, None),
         url,
+        db,
         _data_dir: data_dir,
         _handle: handle,
     }

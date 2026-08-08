@@ -5,14 +5,16 @@ use chacha20poly1305::{
     aead::{Aead as _, KeyInit as _, Payload},
     Key, XChaCha20Poly1305, XNonce,
 };
-use rcgen::{Issuer, KeyPair};
+use rcgen::Issuer;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::private_file::{
-    atomic_private_write, create_private_dir, durable_remove_if_exists, open_private_lock,
+    atomic_private_create_new, atomic_private_write, create_private_dir, durable_remove_if_exists,
+    open_private_lock,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -120,14 +122,18 @@ pub fn export_recovery_bundle(
     validate_passphrase(passphrase)?;
     let _guard = acquire_hub_runtime(data_dir)?;
     ensure_recovery_complete(data_dir)?;
-    validate_recovery_destination(destination, replace_destination)?;
+    let destination = ensure_recovery_bundle_is_external(data_dir, destination)?;
+    validate_recovery_destination(&destination, replace_destination)?;
 
     let secrets = load_recovery_secrets(data_dir)?;
     validate_recovery_secrets(&secrets)?;
     let fingerprint = crate::tls::certificate_fingerprint(&secrets.ca_cert_pem);
     let envelope = seal(&secrets, passphrase, &fingerprint)?;
     let encoded = serde_json::to_vec_pretty(&envelope).context("encode recovery bundle")?;
-    atomic_private_write(destination, &encoded)
+    if encoded.len() > MAX_BUNDLE_BYTES {
+        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
+    }
+    write_recovery_bundle(&destination, &encoded, replace_destination)
         .with_context(|| format!("write recovery bundle {}", destination.display()))?;
 
     Ok(RecoveryExportResult {
@@ -142,11 +148,8 @@ pub fn import_recovery_bundle(
     replace_existing_identity: bool,
 ) -> Result<RecoveryImportResult> {
     validate_passphrase(passphrase)?;
-    let encoded =
-        fs::read(source).with_context(|| format!("read recovery bundle {}", source.display()))?;
-    if encoded.len() > MAX_BUNDLE_BYTES {
-        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
-    }
+    let source = ensure_recovery_bundle_is_external(data_dir, source)?;
+    let encoded = read_bounded_recovery_bundle(&source)?;
     let envelope: RecoveryEnvelope =
         serde_json::from_slice(&encoded).context("parse recovery bundle")?;
     let secrets = open(&envelope, passphrase)?;
@@ -222,8 +225,9 @@ pub fn rotate_hub_identity(
 
     let guard = acquire_hub_runtime(data_dir)?;
     ensure_recovery_complete(data_dir)?;
-    validate_recovery_destination(recovery_destination, replace_destination)?;
-    ensure_rotation_backup_is_external(data_dir, recovery_destination)?;
+    let resolved_recovery_destination =
+        ensure_recovery_bundle_is_external(data_dir, recovery_destination)?;
+    validate_recovery_destination(&resolved_recovery_destination, replace_destination)?;
 
     let existing = load_recovery_secrets(data_dir)?;
     validate_recovery_secrets(&existing)?;
@@ -239,7 +243,15 @@ pub fn rotate_hub_identity(
     let fingerprint = crate::tls::certificate_fingerprint(&rotated.ca_cert_pem);
     let envelope = seal(&rotated, passphrase, &fingerprint)?;
     let encoded = serde_json::to_vec_pretty(&envelope).context("encode rotated recovery bundle")?;
-    atomic_private_write(recovery_destination, &encoded).with_context(|| {
+    if encoded.len() > MAX_BUNDLE_BYTES {
+        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
+    }
+    write_recovery_bundle(
+        &resolved_recovery_destination,
+        &encoded,
+        replace_destination,
+    )
+    .with_context(|| {
         format!(
             "write rotated recovery bundle {}",
             recovery_destination.display()
@@ -284,9 +296,9 @@ fn load_recovery_secrets(data_dir: &Path) -> Result<RecoverySecrets> {
 
 fn validate_recovery_secrets(secrets: &RecoverySecrets) -> Result<()> {
     crate::serve::validate_auth_token(&secrets.auth_token)?;
-    let key = KeyPair::from_pem(&secrets.ca_key_pem).context("parse recovery CA private key")?;
-    Issuer::from_ca_cert_pem(&secrets.ca_cert_pem, key)
-        .context("recovery CA certificate does not match its private key")?;
+    let key = crate::tls::validate_private_ca(&secrets.ca_cert_pem, &secrets.ca_key_pem)
+        .map_err(|error| anyhow::anyhow!("validate recovery CA identity: {error:#}"))?;
+    Issuer::from_ca_cert_pem(&secrets.ca_cert_pem, key).context("load recovery CA issuer")?;
     Ok(())
 }
 
@@ -408,6 +420,14 @@ fn validate_passphrase(passphrase: &str) -> Result<()> {
     Ok(())
 }
 
+fn write_recovery_bundle(destination: &Path, encoded: &[u8], replace: bool) -> Result<()> {
+    if replace {
+        atomic_private_write(destination, encoded)
+    } else {
+        atomic_private_create_new(destination, encoded)
+    }
+}
+
 fn validate_recovery_destination(destination: &Path, replace_destination: bool) -> Result<()> {
     if destination.exists() && !replace_destination {
         bail!(
@@ -429,25 +449,48 @@ fn validate_recovery_destination(destination: &Path, replace_destination: bool) 
     Ok(())
 }
 
-fn ensure_rotation_backup_is_external(data_dir: &Path, destination: &Path) -> Result<()> {
-    let canonical_data_dir = fs::canonicalize(data_dir)
+fn ensure_recovery_bundle_is_external(data_dir: &Path, bundle: &Path) -> Result<PathBuf> {
+    let resolved_data_dir = resolve_existing_or_parent(data_dir)
         .with_context(|| format!("resolve hub data directory {}", data_dir.display()))?;
-    let destination_parent = destination
+    let resolved_bundle = resolve_existing_or_parent(bundle)
+        .with_context(|| format!("resolve recovery bundle path {}", bundle.display()))?;
+    if resolved_bundle.starts_with(&resolved_data_dir) {
+        bail!(
+            "recovery bundles must be stored outside the hub data directory so identity maintenance cannot overwrite hub state"
+        );
+    }
+    Ok(resolved_bundle)
+}
+
+fn resolve_existing_or_parent(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path).context("canonicalize existing path");
+    }
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let canonical_destination_parent = fs::canonicalize(destination_parent).with_context(|| {
-        format!(
-            "resolve recovery bundle directory {}",
-            destination_parent.display()
-        )
-    })?;
-    if canonical_destination_parent.starts_with(&canonical_data_dir) {
-        bail!(
-            "the rotated recovery bundle must be stored outside the hub data directory so identity maintenance cannot overwrite hub state"
-        );
+    let name = path
+        .file_name()
+        .context("path must name a file or directory")?;
+    Ok(fs::canonicalize(parent)?.join(name))
+}
+
+fn read_bounded_recovery_bundle(source: &Path) -> Result<Vec<u8>> {
+    let file =
+        File::open(source).with_context(|| format!("open recovery bundle {}", source.display()))?;
+    let length = file.metadata()?.len();
+    if length > MAX_BUNDLE_BYTES as u64 {
+        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
     }
-    Ok(())
+    let mut encoded = Vec::with_capacity(usize::try_from(length).unwrap_or(MAX_BUNDLE_BYTES));
+    file.take(MAX_BUNDLE_BYTES as u64 + 1)
+        .read_to_end(&mut encoded)
+        .with_context(|| format!("read recovery bundle {}", source.display()))?;
+    if encoded.len() > MAX_BUNDLE_BYTES {
+        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
+    }
+    Ok(encoded)
 }
 
 fn decode_exact<const N: usize>(label: &str, encoded: &str) -> Result<[u8; N]> {
@@ -521,6 +564,45 @@ mod tests {
     }
 
     #[test]
+    fn recovery_validation_rejects_mismatched_ca_and_private_key() {
+        let first = initialized_hub();
+        let second = initialized_hub();
+        let mut secrets = load_recovery_secrets(first.path()).unwrap();
+        secrets.ca_key_pem = load_recovery_secrets(second.path())
+            .unwrap()
+            .ca_key_pem
+            .clone();
+        let error = validate_recovery_secrets(&secrets).expect_err("mismatched key must fail");
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn non_replace_bundle_publication_has_an_atomic_single_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("hub.fnr-recovery");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for content in [b"first".as_slice(), b"second".as_slice()] {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let destination = destination.clone();
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    write_recovery_bundle(&destination, content, false)
+                }));
+            }
+            barrier.wait();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let bytes = fs::read(destination).unwrap();
+        assert!(bytes == b"first" || bytes == b"second");
+    }
+
+    #[test]
     fn encrypted_export_import_preserves_ca_and_token_and_refreshes_leaf() {
         let source = initialized_hub();
         let bundle_dir = tempfile::tempdir().unwrap();
@@ -550,6 +632,55 @@ mod tests {
         );
         assert!(!target.path().join("tls/server-key.pem").exists());
         assert!(!target.path().join(RECOVERY_MARKER).exists());
+    }
+
+    #[test]
+    fn recovery_bundle_paths_cannot_alias_live_hub_state() {
+        let hub = initialized_hub();
+        let token_path = hub.path().join("auth-token");
+        let original_token = fs::read(&token_path).unwrap();
+        let error = export_recovery_bundle(hub.path(), &token_path, PASSPHRASE, true)
+            .expect_err("export must not overwrite live identity");
+        assert!(error.to_string().contains("outside the hub data directory"));
+        assert_eq!(fs::read(&token_path).unwrap(), original_token);
+
+        let external = tempfile::tempdir().unwrap();
+        let bundle = external.path().join("hub.fnr-recovery");
+        export_recovery_bundle(hub.path(), &bundle, PASSPHRASE, false).unwrap();
+        let internal = hub.path().join("internal-recovery-bundle");
+        fs::copy(&bundle, &internal).unwrap();
+        let error = import_recovery_bundle(hub.path(), &internal, PASSPHRASE, true)
+            .expect_err("import source must remain available outside live state");
+        assert!(error.to_string().contains("outside the hub data directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_bundle_rejects_symlinked_parent_into_hub_state() {
+        use std::os::unix::fs::symlink;
+
+        let hub = initialized_hub();
+        let external = tempfile::tempdir().unwrap();
+        let alias = external.path().join("hub-alias");
+        symlink(hub.path(), &alias).unwrap();
+        let destination = alias.join("bundle.fnr-recovery");
+        let error = export_recovery_bundle(hub.path(), &destination, PASSPHRASE, false)
+            .expect_err("symlink alias must not bypass external-path check");
+        assert!(error.to_string().contains("outside the hub data directory"));
+    }
+
+    #[test]
+    fn oversized_recovery_bundle_is_rejected_before_parsing() {
+        let target_parent = tempfile::tempdir().unwrap();
+        let target = target_parent.path().join("hub");
+        fs::create_dir(&target).unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let bundle = bundle_dir.path().join("oversized.fnr-recovery");
+        let file = File::create(&bundle).unwrap();
+        file.set_len(MAX_BUNDLE_BYTES as u64 + 1).unwrap();
+        let error = import_recovery_bundle(&target, &bundle, PASSPHRASE, false)
+            .expect_err("oversized bundle must fail");
+        assert!(error.to_string().contains("exceeds"));
     }
 
     #[test]

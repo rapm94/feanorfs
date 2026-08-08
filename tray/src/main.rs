@@ -1,3 +1,6 @@
+#[cfg(test)]
+feanorfs_test_support::isolate_test_process!();
+
 mod feanorfs;
 mod icons;
 mod password_dialog;
@@ -8,10 +11,10 @@ use feanorfs::{
     agent_land, background_service_managed, background_service_start, background_service_stop,
     check_for_updates, check_for_updates_periodic, clear_pairing_clipboard, conflicts_keep,
     conflicts_keep_all, copy_pairing_clipboard, export_recovery_kit, forget_unavailable_workspaces,
-    graceful_stop_child, import_recovery_kit, join_workspace, run_pairing_session, start_workspace,
-    stop_workspace, sync_once, system_health, tray_activate, tray_pause, tray_recent, tray_status,
-    workspace_has_config, HealthReport, HealthStatus, PairSessionEvent, UpdateCheckResult,
-    UpdateStatus,
+    graceful_stop_child, import_recovery_kit, invalidate_config_cache, join_workspace,
+    run_pairing_session, start_workspace, stop_workspace, sync_once, system_health, tray_activate,
+    tray_pause, tray_recent, tray_status, workspace_has_config, HealthReport, HealthStatus,
+    PairSessionEvent, UpdateCheckResult, UpdateStatus,
 };
 use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
 use icons::{icon_for, visual_from_state, TrayVisual};
@@ -40,7 +43,13 @@ const MAX_WATCH_FAILURES: u32 = 3;
 const FAST_EXIT_SECS: u64 = 10;
 
 struct TrayInstanceGuard {
-    _file: File,
+    file: File,
+}
+
+impl Drop for TrayInstanceGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 fn tray_instance_lock_path() -> Result<PathBuf, String> {
@@ -74,7 +83,7 @@ fn acquire_tray_instance_lock_at(path: &Path) -> io::Result<Option<TrayInstanceG
     }
     let file = options.open(path)?;
     match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some(TrayInstanceGuard { _file: file })),
+        Ok(()) => Ok(Some(TrayInstanceGuard { file })),
         Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             Ok(None)
         }
@@ -2545,6 +2554,7 @@ fn main() {
                 } else {
                     st.stop_watch();
                     st.workspace = Some(path);
+                    invalidate_config_cache();
                     st.invalidate_recent();
                     st.cached_recent();
                     st.reset_watch_policy();
@@ -2617,6 +2627,7 @@ fn main() {
                 } else {
                     st.stop_watch();
                     st.workspace = Some(path.clone());
+                    invalidate_config_cache();
                     st.invalidate_recent();
                     st.cached_recent();
                     st.reset_watch_policy();
@@ -2654,6 +2665,7 @@ fn main() {
                 } else {
                     st.workspace = None;
                     st.last_status = None;
+                    invalidate_config_cache();
                     st.invalidate_recent();
                     st.reset_watch_policy();
                     st.cached_recent();
@@ -2731,6 +2743,7 @@ fn main() {
                     if workspace_has_config(&path) {
                         st.stop_watch();
                         st.workspace = Some(path);
+                        invalidate_config_cache();
                         st.invalidate_recent();
                         st.cached_recent();
                         st.reset_watch_policy();
@@ -2773,25 +2786,19 @@ mod tests {
 
     #[test]
     fn catch_handler_contains_panics_and_logs_them() {
-        let home = std::env::temp_dir().join(format!(
-            "feanorfs-tray-panic-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let home = std::path::PathBuf::from(
+            std::env::var_os("FEANORFS_HOME").expect("isolated FEANORFS_HOME"),
+        );
         std::fs::create_dir_all(&home).unwrap();
-        unsafe {
-            std::env::set_var("FEANORFS_HOME", &home);
-        }
+        let log = home.join("tray-panic.log");
+        let _ = std::fs::remove_file(&log);
         let caught = catch_handler(|| panic!("injected tray handler panic"));
         assert!(!caught, "a panicking handler must be contained, not abort");
-        let log = home.join("tray-panic.log");
         let content = std::fs::read_to_string(&log).expect("panic log must be written");
         assert!(content.contains("injected tray handler panic"));
         // A healthy handler keeps returning true.
         assert!(catch_handler(|| {}));
-        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_file(log).unwrap();
     }
 
     use feanorfs_common::tray_contract::{

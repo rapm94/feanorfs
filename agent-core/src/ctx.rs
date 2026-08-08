@@ -3,7 +3,7 @@ use crate::local::{ClientDb, Config};
 use anyhow::Result;
 use feanorfs_common::LegacyPolicy;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 static WARNED_EMPTY_PASSWORD: OnceLock<()> = OnceLock::new();
 
@@ -16,6 +16,7 @@ pub struct SyncCtx<'a> {
     workspace_id: std::borrow::Cow<'a, str>,
     password: std::borrow::Cow<'a, str>,
     format_version: u32,
+    state_dir_cache: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl<'a> SyncCtx<'a> {
@@ -50,7 +51,16 @@ impl<'a> SyncCtx<'a> {
     }
 
     pub fn state_dir(&self) -> Result<std::path::PathBuf> {
-        crate::workspace_layout::ensure_workspace_state(self.base)
+        let mut cache = self
+            .state_dir_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state_dir) = cache.as_ref() {
+            return Ok(state_dir.clone());
+        }
+        let state_dir = crate::workspace_layout::ensure_workspace_state(self.base)?;
+        *cache = Some(state_dir.clone());
+        Ok(state_dir)
     }
 
     /// Build a context from an explicit policy.
@@ -71,6 +81,7 @@ impl<'a> SyncCtx<'a> {
             workspace_id: std::borrow::Cow::Owned(workspace_id.to_string()),
             password: std::borrow::Cow::Owned(password.unwrap_or("").to_string()),
             format_version: 2,
+            state_dir_cache: Mutex::new(None),
         }
     }
 
@@ -91,6 +102,21 @@ impl<'a> SyncCtx<'a> {
                 config.encryption_password.clone().unwrap_or_default(),
             ),
             format_version: config.format_version,
+            state_dir_cache: Mutex::new(None),
         })
+    }
+
+    /// Build a context whose cache/object state is owned outside `base`'s
+    /// normal top-level workspace registration.
+    pub(crate) fn from_config_with_state_dir(
+        api: &'a ApiClient,
+        db: &'a ClientDb,
+        base: &'a Path,
+        config: &Config,
+        state_dir: std::path::PathBuf,
+    ) -> Result<Self> {
+        let mut ctx = Self::from_config(api, db, base, config)?;
+        ctx.state_dir_cache = Mutex::new(Some(state_dir));
+        Ok(ctx)
     }
 }

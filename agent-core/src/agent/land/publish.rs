@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
+#[cfg(debug_assertions)]
 use tokio::fs;
 
 use super::super::diff::{build_land_candidate, compute_agent_diff, AgentDiff};
+use super::super::runtime::open_agent_runtime;
 use crate::crypto::seal;
 use crate::ctx::SyncCtx;
 use crate::snapshot::{SnapshotEngine, SnapshotInput};
@@ -35,19 +37,25 @@ pub(super) async fn publish_land(
     mut diff: AgentDiff,
 ) -> Result<(AgentDiff, String)> {
     let snapshots = SnapshotEngine::new(input.ctx);
+    let agent_runtime = open_agent_runtime(input.ctx.base, input.name).await?;
+    let agent_config = crate::local::load_config(input.ctx.base)?;
     let mut committed_snapshot = None;
+    let agent_read_root = crate::workspace_read::WorkspaceReadRoot::open(input.agent_path)?;
     for _ in 0..8 {
         for change in diff.our_changes.iter().filter(|change| !change.deleted) {
             if crate::large_file::uses_chunk_transport(change.size) {
-                let agent_ctx = SyncCtx::from_config(
+                let agent_ctx = SyncCtx::from_config_with_state_dir(
                     input.ctx.api,
-                    input.ctx.db,
+                    &agent_runtime.db,
                     input.agent_path,
-                    &crate::local::load_config(input.ctx.base)?,
+                    &agent_config,
+                    agent_runtime.state_dir.clone(),
                 )?;
                 crate::large_file::upload(&agent_ctx, &change.path, &change.hash).await?;
             } else {
-                let bytes = fs::read(input.agent_path.join(&change.path)).await?;
+                let bytes =
+                    crate::sync_pass::read_upload_source(&agent_read_root, &change.path, change)
+                        .await?;
                 let (hash, encrypted) = seal(&bytes, input.ctx.password_str(), &change.path)?;
                 if hash != change.hash {
                     bail!("agent file changed while preparing land: {}", change.path);
@@ -64,15 +72,18 @@ pub(super) async fn publish_land(
                 continue;
             };
             if crate::large_file::uses_chunk_transport(ours.size) {
-                let agent_ctx = SyncCtx::from_config(
+                let agent_ctx = SyncCtx::from_config_with_state_dir(
                     input.ctx.api,
-                    input.ctx.db,
+                    &agent_runtime.db,
                     input.agent_path,
-                    &crate::local::load_config(input.ctx.base)?,
+                    &agent_config,
+                    agent_runtime.state_dir.clone(),
                 )?;
                 crate::large_file::upload(&agent_ctx, &conflict.path, &ours.hash).await?;
             } else {
-                let bytes = fs::read(input.agent_path.join(&conflict.path)).await?;
+                let bytes =
+                    crate::sync_pass::read_upload_source(&agent_read_root, &conflict.path, ours)
+                        .await?;
                 let (hash, encrypted) = seal(&bytes, input.ctx.password_str(), &conflict.path)?;
                 if hash != ours.hash {
                     bail!("agent file changed while preparing land: {}", conflict.path);
@@ -84,6 +95,26 @@ pub(super) async fn publish_land(
                     .await?;
             }
         }
+        let materialization = feanorfs_common::SyncResponse {
+            upload_required: Vec::new(),
+            download_required: diff
+                .our_changes
+                .iter()
+                .filter(|state| !state.deleted)
+                .cloned()
+                .collect(),
+            delete_local: diff
+                .our_changes
+                .iter()
+                .filter(|state| state.deleted)
+                .map(|state| state.path.clone())
+                .collect(),
+        };
+        // Verify every landed byte through the hub/object cache and fsync a
+        // same-filesystem staging copy before the head CAS. Materialization
+        // after the commit point therefore cannot discover a missing/corrupt
+        // object that publication should have rejected.
+        crate::sync_pass::prefetch_downloads(input.ctx, &materialization).await?;
         let current_root = snapshots.load_snapshot(&diff.current_head).await?.root;
         let candidate_state = build_land_candidate(&snapshots, &diff).await?;
         if candidate_state.root == current_root {

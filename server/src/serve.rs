@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServeOptions {
     pub data_dir: PathBuf,
     pub bind_ip: IpAddr,
@@ -22,6 +22,30 @@ pub struct ServeOptions {
     pub tombstone_retention_days: u64,
     pub snapshot_retention_days: u64,
     pub snapshot_keep_last: usize,
+}
+
+impl std::fmt::Debug for ServeOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServeOptions")
+            .field("data_dir", &self.data_dir)
+            .field("bind_ip", &self.bind_ip)
+            .field("port", &self.port)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("allow_open", &self.allow_open)
+            .field("allow_http", &self.allow_http)
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
+            .field("tls_ca", &self.tls_ca)
+            .field("mdns", &self.mdns)
+            .field("relay", &self.relay)
+            .field("gc_interval_secs", &self.gc_interval_secs)
+            .field("gc_grace_minutes", &self.gc_grace_minutes)
+            .field("tombstone_retention_days", &self.tombstone_retention_days)
+            .field("snapshot_retention_days", &self.snapshot_retention_days)
+            .field("snapshot_keep_last", &self.snapshot_keep_last)
+            .finish()
+    }
 }
 
 impl Default for ServeOptions {

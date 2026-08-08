@@ -330,6 +330,7 @@ Unauthenticated and malleable — an attacker who knows plaintext at a position 
 | Migration journal stores old and target keys | Medium | Journal stays in the private global workspace directory and is removed after successful cutover | Temporary local exposure |
 | Metadata leakage (sizes, counts, equality, timing) | Medium | Format v3 encrypts paths and structure; no size padding is claimed | Accepted limitation |
 | No password-stretching KDF for content keys | Medium | New workspaces require generated-shape 256-bit keys; migrate weak historical keys with `migrate --rekey` | Historical format-v1 limitation |
+| Silent or unreachable hub stalls every client command | Medium | Bounded transport timeouts: 15 s connect, 60 s read-idle, 8 s version probe; a blackholed or paused hub fails sync with a retryable error instead of wedging the watcher and CLI forever | Implemented (`HTTP_CONNECT_TIMEOUT`/`HTTP_READ_TIMEOUT` in `agent-core/src/api.rs`) |
 | Replay attacks (old snapshot heads or blobs) | Low | Immutable history and observed-regression warnings; no external transparency log is claimed | Accepted limitation |
 | Update-metadata redirection or code execution | Medium | HTTPS-only bounded no-redirect GitHub API request, pinned API version, stable-semver parsing, exact official tag-URL validation in CLI and tray, explicit browser-open choice, no artifact download/install/execute | Implemented; platform signature/checksum/attestation gates remain authoritative |
 

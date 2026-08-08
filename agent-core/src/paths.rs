@@ -9,6 +9,7 @@ pub fn agents_dir(base: &Path) -> Result<PathBuf> {
 }
 
 pub fn agent_root(base: &Path, name: &str) -> Result<PathBuf> {
+    validate_name(name)?;
     Ok(agents_dir(base)?.join(name))
 }
 
@@ -16,8 +17,20 @@ pub fn agent_dir(base: &Path, name: &str) -> Result<PathBuf> {
     Ok(agent_root(base, name)?.join("worktree"))
 }
 
+pub(crate) fn agent_state_dir(base: &Path, name: &str) -> Result<PathBuf> {
+    Ok(agent_root(base, name)?.join("state"))
+}
+
+pub(crate) fn agent_runtime_dir(base: &Path, name: &str) -> Result<PathBuf> {
+    Ok(agent_state_dir(base, name)?.join("runtime"))
+}
+
+pub fn agent_runner_dir(base: &Path, name: &str) -> Result<PathBuf> {
+    Ok(agent_state_dir(base, name)?.join("runner"))
+}
+
 pub fn agent_base_ref(base: &Path, name: &str) -> Result<PathBuf> {
-    Ok(agent_root(base, name)?.join("state").join("base-snapshot"))
+    Ok(agent_state_dir(base, name)?.join("base-snapshot"))
 }
 
 pub fn conflicts_dir(base: &Path) -> Result<PathBuf> {
@@ -25,14 +38,11 @@ pub fn conflicts_dir(base: &Path) -> Result<PathBuf> {
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("Agent name must not be empty");
-    }
-    if name.chars().any(|c| c.is_control()) {
-        bail!("Agent name must not contain control characters: '{name}'");
-    }
-    if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
-        bail!("Agent name must be a single path segment: '{name}'");
+    if !feanorfs_common::is_valid_agent_name(name) {
+        bail!(
+            "Agent name must be a non-empty portable path segment of at most {} UTF-8 bytes: '{name}'",
+            feanorfs_common::AGENT_NAME_MAX_BYTES
+        );
     }
     Ok(())
 }

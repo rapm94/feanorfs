@@ -1,6 +1,7 @@
 use crate::ctx::SyncCtx;
-use anyhow::Result;
+use anyhow::{bail, Context as _, Result};
 use feanorfs_common::{ConcurrentEdit, ConflictKind, FileState};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -86,7 +87,10 @@ pub async fn write_version_file(
             fs::write(dest, sentinel("deleted")).await?;
         }
         Some(f) => match crate::large_file::read_bytes(ctx, path, &f.hash, f.size).await {
-            Ok(plain) => fs::write(dest, &plain).await?,
+            Ok(plain) => {
+                fs::write(dest, &plain).await?;
+                crate::fs_util::apply_executable_mode(dest, f.mode).await?;
+            }
             Err(e) => {
                 fs::write(dest, sentinel(&format!("materialize-failed {e}"))).await?;
             }
@@ -102,7 +106,7 @@ pub async fn write_conflict_triple(
     dir: &Path,
     edit: &ConcurrentEdit,
     ctx: &SyncCtx<'_>,
-    ours_from: Option<&Path>,
+    ours_root: Option<&crate::workspace_read::WorkspaceReadRoot>,
     ours_missing_label: &str,
 ) -> Result<()> {
     let base_dest = artifact_path(dir, &edit.path, SUFFIX_ORIGINAL);
@@ -111,22 +115,145 @@ pub async fn write_conflict_triple(
 
     write_version_file(&base_dest, edit.base.as_ref(), ctx, &edit.path).await?;
 
-    if let Some(ref ours) = edit.ours {
-        if let Some(src) = ours_from {
-            if src.exists() && !ours.deleted {
-                fs::copy(src, &ours_dest).await?;
-            } else {
-                fs::write(&ours_dest, sentinel("deleted-locally")).await?;
+    match (edit.ours.as_ref(), ours_root) {
+        (Some(ours), _) if ours.deleted => {
+            if let Some(parent) = ours_dest.parent() {
+                fs::create_dir_all(parent).await?;
             }
-        } else {
+            fs::write(&ours_dest, sentinel("deleted-locally")).await?;
+        }
+        (Some(ours), Some(root)) => {
+            write_opened_local_version(&ours_dest, ours, root, ctx.password_str(), &ours.path)
+                .await?;
+        }
+        _ => {
+            if let Some(parent) = ours_dest.parent() {
+                fs::create_dir_all(parent).await?;
+            }
             fs::write(&ours_dest, sentinel(ours_missing_label)).await?;
         }
-    } else {
-        fs::write(&ours_dest, sentinel(ours_missing_label)).await?;
     }
 
     write_version_file(&theirs_dest, edit.theirs.as_ref(), ctx, &edit.path).await?;
     Ok(())
+}
+
+async fn write_opened_local_version(
+    destination: &Path,
+    expected: &FileState,
+    root: &crate::workspace_read::WorkspaceReadRoot,
+    password: &str,
+    relative_path: &str,
+) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let mut source = root
+        .open_regular(relative_path)
+        .with_context(|| format!("open local conflict version {relative_path}"))?;
+    let before = source.metadata()?;
+    if before.len() != expected.size || !portable_mode_matches(&before, expected.mode) {
+        bail!("local conflict version {relative_path} changed before capture");
+    }
+
+    let destination = destination.to_path_buf();
+    let password = password.to_string();
+    let relative_path = relative_path.to_string();
+    let expected = expected.clone();
+    let capture_path = destination.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&capture_path)?;
+        let copied = std::io::copy(
+            &mut (&mut source).take(expected.size.saturating_add(1)),
+            &mut output,
+        )?;
+        if copied != expected.size {
+            bail!(
+                "local conflict version {} changed during capture",
+                relative_path
+            );
+        }
+        output.flush()?;
+        output.sync_all()?;
+        let after = source.metadata()?;
+        if after.len() != before.len()
+            || after.modified().ok() != before.modified().ok()
+            || !portable_mode_matches(&after, expected.mode)
+        {
+            bail!(
+                "local conflict version {} changed during capture",
+                relative_path
+            );
+        }
+
+        output.seek(std::io::SeekFrom::Start(0))?;
+        let observed_hash = if crate::large_file::uses_chunk_transport(expected.size) {
+            crate::large_file::fingerprint_opened(&mut output, &password, &relative_path)?
+                .encrypted_hash
+        } else {
+            let capacity = usize::try_from(expected.size)
+                .context("local conflict version does not fit memory")?;
+            let mut bytes = Vec::with_capacity(capacity);
+            output
+                .take(expected.size.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != expected.size {
+                bail!(
+                    "local conflict version {} changed during capture",
+                    relative_path
+                );
+            }
+            crate::crypto::seal(&bytes, &password, &relative_path)?.0
+        };
+        if observed_hash != expected.hash {
+            bail!(
+                "local conflict version {} no longer matches the detected edit",
+                relative_path
+            );
+        }
+        Ok(())
+    })
+    .await
+    .context("join local conflict capture task")?;
+    if let Err(error) = result {
+        let _ = fs::remove_file(&destination).await;
+        return Err(error);
+    }
+    crate::fs_util::apply_executable_mode(&destination, expected.mode).await?;
+    Ok(())
+}
+
+fn portable_mode_matches(metadata: &std::fs::Metadata, expected: u32) -> bool {
+    #[cfg(unix)]
+    {
+        portable_mode(metadata) == expected
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, expected);
+        true
+    }
+}
+
+fn portable_mode(metadata: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 != 0 {
+            feanorfs_common::EXECUTABLE_MODE
+        } else {
+            0
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
 }
 
 #[must_use]
@@ -178,7 +305,22 @@ fn set_kind_hint(edit: &mut ConcurrentEdit, kind: ConflictKind) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cloud_deleted_sentinel, is_sentinel_content, sentinel_label, SENTINEL_PREFIX};
+    use super::{
+        is_cloud_deleted_sentinel, is_sentinel_content, sentinel_label, write_opened_local_version,
+        SENTINEL_PREFIX,
+    };
+    use feanorfs_common::FileState;
+
+    fn expected(path: &str, bytes: &[u8]) -> FileState {
+        FileState {
+            path: path.to_string(),
+            hash: crate::crypto::seal(bytes, "password", path).unwrap().0,
+            size: bytes.len() as u64,
+            mtime: 0,
+            deleted: false,
+            mode: 0,
+        }
+    }
 
     #[test]
     fn cloud_deleted_sentinel_is_recognized() {
@@ -193,5 +335,74 @@ mod tests {
         let failed = format!("{SENTINEL_PREFIX}download-failed offline>\n");
         assert!(is_sentinel_content(failed.as_bytes()));
         assert!(!is_cloud_deleted_sentinel(failed.as_bytes()));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_conflict_capture_rejects_final_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("file.txt"), b"safe").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
+        let root = crate::workspace_read::WorkspaceReadRoot::open(base.path()).unwrap();
+        std::fs::rename(base.path().join("file.txt"), base.path().join("held.txt")).unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            base.path().join("file.txt"),
+        )
+        .unwrap();
+        let destination = base.path().join("artifact.local");
+
+        write_opened_local_version(
+            &destination,
+            &expected("file.txt", b"safe"),
+            &root,
+            "password",
+            "file.txt",
+        )
+        .await
+        .expect_err("final symlink substitution must fail closed");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_conflict_capture_rejects_ancestor_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("dir")).unwrap();
+        std::fs::write(base.path().join("dir/file.txt"), b"safe").unwrap();
+        std::fs::write(outside.path().join("file.txt"), b"secret").unwrap();
+        let root = crate::workspace_read::WorkspaceReadRoot::open(base.path()).unwrap();
+        std::fs::rename(base.path().join("dir"), base.path().join("held-dir")).unwrap();
+        symlink(outside.path(), base.path().join("dir")).unwrap();
+        let destination = base.path().join("artifact.local");
+
+        write_opened_local_version(
+            &destination,
+            &expected("dir/file.txt", b"safe"),
+            &root,
+            "password",
+            "dir/file.txt",
+        )
+        .await
+        .expect_err("ancestor symlink substitution must fail closed");
+        assert!(!destination.exists());
+    }
+    #[tokio::test]
+    async fn local_conflict_capture_uses_the_local_legs_path_bound_identity() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("Foo"), b"local-case").unwrap();
+        let root = crate::workspace_read::WorkspaceReadRoot::open(base.path()).unwrap();
+        let destination = base.path().join("foo.local");
+        let local = expected("Foo", b"local-case");
+
+        write_opened_local_version(&destination, &local, &root, "password", &local.path)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), b"local-case");
     }
 }

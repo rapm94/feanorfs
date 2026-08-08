@@ -1,35 +1,97 @@
-use anyhow::{bail, Result};
-use feanorfs_common::normalize_path;
+use anyhow::{bail, Context as _, Result};
+use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 
 use crate::api::ApiClient;
 use crate::ctx::SyncCtx;
-use crate::local::{build_workspace_walker, ClientDb};
+use crate::local::{build_workspace_walker, portable_rel_path, ClientDb};
 use crate::lock::SyncLock;
-use crate::paths::{agent_dir, validate_name};
+use crate::paths::{agent_dir, agent_root, validate_name};
 use crate::snapshot::SnapshotEngine;
 
 struct SpawnCleanupGuard {
     target: PathBuf,
     restore_from: Option<PathBuf>,
+    published: bool,
     armed: bool,
 }
 
 impl Drop for SpawnCleanupGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || self.published {
             return;
         }
 
-        let _ = std::fs::remove_dir_all(&self.target);
+        if let Err(error) = remove_directory_if_present(&self.target) {
+            tracing::error!(
+                "failed to remove incomplete agent root {} during rollback: {error}; preserving backup at {}",
+                self.target.display(),
+                self.restore_from
+                    .as_deref()
+                    .map_or_else(|| "<none>".into(), |path| path.display().to_string())
+            );
+            return;
+        }
         if let Some(backup) = &self.restore_from {
-            if std::fs::rename(backup, &self.target).is_err() {
-                let _ = restore_directory(backup, &self.target);
-                let _ = std::fs::remove_dir_all(backup);
+            if let Err(error) = std::fs::rename(backup, &self.target) {
+                tracing::error!(
+                    "failed to restore agent root {} during rollback: {error}; backup preserved at {}",
+                    self.target.display(),
+                    backup.display()
+                );
             }
         }
+    }
+}
+
+impl SpawnCleanupGuard {
+    async fn rollback(&mut self) -> Result<()> {
+        if !self.armed || self.published {
+            return Ok(());
+        }
+
+        if let Err(error) = remove_directory_if_present_async(&self.target).await {
+            self.armed = false;
+            let backup = self
+                .restore_from
+                .as_deref()
+                .map_or_else(|| "<none>".into(), |path| path.display().to_string());
+            bail!(
+                "rollback failed while removing incomplete agent root {}: {error}; original backup preserved at {backup}",
+                self.target.display()
+            );
+        }
+        if let Some(backup) = self.restore_from.as_deref() {
+            if let Err(error) = fs::rename(backup, &self.target).await {
+                self.armed = false;
+                bail!(
+                    "rollback failed while restoring agent root {}: {error}; original backup preserved at {}",
+                    self.target.display(),
+                    backup.display()
+                );
+            }
+            self.restore_from = None;
+        }
+        self.armed = false;
+        Ok(())
+    }
+
+    async fn finish_publication(&mut self) -> Result<()> {
+        self.published = true;
+        if let Some(backup) = self.restore_from.as_deref() {
+            fs::remove_dir_all(backup).await.with_context(|| {
+                format!(
+                    "agent replacement was published, but the old backup could not be removed; preserved remainder at {}",
+                    backup.display()
+                )
+            })?;
+            self.restore_from = None;
+        }
+        self.armed = false;
+        Ok(())
     }
 }
 
@@ -45,29 +107,49 @@ fn replacement_backup_path(target: &Path) -> PathBuf {
     target.with_file_name(format!("{file_name}.replace-backup-{stamp}"))
 }
 
-fn reflink_or_copy(source: &Path, destination: &Path) -> Result<()> {
+fn copy_opened_source(
+    mut source: std::fs::File,
+    destination: &Path,
+    logical_path: &str,
+) -> Result<()> {
+    let before = source.metadata()?;
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if reflink::reflink(source, destination).is_err() {
-        std::fs::copy(source, destination)?;
+    let mut output = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .with_context(|| format!("create agent copy for {logical_path}"))?;
+    let copied = std::io::copy(&mut source, &mut output)?;
+    output.flush()?;
+    output.sync_all()?;
+    let after = source.metadata()?;
+    if copied != before.len()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        bail!("workspace file {logical_path} changed while spawning agent");
     }
+    output.set_permissions(before.permissions())?;
+    output.sync_all()?;
     Ok(())
 }
 
-fn restore_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let child = destination.join(entry.file_name());
-        if ty.is_dir() {
-            restore_directory(&entry.path(), &child)?;
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), child)?;
-        }
+fn remove_directory_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
-    Ok(())
+}
+
+async fn remove_directory_if_present_async(path: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 // Keep the low-level async facade source-compatible; the supported blocking SDK
@@ -109,7 +191,19 @@ async fn spawn_agent_with_ctx(
     replace: bool,
 ) -> Result<usize> {
     validate_name(name)?;
+    let _runner_lifecycle = if replace {
+        Some(super::runner::RunnerLifecycleLock::acquire_async(ctx.base).await?)
+    } else {
+        None
+    };
+    let owned_root = agent_root(ctx.base, name)?;
     let target = agent_dir(ctx.base, name)?;
+    if replace && super::runner::runner_status(ctx.base)?.is_some_and(|status| status.agent == name)
+    {
+        bail!(
+            "agent workspace '{name}' has a configured runner; runner removal is required before replacement"
+        );
+    }
     if target.exists() {
         if replace {
             // Preserve the original agent tree until the new copy is committed.
@@ -120,19 +214,32 @@ async fn spawn_agent_with_ctx(
         }
     }
 
-    let _sync_guard = SyncLock::acquire(ctx.base)?;
+    let sync_guard = SyncLock::acquire(ctx.base)?;
 
-    if no_sync {
+    let snapshots = SnapshotEngine::new(ctx);
+    let no_sync_base = if no_sync {
+        let last_synced_id = snapshots
+            .last_synced_id()
+            .await?
+            .context("Cannot spawn with --no-sync before this folder has completed a sync")?;
         let local = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
-        let last = crate::conflicts::load_last_synced_snapshot(ctx).await?;
-        let dirty = local
-            .iter()
-            .filter(|(path, state)| {
-                !last.get(*path).is_some_and(|last_state| {
-                    last_state.hash == state.hash && last_state.deleted == state.deleted
-                })
+        let last = snapshots.load_files_local(&last_synced_id).await?;
+        let paths = local
+            .keys()
+            .chain(last.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let dirty = paths
+            .into_iter()
+            .filter(|path| {
+                !matches!(
+                    (local.get(path), last.get(path)),
+                    (Some(local), Some(last))
+                        if local.hash == last.hash
+                            && local.deleted == last.deleted
+                            && local.mode == last.mode
+                )
             })
-            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         if !dirty.is_empty() {
             bail!(
@@ -140,7 +247,11 @@ async fn spawn_agent_with_ctx(
                 dirty.join(", ")
             );
         }
-    }
+
+        Some(last_synced_id)
+    } else {
+        None
+    };
 
     let pending = crate::conflicts::pending_conflict_paths(ctx.db).await?;
     if !pending.is_empty() {
@@ -150,15 +261,25 @@ async fn spawn_agent_with_ctx(
         );
     }
 
-    crate::sync_pass::do_sync(
-        ctx.api,
-        ctx.db,
-        ctx.base,
-        ctx.workspace_id(),
-        ctx.password(),
-        false,
-    )
-    .await?;
+    let base_snapshot = if let Some(last_synced_id) = no_sync_base {
+        last_synced_id
+    } else {
+        crate::sync_pass::do_sync_guarded(
+            ctx.api,
+            ctx.db,
+            ctx.base,
+            ctx.workspace_id(),
+            ctx.password(),
+            false,
+            &sync_guard,
+        )
+        .await?;
+
+        let server_files = crate::conflicts::load_server_view(ctx).await?;
+        snapshots
+            .publish_server_view(&server_files, "folder")
+            .await?
+    };
 
     let dehydrated = ctx
         .db
@@ -175,75 +296,78 @@ async fn spawn_agent_with_ctx(
         );
     }
 
-    let server_files = crate::conflicts::load_server_view(ctx).await?;
-    let base_snapshot = SnapshotEngine::new(ctx)
-        .publish_server_view(&server_files, "folder")
-        .await?;
-
-    let restore_from = if replace && target.exists() {
-        let backup = replacement_backup_path(&target);
+    let restore_from = if replace && fs::try_exists(&owned_root).await? {
+        // Move the complete agent-owned root so a failed replacement restores
+        // its worktree, base ref, and runtime cache together. A successful
+        // replacement creates a fresh root and therefore cannot reuse cache
+        // metadata from the worktree it replaced.
+        let backup = replacement_backup_path(&owned_root);
         if fs::try_exists(&backup).await? {
-            fs::remove_dir_all(&backup).await?;
+            bail!(
+                "refusing to overwrite an existing agent replacement backup at {}",
+                backup.display()
+            );
         }
-        fs::rename(&target, &backup).await?;
+        fs::rename(&owned_root, &backup).await?;
         Some(backup)
     } else {
         None
     };
 
     let mut guard = SpawnCleanupGuard {
-        target: target.clone(),
+        target: owned_root.clone(),
         restore_from,
+        published: false,
         armed: true,
     };
 
-    fs::create_dir_all(&target).await?;
-
     let result: Result<usize> = async {
+        fs::create_dir_all(&target).await?;
         inject_spawn_failure(ctx.base, name, "after-stage").await?;
 
         let mut copied = 0;
-        for entry in build_workspace_walker(ctx.base, false)
-            .build()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        {
-            let Ok(relative) = entry.path().strip_prefix(ctx.base) else {
-                continue;
-            };
-            let Some(relative) = relative.to_str() else {
-                continue;
-            };
-
-            let normalized = normalize_path(relative);
-            if !feanorfs_common::is_safe_rel_path(&normalized) {
+        let read_root = crate::workspace_read::WorkspaceReadRoot::open(ctx.base)?;
+        for entry in build_workspace_walker(ctx.base, false).build() {
+            let entry = entry.context("walk workspace while spawning agent")?;
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
             }
-
-            reflink_or_copy(entry.path(), &target.join(normalized))?;
+            let relative = entry
+                .path()
+                .strip_prefix(ctx.base)
+                .context("derive workspace-relative agent source path")?;
+            let Some(relative_text) = relative.to_str() else {
+                continue;
+            };
+            let Some(normalized) = portable_rel_path(relative_text) else {
+                continue;
+            };
+            let source = read_root
+                .open_regular_path(relative)
+                .with_context(|| format!("open agent source {normalized}"))?;
+            copy_opened_source(source, &target.join(&normalized), &normalized)?;
             copied += 1;
         }
 
-        SnapshotEngine::new(ctx)
-            .write_agent_base(name, &base_snapshot)
-            .await?;
-        if let Some(backup) = guard.restore_from.take() {
-            let _ = fs::remove_dir_all(backup).await;
-        }
+        snapshots.write_agent_base(name, &base_snapshot).await?;
         Ok(copied)
     }
     .await;
 
-    if result.is_err() {
-        if let Some(backup) = guard.restore_from.take() {
-            let _ = fs::remove_dir_all(&target).await;
-            let _ = restore_directory(&backup, &target);
-            let _ = fs::remove_dir_all(backup).await;
+    match result {
+        Ok(copied) => {
+            guard.finish_publication().await?;
+            Ok(copied)
+        }
+        Err(operation_error) => {
+            if let Err(rollback_error) = guard.rollback().await {
+                return Err(anyhow::anyhow!(
+                    "agent spawn failed before publication: {operation_error:#}; {rollback_error:#}"
+                ));
+            }
+            Err(operation_error)
         }
     }
-
-    guard.armed = false;
-    result
 }
 
 async fn inject_spawn_failure(base: &Path, name: &str, point: &str) -> Result<()> {

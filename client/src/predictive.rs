@@ -1,7 +1,8 @@
 use crate::api::ApiClient;
-use crate::fs_util::{apply_executable_mode, file_mtime_ms};
-use crate::local::{CacheEntry, ClientDb};
+use crate::local::ClientDb;
 use anyhow::Result;
+use feanorfs_common::{FileState, SyncResponse};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 const DEFAULT_NEIGHBORS: usize = 5;
@@ -66,85 +67,90 @@ pub async fn prefetch_related(
             "No E2EE password set; using insecure legacy default for predictive hydration."
         );
     }
-    let mut report = PrefetchReport::default();
-    let cache = db.get_cache_entries().await?;
-    let ctx = feanorfs_agent_core::sync_pass::build_ctx_or_fallback(
-        api,
-        db,
-        base,
-        "",
-        Some(password_str),
-    )?;
+    let work = async {
+        let mut report = PrefetchReport::default();
+        let ctx = feanorfs_agent_core::sync_pass::build_ctx_or_fallback(
+            api,
+            db,
+            base,
+            "",
+            Some(password_str),
+        )?;
+        let _sync_guard = feanorfs_agent_core::lock::SyncLock::acquire(base)?;
+        let local_files = crate::local::scan_local_directory(base, db, Some(password_str)).await?;
+        let cache = db.get_cache_entries().await?;
+        let mut candidates = BTreeMap::new();
 
-    for seed in seed_paths {
-        report.inspected.push(seed.clone());
-        if let Some(seed_entry) = cache.get(seed) {
-            if seed_entry.hydrated {
-                report.skipped.push(seed.clone());
-                continue;
+        for seed in seed_paths {
+            report.inspected.push(seed.clone());
+            if let Some(seed_entry) = cache.get(seed) {
+                if seed_entry.hydrated || seed_entry.deleted_at.is_some() {
+                    report.skipped.push(seed.clone());
+                } else if local_files
+                    .get(seed)
+                    .is_some_and(|state| !state.deleted && state.hash == seed_entry.encrypted_hash)
+                {
+                    candidates.entry(seed.clone()).or_insert_with(|| FileState {
+                        path: seed_entry.path.clone(),
+                        hash: seed_entry.encrypted_hash.clone(),
+                        size: seed_entry.size,
+                        mtime: seed_entry.server_mtime,
+                        deleted: false,
+                        mode: seed_entry.mode,
+                    });
+                }
             }
-            if hydrate_one(&ctx, seed_entry).await? {
-                report.hydrated.push(seed.clone());
-            }
-        }
 
-        let siblings = db.get_predictive_siblings(seed, DEFAULT_NEIGHBORS).await?;
-        for (sibling_path, _weight) in siblings {
-            if let Some(entry) = cache.get(&sibling_path) {
-                if entry.hydrated {
+            let siblings = db.get_predictive_siblings(seed, DEFAULT_NEIGHBORS).await?;
+            for (sibling_path, _weight) in siblings {
+                let Some(entry) = cache.get(&sibling_path) else {
+                    continue;
+                };
+                if entry.hydrated || entry.deleted_at.is_some() {
                     continue;
                 }
-                if hydrate_one(&ctx, entry).await? {
-                    report.hydrated.push(sibling_path);
+                if local_files
+                    .get(&sibling_path)
+                    .is_some_and(|state| !state.deleted && state.hash == entry.encrypted_hash)
+                {
+                    candidates.entry(sibling_path).or_insert_with(|| FileState {
+                        path: entry.path.clone(),
+                        hash: entry.encrypted_hash.clone(),
+                        size: entry.size,
+                        mtime: entry.server_mtime,
+                        deleted: false,
+                        mode: entry.mode,
+                    });
                 }
             }
         }
-    }
 
-    db.decay_access_log(DECAY_FACTOR).await?;
-    Ok(report)
-}
-
-async fn hydrate_one(ctx: &crate::SyncCtx<'_>, entry: &CacheEntry) -> Result<bool> {
-    let full_path = ctx.base.join(&entry.path);
-    // Placeholders are write-protected; clear the bit before the atomic
-    // rename so Windows can replace the sentinel (POSIX renames ignore it).
-    if let Err(error) = crate::fs_util::set_readonly(&full_path, false).await {
-        tracing::warn!("failed to clear readonly for {}: {error}", entry.path);
-    }
-    let materialized = match feanorfs_agent_core::large_file::materialize(
-        ctx,
-        &entry.path,
-        &entry.encrypted_hash,
-        entry.size,
-    )
-    .await
-    {
-        Ok(materialized) => materialized,
-        Err(error) => {
-            tracing::warn!("predictive hydration failed for {}: {error:#}", entry.path);
-            return Ok(false);
+        if !candidates.is_empty() {
+            let hydrated = candidates.keys().cloned().collect::<Vec<_>>();
+            let response = SyncResponse {
+                upload_required: Vec::new(),
+                download_required: candidates.into_values().collect(),
+                delete_local: Vec::new(),
+            };
+            feanorfs_agent_core::sync_pass::process_downloads(&ctx, &response, &local_files, false)
+                .await?;
+            report.hydrated = hydrated;
         }
-    };
-    apply_executable_mode(&full_path, entry.mode).await?;
+        Ok::<_, anyhow::Error>(report)
+    }
+    .await;
 
-    let actual_mtime = file_mtime_ms(&ctx.base.join(&entry.path))
-        .await
-        .unwrap_or(entry.server_mtime);
-
-    ctx.db
-        .upsert_cache_entry(&CacheEntry {
-            path: entry.path.clone(),
-            plaintext_hash: materialized.plaintext_hash,
-            encrypted_hash: entry.encrypted_hash.clone(),
-            size: materialized.size,
-            mtime: actual_mtime,
-            server_mtime: entry.server_mtime,
-            mode: entry.mode,
-            hydrated: true,
-            deleted_at: None,
-        })
-        .await?;
-
-    Ok(true)
+    let decay = db.decay_access_log(DECAY_FACTOR).await;
+    match work {
+        Ok(report) => {
+            decay?;
+            Ok(report)
+        }
+        Err(error) => {
+            if let Err(decay_error) = decay {
+                tracing::warn!("predictive access-log decay also failed: {decay_error:#}");
+            }
+            Err(error)
+        }
+    }
 }

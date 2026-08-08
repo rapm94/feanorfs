@@ -3,15 +3,14 @@ use crate::fs_util::atomic_write;
 use crate::prepared_tree::{PreparedTreeBundle, OBJECT_DOMAIN};
 use anyhow::{bail, Context, Result};
 use feanorfs_common::{
-    hash_bytes, is_valid_hash, pack_bytes, unpack_bytes_with_policy, ConcurrentEdit, FileState,
-    LegacyPolicy, Snapshot, Tree, TreeBundle, TreeEntryKind,
+    hash_bytes, is_safe_rel_path, is_valid_hash, pack_bytes, unpack_bytes_with_policy,
+    ConcurrentEdit, FileState, LegacyPolicy, Snapshot, Tree, TreeBundle, TreeEntryKind,
+    MANIFEST_MAX_ENTRIES, MAX_CANONICAL_OBJECT_BYTES, MAX_ENCRYPTED_OBJECT_BYTES, MAX_TREE_DEPTH,
+    MAX_TREE_OBJECTS, MAX_TREE_OUTPUT_PATHS, MAX_TREE_PATH_BYTES_TOTAL, MAX_TREE_WORK_ITEMS,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::io::ErrorKind;
 use tokio::fs;
-
-const MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_OBJECT_CIPHERTEXT_BYTES: usize = MAX_OBJECT_BYTES + 64;
 
 /// Encrypted immutable tree/snapshot store backed by FeanorFS CAS.
 pub struct ObjectStore<'ctx, 'a> {
@@ -21,6 +20,21 @@ pub struct ObjectStore<'ctx, 'a> {
 pub(crate) struct LoadedTree {
     pub files: HashMap<String, FileState>,
     pub conflicts: Vec<ConcurrentEdit>,
+}
+
+enum TreeStateWork {
+    Enter {
+        id: String,
+        prefix: String,
+        depth: usize,
+    },
+    Exit(String),
+}
+
+#[derive(Clone, Copy)]
+enum ObjectReadSource {
+    CacheOrHub,
+    CacheOnly,
 }
 
 impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
@@ -35,6 +49,7 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     /// # Errors
     /// Returns an error when encryption, local persistence, or upload fails.
     pub async fn put_tree(&self, tree: &Tree) -> Result<String> {
+        tree.validate()?;
         self.put_bytes(&tree.to_canonical_bytes()).await
     }
 
@@ -55,7 +70,11 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     /// # Errors
     /// Returns an error for invalid ids, corrupt ciphertext, or malformed trees.
     pub async fn get_tree(&self, id: &str) -> Result<Tree> {
-        Tree::from_canonical_bytes(&self.get_bytes(id).await?)
+        self.get_tree_from(id, ObjectReadSource::CacheOrHub).await
+    }
+
+    async fn get_tree_from(&self, id: &str, source: ObjectReadSource) -> Result<Tree> {
+        Tree::from_canonical_bytes(&self.get_bytes_from(id, source).await?)
             .with_context(|| format!("decode tree object {id}"))
     }
 
@@ -67,84 +86,147 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
         Ok(self.get_tree_state(root).await?.files)
     }
 
+    pub(crate) async fn get_flat_tree_local(
+        &self,
+        root: &str,
+    ) -> Result<HashMap<String, FileState>> {
+        Ok(self
+            .get_tree_state_from(root, ObjectReadSource::CacheOnly)
+            .await?
+            .files)
+    }
+
     pub(crate) async fn get_tree_state(&self, root: &str) -> Result<LoadedTree> {
+        self.get_tree_state_from(root, ObjectReadSource::CacheOrHub)
+            .await
+    }
+
+    async fn get_tree_state_from(
+        &self,
+        root: &str,
+        source: ObjectReadSource,
+    ) -> Result<LoadedTree> {
         let mut state = LoadedTree {
             files: HashMap::new(),
             conflicts: Vec::new(),
         };
-        let mut pending = vec![(root.to_string(), String::new(), Vec::<String>::new())];
-        while let Some((id, prefix, mut ancestors)) = pending.pop() {
-            if ancestors.iter().any(|ancestor| ancestor == &id) {
-                bail!("cycle in encrypted tree at {id}");
-            }
-            ancestors.push(id.clone());
-            for entry in self.get_tree(&id).await?.entries {
-                let path = if prefix.is_empty() {
-                    entry.name.clone()
-                } else {
-                    format!("{prefix}/{}", entry.name)
-                };
-                match entry.kind {
-                    TreeEntryKind::Dir => {
-                        pending.push((entry.hash, path, ancestors.clone()));
+        let mut pending = vec![TreeStateWork::Enter {
+            id: root.to_string(),
+            prefix: String::new(),
+            depth: 0,
+        }];
+        let mut active = std::collections::HashSet::new();
+        let mut objects = std::collections::HashSet::new();
+        let mut work_items = 0_usize;
+        let mut path_bytes = 0_usize;
+        while let Some(work) = pending.pop() {
+            match work {
+                TreeStateWork::Exit(id) => {
+                    active.remove(&id);
+                }
+                TreeStateWork::Enter { id, prefix, depth } => {
+                    if depth > MAX_TREE_DEPTH {
+                        bail!("encrypted tree exceeds supported depth");
                     }
-                    TreeEntryKind::File => {
-                        state.files.insert(
-                            path.clone(),
-                            FileState {
-                                path: path.clone(),
-                                hash: entry.hash,
-                                size: entry.size,
-                                mtime: 0,
-                                deleted: false,
-                                mode: entry.mode,
-                            },
-                        );
+                    if !active.insert(id.clone()) {
+                        bail!("cycle in encrypted tree at {id}");
                     }
-                    TreeEntryKind::Conflict { base, ours, theirs } => {
-                        // The tree stores only the visible leg's size and
-                        // content id; the visible leg is always a live blob
-                        // (insert_conflict refuses all-deleted conflicts), so
-                        // the flattened file is present in the working copy.
-                        state.files.insert(
-                            path.clone(),
-                            FileState {
-                                path: path.clone(),
-                                hash: entry.hash,
-                                size: entry.size,
-                                mtime: 0,
-                                deleted: false,
-                                mode: 0,
-                            },
-                        );
-                        // Non-visible legs carry size 0 ("unknown"): their
-                        // sizes are not part of the tree format.
-                        let visible_hash = theirs
-                            .clone()
-                            .or_else(|| ours.clone())
-                            .or_else(|| base.clone());
-                        let size_of = |hash: &str| {
-                            if Some(hash) == visible_hash.as_deref() {
-                                entry.size
-                            } else {
-                                0
-                            }
+                    if objects.insert(id.clone()) && objects.len() > MAX_TREE_OBJECTS {
+                        bail!("encrypted tree exceeds distinct-object limit");
+                    }
+                    pending.push(TreeStateWork::Exit(id.clone()));
+                    let tree = self.get_tree_from(&id, source).await?;
+                    work_items = work_items
+                        .checked_add(tree.entries.len().saturating_add(1))
+                        .context("encrypted tree work counter overflow")?;
+                    if work_items > MAX_TREE_WORK_ITEMS {
+                        bail!("encrypted tree exceeds traversal work limit");
+                    }
+                    for entry in tree.entries.into_iter().rev() {
+                        let path = if prefix.is_empty() {
+                            entry.name.clone()
+                        } else {
+                            format!("{prefix}/{}", entry.name)
                         };
-                        state.conflicts.push(ConcurrentEdit::new(
-                            path.clone(),
-                            base.map(|hash| {
-                                let size = size_of(&hash);
-                                conflict_leg(&path, hash, size)
+                        if !is_safe_rel_path(&path) || path.split('/').count() > MAX_TREE_DEPTH {
+                            bail!("encrypted tree produced an unsafe or oversized path");
+                        }
+                        path_bytes = path_bytes
+                            .checked_add(path.len())
+                            .context("encrypted tree path counter overflow")?;
+                        if path_bytes > MAX_TREE_PATH_BYTES_TOTAL {
+                            bail!("encrypted tree paths exceed aggregate byte limit");
+                        }
+                        match entry.kind {
+                            TreeEntryKind::Dir => pending.push(TreeStateWork::Enter {
+                                id: entry.hash,
+                                prefix: path,
+                                depth: depth + 1,
                             }),
-                            ours.map(|hash| {
-                                let size = size_of(&hash);
-                                conflict_leg(&path, hash, size)
-                            }),
-                            theirs.map(|hash| {
-                                let size = size_of(&hash);
-                                conflict_leg(&path, hash, size)
-                            }),
-                        ));
+                            TreeEntryKind::File => {
+                                if state.files.len() >= MAX_TREE_OUTPUT_PATHS {
+                                    bail!("encrypted tree exceeds flat-output limit");
+                                }
+                                state.files.insert(
+                                    path.clone(),
+                                    FileState {
+                                        path,
+                                        hash: entry.hash,
+                                        size: entry.size,
+                                        mtime: 0,
+                                        deleted: false,
+                                        mode: entry.mode,
+                                    },
+                                );
+                            }
+                            TreeEntryKind::Conflict {
+                                base,
+                                ours,
+                                theirs,
+                                modes,
+                            } => {
+                                if state.files.len() >= MAX_TREE_OUTPUT_PATHS {
+                                    bail!("encrypted tree exceeds flat-output limit");
+                                }
+                                state.files.insert(
+                                    path.clone(),
+                                    FileState {
+                                        path: path.clone(),
+                                        hash: entry.hash,
+                                        size: entry.size,
+                                        mtime: 0,
+                                        deleted: false,
+                                        mode: entry.mode,
+                                    },
+                                );
+                                let visible_hash = theirs
+                                    .clone()
+                                    .or_else(|| ours.clone())
+                                    .or_else(|| base.clone());
+                                let size_of = |hash: &str| {
+                                    if Some(hash) == visible_hash.as_deref() {
+                                        entry.size
+                                    } else {
+                                        0
+                                    }
+                                };
+                                state.conflicts.push(ConcurrentEdit::new(
+                                    path.clone(),
+                                    base.map(|hash| {
+                                        let size = size_of(&hash);
+                                        conflict_leg(&path, hash, size, modes.base)
+                                    }),
+                                    ours.map(|hash| {
+                                        let size = size_of(&hash);
+                                        conflict_leg(&path, hash, size, modes.ours)
+                                    }),
+                                    theirs.map(|hash| {
+                                        let size = size_of(&hash);
+                                        conflict_leg(&path, hash, size, modes.theirs)
+                                    }),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -157,6 +239,7 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     /// # Errors
     /// Returns an error when encryption, local persistence, or upload fails.
     pub async fn put_snapshot(&self, snapshot: &Snapshot) -> Result<String> {
+        snapshot.validate()?;
         self.put_bytes(&snapshot.to_canonical_bytes()).await
     }
 
@@ -165,7 +248,17 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     /// # Errors
     /// Returns an error for invalid ids, corrupt ciphertext, or malformed snapshots.
     pub async fn get_snapshot(&self, id: &str) -> Result<Snapshot> {
-        Snapshot::from_canonical_bytes(&self.get_bytes(id).await?)
+        self.get_snapshot_from(id, ObjectReadSource::CacheOrHub)
+            .await
+    }
+
+    pub(crate) async fn get_snapshot_local(&self, id: &str) -> Result<Snapshot> {
+        self.get_snapshot_from(id, ObjectReadSource::CacheOnly)
+            .await
+    }
+
+    async fn get_snapshot_from(&self, id: &str, source: ObjectReadSource) -> Result<Snapshot> {
+        Snapshot::from_canonical_bytes(&self.get_bytes_from(id, source).await?)
             .with_context(|| format!("decode snapshot object {id}"))
     }
 
@@ -175,55 +268,112 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
         expand_chunked_files: bool,
     ) -> Result<Vec<String>> {
         let snapshot = self.get_snapshot(id).await?;
-        let mut hashes = BTreeSet::from([id.to_string()]);
-        let mut pending = vec![(snapshot.root, String::new())];
-        while let Some((tree_id, prefix)) = pending.pop() {
-            if !hashes.insert(tree_id.clone()) {
-                continue;
-            }
-            for entry in self.get_tree(&tree_id).await?.entries {
-                let path = if prefix.is_empty() {
-                    entry.name.clone()
-                } else {
-                    format!("{prefix}/{}", entry.name)
-                };
-                match entry.kind {
-                    TreeEntryKind::Dir => pending.push((entry.hash, path)),
-                    TreeEntryKind::File => {
-                        hashes.insert(entry.hash.clone());
-                        if expand_chunked_files {
-                            hashes.extend(
-                                crate::large_file::reachable_chunks(
-                                    self.ctx,
-                                    &path,
-                                    &entry.hash,
-                                    Some(entry.size),
-                                )
-                                .await?,
-                            );
-                        }
+        let mut hashes = BTreeSet::new();
+        insert_reachable_hash(&mut hashes, id.to_string())?;
+        let mut pending = vec![TreeStateWork::Enter {
+            id: snapshot.root,
+            prefix: String::new(),
+            depth: 0,
+        }];
+        let mut active = std::collections::HashSet::new();
+        let mut objects = std::collections::HashSet::new();
+        let mut work_items = 0_usize;
+        let mut path_bytes = 0_usize;
+        while let Some(work) = pending.pop() {
+            match work {
+                TreeStateWork::Exit(tree_id) => {
+                    active.remove(&tree_id);
+                }
+                TreeStateWork::Enter {
+                    id: tree_id,
+                    prefix,
+                    depth,
+                } => {
+                    if depth > MAX_TREE_DEPTH || !active.insert(tree_id.clone()) {
+                        bail!("cycle or excessive depth in reachable encrypted tree");
                     }
-                    TreeEntryKind::Conflict { base, ours, theirs } => {
-                        let mut legs = vec![entry.hash.clone()];
-                        legs.extend(base);
-                        legs.extend(ours);
-                        legs.extend(theirs);
-                        legs.sort_unstable();
-                        legs.dedup();
-                        for leg in legs {
-                            hashes.insert(leg.clone());
-                            if expand_chunked_files {
-                                // Only the visible leg's size is stored in the
-                                // tree; hidden legs are size-unknown, so their
-                                // chunks must be discovered from the blob
-                                // itself or server GC could delete them.
-                                let size = (leg == entry.hash).then_some(entry.size);
-                                hashes.extend(
-                                    crate::large_file::reachable_chunks(
-                                        self.ctx, &path, &leg, size,
+                    if objects.insert(tree_id.clone()) && objects.len() > MAX_TREE_OBJECTS {
+                        bail!("reachable encrypted tree exceeds distinct-object limit");
+                    }
+                    insert_reachable_hash(&mut hashes, tree_id.clone())?;
+                    pending.push(TreeStateWork::Exit(tree_id.clone()));
+                    let tree = self.get_tree(&tree_id).await?;
+                    work_items = work_items
+                        .checked_add(tree.entries.len().saturating_add(1))
+                        .context("reachability work counter overflow")?;
+                    if work_items > MAX_TREE_WORK_ITEMS {
+                        bail!("snapshot reachability exceeds traversal work limit");
+                    }
+                    for entry in tree.entries.into_iter().rev() {
+                        let path = if prefix.is_empty() {
+                            entry.name.clone()
+                        } else {
+                            format!("{prefix}/{}", entry.name)
+                        };
+                        if !is_safe_rel_path(&path) || path.split('/').count() > MAX_TREE_DEPTH {
+                            bail!("reachable encrypted tree produced an unsafe path");
+                        }
+                        path_bytes = path_bytes
+                            .checked_add(path.len())
+                            .context("reachability path counter overflow")?;
+                        if path_bytes > MAX_TREE_PATH_BYTES_TOTAL {
+                            bail!("snapshot reachability paths exceed aggregate byte limit");
+                        }
+                        match entry.kind {
+                            TreeEntryKind::Dir => pending.push(TreeStateWork::Enter {
+                                id: entry.hash,
+                                prefix: path,
+                                depth: depth + 1,
+                            }),
+                            TreeEntryKind::File => {
+                                insert_reachable_hash(&mut hashes, entry.hash.clone())?;
+                                if expand_chunked_files {
+                                    let chunks = crate::large_file::reachable_chunks(
+                                        self.ctx,
+                                        &path,
+                                        &entry.hash,
+                                        Some(entry.size),
                                     )
-                                    .await?,
-                                );
+                                    .await?;
+                                    work_items = work_items
+                                        .checked_add(chunks.len())
+                                        .context("reachability chunk counter overflow")?;
+                                    if work_items > MAX_TREE_WORK_ITEMS {
+                                        bail!("snapshot reachability exceeds work limit");
+                                    }
+                                    for chunk in chunks {
+                                        insert_reachable_hash(&mut hashes, chunk)?;
+                                    }
+                                }
+                            }
+                            TreeEntryKind::Conflict {
+                                base, ours, theirs, ..
+                            } => {
+                                let mut legs = vec![entry.hash.clone()];
+                                legs.extend(base);
+                                legs.extend(ours);
+                                legs.extend(theirs);
+                                legs.sort_unstable();
+                                legs.dedup();
+                                for leg in legs {
+                                    insert_reachable_hash(&mut hashes, leg.clone())?;
+                                    if expand_chunked_files {
+                                        let size = (leg == entry.hash).then_some(entry.size);
+                                        let chunks = crate::large_file::reachable_chunks(
+                                            self.ctx, &path, &leg, size,
+                                        )
+                                        .await?;
+                                        work_items = work_items
+                                            .checked_add(chunks.len())
+                                            .context("reachability chunk counter overflow")?;
+                                        if work_items > MAX_TREE_WORK_ITEMS {
+                                            bail!("snapshot reachability exceeds work limit");
+                                        }
+                                        for chunk in chunks {
+                                            insert_reachable_hash(&mut hashes, chunk)?;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -234,7 +384,8 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     }
 
     pub(crate) async fn cache_manifest(&self, id: &str, hashes: &[String]) -> Result<()> {
-        let mut manifest = hashes.join("\n").into_bytes();
+        let canonical = feanorfs_common::canonical_manifest_hash_list(id, hashes)?;
+        let mut manifest = canonical.join("\n").into_bytes();
         manifest.push(b'\n');
         let state = self.ctx.state_dir()?;
         atomic_write(&state, &format!("manifests/{id}"), &manifest).await?;
@@ -242,7 +393,7 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     }
 
     async fn put_bytes(&self, bytes: &[u8]) -> Result<String> {
-        if bytes.len() > MAX_OBJECT_BYTES {
+        if bytes.len() > MAX_CANONICAL_OBJECT_BYTES {
             bail!("canonical object exceeds 16 MiB limit");
         }
         let ciphertext = pack_bytes(bytes, self.ctx.password_str(), OBJECT_DOMAIN)?;
@@ -262,23 +413,18 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
         Ok(id)
     }
 
-    async fn get_bytes(&self, id: &str) -> Result<Vec<u8>> {
+    async fn get_bytes_from(&self, id: &str, source: ObjectReadSource) -> Result<Vec<u8>> {
         if !is_valid_hash(id) {
             bail!("invalid object id {id:?}");
         }
-        let cache_path = self.cache_path(id)?;
-        let ciphertext = match fs::read(&cache_path).await {
-            Ok(bytes) if hash_bytes(&bytes) == id => bytes,
-            Ok(_) => {
-                match fs::remove_file(&cache_path).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => return Err(error).context("remove corrupt object cache"),
-                }
-                self.fetch_remote(id).await?
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => self.fetch_remote(id).await?,
-            Err(error) => return Err(error).context("read object cache"),
+        let ciphertext = match cached_object(self.ctx, id, MAX_ENCRYPTED_OBJECT_BYTES).await? {
+            Some(bytes) => bytes,
+            None => match source {
+                ObjectReadSource::CacheOrHub => self.fetch_remote(id).await?,
+                ObjectReadSource::CacheOnly => bail!(
+                    "local snapshot state is incomplete or corrupt: object {id} is unavailable in the local cache"
+                ),
+            },
         };
         unpack_bytes_with_policy(
             &ciphertext,
@@ -290,8 +436,12 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
     }
 
     async fn fetch_remote(&self, id: &str) -> Result<Vec<u8>> {
-        let ciphertext = self.ctx.api.download_file(id).await?;
-        if ciphertext.len() > MAX_OBJECT_CIPHERTEXT_BYTES {
+        let ciphertext = self
+            .ctx
+            .api
+            .download_file_bounded(id, MAX_ENCRYPTED_OBJECT_BYTES)
+            .await?;
+        if ciphertext.len() > MAX_ENCRYPTED_OBJECT_BYTES {
             bail!("downloaded object exceeds ciphertext size limit");
         }
         if hash_bytes(&ciphertext) != id {
@@ -307,35 +457,58 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
             .await
             .with_context(|| format!("cache object {id}"))
     }
-
-    fn cache_path(&self, id: &str) -> Result<std::path::PathBuf> {
-        Ok(self.ctx.state_dir()?.join("objects").join(id))
-    }
 }
 
 /// Reads a verified ciphertext object from the local object cache when
 /// present, without touching the network. Corrupt cache entries are dropped.
-pub(crate) async fn cached_object(ctx: &SyncCtx<'_>, id: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) async fn cached_object(
+    ctx: &SyncCtx<'_>,
+    id: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
     let cache_path = ctx.state_dir()?.join("objects").join(id);
-    match fs::read(&cache_path).await {
-        Ok(bytes) if hash_bytes(&bytes) == id => Ok(Some(bytes)),
-        Ok(_) => {
-            let _ = fs::remove_file(&cache_path).await;
-            Ok(None)
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).context("read object cache"),
+    let metadata = match fs::metadata(&cache_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read object-cache metadata"),
+    };
+    if metadata.len() > max_bytes as u64 {
+        let _ = fs::remove_file(&cache_path).await;
+        return Ok(None);
+    }
+    let file = fs::File::open(&cache_path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    use tokio::io::AsyncReadExt as _;
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > max_bytes || hash_bytes(&bytes) != id {
+        let _ = fs::remove_file(&cache_path).await;
+        Ok(None)
+    } else {
+        Ok(Some(bytes))
     }
 }
 
-fn conflict_leg(path: &str, hash: String, size: u64) -> FileState {
+fn insert_reachable_hash(hashes: &mut BTreeSet<String>, hash: String) -> Result<()> {
+    if !is_valid_hash(&hash) {
+        bail!("snapshot reachability contains an invalid object id");
+    }
+    if !hashes.contains(&hash) && hashes.len() >= MANIFEST_MAX_ENTRIES {
+        bail!("snapshot reachability exceeds manifest object limit");
+    }
+    hashes.insert(hash);
+    Ok(())
+}
+
+fn conflict_leg(path: &str, hash: String, size: u64, mode: u32) -> FileState {
     FileState {
         path: path.to_string(),
         hash,
         size,
         mtime: 0,
         deleted: false,
-        mode: 0,
+        mode,
     }
 }
 
@@ -351,6 +524,67 @@ mod tests {
     use std::io::{Seek as _, Write as _};
 
     const TEST_PASSWORD: &str = "unit-test-password";
+
+    #[tokio::test]
+    async fn conflict_tree_roundtrip_preserves_visible_and_hidden_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws");
+        std::fs::create_dir_all(&base).unwrap();
+        let state_dir = crate::workspace_layout::ensure_workspace_state(&base).unwrap();
+        let hub = LocalHub::open(dir.path().join("hub-data"), None)
+            .await
+            .unwrap();
+        let api = ApiClient::local(hub, None);
+        let db = ClientDb::new(state_dir).await.unwrap();
+        let ctx = SyncCtx::new(
+            &api,
+            &db,
+            &base,
+            "test-ws",
+            Some(TEST_PASSWORD),
+            feanorfs_common::LegacyPolicy::Reject,
+        );
+        let ordinary = FileState {
+            path: "run.sh".into(),
+            hash: feanorfs_common::hash_bytes(b"ordinary"),
+            size: 8,
+            mtime: 0,
+            deleted: false,
+            mode: 0,
+        };
+        let executable = FileState {
+            hash: feanorfs_common::hash_bytes(b"executable"),
+            size: 10,
+            mode: feanorfs_common::EXECUTABLE_MODE,
+            ..ordinary.clone()
+        };
+        let visible = FileState {
+            hash: feanorfs_common::hash_bytes(b"visible"),
+            size: 7,
+            ..ordinary.clone()
+        };
+        let conflict = ConcurrentEdit::new(
+            "run.sh".into(),
+            Some(ordinary),
+            Some(executable),
+            Some(visible),
+        );
+        let bundle =
+            feanorfs_common::flat_to_tree_with_conflicts(&HashMap::new(), &[conflict]).unwrap();
+        let objects = ObjectStore::new(&ctx);
+        let root = objects.put_bundle(&bundle).await.unwrap();
+        let loaded = objects.get_tree_state(&root).await.unwrap();
+
+        assert_eq!(loaded.files["run.sh"].mode, 0);
+        assert_eq!(loaded.conflicts.len(), 1);
+        let conflict = &loaded.conflicts[0];
+        assert_eq!(conflict.base.as_ref().unwrap().mode, 0);
+        assert_eq!(
+            conflict.ours.as_ref().unwrap().mode,
+            feanorfs_common::EXECUTABLE_MODE
+        );
+        assert_eq!(conflict.theirs.as_ref().unwrap().mode, 0);
+    }
 
     /// A conflict entry's hidden (non-visible) leg may be a chunked file while
     /// the visible leg is small. Its chunk hashes must still be included in
@@ -387,7 +621,7 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
         let fingerprint =
-            crate::large_file::fingerprint(&path, TEST_PASSWORD, "large.bin").unwrap();
+            crate::large_file::fingerprint(&base, TEST_PASSWORD, "large.bin").unwrap();
         crate::large_file::upload(&ctx, "large.bin", &fingerprint.encrypted_hash)
             .await
             .unwrap();
@@ -479,7 +713,7 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
         let fingerprint =
-            crate::large_file::fingerprint(&path, TEST_PASSWORD, "large.bin").unwrap();
+            crate::large_file::fingerprint(&base, TEST_PASSWORD, "large.bin").unwrap();
         crate::large_file::upload(&ctx, "large.bin", &fingerprint.encrypted_hash)
             .await
             .unwrap();

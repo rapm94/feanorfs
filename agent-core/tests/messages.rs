@@ -1,12 +1,12 @@
-//! Encrypted agent signal tests over the embedded LocalHub (own process, so the
-//! FEANORFS_HOME override cannot race the library test binary).
-//!
-//! The test lock deliberately serializes the process-global FEANORFS_HOME
-//! override across awaits; holding it is the point, not a leak.
-#![allow(clippy::await_holding_lock)]
+//! Encrypted agent signal tests over the embedded LocalHub.
+
+feanorfs_test_support::isolate_test_process!();
 
 use feanorfs_agent_core::local::{save_config, Config};
-use feanorfs_agent_core::messages::{append_raw_snapshot, inbox, send_message, signals_since};
+use feanorfs_agent_core::messages::{
+    append_raw_snapshot, inbox, send_message, send_message_if_head, signals_since,
+    HeadConditionalSendResult,
+};
 use feanorfs_agent_core::{
     ensure_workspace_state, land_agent, spawn_agent, ApiClient, ClientDb, SnapshotEngine, SyncCtx,
     LOCAL_HUB_URL,
@@ -19,11 +19,7 @@ use feanorfs_common::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 struct TestWorkspace {
-    _serial: std::sync::MutexGuard<'static, ()>,
-    _home: tempfile::TempDir,
     _workspace: tempfile::TempDir,
     root: PathBuf,
     db: ClientDb,
@@ -46,13 +42,6 @@ fn config(workspace_id: &str, key: &str) -> Config {
 }
 
 async fn setup(workspace_id: &str) -> TestWorkspace {
-    // FEANORFS_HOME is process-global; serialize every test body so the
-    // env override cannot leak into a concurrent test.
-    let serial = TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let home = tempfile::tempdir().unwrap();
-    std::env::set_var("FEANORFS_HOME", home.path());
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path().to_path_buf();
     std::fs::write(root.join("seed.txt"), b"seed").unwrap();
@@ -69,8 +58,6 @@ async fn setup(workspace_id: &str) -> TestWorkspace {
         .await
         .unwrap();
     TestWorkspace {
-        _serial: serial,
-        _home: home,
         _workspace: workspace,
         root,
         db,
@@ -146,6 +133,143 @@ async fn send_appends_message_only_snapshot_reusing_head_root() {
         1,
         "signal must not materialize project paths"
     );
+}
+
+#[tokio::test]
+async fn stale_conditional_fallback_cannot_follow_a_legitimate_terminal() {
+    let ws = setup("conditional-terminal-race").await;
+    let ctx = ws.ctx();
+    let request = send_message(
+        &ctx,
+        AgentMessageInput {
+            to: "worker".into(),
+            kind: AgentMessageKind::Request,
+            body: "run checks".into(),
+            about_snapshot: None,
+            reply_to: None,
+            from: Some("requester".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let terminal = send_message(
+        &ctx,
+        AgentMessageInput {
+            to: "requester".into(),
+            kind: AgentMessageKind::Result,
+            body: "checks passed".into(),
+            about_snapshot: Some(request.about_snapshot.clone()),
+            reply_to: Some(request.message_id.clone()),
+            from: Some("worker".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let fallback = send_message_if_head(
+        &ctx,
+        &request.message_id,
+        AgentMessageInput {
+            to: "requester".into(),
+            kind: AgentMessageKind::Blocked,
+            body: "runner blocked".into(),
+            about_snapshot: Some(request.about_snapshot.clone()),
+            reply_to: Some(request.message_id.clone()),
+            from: Some("worker".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        fallback,
+        HeadConditionalSendResult::Conflict(Some(terminal.message_id.clone()))
+    );
+    assert_eq!(
+        ctx.api.get_head(ctx.workspace_id()).await.unwrap(),
+        Some(terminal.message_id.clone())
+    );
+    let replies = inbox(
+        &ctx,
+        AgentInboxQuery {
+            recipient: "requester".into(),
+            after: Some(request.message_id.clone()),
+            limit: 50,
+        },
+    )
+    .await
+    .unwrap()
+    .messages;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].message_id, terminal.message_id);
+    assert_eq!(replies[0].kind, AgentMessageKind::Result);
+}
+
+#[tokio::test]
+async fn conditional_fallback_can_retry_after_unrelated_head_advancement() {
+    let ws = setup("conditional-unrelated-race").await;
+    let ctx = ws.ctx();
+    let request = send_message(
+        &ctx,
+        AgentMessageInput {
+            to: "worker".into(),
+            kind: AgentMessageKind::Request,
+            body: "run checks".into(),
+            about_snapshot: None,
+            reply_to: None,
+            from: Some("requester".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let unrelated = send_message(
+        &ctx,
+        AgentMessageInput {
+            to: "observer".into(),
+            kind: AgentMessageKind::Status,
+            body: "unrelated progress".into(),
+            about_snapshot: None,
+            reply_to: None,
+            from: Some("other-worker".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let fallback = AgentMessageInput {
+        to: "requester".into(),
+        kind: AgentMessageKind::Blocked,
+        body: "runner blocked".into(),
+        about_snapshot: Some(request.about_snapshot.clone()),
+        reply_to: Some(request.message_id.clone()),
+        from: Some("worker".into()),
+    };
+
+    assert_eq!(
+        send_message_if_head(&ctx, &request.message_id, fallback.clone())
+            .await
+            .unwrap(),
+        HeadConditionalSendResult::Conflict(Some(unrelated.message_id.clone()))
+    );
+    let sent = send_message_if_head(&ctx, &unrelated.message_id, fallback)
+        .await
+        .unwrap();
+    let HeadConditionalSendResult::Sent(sent) = sent else {
+        panic!("fallback should publish against the reread head");
+    };
+    let replies = inbox(
+        &ctx,
+        AgentInboxQuery {
+            recipient: "requester".into(),
+            after: Some(request.message_id.clone()),
+            limit: 50,
+        },
+    )
+    .await
+    .unwrap()
+    .messages;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].message_id, sent.message_id);
+    assert_eq!(replies[0].kind, AgentMessageKind::Blocked);
 }
 
 impl TestWorkspace {
@@ -711,11 +835,6 @@ async fn reply_to_validates_against_a_reachable_signal() {
 
 #[tokio::test]
 async fn empty_workspace_has_no_signals_and_cannot_send() {
-    let _serial = TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let home = tempfile::tempdir().unwrap();
-    std::env::set_var("FEANORFS_HOME", home.path());
     let workspace = tempfile::tempdir().unwrap();
     let key = generate_password().unwrap();
     let cfg = config("empty-ws", &key);
@@ -755,11 +874,6 @@ async fn empty_workspace_has_no_signals_and_cannot_send() {
 
 #[tokio::test]
 async fn signals_fail_clearly_before_format_v3() {
-    let _serial = TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let home = tempfile::tempdir().unwrap();
-    std::env::set_var("FEANORFS_HOME", home.path());
     let workspace = tempfile::tempdir().unwrap();
     let key = generate_password().unwrap();
     let mut cfg = config("legacy-signals", &key);

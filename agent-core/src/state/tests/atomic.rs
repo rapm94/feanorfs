@@ -1,6 +1,8 @@
 use std::fs;
 
-use crate::durable::{atomic_overwrite, set_atomic_faults, AtomicFaults};
+use crate::durable::{
+    atomic_overwrite, commit_durability_is_uncertain, set_atomic_faults, AtomicFaults,
+};
 
 #[test]
 fn atomic_overwrite_happy_path_succeeds() {
@@ -43,6 +45,7 @@ fn atomic_overwrite_post_commit_fault_reports_uncertain_with_valid_new_bytes() {
 
     let error = atomic_overwrite(&path, b"replacement").expect_err("post-commit fault must fail");
 
+    assert!(commit_durability_is_uncertain(&error));
     assert!(error
         .to_string()
         .contains("committed-but-durability-uncertain"));

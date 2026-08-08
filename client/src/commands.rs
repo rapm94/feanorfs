@@ -1,15 +1,14 @@
 use crate::api::ApiClient;
 use crate::conflicts;
 use crate::ctx::SyncCtx;
-use crate::fs_util::{apply_executable_mode, file_mtime_ms, set_readonly};
-use crate::local::{load_config, CacheEntry, ClientDb, Config};
-use anyhow::Result;
+use crate::local::{load_config, ClientDb, Config};
+use anyhow::{Context as _, Result};
 use feanorfs_agent_core::sync_pass::{self, SyncMode};
 use feanorfs_common::{FileState, SyncResponse};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use tokio::fs;
+use tokio::io::AsyncReadExt as _;
 
 /// Mirror state for status output and `--json` consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -213,6 +212,30 @@ pub async fn do_sync(
     })
 }
 
+#[doc(hidden)]
+pub async fn do_sync_guarded(
+    api: &ApiClient,
+    db: &ClientDb,
+    base_path: &Path,
+    workspace_id: &str,
+    password: Option<&str>,
+    lazy: bool,
+    guard: &feanorfs_agent_core::lock::SyncLock,
+) -> Result<SyncResult> {
+    let (outcome, blocked) =
+        sync_pass::do_sync_guarded(api, db, base_path, workspace_id, password, lazy, guard).await?;
+    Ok(SyncResult {
+        mirror_state: mirror_state_after_apply(&blocked, false),
+        uploads: outcome.uploads,
+        downloads: outcome.downloads,
+        placeholders: outcome.placeholders,
+        deletes_local: outcome.deletes_local,
+        deletes_remote: outcome.deletes_remote,
+        large_file_count: outcome.large_file_count,
+        large_file_examples: outcome.large_file_examples,
+    })
+}
+
 pub async fn do_hydrate(
     api: &ApiClient,
     db: &ClientDb,
@@ -239,48 +262,68 @@ async fn do_hydrate_with_ctx(
     target_path: Option<String>,
 ) -> Result<HydrateResult> {
     tracing::info!("Hydrate (target={:?})", target_path);
+    let _sync_guard = feanorfs_agent_core::lock::SyncLock::acquire(ctx.base)?;
+    if let Some(target) = target_path.as_deref() {
+        if !feanorfs_common::is_safe_rel_path(target) {
+            anyhow::bail!("hydrate target must be a safe relative workspace path");
+        }
+    }
+    let before_scan = ctx.db.get_cache_entries().await?;
+    let read_root = feanorfs_agent_core::workspace_read::WorkspaceReadRoot::open(ctx.base)?;
+    for entry in before_scan.values().filter(|entry| {
+        !entry.hydrated
+            && target_path
+                .as_deref()
+                .is_none_or(|target| entry.path == target)
+    }) {
+        if let Err(error) = read_root.open_regular(&entry.path) {
+            let genuinely_missing = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+            });
+            if !genuinely_missing {
+                return Err(error);
+            }
+        }
+    }
+
+    let local_files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     let cache_entries = ctx.db.get_cache_entries().await?;
-
-    let mut hydrated = Vec::new();
-
-    for (path, entry) in cache_entries {
-        if let Some(ref target) = target_path {
-            if path != *target {
-                continue;
-            }
-        }
-
-        if !entry.hydrated {
-            tracing::info!("Hydrating {} (hash: {})", path, entry.encrypted_hash);
-            let full_path = ctx.base.join(&path);
-            if let Some(parent) = full_path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            set_readonly(&full_path, false).await?;
-            let materialized = feanorfs_agent_core::large_file::materialize(
-                ctx,
-                &path,
-                &entry.encrypted_hash,
-                entry.size,
-            )
+    let mut downloads = cache_entries
+        .values()
+        .filter(|entry| {
+            !entry.hydrated
+                && entry.deleted_at.is_none()
+                && local_files
+                    .get(&entry.path)
+                    .is_some_and(|state| !state.deleted && state.hash == entry.encrypted_hash)
+                && target_path
+                    .as_deref()
+                    .is_none_or(|target| entry.path == target)
+        })
+        .map(|entry| FileState {
+            path: entry.path.clone(),
+            hash: entry.encrypted_hash.clone(),
+            size: entry.size,
+            mtime: entry.server_mtime,
+            deleted: false,
+            mode: entry.mode,
+        })
+        .collect::<Vec<_>>();
+    downloads.sort_by(|left, right| left.path.cmp(&right.path));
+    let hydrated = downloads
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    if !downloads.is_empty() {
+        let response = SyncResponse {
+            upload_required: Vec::new(),
+            download_required: downloads,
+            delete_local: Vec::new(),
+        };
+        feanorfs_agent_core::sync_pass::process_downloads(ctx, &response, &local_files, false)
             .await?;
-            apply_executable_mode(&full_path, entry.mode).await?;
-
-            let actual_mtime = file_mtime_ms(&full_path).await.unwrap_or(entry.mtime);
-            let updated_entry = CacheEntry {
-                path: path.clone(),
-                plaintext_hash: materialized.plaintext_hash,
-                encrypted_hash: entry.encrypted_hash.clone(),
-                size: materialized.size,
-                mtime: actual_mtime,
-                server_mtime: entry.server_mtime,
-                mode: entry.mode,
-                hydrated: true,
-                deleted_at: None,
-            };
-            ctx.db.upsert_cache_entry(&updated_entry).await?;
-            hydrated.push(path);
-        }
     }
 
     let (skipped, message) = if hydrated.is_empty() {
@@ -316,6 +359,10 @@ pub async fn do_cat(
 
 async fn do_cat_with_ctx(ctx: &SyncCtx<'_>, target_path: &str) -> Result<CatResult> {
     tracing::info!("Cat (path={})", target_path);
+    if !feanorfs_common::is_safe_rel_path(target_path) {
+        anyhow::bail!("cat target must be a safe relative workspace path");
+    }
+    let read_root = feanorfs_agent_core::workspace_read::WorkspaceReadRoot::open(ctx.base)?;
     let cache_entries = ctx.db.get_cache_entries().await?;
 
     let mut hydrated_first = false;
@@ -324,25 +371,50 @@ async fn do_cat_with_ctx(ctx: &SyncCtx<'_>, target_path: &str) -> Result<CatResu
     if let Some(entry) = cache_entries.get(target_path) {
         if !entry.hydrated {
             tracing::info!("Auto-hydrating {}", target_path);
-            do_hydrate_with_ctx(ctx, Some(target_path.to_string())).await?;
-            hydrated_first = true;
+            let hydration = do_hydrate_with_ctx(ctx, Some(target_path.to_string())).await?;
+            hydrated_first = hydration.hydrated.iter().any(|path| path == target_path);
         }
     } else {
         tracing::warn!("File '{}' not tracked", target_path);
         untracked = true;
     }
 
-    let full_path = ctx.base.join(target_path);
-    if !full_path.exists() {
-        return Ok(CatResult {
-            content: Vec::new(),
-            hydrated_first,
-            untracked,
-            not_found: true,
-        });
+    let source = match read_root.open_regular(target_path) {
+        Ok(source) => source,
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| matches!(error.kind(), std::io::ErrorKind::NotFound))
+            }) =>
+        {
+            return Ok(CatResult {
+                content: Vec::new(),
+                hydrated_first,
+                untracked,
+                not_found: true,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut source = tokio::fs::File::from_std(source);
+    let before = source.metadata().await?;
+    let mut content = Vec::new();
+    {
+        let limit = before
+            .len()
+            .checked_add(1)
+            .context("cat file size overflow")?;
+        let mut bounded = (&mut source).take(limit);
+        bounded.read_to_end(&mut content).await?;
     }
-
-    let content = fs::read(full_path).await?;
+    let after = source.metadata().await?;
+    if content.len() as u64 != before.len()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        anyhow::bail!("workspace file {target_path} changed while it was being read");
+    }
     Ok(CatResult {
         content,
         hydrated_first,
@@ -390,7 +462,7 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
                 skipped_symlinks,
             })
         }
-        Ok((response, blocked)) => {
+        Ok((response, blocked, _)) => {
             let server_files: Vec<FileState> = conflicts::load_server_view(ctx)
                 .await?
                 .into_values()

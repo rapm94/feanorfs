@@ -5,7 +5,7 @@ use feanorfs_client::{
     AgentListOfflineResult, AgentListResult, AgentMessageInput, AgentMessageKind, ApiClient,
     ClientDb, RefreshOptions, SpawnResult,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::util::{output_json, terminal_line};
 
@@ -115,6 +115,11 @@ pub enum AgentAction {
         #[command(subcommand)]
         action: super::integrator::IntegratorAction,
     },
+    /// Configure and control the workspace's unattended agent runner.
+    Runner {
+        #[command(subcommand)]
+        action: super::runner::RunnerAction,
+    },
     /// Preview agent changes (legacy — prefer `agent status <name>`)
     #[command(hide = true)]
     Check { name: String },
@@ -130,6 +135,10 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
         }
         AgentAction::Integrator { action } => {
             super::integrator::run(current_dir, action, json).await?
+        }
+        AgentAction::Runner { action } => {
+            let control_root = control_workspace_root(current_dir)?;
+            super::runner::run(&control_root, action, json).await?
         }
         AgentAction::Status { name: None } => run_agent_status_list(current_dir, json).await?,
         AgentAction::List => run_agent_list_legacy(current_dir, json).await?,
@@ -225,6 +234,18 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 anyhow::bail!("`agent run` requires a command after `--`");
             }
             feanorfs_client::agent::validate_name(&name)?;
+            let workspace_root = current_dir.canonicalize().map_err(|error| {
+                anyhow::anyhow!(
+                    "Could not resolve shared workspace root '{}': {error}",
+                    current_dir.display()
+                )
+            })?;
+            if !workspace_root.is_dir() {
+                anyhow::bail!(
+                    "Shared workspace root '{}' is not a directory.",
+                    workspace_root.display()
+                );
+            }
             let agent_path = feanorfs_client::agent::agent_dir(current_dir, &name)?;
             if !agent_path.exists() {
                 anyhow::bail!(
@@ -236,7 +257,8 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             cmd.args(&command[1..])
                 .current_dir(&agent_path)
                 .env("FEANORFS_AGENT", &name)
-                .env("FEANORFS_AGENT_DIR", agent_dir_abs);
+                .env("FEANORFS_AGENT_DIR", agent_dir_abs)
+                .env("FEANORFS_WORKSPACE_ROOT", workspace_root);
             let status = cmd.status()?;
             if !status.success() {
                 std::process::exit(status.code().unwrap_or(1));
@@ -289,15 +311,42 @@ fn agent_sender(explicit: Option<String>) -> String {
         .unwrap_or_else(|| "human".to_string())
 }
 
+pub(super) fn control_workspace_root(current_dir: &Path) -> anyhow::Result<PathBuf> {
+    let Some(value) = std::env::var_os("FEANORFS_WORKSPACE_ROOT") else {
+        return Ok(current_dir.to_path_buf());
+    };
+    let root = PathBuf::from(value);
+    if !root.is_absolute() {
+        anyhow::bail!(
+            "FEANORFS_WORKSPACE_ROOT must be an absolute workspace path; got '{}'. Unset it or rerun `feanorfs agent run` from the shared workspace.",
+            root.display()
+        );
+    }
+    let root = root.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "FEANORFS_WORKSPACE_ROOT '{}' is unavailable: {error}. Unset it or rerun `feanorfs agent run` from the shared workspace.",
+            root.display()
+        )
+    })?;
+    if !root.is_dir() {
+        anyhow::bail!(
+            "FEANORFS_WORKSPACE_ROOT '{}' must identify a workspace directory.",
+            root.display()
+        );
+    }
+    Ok(root)
+}
+
 async fn run_agent_send(
     current_dir: &Path,
     json: bool,
     args: SendSignalArgs,
 ) -> anyhow::Result<()> {
-    let config = load_config(current_dir)?;
-    let db = crate::open_client_db(current_dir).await?;
-    let api = crate::open_api_client(current_dir, &config).await?;
-    let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, current_dir, &config)?;
+    let control_root = control_workspace_root(current_dir)?;
+    let config = load_config(&control_root)?;
+    let db = crate::open_client_db(&control_root).await?;
+    let api = crate::open_api_client(&control_root, &config).await?;
+    let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, &control_root, &config)?;
     let sender = agent_sender(args.from);
     let result = feanorfs_client::send_message(
         &ctx,
@@ -332,10 +381,11 @@ async fn run_agent_inbox(
     after: Option<&str>,
     limit: Option<usize>,
 ) -> anyhow::Result<()> {
-    let config = load_config(current_dir)?;
-    let db = crate::open_client_db(current_dir).await?;
-    let api = crate::open_api_client(current_dir, &config).await?;
-    let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, current_dir, &config)?;
+    let control_root = control_workspace_root(current_dir)?;
+    let config = load_config(&control_root)?;
+    let db = crate::open_client_db(&control_root).await?;
+    let api = crate::open_api_client(&control_root, &config).await?;
+    let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, &control_root, &config)?;
     let recipient = agent_sender(for_recipient.map(str::to_string));
     let result = feanorfs_client::inbox(
         &ctx,

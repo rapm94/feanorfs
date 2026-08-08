@@ -3,9 +3,10 @@ use feanorfs_common::{detect_concurrent_edits, ConcurrentEdit, ConflictKind, Fil
 use std::collections::{HashMap, HashSet};
 
 use crate::ctx::SyncCtx;
-use crate::local::ClientDb;
 use crate::paths::{agent_dir, validate_name};
 use crate::snapshot::SnapshotEngine;
+
+use super::runtime::open_agent_runtime;
 
 pub(super) struct AgentDiff {
     pub(super) current_head: String,
@@ -72,12 +73,9 @@ pub(super) async fn compute_agent_diff(ctx: &SyncCtx<'_>, name: &str) -> Result<
         }
     };
     let server_files = snapshots.load_files(&current_head).await?;
-    let agent_cache = ClientDb::new(crate::workspace_layout::ensure_workspace_state(
-        &agent_path,
-    )?)
-    .await?;
+    let agent_runtime = open_agent_runtime(ctx.base, name).await?;
     let agent_scan =
-        crate::local::scan_local_directory(&agent_path, &agent_cache, ctx.password()).await?;
+        crate::local::scan_local_directory(&agent_path, &agent_runtime.db, ctx.password()).await?;
     let our_diff = snapshots.diff_file_view(&base_id, &agent_scan).await?;
     let their_diff = snapshots.diff_file_view(&base_id, &server_files).await?;
 

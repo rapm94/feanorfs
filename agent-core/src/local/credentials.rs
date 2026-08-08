@@ -18,11 +18,28 @@ pub enum CredentialProtection {
     PrivateFile,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub(super) struct Secrets {
     version: u8,
     pub encryption_password: Option<String>,
     pub server_password: Option<String>,
+}
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Secrets")
+            .field("version", &self.version)
+            .field(
+                "encryption_password",
+                &self.encryption_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "server_password",
+                &self.server_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Secrets {

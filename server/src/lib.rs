@@ -18,6 +18,8 @@ pub use tls::{prepare_tls, TlsIdentity};
 
 /// Maximum request/response body size for upload/download (100 MiB).
 pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+/// Maximum encoded reachability manifest body size (64 MiB).
+pub const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +37,9 @@ pub async fn init_app_state(
         storage_dir: data_dir,
         auth_token,
         publication_lock: Arc::new(tokio::sync::RwLock::new(())),
+        protected_requests: Arc::new(tokio::sync::Semaphore::new(app::MAX_PROTECTED_REQUESTS)),
+        upload_requests: Arc::new(tokio::sync::Semaphore::new(app::MAX_UPLOAD_REQUESTS)),
+        manifest_requests: Arc::new(tokio::sync::Semaphore::new(app::MAX_MANIFEST_REQUESTS)),
         pair_relay: app::routes_pair_relay::PairRelayState::default(),
         tunnel_relay: app::routes_tunnel_relay::TunnelRelayState::default(),
     })

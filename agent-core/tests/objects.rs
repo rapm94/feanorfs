@@ -1,3 +1,5 @@
+feanorfs_test_support::isolate_test_process!();
+
 use feanorfs_agent_core::{
     ensure_workspace_state, ApiClient, ClientDb, LocalHub, ObjectStore, SyncCtx,
 };

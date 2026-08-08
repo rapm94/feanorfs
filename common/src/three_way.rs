@@ -9,7 +9,7 @@ pub fn classify_conflict_kind(
     theirs: Option<&FileState>,
     their_deleted: bool,
 ) -> ConflictKind {
-    let we_deleted = ours.is_some_and(|o| o.deleted);
+    let we_deleted = ours.is_none() || ours.is_some_and(|o| o.deleted);
     let they_deleted = their_deleted || theirs.is_some_and(|t| t.deleted);
     if we_deleted && !they_deleted && !base.deleted {
         ConflictKind::DeleteEdit
@@ -74,9 +74,7 @@ pub fn detect_concurrent_edits(
         let base_entry = base.get(&path);
 
         if let Some(base_entry) = base_entry {
-            let we_changed = ours
-                .map(|ours| !same_content(Some(ours), Some(base_entry)))
-                .unwrap_or(false);
+            let we_changed = !same_content(ours, Some(base_entry));
             let server_changed = their_changed.contains_key(&path) || their_deleted.contains(&path);
 
             if we_changed && server_changed {

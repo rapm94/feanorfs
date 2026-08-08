@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use super::LocalStateV1;
+use super::{LocalStateV1, MAX_LOCAL_STATE_BYTES};
 use crate::durable::{
     atomic_overwrite, create_lock_acquire_exclusive, open_lock_exclusive, open_lock_shared,
 };
@@ -25,7 +26,7 @@ impl DurableState {
         let lock_file = create_lock_acquire_exclusive(&lock_path)?;
 
         if state_path.exists() {
-            let content = fs::read_to_string(&state_path).context("read existing state")?;
+            let content = read_local_state_text(&state_path)?;
             LocalStateV1::from_json(&content)?;
         } else {
             let json = LocalStateV1::default().to_json()?;
@@ -76,8 +77,30 @@ impl DurableState {
 }
 
 fn read_state_file(path: &Path) -> Result<LocalStateV1> {
-    let content = crate::durable::read_file_required(path)?;
+    let content = read_local_state_text(path)?;
     LocalStateV1::from_json(&content)
+}
+
+pub(crate) fn read_local_state_text(path: &Path) -> Result<String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("{} is missing — local state is corrupt", path.display())
+        }
+        Err(error) => return Err(error).context("inspect local state"),
+    };
+    if metadata.len() > MAX_LOCAL_STATE_BYTES as u64 {
+        bail!("local_state.json exceeds {MAX_LOCAL_STATE_BYTES} byte limit");
+    }
+    let file = fs::File::open(path).context("open local state")?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_LOCAL_STATE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .context("read local state")?;
+    if bytes.len() > MAX_LOCAL_STATE_BYTES {
+        bail!("local_state.json exceeds {MAX_LOCAL_STATE_BYTES} byte limit");
+    }
+    String::from_utf8(bytes).context("local_state.json is not UTF-8")
 }
 
 /// Reject any live `local_cache.db`; migration must run first.
