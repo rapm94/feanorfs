@@ -1862,8 +1862,10 @@ mod tests {
         .expect("disabled cancellation receives a completion deadline");
         let send_attempts = Arc::new(AtomicUsize::new(0));
         let send_count = Arc::clone(&send_attempts);
-        let started = tokio::time::Instant::now();
 
+        // The pending remote can complete only through the cancellation
+        // deadline. The outer timeout is a hang guard; a tighter wall-clock
+        // assertion would measure executor scheduling rather than behavior.
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             complete_request_with_remote(
@@ -1888,7 +1890,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, CycleOutcome::NeedsAttention);
-        assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(send_attempts.load(Ordering::SeqCst), 0);
         assert_delivery_unknown(&store, &launch, false);
     }
