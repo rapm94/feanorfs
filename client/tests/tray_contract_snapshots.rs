@@ -4,6 +4,15 @@ feanorfs_test_support::isolate_test_process!();
 
 use feanorfs_common::tray_contract::fixtures;
 
+fn normalize_package_version(json: String) -> String {
+    let version = format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"));
+    assert!(
+        json.contains(&version),
+        "versioned contract fixture must contain the package version"
+    );
+    json.replacen(&version, "\"version\":\"<package-version>\"", 1)
+}
+
 macro_rules! contract_snapshot {
     ($name:ident, $json:expr) => {
         #[test]
@@ -24,4 +33,7 @@ contract_snapshot!(recent_workspaces_json, fixtures::recent_workspaces_json());
 contract_snapshot!(tray_pause_json, fixtures::tray_pause_json());
 contract_snapshot!(conflict_keep_json, fixtures::conflict_keep_json());
 contract_snapshot!(conflict_show_json, fixtures::conflict_show_json());
-contract_snapshot!(worker_status_json, fixtures::worker_status_json());
+contract_snapshot!(
+    worker_status_json,
+    normalize_package_version(fixtures::worker_status_json())
+);

@@ -11,11 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(release)* carry product changes
-- add unattended agent collaboration
-
-### Added
-
 - **Optional local agent runner** — `feanorfs agent runner setup/start/stop/status/reset/remove` configures one explicit, fixed-command worker for one existing format-v3 agent workspace. It admits only direct `request` signals, supplies one bounded JSON invocation on stdin, and waits for one correlated `result` or `blocked` terminal; native process ownership tears down descendants on timeout/cancel/exit, and supervised stop waits for durable workspace reconciliation when authority exists. Cursor resets, queue overflow, ambiguous execution, unknown terminal delivery, and local preparation failures require inspect-and-discard/reset recovery and are never automatically replayed.
 
 ### Fixed
