@@ -29,6 +29,11 @@ use tokio::io::AsyncWriteExt as _;
 const AGENT: &str = "runner-worker";
 const SECRET_OUTPUT: &str = "runner-private-output-must-not-leak";
 
+// This integration-test executable owns one isolated process profile. Its
+// real-process tests must not concurrently mutate that profile or supervise
+// children registered in it.
+static REAL_PROCESS_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug, Serialize, Deserialize)]
 struct InvocationRecord {
     invocation: RunnerInvocation,
@@ -702,6 +707,7 @@ fn assert_cli_success(output: &std::process::Output) {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn test_child_drop_reaps_a_hanging_process() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     use std::os::unix::process::CommandExt as _;
 
     let mut command = tokio::process::Command::new("/bin/sleep");
@@ -724,6 +730,7 @@ async fn test_child_drop_reaps_a_hanging_process() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn persistent_reaper_handoff_reaps_after_bounded_cleanup() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     use std::os::unix::process::CommandExt as _;
 
     let mut command = tokio::process::Command::new("/bin/sleep");
@@ -753,6 +760,7 @@ async fn persistent_reaper_handoff_reaps_after_bounded_cleanup() {
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn visible_runner_cli_reconfigures_redacts_resets_and_preserves_agent_on_remove() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let server = spawn_test_server().await;
     let client = spawn_test_client_with_server(&server).await;
     let mut config = load_config(client.workspace.path()).unwrap();
@@ -931,6 +939,7 @@ async fn visible_runner_cli_reconfigures_redacts_resets_and_preserves_agent_on_r
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn visible_runner_stop_is_idempotent_on_an_empty_profile() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner_workspace().await;
     let output = run_cli(fixture.root(), &["--json", "agent", "runner", "stop"]).await;
     assert_cli_success(&output);
@@ -944,6 +953,7 @@ async fn visible_runner_stop_is_idempotent_on_an_empty_profile() {
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn visible_runner_setup_is_fresh_without_supervisor_authority() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner_workspace().await;
     let program = fixture.helper_program.to_str().unwrap();
     let mut args = vec![
@@ -970,6 +980,7 @@ async fn visible_runner_setup_is_fresh_without_supervisor_authority() {
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn visible_runner_stop_on_disabled_configured_runner_without_authority_succeeds() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner_workspace().await;
     let program = fixture.helper_program.to_str().unwrap();
     let mut setup_args = vec![
@@ -1001,6 +1012,7 @@ async fn visible_runner_stop_on_disabled_configured_runner_without_authority_suc
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn visible_runner_repeated_setup_without_supervisor_authority_succeeds() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner_workspace().await;
     let program = fixture.helper_program.to_str().unwrap();
     let mut setup_args = vec![
@@ -1029,6 +1041,7 @@ async fn visible_runner_repeated_setup_without_supervisor_authority_succeeds() {
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn visible_runner_fresh_setup_waits_for_a_stale_registry_entry() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner_workspace().await;
     let temp = tempfile::tempdir().unwrap();
     let mut supervisor = ManualSupervisor::spawn(
@@ -1086,6 +1099,7 @@ async fn visible_runner_fresh_setup_waits_for_a_stale_registry_entry() {
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "current_thread")]
 async fn visible_runner_stop_prevents_resurrection_across_manual_supervisor_restart() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     // The manual supervisor and visible CLI commands share the isolated
     // profile; ManualSupervisor's process-local guard serializes this test
     // with the other tests that own a supervisor child.
@@ -1166,6 +1180,7 @@ async fn visible_runner_stop_prevents_resurrection_across_manual_supervisor_rest
 
 #[tokio::test]
 async fn invocation_contract_and_child_published_terminal_complete() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner().await;
     let request = send_request(&fixture, AGENT, "perform the configured task").await;
     let temp = tempfile::tempdir().unwrap();
@@ -1214,6 +1229,7 @@ async fn invocation_contract_and_child_published_terminal_complete() {
 
 #[tokio::test]
 async fn generic_blocked_fallback_never_leaks_process_output() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner().await;
     let request = send_request(&fixture, AGENT, "fallback request").await;
     let temp = tempfile::tempdir().unwrap();
@@ -1244,6 +1260,7 @@ async fn generic_blocked_fallback_never_leaks_process_output() {
 
 #[tokio::test]
 async fn direct_requests_execute_sequentially_and_broadcast_is_ignored() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner().await;
     send_request(&fixture, AGENT, "first direct").await;
     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1266,6 +1283,7 @@ async fn direct_requests_execute_sequentially_and_broadcast_is_ignored() {
 
 #[tokio::test]
 async fn disable_cancels_current_child_and_completes_durable_state() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner().await;
     let request = send_request(&fixture, AGENT, "long-running request").await;
     let temp = tempfile::tempdir().unwrap();
@@ -1303,6 +1321,7 @@ async fn disable_cancels_current_child_and_completes_durable_state() {
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn foreground_invocation_cancellation_kills_term_ignoring_descendant() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner().await;
     let supervisor_record = tempfile::tempdir().unwrap();
     let mut supervisor = ManualSupervisor::spawn(
@@ -1363,6 +1382,7 @@ async fn foreground_invocation_cancellation_kills_term_ignoring_descendant() {
 #[cfg(unix)]
 #[tokio::test]
 async fn normal_exit_terminates_remaining_process_group_before_completion() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner().await;
     let request = send_request(&fixture, AGENT, "normal-exit process tree").await;
     let temp = tempfile::tempdir().unwrap();
@@ -1396,6 +1416,7 @@ async fn normal_exit_terminates_remaining_process_group_before_completion() {
 
 #[tokio::test]
 async fn startup_ambiguous_checkpoint_never_relaunches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner().await;
     let request = send_request(&fixture, AGENT, "must not replay").await;
     let store = fixture.store();
@@ -1439,6 +1460,7 @@ async fn startup_ambiguous_checkpoint_never_relaunches() {
 
 #[tokio::test]
 async fn startup_running_checkpoint_never_relaunches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     let fixture = setup_runner().await;
     let request = send_request(&fixture, AGENT, "running request must not replay").await;
     let store = fixture.store();
@@ -1517,6 +1539,7 @@ async fn assert_process_dies(pid: u32) {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn exec_gate_release_preserves_process_identity_and_io() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     use std::os::unix::process::CommandExt as _;
 
     let temp = tempfile::tempdir().unwrap();
@@ -1583,6 +1606,7 @@ async fn exec_gate_release_preserves_process_identity_and_io() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn exec_gate_owner_drop_prevents_target_execution() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
     use std::os::unix::process::CommandExt as _;
 
     let temp = tempfile::tempdir().unwrap();
