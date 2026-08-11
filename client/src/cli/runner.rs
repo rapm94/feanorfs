@@ -257,7 +257,7 @@ impl RunnerSupervisorOps for SystemRunnerSupervisorOps {
     }
 
     fn wait_for_runner_child(&mut self, workspace: &str) -> anyhow::Result<()> {
-        supervisor::wait_for_runner_child(workspace, supervisor::READY_TIMEOUT)
+        supervisor::wait_for_runner_child(workspace, supervisor::RUNNER_READY_TIMEOUT)
     }
 
     fn wait_for_runner_stopped(&mut self, workspace: &Path) -> anyhow::Result<()> {

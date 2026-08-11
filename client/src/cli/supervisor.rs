@@ -43,6 +43,8 @@ const MARKER_FILE: &str = "supervisor-service-program";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(5);
+// Runner startup also performs native process-tree adoption and exact identity checks.
+pub(crate) const RUNNER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const CHILD_REAP_GRACE: Duration = Duration::from_secs(1);
 const BACKOFF_BASE_SECS: u64 = 1;
 const BACKOFF_MAX_SECS: u64 = 60;
@@ -1070,7 +1072,8 @@ pub(crate) fn wait_for_runner_child(canonical: &str, timeout: Duration) -> anyho
         std::thread::sleep(Duration::from_millis(50));
     }
     anyhow::bail!(
-        "the agent runner did not reach the supervised running state within 5 seconds; run `feanorfs agent runner status` and retry"
+        "the agent runner did not reach the supervised running state within {} seconds; run `feanorfs agent runner status` and retry",
+        timeout.as_secs()
     )
 }
 
