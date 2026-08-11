@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The per-user tray instance guard now explicitly releases its operating-system
   file lock before closing the handle, so a replacement tray can acquire the
   singleton lock immediately and reliably after the prior tray exits.
+- Windows materialization now flushes files through write-capable handles before
+  restoring read-only attributes and avoids unsupported directory-handle flushes,
+  so downloads and rollback recovery no longer fail with `Access is denied`.
+- Windows rollback and crash recovery now delete only the exact verified file or
+  transaction-created directory handles, preserve concurrent replacements and
+  pre-existing empty parents, and restore directory-to-file transitions safely.
+- Windows supervisor ownership now publishes an exact process identity beside
+  its whole-file lock, so runner stop acknowledgements remain readable and
+  bounded while the supervisor is active.
 
 ### Security
 

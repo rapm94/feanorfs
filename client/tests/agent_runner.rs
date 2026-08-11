@@ -437,6 +437,7 @@ impl TestChild {
             }
         }
 
+        #[cfg(unix)]
         let pid = child.id();
         #[cfg(unix)]
         if let Some(pid) = pid {
@@ -497,6 +498,7 @@ impl TestChild {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        #[cfg(unix)]
         let pid = child.id();
         #[cfg(unix)]
         if let Some(pid) = pid {
@@ -1676,9 +1678,7 @@ fn runner_child_helper() {
                 // foreground worker's targeted Ctrl+Break. Its eventual
                 // death therefore comes from Job teardown, not the console
                 // event itself.
-                descendant
-                    .as_std_mut()
-                    .creation_flags(CREATE_NEW_PROCESS_GROUP);
+                descendant.creation_flags(CREATE_NEW_PROCESS_GROUP);
             }
             let mut descendant = descendant.spawn().unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);

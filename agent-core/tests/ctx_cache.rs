@@ -55,36 +55,40 @@ async fn state_dir_cache_retries_pins_and_allows_fresh_context_relocation() {
     });
     fs::rename(&moved_state, &retry_state).unwrap();
 
-    // A context pins its successful resolution across an on-disk workspace
-    // rename. A fresh context re-resolves the inode identity and updates the
-    // durable location while retaining the same private state directory.
-    let parent = tempfile::tempdir().unwrap();
-    let original = parent.path().join("original");
-    let relocated = parent.path().join("relocated");
-    fs::create_dir(&original).unwrap();
-    let first = SyncCtx::new(
-        &api,
-        &db,
-        &original,
-        "relocate",
-        Some("key"),
-        LegacyPolicy::Reject,
-    );
-    let state = first.state_dir().unwrap();
-    fs::rename(&original, &relocated).unwrap();
-    assert_eq!(first.state_dir().unwrap(), state);
+    // Unix uses inode identity to relocate a fresh context after an on-disk
+    // workspace rename. Windows and other weak-filesystem targets currently
+    // have no stable identity implementation, so this subscenario is not a
+    // portability promise there (see TODO AI-5).
+    #[cfg(unix)]
+    {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("original");
+        let relocated = parent.path().join("relocated");
+        fs::create_dir(&original).unwrap();
+        let first = SyncCtx::new(
+            &api,
+            &db,
+            &original,
+            "relocate",
+            Some("key"),
+            LegacyPolicy::Reject,
+        );
+        let state = first.state_dir().unwrap();
+        fs::rename(&original, &relocated).unwrap();
+        assert_eq!(first.state_dir().unwrap(), state);
 
-    let fresh = SyncCtx::new(
-        &api,
-        &db,
-        &relocated,
-        "relocate",
-        Some("key"),
-        LegacyPolicy::Reject,
-    );
-    assert_eq!(fresh.state_dir().unwrap(), state);
-    assert_eq!(
-        fs::read_to_string(state.join("location")).unwrap(),
-        fs::canonicalize(relocated).unwrap().to_str().unwrap()
-    );
+        let fresh = SyncCtx::new(
+            &api,
+            &db,
+            &relocated,
+            "relocate",
+            Some("key"),
+            LegacyPolicy::Reject,
+        );
+        assert_eq!(fresh.state_dir().unwrap(), state);
+        assert_eq!(
+            fs::read_to_string(state.join("location")).unwrap(),
+            fs::canonicalize(relocated).unwrap().to_str().unwrap()
+        );
+    }
 }

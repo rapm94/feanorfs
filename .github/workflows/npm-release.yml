@@ -164,9 +164,9 @@ jobs:
           USE_ZIG: ${{ matrix.zig }}
         run: |
           set -euo pipefail
-          args=(build --release -p feanorfs-agent-node --target "$TARGET")
+          args=(build --platform --release -p feanorfs-agent-node --target "$TARGET")
           if [ "$USE_ZIG" = "true" ]; then
-            args+=(--zig)
+            args+=(--cross-compile)
           fi
           ./node_modules/.bin/napi "${args[@]}"
           test -f "$ARTIFACT"

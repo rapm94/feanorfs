@@ -740,6 +740,424 @@ async fn failed_new_nested_download_removes_transaction_created_directories() {
     }
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_user_parent_created_after_validation_survives_rollback() {
+    let server = spawn_test_server().await;
+    let first = spawn_test_client_with_server(&server).await;
+    let second = spawn_test_client_with_server(&server).await;
+    write_workspace_file(first.workspace.path(), "new/nested/file.txt", b"remote").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let second_path = second.workspace.path().to_path_buf();
+    let second_state = state_path(&second_path);
+    tokio::fs::write(
+        second_state.join("test-sync-pause"),
+        b"after-final-validation-1",
+    )
+    .await
+    .unwrap();
+    let url = server.url.clone();
+    let task_path = second_path.clone();
+    let task_state = second_state.clone();
+    let sync = tokio::spawn(async move {
+        let api = feanorfs_client::ApiClient::new(&url, None);
+        let db = feanorfs_client::ClientDb::new(task_state).await.unwrap();
+        do_sync(
+            &api,
+            &db,
+            &task_path,
+            WORKSPACE_ID,
+            Some(TEST_PASSWORD),
+            false,
+        )
+        .await
+    });
+    let reached = second_state.join("test-sync-pause-reached");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reached.exists() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The parent was absent when validation paused, but belongs to the user
+    // when the publication helper observes it. Rollback must not infer that
+    // it was transaction-created merely because it is now present.
+    tokio::fs::create_dir_all(second_path.join("new/nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        second_state.join("test-materialize-failpoint"),
+        b"after-publish-mutation-1",
+    )
+    .await
+    .unwrap();
+    tokio::fs::remove_file(second_state.join("test-sync-pause"))
+        .await
+        .unwrap();
+    sync.await
+        .unwrap()
+        .expect_err("injected publication failure must abort the sync");
+
+    assert!(second_path.join("new/nested").is_dir());
+    assert!(std::fs::read_dir(second_path.join("new/nested"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert!(std::fs::read_dir(&second_path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .all(|entry| !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".feanorfs-tmp-materialize-")));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_directory_to_file_rollback_restores_removed_parent() {
+    let server = spawn_test_server().await;
+    let first = spawn_test_client_with_server(&server).await;
+    let second = spawn_test_client_with_server(&server).await;
+    write_workspace_file(first.workspace.path(), "d/f", b"old").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    tokio::fs::remove_file(first.workspace.path().join("d/f"))
+        .await
+        .unwrap();
+    tokio::fs::remove_dir(first.workspace.path().join("d"))
+        .await
+        .unwrap();
+    write_workspace_file(first.workspace.path(), "d", b"remote-new").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let original_file = second.workspace.path().join("d/f");
+    let mut readonly_permissions = std::fs::metadata(&original_file).unwrap().permissions();
+    readonly_permissions.set_readonly(true);
+    std::fs::set_permissions(&original_file, readonly_permissions).unwrap();
+    let before_cache = second.db.get_cache_entries().await.unwrap();
+    let force_basic_delete = state_path(second.workspace.path()).join("test-force-basic-delete");
+    tokio::fs::write(&force_basic_delete, b"1").await.unwrap();
+    tokio::fs::write(
+        state_path(second.workspace.path()).join("test-materialize-failpoint"),
+        b"after-publish-mutation-1",
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .expect_err("directory-to-file publication failure must roll back");
+
+    assert_eq!(
+        read_workspace_file(second.workspace.path(), "d/f").await,
+        b"old"
+    );
+    assert!(second.workspace.path().join("d").is_dir());
+    assert!(!second.workspace.path().join("d").is_file());
+    assert!(std::fs::metadata(&original_file)
+        .unwrap()
+        .permissions()
+        .readonly());
+    assert!(!std::fs::read_dir(second.workspace.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".feanorfs-tmp-materialize-")));
+    let cache_after = second.db.get_cache_entries().await.unwrap();
+    assert_eq!(
+        cache_after.get("d/f").map(|entry| &entry.encrypted_hash),
+        before_cache.get("d/f").map(|entry| &entry.encrypted_hash)
+    );
+    assert!(!cache_after.contains_key("d"));
+    tokio::fs::remove_file(force_basic_delete).await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_directory_to_file_recovery_restores_removed_parent_before_retry() {
+    let server = spawn_test_server().await;
+    let first = spawn_test_client_with_server(&server).await;
+    let second = spawn_test_client_with_server(&server).await;
+    write_workspace_file(first.workspace.path(), "d/f", b"old").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    tokio::fs::remove_file(first.workspace.path().join("d/f"))
+        .await
+        .unwrap();
+    tokio::fs::remove_dir(first.workspace.path().join("d"))
+        .await
+        .unwrap();
+    write_workspace_file(first.workspace.path(), "d", b"remote-new").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let before_cache = second.db.get_cache_entries().await.unwrap();
+    let second_path = second.workspace.path().to_path_buf();
+    let second_state = state_path(&second_path);
+    tokio::fs::write(second_state.join("test-sync-pause"), b"after-publish-1")
+        .await
+        .unwrap();
+    let url = server.url.clone();
+    let task_path = second_path.clone();
+    let task_state = second_state.clone();
+    let sync = tokio::spawn(async move {
+        let api = feanorfs_client::ApiClient::new(&url, None);
+        let db = feanorfs_client::ClientDb::new(task_state).await.unwrap();
+        do_sync(
+            &api,
+            &db,
+            &task_path,
+            WORKSPACE_ID,
+            Some(TEST_PASSWORD),
+            false,
+        )
+        .await
+    });
+    let reached = second_state.join("test-sync-pause-reached");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reached.exists() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    sync.abort();
+    assert!(sync.await.unwrap_err().is_cancelled());
+    tokio::fs::remove_file(second_state.join("test-sync-pause"))
+        .await
+        .unwrap();
+    assert!(std::fs::read_dir(&second_path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".feanorfs-tmp-materialize-")));
+
+    // Force the recovery pass to complete before negotiation. This leaves the
+    // restored pre-transaction bytes observable while proving the journal is
+    // no longer a wedge if the next hub attempt is unavailable.
+    let unavailable = feanorfs_client::ApiClient::new("http://127.0.0.1:1", None);
+    do_sync(
+        &unavailable,
+        &second.db,
+        &second_path,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .expect_err("recovery should finish before the unavailable retry fails");
+    assert_eq!(read_workspace_file(&second_path, "d/f").await, b"old");
+    assert!(second_path.join("d").is_dir());
+    let cache_after = second.db.get_cache_entries().await.unwrap();
+    assert_eq!(
+        cache_after.get("d/f").map(|entry| &entry.encrypted_hash),
+        before_cache.get("d/f").map(|entry| &entry.encrypted_hash)
+    );
+    assert!(!cache_after.contains_key("d"));
+    assert!(std::fs::read_dir(&second_path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .all(|entry| !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".feanorfs-tmp-materialize-")));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_directory_to_file_recovery_before_first_publication_restores_parent() {
+    let server = spawn_test_server().await;
+    let first = spawn_test_client_with_server(&server).await;
+    let second = spawn_test_client_with_server(&server).await;
+    write_workspace_file(first.workspace.path(), "d/f", b"old").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    tokio::fs::remove_file(first.workspace.path().join("d/f"))
+        .await
+        .unwrap();
+    tokio::fs::remove_dir(first.workspace.path().join("d"))
+        .await
+        .unwrap();
+    write_workspace_file(first.workspace.path(), "d", b"remote-new").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let before_cache = second.db.get_cache_entries().await.unwrap();
+    let second_path = second.workspace.path().to_path_buf();
+    let second_state = state_path(&second_path);
+    tokio::fs::write(
+        second_state.join("test-sync-pause"),
+        b"after-final-validation-1",
+    )
+    .await
+    .unwrap();
+    let url = server.url.clone();
+    let task_path = second_path.clone();
+    let task_state = second_state.clone();
+    let sync = tokio::spawn(async move {
+        let api = feanorfs_client::ApiClient::new(&url, None);
+        let db = feanorfs_client::ClientDb::new(task_state).await.unwrap();
+        do_sync(
+            &api,
+            &db,
+            &task_path,
+            WORKSPACE_ID,
+            Some(TEST_PASSWORD),
+            false,
+        )
+        .await
+    });
+    let reached = second_state.join("test-sync-pause-reached");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reached.exists() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let stage = std::fs::read_dir(&second_path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(".feanorfs-tmp-materialize-")
+            })
+        })
+        .expect("cancelled pre-publication stage");
+    let journal: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(stage.join("journal.json")).await.unwrap())
+            .unwrap();
+    assert_eq!(journal["publication_progress_recorded"], true);
+    assert!(journal["published_paths"].is_null());
+    assert!(journal["publishing_path"].is_null());
+
+    sync.abort();
+    assert!(sync.await.unwrap_err().is_cancelled());
+    tokio::fs::remove_file(second_state.join("test-sync-pause"))
+        .await
+        .unwrap();
+    assert!(stage.exists());
+
+    let unavailable = feanorfs_client::ApiClient::new("http://127.0.0.1:1", None);
+    do_sync(
+        &unavailable,
+        &second.db,
+        &second_path,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .expect_err("recovery should finish before the unavailable retry fails");
+    assert_eq!(read_workspace_file(&second_path, "d/f").await, b"old");
+    assert!(second_path.join("d").is_dir());
+    assert!(!second_path.join("d").is_file());
+    let cache_after = second.db.get_cache_entries().await.unwrap();
+    assert_eq!(
+        cache_after.get("d/f").map(|entry| &entry.encrypted_hash),
+        before_cache.get("d/f").map(|entry| &entry.encrypted_hash)
+    );
+    assert!(!cache_after.contains_key("d"));
+    assert!(!stage.exists());
+}
+
 #[tokio::test]
 async fn every_activation_boundary_failure_restores_bytes_modes_and_cache() {
     let server = spawn_test_server().await;
@@ -1619,6 +2037,26 @@ async fn cancelled_activation_recovers_from_its_journal_on_next_sync() {
             .to_string_lossy()
             .starts_with(".feanorfs-tmp-materialize-")));
 
+    #[cfg(windows)]
+    {
+        let stage = std::fs::read_dir(&second_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with(".feanorfs-tmp-materialize-")
+                })
+            })
+            .expect("cancelled activation stage");
+        let journal: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(stage.join("journal.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(journal["published_paths"], serde_json::json!(["a.txt"]));
+        assert!(journal["publishing_path"].is_null());
+    }
+
     do_sync(
         &server.api,
         &second.db,
@@ -1639,6 +2077,116 @@ async fn cancelled_activation_recovers_from_its_journal_on_next_sync() {
             .file_name()
             .to_string_lossy()
             .starts_with(".feanorfs-tmp-materialize-")));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_cancelled_activation_refuses_in_place_edit_during_recovery() {
+    let server = spawn_test_server().await;
+    let first = spawn_test_client_with_server(&server).await;
+    let second = spawn_test_client_with_server(&server).await;
+    write_workspace_file(first.workspace.path(), "a.txt", b"old").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    do_sync(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    write_workspace_file(first.workspace.path(), "a.txt", b"remote-new").await;
+    do_sync(
+        &server.api,
+        &first.db,
+        first.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let second_path = second.workspace.path().to_path_buf();
+    let second_state = state_path(&second_path);
+    tokio::fs::write(second_state.join("test-sync-pause"), b"after-publish-1")
+        .await
+        .unwrap();
+    let url = server.url.clone();
+    let task_path = second_path.clone();
+    let task_state = second_state.clone();
+    let sync = tokio::spawn(async move {
+        let api = feanorfs_client::ApiClient::new(&url, None);
+        let db = feanorfs_client::ClientDb::new(task_state).await.unwrap();
+        do_sync(
+            &api,
+            &db,
+            &task_path,
+            WORKSPACE_ID,
+            Some(TEST_PASSWORD),
+            false,
+        )
+        .await
+    });
+    let reached = second_state.join("test-sync-pause-reached");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !reached.exists() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    sync.abort();
+    assert!(sync.await.unwrap_err().is_cancelled());
+    tokio::fs::remove_file(second_state.join("test-sync-pause"))
+        .await
+        .unwrap();
+
+    // The destination and stage/new/a.txt are hard links. An in-place edit of
+    // either path changes both, so identity alone must not authorize recovery.
+    write_workspace_file(&second_path, "a.txt", b"user-edit-before-recovery").await;
+    let error = do_sync(
+        &server.api,
+        &second.db,
+        &second_path,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .expect_err("recovery must refuse an in-place edit of the published hard link");
+    assert!(format!("{error:#}").contains("changed"));
+    assert_eq!(
+        read_workspace_file(&second_path, "a.txt").await,
+        b"user-edit-before-recovery"
+    );
+    let stages = std::fs::read_dir(&second_path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".feanorfs-tmp-materialize-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stages.len(), 1);
+    assert_eq!(
+        tokio::fs::read(stages[0].join("backup/a.txt"))
+            .await
+            .unwrap(),
+        b"old"
+    );
 }
 
 #[tokio::test]
@@ -1774,6 +2322,11 @@ async fn interrupted_activation_journal_restores_backups_before_next_sync() {
         .encrypted_hash
         .clone();
 
+    #[cfg(windows)]
+    let unrelated_parent = client.workspace.path().join("unrelated-parent");
+    #[cfg(windows)]
+    tokio::fs::create_dir(&unrelated_parent).await.unwrap();
+
     let stage = client
         .workspace
         .path()
@@ -1788,6 +2341,20 @@ async fn interrupted_activation_journal_restores_backups_before_next_sync() {
     .await
     .unwrap();
     write_workspace_file(client.workspace.path(), "recover.txt", b"interrupted-new").await;
+    #[cfg(windows)]
+    {
+        // Preserve the real interrupted topology: recovery only trusts this
+        // publication when stage/new and the destination are the same file
+        // identity.  The old-journal compatibility case omits only the
+        // created_directories field.
+        tokio::fs::create_dir_all(stage.join("new")).await.unwrap();
+        tokio::fs::hard_link(
+            client.workspace.path().join("recover.txt"),
+            stage.join("new/recover.txt"),
+        )
+        .await
+        .unwrap();
+    }
     let ciphertext =
         feanorfs_common::pack_bytes(b"interrupted-new", TEST_PASSWORD, "recover.txt").unwrap();
     let journal = serde_json::json!({
@@ -1840,6 +2407,148 @@ async fn interrupted_activation_journal_restores_backups_before_next_sync() {
             .encrypted_hash,
         cache_before
     );
+    #[cfg(windows)]
+    assert!(
+        unrelated_parent.is_dir(),
+        "old journals must not own unknown paths"
+    );
+
+    #[cfg(windows)]
+    {
+        let bad_stage = client
+            .workspace
+            .path()
+            .join(".feanorfs-tmp-materialize-unrelated-proof");
+        tokio::fs::create_dir(&bad_stage).await.unwrap();
+        let bad_journal = serde_json::json!({
+            "phase": "activating",
+            "original_paths": [],
+            "downloads": [],
+            "delete_paths": [],
+            "created_directories": [{"path": "unrelated-parent", "identity": null}]
+        });
+        tokio::fs::write(
+            bad_stage.join("journal.json"),
+            serde_json::to_vec(&bad_journal).unwrap(),
+        )
+        .await
+        .unwrap();
+        do_sync(
+            &server.api,
+            &client.db,
+            client.workspace.path(),
+            WORKSPACE_ID,
+            Some(TEST_PASSWORD),
+            false,
+        )
+        .await
+        .unwrap();
+        let quarantine = client
+            .workspace
+            .path()
+            .join(".feanorfs-tmp-recovery-materialize-unrelated-proof");
+        assert!(!bad_stage.exists());
+        assert!(quarantine.is_dir());
+        assert!(unrelated_parent.is_dir());
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn old_journal_nested_ancestor_survives_recovery() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    write_workspace_file(client.workspace.path(), "nested/recover.txt", b"old").await;
+    do_sync(
+        &server.api,
+        &client.db,
+        client.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let stage = client
+        .workspace
+        .path()
+        .join(".feanorfs-tmp-materialize-old-nested-test");
+    tokio::fs::create_dir_all(stage.join("backup/nested"))
+        .await
+        .unwrap();
+    tokio::fs::rename(
+        client.workspace.path().join("nested/recover.txt"),
+        stage.join("backup/nested/recover.txt"),
+    )
+    .await
+    .unwrap();
+    // Replace the now-empty ancestor with a user-owned directory.  An old
+    // journal has no directory proofs, so recovery must never remove it.
+    tokio::fs::remove_dir(client.workspace.path().join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir(client.workspace.path().join("nested"))
+        .await
+        .unwrap();
+    write_workspace_file(
+        client.workspace.path(),
+        "nested/recover.txt",
+        b"interrupted-new",
+    )
+    .await;
+    tokio::fs::create_dir_all(stage.join("new/nested"))
+        .await
+        .unwrap();
+    tokio::fs::hard_link(
+        client.workspace.path().join("nested/recover.txt"),
+        stage.join("new/nested/recover.txt"),
+    )
+    .await
+    .unwrap();
+    let ciphertext =
+        feanorfs_common::pack_bytes(b"interrupted-new", TEST_PASSWORD, "nested/recover.txt")
+            .unwrap();
+    let journal = serde_json::json!({
+        "phase": "activating",
+        "original_paths": ["nested/recover.txt"],
+        "downloads": [{
+            "file": {
+                "path": "nested/recover.txt",
+                "hash": feanorfs_common::hash_bytes(&ciphertext),
+                "size": 15,
+                "mtime": 0,
+                "deleted": false,
+                "mode": 0
+            },
+            "plaintext_hash": feanorfs_common::hash_bytes(b"interrupted-new"),
+            "hydrated": true
+        }],
+        "delete_paths": []
+    });
+    tokio::fs::write(
+        stage.join("journal.json"),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    do_sync(
+        &server.api,
+        &client.db,
+        client.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_workspace_file(client.workspace.path(), "nested/recover.txt").await,
+        b"old"
+    );
+    assert!(client.workspace.path().join("nested").is_dir());
+    assert!(!stage.exists());
 }
 
 #[cfg(unix)]
@@ -3362,7 +4071,9 @@ async fn agent_spawn_replace_resets_equal_metadata_runtime_cache() {
     let cached_mtime = std::fs::metadata(&agent_file).unwrap().modified().unwrap();
 
     let shared_file = write_workspace_file(base, "task.txt", b"next").await;
-    std::fs::File::open(&shared_file)
+    std::fs::File::options()
+        .write(true)
+        .open(&shared_file)
         .unwrap()
         .set_modified(cached_mtime + Duration::from_secs(1))
         .unwrap();
@@ -3380,7 +4091,9 @@ async fn agent_spawn_replace_resets_equal_metadata_runtime_cache() {
     .unwrap();
 
     let replaced_file = write_workspace_file(&agent, "task.txt", b"edit").await;
-    std::fs::File::open(&replaced_file)
+    std::fs::File::options()
+        .write(true)
+        .open(&replaced_file)
         .unwrap()
         .set_modified(cached_mtime)
         .unwrap();

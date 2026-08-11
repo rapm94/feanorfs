@@ -1,6 +1,6 @@
-import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
+  copyFileSync,
   existsSync,
   readFileSync,
   readdirSync,
@@ -208,13 +208,11 @@ function collectArtifacts() {
       }),
     )
     if (!verifyOnly) {
-      const napi = join(packageRoot, 'node_modules/@napi-rs/cli/scripts/index.js')
-      const result = spawnSync(process.execPath, [napi, 'artifacts'], {
-        cwd: packageRoot,
-        encoding: 'utf8',
-      })
-      if (result.status !== 0) {
-        throw new AssemblyError(`napi artifacts failed: ${result.stderr || result.stdout}`)
+      for (const target of targets) {
+        copyFileSync(
+          join(artifactsRoot, target.artifact),
+          join(npmRoot, target.dir, target.artifact),
+        )
       }
     }
     return sourceHashes

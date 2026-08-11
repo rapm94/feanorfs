@@ -1377,8 +1377,63 @@ fn supervisor_instance_lock_held() -> anyhow::Result<bool> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SupervisorLockOwner {
+    pid: u32,
+    process_start_id: String,
+}
+
+fn supervisor_lock_owner_path_at(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("owner")
+}
+
+#[cfg(test)]
+fn read_supervisor_lock_owner_at(lock_path: &Path) -> Option<SupervisorLockOwner> {
+    let content = fs::read_to_string(supervisor_lock_owner_path_at(lock_path)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_supervisor_lock_owner_at(
+    lock_path: &Path,
+    owner: &SupervisorLockOwner,
+) -> anyhow::Result<()> {
+    let path = supervisor_lock_owner_path_at(lock_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_vec(owner).context("serialize supervisor lock owner")?;
+    #[cfg(unix)]
+    let mut file = {
+        let mut options = atomic_write_file::OpenOptions::new();
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        atomic_write_file::unix::OpenOptionsExt::preserve_mode(&mut options, false);
+        options.open(&path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = atomic_write_file::AtomicWriteFile::open(&path)?;
+    file.write_all(&content)?;
+    file.commit().context("publish supervisor lock owner")
+}
+
 fn supervisor_lock_owner_pid() -> anyhow::Result<Option<u32>> {
     let path = supervisor_lock_path()?;
+    match fs::read_to_string(supervisor_lock_owner_path_at(&path)) {
+        Ok(content) => {
+            let owner = serde_json::from_str::<SupervisorLockOwner>(&content).ok();
+            return Ok(owner.and_then(|owner| {
+                (owner.pid != 0
+                    && feanorfs_agent_core::lock::pid_alive(owner.pid)
+                    && process_tree::process_start_matches(owner.pid, &owner.process_start_id))
+                .then_some(owner.pid)
+            }));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(None),
+    }
+
+    // Compatibility for supervisors installed before the owner sidecar was
+    // introduced. Windows whole-file locks make this record unreadable while
+    // held, so old Windows supervisors remain fail-closed until restarted.
     let Ok(content) = fs::read_to_string(path) else {
         return Ok(None);
     };
@@ -3382,21 +3437,66 @@ fn acquire_supervisor_lock_at(path: &Path) -> anyhow::Result<Option<SupervisorGu
         .context("open supervisor instance lock")?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => {
-            let _ = file.set_len(0);
-            use std::io::Write as _;
             let mut file = file;
-            let _ = writeln!(file, "{}", std::process::id());
-            Ok(Some(SupervisorGuard(file)))
+            let setup = (|| -> anyhow::Result<(PathBuf, SupervisorLockOwner)> {
+                // Clear the legacy record first so a reader cannot mistake a
+                // previous live PID for the new lock owner during handoff.
+                file.set_len(0).context("clear supervisor lock owner")?;
+                let pid = std::process::id();
+                let process_start_id = process_tree::process_start_identifier(pid, "supervisor");
+                ensure!(
+                    process_tree::process_start_matches(pid, &process_start_id),
+                    "capture exact supervisor process identity"
+                );
+                let owner = SupervisorLockOwner {
+                    pid,
+                    process_start_id,
+                };
+                let owner_path = supervisor_lock_owner_path_at(path);
+                match fs::remove_file(&owner_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("remove stale supervisor lock owner"),
+                }
+                write_supervisor_lock_owner_at(path, &owner)?;
+                writeln!(file, "{pid}").context("write legacy supervisor lock owner")?;
+                file.flush().context("flush legacy supervisor lock owner")?;
+                Ok((owner_path, owner))
+            })();
+            match setup {
+                Ok((owner_path, owner)) => Ok(Some(SupervisorGuard {
+                    file,
+                    owner_path,
+                    owner,
+                })),
+                Err(error) => {
+                    let _ = fs::remove_file(supervisor_lock_owner_path_at(path));
+                    let _ = fs2::FileExt::unlock(&file);
+                    Err(error)
+                }
+            }
         }
         Err(_) => Ok(None),
     }
 }
 
-struct SupervisorGuard(std::fs::File);
+struct SupervisorGuard {
+    file: std::fs::File,
+    owner_path: PathBuf,
+    owner: SupervisorLockOwner,
+}
 
 impl Drop for SupervisorGuard {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
+        if fs::read_to_string(&self.owner_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<SupervisorLockOwner>(&content).ok())
+            .as_ref()
+            == Some(&self.owner)
+        {
+            let _ = fs::remove_file(&self.owner_path);
+        }
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 
@@ -4548,6 +4648,23 @@ mod tests {
         (dir, workspace, store)
     }
 
+    #[cfg(target_os = "windows")]
+    fn release_test_suspended_child(children: &mut BTreeMap<String, ManagedChild>, key: &str) {
+        let managed = children
+            .get_mut(key)
+            .expect("test reconcile spawned the managed child");
+        let tree = managed
+            .process_tree
+            .as_ref()
+            .expect("test child has a private Windows Job Object");
+        let child = managed
+            .child
+            .as_ref()
+            .expect("test child retains its process handle");
+        tree.release_child(child)
+            .expect("resume adopted suspended test child");
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_utf8_workspace_is_rejected_before_registry_mutation() {
@@ -4576,10 +4693,12 @@ mod tests {
         let ack_file = runner_ack_path().unwrap();
         let status_file = status_path().unwrap();
         let lock_file = supervisor_lock_path().unwrap();
+        let owner_file = supervisor_lock_owner_path_at(&lock_file);
         let original_registry = fs::read(&registry_file).ok();
         let original_ack = fs::read(&ack_file).ok();
         let original_status = fs::read(&status_file).ok();
         let original_lock = fs::read(&lock_file).ok();
+        let original_owner = fs::read(&owner_file).ok();
         let restore = |path: &Path, original: &Option<Vec<u8>>| match original {
             Some(content) => fs::write(path, content).unwrap(),
             None => {
@@ -4590,6 +4709,7 @@ mod tests {
         let supervisor_guard = acquire_supervisor_lock_at(&supervisor_lock_path().unwrap())
             .unwrap()
             .expect("ack test owns supervisor lock");
+        let current_owner = fs::read(&owner_file).expect("read current supervisor owner");
         let token_a = "token-a".to_string();
         let registry = SupervisorRegistry {
             mutation_generation: 1,
@@ -4608,9 +4728,9 @@ mod tests {
         fs::write(&status_file, b"not-json").unwrap();
 
         assert!(supervisor_instance_lock_held().unwrap());
-        fs::write(&lock_file, b"not-a-pid\n").unwrap();
+        fs::write(&owner_file, b"not-json").unwrap();
         assert_eq!(supervisor_lock_owner_pid().unwrap(), None);
-        fs::write(&lock_file, format!("{}\n", std::process::id())).unwrap();
+        fs::write(&owner_file, &current_owner).unwrap();
         assert_eq!(
             supervisor_lock_owner_pid().unwrap(),
             Some(std::process::id())
@@ -4716,6 +4836,7 @@ mod tests {
         restore(&ack_file, &original_ack);
         restore(&status_file, &original_status);
         restore(&lock_file, &original_lock);
+        restore(&owner_file, &original_owner);
     }
 
     #[test]
@@ -5332,7 +5453,15 @@ mod tests {
         desired.insert(key.clone(), spec);
         let mut children = BTreeMap::new();
         reconcile(&mut children, &desired, false).await.unwrap();
-        let descendant = tokio::time::timeout(Duration::from_secs(5), async {
+        #[cfg(target_os = "windows")]
+        release_test_suspended_child(&mut children, &key);
+        // The nested test harness starts another copy of this binary.  On a
+        // loaded Windows runner that startup can exceed the supervisor's
+        // normal five-second service readiness bound even though the Job
+        // adoption itself is correct.  Keep a bounded test-only window wide
+        // enough to observe the descendant without weakening the product
+        // timeout or the ownership assertions below.
+        let descendant = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if let Ok(value) = fs::read_to_string(&descendant_path) {
                     if let Ok(pid) = value.parse::<u32>() {
@@ -5891,7 +6020,22 @@ mod tests {
             },
         );
         assert!(runner_child_is_running(&status, "/ws"));
-        status.workspaces.get_mut("/ws").unwrap().since = current_start.saturating_sub(30);
+        #[cfg(unix)]
+        {
+            status.workspaces.get_mut("/ws").unwrap().since = current_start.saturating_sub(30);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Windows intentionally does not infer process liveness from the
+            // wall-clock `since` field.  Exercise the same stale-child
+            // boundary with a mismatched kernel creation token instead.
+            status.workspaces.get_mut("/ws").unwrap().process_start_id =
+                Some("windows:1".to_string());
+        }
+        #[cfg(not(any(unix, target_os = "windows")))]
+        {
+            status.workspaces.get_mut("/ws").unwrap().state = ChildState::Stopped;
+        }
         assert!(!child_is_running(&status, "/ws"));
         status.workspaces.get_mut("/ws").unwrap().since = current_start;
         // Dead child pid -> not running.
@@ -5962,8 +6106,32 @@ mod tests {
         desired.insert(key.clone(), spec);
         let mut children = BTreeMap::new();
         assert!(reconcile(&mut children, &desired, false).await.unwrap());
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(reconcile(&mut children, &desired, false).await.unwrap());
+        // Isolate the first exit-to-backoff transition. On a loaded Windows
+        // worker, cleanup can consume the one-second backoff and otherwise
+        // let this test observe a newly spawned (and suspended) replacement.
+        store.set_enabled(false).unwrap();
+        #[cfg(target_os = "windows")]
+        release_test_suspended_child(&mut children, &key);
+        // Process creation is materially slower on Windows when the complete
+        // client test binary is starting children in parallel.  A fixed 20 ms
+        // sleep races the first `true` process and makes this test assert on
+        // the still-running state.  Poll the exact managed child until its
+        // exit is observed instead; the backoff assertion remains unchanged.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let changed = reconcile(&mut children, &desired, false).await.unwrap();
+            if children.get(&key).is_some_and(|managed| {
+                managed.last_exit == Some(0) && managed.state == ChildState::Backoff
+            }) {
+                assert!(changed);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "clean runner test child did not exit within the bounded test window"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let managed = &children[&key];
         assert_eq!(managed.last_exit, Some(0));
         assert_eq!(managed.state, ChildState::Backoff);
@@ -5999,15 +6167,30 @@ mod tests {
     fn supervisor_lock_is_exclusive_and_reusable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("supervisor.lock");
-        let first = acquire_supervisor_lock_at(&path).unwrap();
-        assert!(first.is_some());
+        let owner_path = supervisor_lock_owner_path_at(&path);
+        let first = acquire_supervisor_lock_at(&path)
+            .unwrap()
+            .expect("first supervisor owns lock");
+        assert_eq!(
+            read_supervisor_lock_owner_at(&path).map(|owner| owner.pid),
+            Some(std::process::id())
+        );
         // A second supervisor in the same process cannot re-acquire: flock is
         // per open-file-description, so this exercises the cross-process path.
         let second = acquire_supervisor_lock_at(&path).unwrap();
         assert!(second.is_none());
         drop(first);
-        let third = acquire_supervisor_lock_at(&path).unwrap();
-        assert!(third.is_some());
+        assert!(!owner_path.exists());
+        fs::write(&owner_path, b"stale-owner").unwrap();
+        let third = acquire_supervisor_lock_at(&path)
+            .unwrap()
+            .expect("third supervisor reuses released lock");
+        assert_eq!(
+            read_supervisor_lock_owner_at(&path).map(|owner| owner.pid),
+            Some(std::process::id())
+        );
+        drop(third);
+        assert!(!owner_path.exists());
     }
 
     #[test]

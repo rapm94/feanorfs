@@ -62,46 +62,6 @@ cannot obtain production approval.
 
 ## AI tasks
 
-### AI-0. Obtain native CI evidence for the unattended agent runner
-
-The unattended runner, supervisor ownership, durable request state, process-tree
-cleanup, messaging correlation, CLI/MCP/events surfaces, and cross-platform test
-harness are implemented and locally verified on the current working tree. The
-lifecycle crash windows, stop acknowledgement, strict MCP contracts, resilient
-typed events, canonical UTF-8 registry keys, collaboration protocol,
-architecture documentation, and deterministic tray-lock release are complete.
-Only evidence that requires immutable CI input and native platform runners
-remains.
-
-- [ ] Run the runner/supervisor lifecycle and process-tree fault tests on a
-  native Windows CI worker for the exact reviewed commit. Prove suspended child
-  startup, Job ownership, descendant termination, durable ambiguous/no-replay
-  recovery, deferred stop acknowledgement, and reaping behavior. The
-  `runner-windows-pr` job checks out the exact pull-request head (including a
-  fork head), verifies its SHA, and runs the complete agent-core/client suites;
-  preserve its successful log as evidence.
-- [ ] Run the final npm publish-package verification with all six assembled
-  cross-platform tarballs and `TARBALL_DIR` for the same commit. The
-  `npm-release.yml` package job already builds the five native addons, assembles
-  the facade plus five platform packages, packs all six tarballs, and runs
-  `test:publish-packages`. Dispatch the reviewed repository branch in dry-run
-  mode and preserve the successful job log and package artifacts; manual branch
-  dispatch can never enter the publish job.
-- [ ] Do not merge or release until both jobs above pass for the same immutable
-  reviewed commit. A cross-compile, mock, skipped test, or single-platform
-  substitute is not native lifecycle or packaging proof.
-
-Current local evidence (2026-08-11): formatting and workspace-wide Clippy pass;
-the tray crate passes 25 consecutive normal-parallel runs (1,325 tests); the
-complete `cargo test --workspace --all-features --locked` suite passes; focused
-runner (19 passed, 2 ignored), supervisor/events/MCP/process-tree, message CLI,
-and collaboration-skill tests pass; `actionlint`, pedantic `zizmor` for
-repository-owned workflows, `cargo dist generate --check`, whitespace/conflict/
-secret scans, and the local Node release build/test/metadata pipeline pass.
-Native Windows lifecycle evidence and the six-tarball npm publish-package proof
-remain open because they require CI runners and artifacts unavailable to this
-local worktree.
-
 ### AI-1. Finish installed-product mixed-version upgrade proof
 
 The current branch adds useful partial evidence: source-level previous-release

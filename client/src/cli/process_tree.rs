@@ -1347,6 +1347,10 @@ mod tests {
             .spawn()
             .expect("spawn copied worker");
         let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !executable_identity_matches(pid, &expected) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(executable_identity_matches(pid, &expected));
         std::fs::remove_file(&copied).expect("unlink old worker path");
         assert!(
@@ -1368,7 +1372,21 @@ mod tests {
         assert!(!process_start_matches(pid, "windows:01"));
         assert!(!process_start_matches(pid, "windows:+1"));
         assert!(!process_start_matches(pid, "windows:0"));
-        assert!(!process_start_matches(pid.saturating_add(1), &id));
+
+        let ticks = id
+            .strip_prefix("windows:")
+            .expect("Windows identity contains creation ticks")
+            .parse::<u64>()
+            .expect("Windows creation ticks are numeric");
+        let mismatched_ticks = if ticks == u64::MAX {
+            ticks - 1
+        } else {
+            ticks + 1
+        };
+        assert!(!process_start_matches(
+            pid,
+            &format!("windows:{mismatched_ticks}")
+        ));
     }
 
     #[cfg(target_os = "windows")]

@@ -1518,6 +1518,36 @@ mod tests {
         spawn_managed_child(reaper, || command.spawn()).unwrap()
     }
 
+    #[cfg(windows)]
+    fn release_suspended_child(child: &ManagedChild) {
+        let tree = child
+            .process_tree
+            .as_ref()
+            .expect("managed child has a Windows Job Object");
+        let process = child
+            .child
+            .as_ref()
+            .expect("managed child retains its process handle");
+        tree.release_child(process)
+            .expect("release adopted suspended child");
+    }
+
+    #[cfg(any(unix, windows))]
+    async fn wait_for_descendant_pid(path: &Path, timeout: Duration) -> u32 {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = value.parse::<u32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant became ready")
+    }
+
     async fn wait_for_reaper_idle(reaper: &'static ChildReaper) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while !reaper.is_idle() {
@@ -2331,19 +2361,13 @@ mod tests {
         process_tree::configure_process_group(&mut command).unwrap();
         let reaper = test_reaper();
         let mut child = spawn_managed_child(reaper, || command.spawn()).unwrap();
-        let file_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let descendant = loop {
-            if let Ok(value) = std::fs::read_to_string(&descendant_path) {
-                if let Ok(pid) = value.parse::<u32>() {
-                    break pid;
-                }
-            }
-            assert!(
-                tokio::time::Instant::now() < file_deadline,
-                "descendant did not become ready"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        // `configure_process_group` creates a suspended child on Windows so
+        // adoption is atomic with respect to user code. These tests bypass
+        // `run_configured_process`, so release the verified Job-owned child
+        // explicitly before waiting for the helper's readiness marker.
+        #[cfg(windows)]
+        release_suspended_child(&child);
+        let descendant = wait_for_descendant_pid(&descendant_path, Duration::from_secs(5)).await;
         let outcome = wait_for_child_until(
             &mut child,
             tokio::time::Instant::now() + Duration::from_millis(50),
@@ -2408,6 +2432,14 @@ mod tests {
         process_tree::configure_process_group(&mut command).unwrap();
         let reaper = test_reaper();
         let mut child = spawn_managed_child(reaper, || command.spawn()).unwrap();
+        // See the timeout test above: direct test spawning bypasses the
+        // production startup gate, so the adopted suspended process must be
+        // released explicitly after Job membership is verified.
+        release_suspended_child(&child);
+        // Observe the descendant's readiness before waiting for the helper.
+        // Otherwise the direct-child-exit cleanup can close the Job Object in
+        // the small window between the helper exiting and its marker write.
+        let descendant = wait_for_descendant_pid(&descendant_path, Duration::from_secs(5)).await;
         let outcome = wait_for_child_until(
             &mut child,
             tokio::time::Instant::now() + Duration::from_secs(5),
@@ -2416,18 +2448,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome, ProcessOutcome::Exited);
-        let descendant = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(value) = std::fs::read_to_string(&descendant_path) {
-                    if let Ok(pid) = value.parse::<u32>() {
-                        break pid;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("direct-exit descendant became ready");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while feanorfs_agent_core::lock::pid_alive(descendant)
             && tokio::time::Instant::now() < deadline

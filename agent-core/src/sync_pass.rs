@@ -581,14 +581,44 @@ struct JournalDownload {
     hydrated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MaterializationDirectoryIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MaterializationDirectoryProof {
+    path: String,
+    #[serde(default)]
+    identity: Option<MaterializationDirectoryIdentity>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MaterializationJournal {
     phase: String,
+    /// Explicitly distinguishes journals written by the current activation
+    /// protocol from older journals that predate per-publication progress.
+    #[serde(default)]
+    publication_progress_recorded: bool,
     original_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     original_readonly: std::collections::BTreeMap<String, bool>,
     downloads: Vec<JournalDownload>,
     delete_paths: Vec<String>,
+    /// Paths whose publication hard link was verified and durably recorded.
+    /// Missing in older journals, which retain the conservative legacy
+    /// recovery heuristics below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    published_paths: Vec<String>,
+    /// Path whose publication is between the pre-link journal write and the
+    /// post-link progress write. Missing in older journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publishing_path: Option<String>,
+    /// Exact identities of destination directories created by this
+    /// activation. Missing in old journals, so recovery removes none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    created_directories: Vec<MaterializationDirectoryProof>,
 }
 
 struct MaterializationAnchors {
@@ -620,21 +650,24 @@ struct CreatedMaterializationDirectory {
     path: String,
 }
 
-#[cfg(not(unix))]
-struct CreatedMaterializationDirectory {
-    path: PathBuf,
-}
-
 struct PublishedDownload {
     destination: PathBuf,
     expected: JournalDownload,
     mode_applied: bool,
     #[cfg(unix)]
     file: std::fs::File,
+    #[cfg(windows)]
+    /// Delete-capable handle for the exact inode published by this
+    /// transaction.  Windows rollback must use this handle rather than
+    /// reopening the destination path, which may have been replaced by a
+    /// user while activation was in flight.
+    file: std::fs::File,
     #[cfg(unix)]
     directory_chain: Vec<std::fs::File>,
     #[cfg(unix)]
     created_directories: Vec<CreatedMaterializationDirectory>,
+    #[cfg(not(unix))]
+    created_directories: Vec<MaterializationDirectoryProof>,
 }
 
 #[doc(hidden)]
@@ -743,6 +776,7 @@ const MAX_PARALLEL_UPLOADS: usize = 4;
 const MAX_PARALLEL_DOWNLOADS: usize = 8;
 const MAX_MATERIALIZATION_STAGES: usize = 64;
 const MAX_MATERIALIZATION_JOURNAL_BYTES: usize = 128 * 1024 * 1024;
+const MAX_MATERIALIZATION_DIRECTORY_PROOFS: usize = feanorfs_common::MAX_TREE_OUTPUT_PATHS;
 
 /// Fetches, authenticates, and fsyncs one staged download inside the
 /// materialization stage. Worktree changes are never made here; activation
@@ -834,9 +868,25 @@ async fn sync_directory(path: &Path) -> Result<()> {
                 .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
                 .open(&path)?
         };
+        #[cfg(windows)]
+        {
+            // Windows has no portable directory-entry fsync: FlushFileBuffers
+            // on a directory handle returns ERROR_ACCESS_DENIED. Files and the
+            // materialization journal are flushed before publication. Keep the
+            // directory open/metadata check so missing or inaccessible paths
+            // still fail closed.
+            if !directory.metadata()?.is_dir() {
+                return Err(std::io::Error::other(
+                    "directory sync target is not a directory",
+                ));
+            }
+            Ok(())
+        }
         #[cfg(not(windows))]
-        let directory = std::fs::File::open(&path)?;
-        directory.sync_all()
+        {
+            let directory = std::fs::File::open(&path)?;
+            directory.sync_all()
+        }
     })
     .await
     .context("join directory sync task")?
@@ -860,9 +910,17 @@ async fn sync_directory_chain(start: &Path, root: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 async fn sync_file(path: &Path) -> Result<()> {
-    fs::File::open(path)
-        .await
-        .with_context(|| format!("open {} for durability sync", path.display()))?
+    #[cfg(windows)]
+    let file = fs::OpenOptions::new()
+        // FlushFileBuffers requires a write-capable handle on Windows. All
+        // callers flush before restoring a placeholder's read-only bit.
+        .read(true)
+        .write(true)
+        .open(path)
+        .await;
+    #[cfg(not(windows))]
+    let file = fs::File::open(path).await;
+    file.with_context(|| format!("open {} for durability sync", path.display()))?
         .sync_all()
         .await
         .with_context(|| format!("sync {}", path.display()))
@@ -1732,9 +1790,48 @@ async fn read_materialization_journal(stage: &Path) -> Result<MaterializationJou
         anyhow::bail!("materialization journal exceeds bounded size");
     }
     let journal: MaterializationJournal = serde_json::from_slice(&bytes)?;
+    let download_paths = journal
+        .downloads
+        .iter()
+        .map(|item| item.file.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut published_path_set = std::collections::BTreeSet::new();
+    let published_paths_valid = journal.published_paths.len()
+        <= MAX_MATERIALIZATION_DIRECTORY_PROOFS
+        && journal.published_paths.iter().all(|path| {
+            is_safe_rel_path(path)
+                && download_paths.contains(path.as_str())
+                && published_path_set.insert(path.as_str())
+        });
+    let publishing_path_valid = journal.publishing_path.as_ref().is_none_or(|path| {
+        is_safe_rel_path(path)
+            && download_paths.contains(path.as_str())
+            && !published_path_set.contains(path.as_str())
+    });
+    let publication_progress_valid = if journal.publication_progress_recorded {
+        published_paths_valid && publishing_path_valid
+    } else {
+        journal.published_paths.is_empty() && journal.publishing_path.is_none()
+    };
+    let created_directories_valid = journal.created_directories.len()
+        <= MAX_MATERIALIZATION_DIRECTORY_PROOFS
+        && journal.created_directories.iter().all(|proof| {
+            let prefix = format!("{}/", proof.path);
+            is_safe_rel_path(&proof.path)
+                && proof
+                    .identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.file_index != 0)
+                && journal
+                    .downloads
+                    .iter()
+                    .any(|item| item.file.path.starts_with(&prefix))
+        });
     if journal.original_paths.len() > feanorfs_common::MAX_TREE_OUTPUT_PATHS
         || journal.downloads.len() > feanorfs_common::MAX_TREE_OUTPUT_PATHS
         || journal.delete_paths.len() > feanorfs_common::MAX_TREE_OUTPUT_PATHS
+        || !publication_progress_valid
+        || journal.created_directories.len() > MAX_MATERIALIZATION_DIRECTORY_PROOFS
         || !journal
             .original_paths
             .iter()
@@ -1747,6 +1844,7 @@ async fn read_materialization_journal(stage: &Path) -> Result<MaterializationJou
             .delete_paths
             .iter()
             .all(|path| is_safe_rel_path(path))
+        || !created_directories_valid
     {
         anyhow::bail!("materialization journal contains invalid or excessive paths");
     }
@@ -1892,7 +1990,148 @@ async fn recover_activating_materialization(
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let recreate_ancestors =
+            derive_windows_restore_ancestors(&journal.original_paths, &journal.downloads)?;
+        let has_publication_progress = journal.publication_progress_recorded;
+        for item in journal.downloads.iter().rev() {
+            let staged = stage.join("new").join(&item.file.path);
+            let destination = ctx.base.join(&item.file.path);
+            let staged_exists = match fs::symlink_metadata(&staged).await {
+                Ok(_) => true,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let backup_exists =
+                windows_backup_exists_for_download(stage, &item.file.path, &journal.original_paths)
+                    .await?;
+            let destination_exists = match fs::symlink_metadata(&destination).await {
+                Ok(_) => true,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if has_publication_progress {
+                let published = journal
+                    .published_paths
+                    .iter()
+                    .any(|path| path == &item.file.path);
+                let publishing =
+                    journal.publishing_path.as_deref() == Some(item.file.path.as_str());
+                if published || publishing {
+                    if !staged_exists || !destination_exists {
+                        anyhow::bail!(
+                            "interrupted materialization {} lost a recorded publication; refusing automatic recovery",
+                            item.file.path
+                        );
+                    }
+                    let removed = remove_verified_published_file_async(
+                        &staged,
+                        &destination,
+                        item,
+                        ctx.password_str(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("remove interrupted materialization {}", item.file.path)
+                    })?;
+                    if !removed {
+                        anyhow::bail!(
+                            "interrupted materialization {} changed; refusing automatic recovery",
+                            item.file.path
+                        );
+                    }
+                    if let Some(parent) = destination.parent() {
+                        let _ = sync_directory(parent).await;
+                    }
+                    continue;
+                }
+
+                // No durable publication progress exists for this item. A
+                // staged copy with no destination is definitively pending;
+                // leave it for the original-path backup restore below. Any
+                // other missing-name combination with a backup is ambiguous.
+                if staged_exists && !destination_exists {
+                    continue;
+                }
+                if (!staged_exists || !destination_exists) && backup_exists {
+                    anyhow::bail!(
+                        "interrupted materialization {} is missing its staged publication; refusing automatic recovery",
+                        item.file.path
+                    );
+                }
+                continue;
+            }
+
+            // Journals written before per-item publication progress retain the
+            // conservative identity/content heuristic. In particular, a
+            // backup with both publication names absent remains ambiguous.
+            match classify_windows_publication_recovery(
+                staged_exists,
+                destination_exists,
+                backup_exists,
+            ) {
+                WindowsPublicationRecovery::NotPublished => continue,
+                WindowsPublicationRecovery::Ambiguous => {
+                    anyhow::bail!(
+                        "interrupted materialization {} is missing its staged publication; refusing automatic recovery",
+                        item.file.path
+                    );
+                }
+                WindowsPublicationRecovery::Published => {}
+            }
+            let removed = remove_verified_published_file_async(
+                &staged,
+                &destination,
+                item,
+                ctx.password_str(),
+            )
+            .await
+            .with_context(|| format!("remove interrupted materialization {}", item.file.path))?;
+            if !removed {
+                if backup_exists {
+                    anyhow::bail!(
+                        "interrupted materialization {} changed; refusing automatic recovery",
+                        item.file.path
+                    );
+                }
+                continue;
+            }
+            if let Some(parent) = destination.parent() {
+                let _ = sync_directory(parent).await;
+            }
+        }
+        // Remove only the exact transaction-created directories before trying
+        // to restore backups. A user-created/replaced directory is skipped;
+        // restore then fails closed rather than recursively deleting it.
+        cleanup_materialization_directories(ctx.base, &journal.created_directories).await?;
+        for path in journal.original_paths.iter().rev() {
+            let readonly = journal
+                .original_readonly
+                .get(path)
+                .copied()
+                .unwrap_or(false);
+            restore_windows_backup(ctx.base, stage, path, readonly, &recreate_ancestors)
+                .await
+                .with_context(|| format!("restore interrupted materialization {path}"))?;
+        }
+        Ok(())
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         for item in journal.downloads.iter().rev() {
             validate_worktree_ancestors(ctx.base, &item.file.path).await?;
@@ -1919,7 +2158,11 @@ async fn recover_activating_materialization(
                 .await
                 .is_ok();
             let published = if staged_exists {
-                same_file_identity(&staged, &destination).await?
+                let same_identity = same_file_identity(&staged, &destination).await?;
+                same_identity
+                    && verify_materialized_destination(ctx, item, false)
+                        .await
+                        .is_ok()
             } else {
                 verify_materialized_destination(ctx, item, false)
                     .await
@@ -1936,8 +2179,6 @@ async fn recover_activating_materialization(
                 // if deleting the now-disposable stage failed. Preserve it.
                 continue;
             }
-            #[cfg(windows)]
-            set_readonly(&destination, false).await?;
             fs::remove_file(&destination).await.with_context(|| {
                 format!("remove interrupted materialization {}", item.file.path)
             })?;
@@ -1948,14 +2189,6 @@ async fn recover_activating_materialization(
         for path in journal.original_paths.iter().rev() {
             let backup = stage.join("backup").join(path);
             let original = ctx.base.join(path);
-            #[cfg(not(unix))]
-            let readonly = journal
-                .original_readonly
-                .get(path)
-                .copied()
-                .unwrap_or(false);
-            #[cfg(not(windows))]
-            let _ = readonly;
             let backup_exists = match fs::symlink_metadata(&backup).await {
                 Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
                 Ok(_) => anyhow::bail!("materialization backup {path} changed type"),
@@ -1970,10 +2203,6 @@ async fn recover_activating_materialization(
                 Err(error) => return Err(error.into()),
             };
             if !backup_exists {
-                #[cfg(windows)]
-                if readonly && original.is_file() {
-                    set_readonly(&original, true).await?;
-                }
                 continue;
             }
             if fs::symlink_metadata(&original).await.is_ok()
@@ -1982,10 +2211,6 @@ async fn recover_activating_materialization(
                 fs::remove_file(&backup).await?;
                 if let Some(parent) = backup.parent() {
                     sync_directory(parent).await?;
-                }
-                #[cfg(windows)]
-                if readonly {
-                    set_readonly(&original, true).await?;
                 }
                 continue;
             }
@@ -2006,10 +2231,6 @@ async fn recover_activating_materialization(
             if let Some(parent) = original.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            #[cfg(windows)]
-            if readonly {
-                set_readonly(&backup, false).await?;
-            }
             fs::hard_link(&backup, &original)
                 .await
                 .with_context(|| format!("restore interrupted materialization {path}"))?;
@@ -2020,31 +2241,25 @@ async fn recover_activating_materialization(
             if let Some(parent) = backup.parent() {
                 sync_directory(parent).await?;
             }
-            #[cfg(windows)]
-            if readonly {
-                set_readonly(&original, true).await?;
-            }
             sync_file(&original).await?;
         }
-        cleanup_materialization_directories(ctx.base, &journal.downloads).await?;
         Ok(())
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 async fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let left = fs::metadata(left).await?;
-        let right = fs::metadata(right).await?;
-        Ok(left.dev() == right.dev() && left.ino() == right.ino())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (left, right);
-        Ok(false)
-    }
+    let left = left.to_path_buf();
+    let right = right.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let left = open_regular_no_follow_absolute(&left)?;
+        let right = open_regular_no_follow_absolute(&right)?;
+        // On Windows this compares volume serial plus file index from the
+        // opened handles, never content, mtime, or a pathname.
+        same_open_file_identity(&left, &right)
+    })
+    .await
+    .context("join materialization file identity check")?
 }
 
 async fn recover_activated_materialization(
@@ -2156,6 +2371,7 @@ async fn activate_prepared_downloads(
     }
     let mut journal = MaterializationJournal {
         phase: "activating".to_string(),
+        publication_progress_recorded: true,
         original_paths: original_paths.clone(),
         original_readonly,
         downloads: prepared
@@ -2167,6 +2383,9 @@ async fn activate_prepared_downloads(
             })
             .collect(),
         delete_paths: response.delete_local.clone(),
+        published_paths: Vec::new(),
+        publishing_path: None,
+        created_directories: Vec::new(),
     };
     write_materialization_journal(stage, &journal).await?;
     let backup_root = stage.join("backup");
@@ -2306,10 +2525,6 @@ async fn activate_prepared_downloads(
             inject_materialization_failure(ctx, &point).await?;
             validate_worktree_ancestors(ctx.base, path).await?;
             remove_empty_destination_tree(&destination).await?;
-            #[cfg(not(unix))]
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent).await?;
-            }
             validate_worktree_ancestors(ctx.base, path).await?;
             match fs::symlink_metadata(&destination).await {
                 Ok(_) => anyhow::bail!(
@@ -2325,6 +2540,11 @@ async fn activate_prepared_downloads(
             let point = format!("after-final-validation-{}", published.len() + 1);
             pause_sync_test(ctx, &point).await?;
             inject_materialization_failure(ctx, &point).await?;
+            let expected = JournalDownload {
+                file: item.file.clone(),
+                plaintext_hash: item.plaintext_hash.clone(),
+                hydrated: item.hydrated,
+            };
             // Publish relative to already-open, no-follow directory handles on
             // Unix. This prevents an ancestor swap from redirecting the link
             // or subsequent mode/fsync operations outside the workspace.
@@ -2332,18 +2552,46 @@ async fn activate_prepared_downloads(
             let (published_file, published_directories, created_directories) =
                 publish_staged_no_follow(ctx.base, stage, path).await?;
             #[cfg(not(unix))]
-            {
+            let publication_created_directories = {
                 // A same-device hard link is an atomic no-clobber publication.
                 // Unlike rename it cannot replace a path created after the
                 // preceding absence check.
+                let created_directories =
+                    ensure_materialization_ancestors(ctx.base, path, stage, &mut journal).await?;
+                #[cfg(windows)]
+                {
+                    // Persist the in-flight marker before the namespace
+                    // mutation. A crash after this write but before the hard
+                    // link must be treated as ambiguous, never guessed as a
+                    // completed publication.
+                    journal.publishing_path = Some(path.clone());
+                    write_materialization_journal(stage, &journal).await?;
+                }
                 fs::hard_link(&item.staged_path, &destination)
                     .await
                     .with_context(|| format!("publish staged download {path}"))?;
-            }
-            let expected = JournalDownload {
-                file: item.file.clone(),
-                plaintext_hash: item.plaintext_hash.clone(),
-                hydrated: item.hydrated,
+                created_directories
+            };
+            #[cfg(windows)]
+            let published_file = match open_verified_published_file_async(
+                &item.staged_path,
+                &destination,
+                &expected,
+                ctx.password_str(),
+            )
+            .await
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    // Publication already created a hard link, but no
+                    // ownership record can be constructed without a
+                    // validated destination handle. Keep the journal/stage
+                    // for handle-based crash recovery instead of allowing
+                    // the ordinary rollback to discard its only proof.
+                    return Err(preserve_materialization_stage(
+                        error.context(format!("verify published download {path}")),
+                    ));
+                }
             };
             published.push(PublishedDownload {
                 destination: destination.clone(),
@@ -2351,11 +2599,26 @@ async fn activate_prepared_downloads(
                 mode_applied: false,
                 #[cfg(unix)]
                 file: published_file,
+                #[cfg(windows)]
+                file: published_file,
                 #[cfg(unix)]
                 directory_chain: published_directories,
                 #[cfg(unix)]
                 created_directories,
+                #[cfg(not(unix))]
+                created_directories: publication_created_directories,
             });
+            #[cfg(windows)]
+            {
+                // The handle proof is now retained in `published`; record
+                // the completed namespace mutation and clear the in-flight
+                // marker. If this write fails, ordinary rollback still owns
+                // the exact destination handle and the journal remains
+                // conservatively marked as publishing for crash recovery.
+                journal.published_paths.push(path.clone());
+                journal.publishing_path = None;
+                write_materialization_journal(stage, &journal).await?;
+            }
             // Rollback ownership begins at the namespace mutation, not after
             // the following directory durability step succeeds.
             let mutation_point = format!("after-publish-mutation-{}", published.len());
@@ -2392,14 +2655,16 @@ async fn activate_prepared_downloads(
             pause_sync_test(ctx, &point).await?;
             inject_materialization_failure(ctx, &point).await?;
             if !item.hydrated {
-                #[cfg(not(unix))]
-                set_readonly(&destination, true).await?;
                 placeholders += 1;
             } else {
                 downloads += 1;
             }
             #[cfg(not(unix))]
             sync_file(&destination).await?;
+            if !item.hydrated {
+                #[cfg(not(unix))]
+                set_readonly(&destination, true).await?;
+            }
             #[cfg(not(unix))]
             let actual_mtime = file_mtime_ms(&destination).await.unwrap_or_else(|error| {
                 tracing::warn!(
@@ -2427,9 +2692,17 @@ async fn activate_prepared_downloads(
     let (cache_entries, downloads, placeholders) = match activation {
         Ok(value) => value,
         Err(error) => {
-            if let Err(rollback) =
-                rollback_materialization(ctx, &anchors, &published, &backups, &journal.downloads)
-                    .await
+            if let Err(rollback) = rollback_materialization(
+                ctx,
+                &anchors,
+                stage,
+                &journal.original_paths,
+                published,
+                &backups,
+                &journal.downloads,
+                &journal.created_directories,
+            )
+            .await
             {
                 return Err(preserve_materialization_stage(
                     error.context(format!("materialization rollback failed: {rollback:#}")),
@@ -2440,8 +2713,17 @@ async fn activate_prepared_downloads(
     };
     journal.phase = "activated".to_string();
     if let Err(error) = write_materialization_journal(stage, &journal).await {
-        if let Err(rollback) =
-            rollback_materialization(ctx, &anchors, &published, &backups, &journal.downloads).await
+        if let Err(rollback) = rollback_materialization(
+            ctx,
+            &anchors,
+            stage,
+            &journal.original_paths,
+            published,
+            &backups,
+            &journal.downloads,
+            &journal.created_directories,
+        )
+        .await
         {
             return Err(preserve_materialization_stage(error.context(format!(
                 "journal update and materialization rollback failed: {rollback:#}"
@@ -2454,8 +2736,17 @@ async fn activate_prepared_downloads(
         Err(error) => Err(error),
     };
     if let Err(error) = before_cache {
-        if let Err(rollback) =
-            rollback_materialization(ctx, &anchors, &published, &backups, &journal.downloads).await
+        if let Err(rollback) = rollback_materialization(
+            ctx,
+            &anchors,
+            stage,
+            &journal.original_paths,
+            published,
+            &backups,
+            &journal.downloads,
+            &journal.created_directories,
+        )
+        .await
         {
             return Err(preserve_materialization_stage(
                 error.context(format!("materialization rollback failed: {rollback:#}")),
@@ -2473,8 +2764,17 @@ async fn activate_prepared_downloads(
                 error.context("commit materialized cache state"),
             ));
         }
-        if let Err(rollback) =
-            rollback_materialization(ctx, &anchors, &published, &backups, &journal.downloads).await
+        if let Err(rollback) = rollback_materialization(
+            ctx,
+            &anchors,
+            stage,
+            &journal.original_paths,
+            published,
+            &backups,
+            &journal.downloads,
+            &journal.created_directories,
+        )
+        .await
         {
             return Err(preserve_materialization_stage(error.context(format!(
                 "cache commit and materialization rollback failed: {rollback:#}"
@@ -2502,14 +2802,23 @@ async fn inject_materialization_failure(ctx: &SyncCtx<'_>, point: &str) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rollback_materialization(
     ctx: &SyncCtx<'_>,
     anchors: &MaterializationAnchors,
-    published: &[PublishedDownload],
+    stage: &Path,
+    original_paths: &[String],
+    published: Vec<PublishedDownload>,
     backups: &[MaterializationBackup],
     downloads: &[JournalDownload],
+    created_directories: &[MaterializationDirectoryProof],
 ) -> Result<()> {
-    for published in published.iter().rev() {
+    #[cfg(not(windows))]
+    let _ = (stage, original_paths);
+    #[cfg(windows)]
+    let recreate_ancestors = derive_windows_restore_ancestors(original_paths, downloads)?;
+    for published in published.into_iter().rev() {
+        #[cfg(not(windows))]
         validate_worktree_ancestors(ctx.base, &published.expected.file.path).await?;
         #[cfg(unix)]
         {
@@ -2552,7 +2861,21 @@ async fn rollback_materialization(
             remove_created_directories_at(&published.created_directories)?;
             continue;
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // The retained handle is the ownership proof.  Reopening or
+            // deleting the destination pathname could target a user-created
+            // replacement after publication, so verify and dispose the exact
+            // published file handle instead.
+            let created_directories = published.created_directories.clone();
+            remove_retained_published_file_async(&published, ctx.password_str()).await?;
+            // The retained publication handle keeps a delete-pending inode
+            // alive on Windows. Close it before removing transaction-created
+            // parent directories or restoring backups.
+            drop(published.file);
+            cleanup_materialization_directories(ctx.base, &created_directories).await?;
+        }
+        #[cfg(all(not(unix), not(windows)))]
         {
             match fs::symlink_metadata(&published.destination).await {
                 Ok(metadata) => {
@@ -2579,8 +2902,6 @@ async fn rollback_materialization(
                 }
                 Err(error) => return Err(error.into()),
             }
-            #[cfg(windows)]
-            set_readonly(&published.destination, false).await?;
             fs::remove_file(&published.destination)
                 .await
                 .with_context(|| {
@@ -2602,7 +2923,22 @@ async fn rollback_materialization(
             restored.sync_all()?;
             continue;
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            restore_windows_backup(
+                ctx.base,
+                stage,
+                &item.path,
+                item.readonly,
+                &recreate_ancestors,
+            )
+            .await
+            .with_context(|| {
+                format!("restore materialization backup {}", item.original.display())
+            })?;
+            continue;
+        }
+        #[cfg(all(not(unix), not(windows)))]
         {
             let backup_metadata = match fs::symlink_metadata(&item.backup).await {
                 Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
@@ -2641,10 +2977,6 @@ async fn rollback_materialization(
             if let Some(parent) = item.original.parent() {
                 fs::create_dir_all(parent).await?;
             }
-            #[cfg(windows)]
-            if item.readonly {
-                set_readonly(&item.backup, false).await?;
-            }
             fs::hard_link(&item.backup, &item.original)
                 .await
                 .with_context(|| {
@@ -2659,65 +2991,62 @@ async fn rollback_materialization(
             if let Some(parent) = item.backup.parent() {
                 sync_directory(parent).await?;
             }
-            #[cfg(windows)]
-            if item.readonly {
-                set_readonly(&item.original, true).await?;
-            }
             sync_file(&item.original).await?;
         }
     }
-    #[cfg(not(unix))]
-    cleanup_materialization_directories(ctx.base, downloads).await?;
+    #[cfg(windows)]
+    cleanup_materialization_directories(ctx.base, created_directories).await?;
+    #[cfg(all(not(unix), not(windows)))]
+    cleanup_materialization_directories(ctx.base, created_directories).await?;
     #[cfg(unix)]
-    let _ = downloads;
+    let _ = (created_directories, downloads);
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 async fn cleanup_materialization_directories(
     base: &Path,
-    downloads: &[JournalDownload],
+    created_directories: &[MaterializationDirectoryProof],
 ) -> Result<()> {
-    for item in downloads.iter().rev() {
-        let mut current = match base.join(&item.file.path).parent() {
-            Some(parent) => parent.to_path_buf(),
-            None => continue,
+    for proof in created_directories.iter().rev() {
+        let Some(identity) = proof.identity.as_ref() else {
+            // Unsupported non-Unix platforms have no exact directory identity
+            // primitive; retaining the directory is the fail-closed choice.
+            continue;
         };
-        while current != base {
-            let metadata = match fs::symlink_metadata(&current).await {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
-                Ok(_) => break,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    break
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let _ = metadata;
-            match fs::remove_dir(&current).await {
-                Ok(()) => {
-                    let Some(parent) = current.parent() else {
-                        anyhow::bail!("materialization directory escaped workspace");
-                    };
-                    sync_directory(parent).await?;
-                    current = parent.to_path_buf();
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::DirectoryNotEmpty
-                            | std::io::ErrorKind::NotFound
-                            | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    break
-                }
-                Err(error) => return Err(error.into()),
+        let current = base.join(&proof.path);
+        if capture_directory_identity(&current).await?.as_ref() != Some(identity) {
+            // A user replacement, rename, or other identity change means this
+            // path is no longer proven to be transaction-owned.
+            continue;
+        }
+        match fs::symlink_metadata(&current).await {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
             }
+            Err(error) => return Err(error.into()),
+        }
+        match fs::remove_dir(&current).await {
+            Ok(()) => {
+                if let Some(parent) = current.parent() {
+                    sync_directory(parent).await?;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
@@ -2810,35 +3139,792 @@ fn same_open_file_identity(left: &std::fs::File, right: &std::fs::File) -> Resul
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::Storage::FileSystem::{
-            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        };
-
-        fn identity(file: &std::fs::File) -> Result<(u32, u64)> {
-            let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-            // SAFETY: the file owns a valid handle and the output points to
-            // writable storage for the duration of this synchronous call.
-            let result = unsafe {
-                GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr())
-            };
-            if result == 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            // SAFETY: the successful call initialized the complete structure.
-            let information = unsafe { information.assume_init() };
-            let index = (u64::from(information.nFileIndexHigh) << 32)
-                | u64::from(information.nFileIndexLow);
-            Ok((information.dwVolumeSerialNumber, index))
-        }
-
-        Ok(identity(left)? == identity(right)?)
+        Ok(windows_file_identity(left)? == windows_file_identity(right)?)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (left, right);
         Ok(false)
     }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> Result<MaterializationDirectoryIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the file owns a valid handle and the output points to writable
+    // storage for the duration of this synchronous call.
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: the successful call initialized the complete structure.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    anyhow::ensure!(file_index != 0, "Windows file identity has a zero index");
+    Ok(MaterializationDirectoryIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index,
+    })
+}
+
+#[cfg(windows)]
+fn open_materialization_file_for_delete(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialization path is not a non-reparse regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_materialization_directory_for_delete(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialization path is not a non-reparse directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn delete_materialization_handle(file: &std::fs::File) -> std::io::Result<()> {
+    delete_materialization_handle_with_options(file, false)
+}
+
+#[cfg(windows)]
+fn delete_materialization_handle_with_options(
+    file: &std::fs::File,
+    force_basic_disposition: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    if !force_basic_disposition {
+        // SAFETY: the handle is owned by `file`, and the disposition structure
+        // is initialized for the duration of this synchronous system call.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfoEx,
+                (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        };
+        if result != 0 {
+            return Ok(());
+        }
+    }
+    let extended_error = if force_basic_disposition {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "test-forced FileDispositionInfoEx fallback",
+        )
+    } else {
+        std::io::Error::last_os_error()
+    };
+    let basic = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: same valid handle and initialized fallback structure. This
+    // supports filesystems that do not implement FileDispositionInfoEx.
+    let result = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&basic as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if result != 0 {
+        return Ok(());
+    }
+    let fallback_error = std::io::Error::last_os_error();
+    Err(std::io::Error::new(
+        fallback_error.kind(),
+        format!("delete disposition failed ({extended_error}); fallback failed ({fallback_error})"),
+    ))
+}
+
+#[cfg(windows)]
+fn verify_materialized_handle(
+    file: &mut std::fs::File,
+    item: &JournalDownload,
+    password: &str,
+    check_mode: bool,
+) -> Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        anyhow::bail!("materialization destination is not a non-reparse regular file");
+    }
+    if !item.hydrated {
+        if metadata.len() != 0
+            || (check_mode && !metadata.permissions().readonly())
+            || (check_mode
+                && !materialization_mode_matches(portable_mode(&metadata), item.file.mode))
+        {
+            anyhow::bail!(
+                "interrupted placeholder {} changed; refusing automatic recovery",
+                item.file.path
+            );
+        }
+        return Ok(());
+    }
+    let encrypted_hash = if crate::large_file::uses_chunk_transport(item.file.size) {
+        file.seek(SeekFrom::Start(0))?;
+        crate::large_file::fingerprint_opened(file, password, &item.file.path)?.encrypted_hash
+    } else {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata.len())
+                .unwrap_or(crate::large_file::CHUNK_THRESHOLD_BYTES as usize)
+                .min(crate::large_file::CHUNK_THRESHOLD_BYTES as usize),
+        );
+        file.take(crate::large_file::CHUNK_THRESHOLD_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > crate::large_file::CHUNK_THRESHOLD_BYTES {
+            anyhow::bail!("materialization destination grew while it was being checked");
+        }
+        seal(&bytes, password, &item.file.path)?.0
+    };
+    let after = file.metadata()?;
+    if after.len() != metadata.len() {
+        anyhow::bail!(
+            "interrupted materialization {} changed while it was being checked",
+            item.file.path
+        );
+    }
+    if encrypted_hash != item.file.hash
+        || after.len() != item.file.size
+        || (check_mode && !materialization_mode_matches(portable_mode(&after), item.file.mode))
+    {
+        anyhow::bail!(
+            "interrupted materialization {} changed; refusing automatic recovery",
+            item.file.path
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_verified_published_file(
+    staged: &Path,
+    destination: &Path,
+    item: &JournalDownload,
+    password: &str,
+) -> Result<std::fs::File> {
+    let mut staged_file = open_materialization_file_for_delete(staged)
+        .with_context(|| format!("open staged materialization {}", staged.display()))?;
+    let mut destination_file = open_materialization_file_for_delete(destination)
+        .with_context(|| format!("open published materialization {}", destination.display()))?;
+    anyhow::ensure!(
+        same_open_file_identity(&staged_file, &destination_file)?,
+        "staged and published materializations do not share an identity"
+    );
+    verify_materialized_handle(&mut staged_file, item, password, false)?;
+    verify_materialized_handle(&mut destination_file, item, password, false)?;
+    Ok(destination_file)
+}
+
+#[cfg(windows)]
+fn remove_verified_published_file(
+    staged: &Path,
+    destination: &Path,
+    item: &JournalDownload,
+    password: &str,
+) -> Result<bool> {
+    let mut staged_file = match open_materialization_file_for_delete(staged) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut destination_file = match open_materialization_file_for_delete(destination) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !same_open_file_identity(&staged_file, &destination_file)? {
+        return Ok(false);
+    }
+    verify_materialized_handle(&mut staged_file, item, password, false)?;
+    verify_materialized_handle(&mut destination_file, item, password, false)?;
+    if destination_file.metadata()?.permissions().readonly() {
+        set_readonly_materialization_handle(&destination_file, false)?;
+    }
+    delete_materialization_handle(&destination_file)?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+async fn open_verified_published_file_async(
+    staged: &Path,
+    destination: &Path,
+    item: &JournalDownload,
+    password: &str,
+) -> Result<std::fs::File> {
+    let staged = staged.to_path_buf();
+    let destination = destination.to_path_buf();
+    let item = item.clone();
+    let password = password.to_owned();
+    tokio::task::spawn_blocking(move || {
+        open_verified_published_file(&staged, &destination, &item, &password)
+    })
+    .await
+    .context("join published materialization verification task")?
+}
+
+#[cfg(windows)]
+async fn remove_verified_published_file_async(
+    staged: &Path,
+    destination: &Path,
+    item: &JournalDownload,
+    password: &str,
+) -> Result<bool> {
+    let staged = staged.to_path_buf();
+    let destination = destination.to_path_buf();
+    let item = item.clone();
+    let password = password.to_owned();
+    tokio::task::spawn_blocking(move || {
+        remove_verified_published_file(&staged, &destination, &item, &password)
+    })
+    .await
+    .context("join interrupted materialization removal task")?
+}
+
+#[cfg(windows)]
+async fn remove_retained_published_file_async(
+    published: &PublishedDownload,
+    password: &str,
+) -> Result<()> {
+    let mut file = published.file.try_clone()?;
+    let item = published.expected.clone();
+    let password = password.to_owned();
+    let check_mode = published.mode_applied;
+    tokio::task::spawn_blocking(move || {
+        verify_materialized_handle(&mut file, &item, &password, check_mode)?;
+        if file.metadata()?.permissions().readonly() {
+            set_readonly_materialization_handle(&file, false)?;
+        }
+        delete_materialization_handle(&file)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("join retained materialization removal task")??;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_restore_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    };
+
+    // Ancestor directory handles below are intentionally opened without
+    // FILE_SHARE_DELETE to pin the namespace. File handles themselves must
+    // share deletion because the destination may already be a hard link to
+    // this same inode and Windows rejects a second open otherwise.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialization restore source is not a non-reparse regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_windows_restore_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialization restore ancestor is not a non-reparse directory",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn open_windows_restore_ancestors(
+    root: &Path,
+    relative: &str,
+) -> std::io::Result<Vec<std::fs::File>> {
+    open_windows_restore_ancestors_with_creation(root, relative, &[])
+}
+
+#[cfg(windows)]
+fn open_windows_restore_ancestors_with_creation(
+    root: &Path,
+    relative: &str,
+    recreate: &[String],
+) -> std::io::Result<Vec<std::fs::File>> {
+    if !relative.is_empty() {
+        if !is_safe_rel_path(relative) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe restore ancestor path",
+            ));
+        }
+    }
+    for path in recreate {
+        if !is_safe_rel_path(path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe restore ancestor allowlist path",
+            ));
+        }
+    }
+    let mut current = root.to_path_buf();
+    let mut chain = vec![open_windows_restore_directory(&current)?];
+    let mut current_relative = String::new();
+    for component in relative
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
+        if !current_relative.is_empty() {
+            current_relative.push('/');
+        }
+        current_relative.push_str(component);
+        current.push(component);
+        let directory = match open_windows_restore_directory(&current) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !recreate.iter().any(|path| path == &current_relative) {
+                    return Err(error);
+                }
+                match std::fs::create_dir(&current) {
+                    Ok(()) => open_windows_restore_directory(&current)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // A concurrent creator owns this namespace entry. Reopen
+                        // it with no-follow semantics and pin the resulting
+                        // identity before continuing.
+                        open_windows_restore_directory(&current)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        chain.push(directory);
+    }
+    Ok(chain)
+}
+
+#[cfg(windows)]
+fn derive_windows_restore_ancestors(
+    original_paths: &[String],
+    downloads: &[JournalDownload],
+) -> Result<Vec<String>> {
+    let mut ancestors = std::collections::BTreeSet::new();
+    for download in downloads {
+        let destination = &download.file.path;
+        let destination_depth = destination.split('/').count();
+        let prefix = format!("{destination}/");
+        for original in original_paths {
+            if !original.starts_with(&prefix) {
+                continue;
+            }
+            let components = original.split('/').collect::<Vec<_>>();
+            let parent_depth = components.len().saturating_sub(1);
+            for depth in destination_depth..=parent_depth {
+                let candidate = components[..depth].join("/");
+                if ancestors.insert(candidate)
+                    && ancestors.len() > MAX_MATERIALIZATION_DIRECTORY_PROOFS
+                {
+                    anyhow::bail!("materialization restore ancestor allowlist exceeds bound");
+                }
+            }
+        }
+    }
+    Ok(ancestors.into_iter().collect())
+}
+
+#[cfg(windows)]
+async fn windows_backup_exists_for_download(
+    stage: &Path,
+    download_path: &str,
+    original_paths: &[String],
+) -> Result<bool> {
+    let prefix = format!("{download_path}/");
+    for original in original_paths
+        .iter()
+        .filter(|original| original.as_str() == download_path || original.starts_with(&prefix))
+    {
+        let backup = stage.join("backup").join(original);
+        match fs::symlink_metadata(&backup).await {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                return Ok(true)
+            }
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                // A directory is only the container for descendant backups;
+                // the exact original path has no file backup at this level.
+            }
+            Ok(_) => anyhow::bail!("materialization backup {original} changed type"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsPublicationRecovery {
+    NotPublished,
+    Published,
+    Ambiguous,
+}
+
+#[cfg(windows)]
+fn classify_windows_publication_recovery(
+    staged_exists: bool,
+    destination_exists: bool,
+    backup_exists: bool,
+) -> WindowsPublicationRecovery {
+    if staged_exists && destination_exists {
+        return WindowsPublicationRecovery::Published;
+    }
+    if backup_exists {
+        WindowsPublicationRecovery::Ambiguous
+    } else {
+        WindowsPublicationRecovery::NotPublished
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_publication_recovery_tests {
+    use super::{classify_windows_publication_recovery, WindowsPublicationRecovery};
+
+    #[test]
+    fn publication_progress_truth_table_is_conservative() {
+        assert_eq!(
+            classify_windows_publication_recovery(true, false, true),
+            WindowsPublicationRecovery::Ambiguous
+        );
+        assert_eq!(
+            classify_windows_publication_recovery(true, false, false),
+            WindowsPublicationRecovery::NotPublished
+        );
+        assert_eq!(
+            classify_windows_publication_recovery(false, false, true),
+            WindowsPublicationRecovery::Ambiguous
+        );
+        assert_eq!(
+            classify_windows_publication_recovery(false, true, true),
+            WindowsPublicationRecovery::Ambiguous
+        );
+        assert_eq!(
+            classify_windows_publication_recovery(true, true, true),
+            WindowsPublicationRecovery::Published
+        );
+        assert_eq!(
+            classify_windows_publication_recovery(true, true, false),
+            WindowsPublicationRecovery::Published
+        );
+    }
+}
+
+#[cfg(windows)]
+fn set_readonly_materialization_handle(
+    file: &std::fs::File,
+    readonly: bool,
+) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(readonly);
+    file.set_permissions(permissions)
+}
+
+#[cfg(windows)]
+fn force_basic_delete_disposition_for_tests(base: &Path) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        crate::workspace_layout::ensure_workspace_state(base)
+            .map(|state| state.join("test-force-basic-delete").is_file())
+            .unwrap_or(false)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = base;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn restore_windows_backup_blocking(
+    base: &Path,
+    stage: &Path,
+    relative: &str,
+    readonly: bool,
+    recreate_ancestors: &[String],
+) -> std::io::Result<bool> {
+    let parent = relative.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let backup_relative = if parent.is_empty() {
+        "backup".to_owned()
+    } else {
+        format!("backup/{parent}")
+    };
+    // Open and retain every ancestor without delete sharing before opening
+    // either file.  This rejects junctions/reparse points and prevents an
+    // ancestor replacement from redirecting the later path operations.
+    let _backup_ancestors = match open_windows_restore_ancestors(stage, &backup_relative) {
+        Ok(chain) => chain,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let backup_path = stage.join("backup").join(relative);
+    let original_path = base.join(relative);
+    match std::fs::symlink_metadata(&backup_path) {
+        Ok(metadata) if metadata.is_dir() => {
+            // A directory here is the container for descendant backups (for
+            // example stage/backup/d when restoring d/f), not a backed-up file
+            // for this exact journal path. Validate it as a non-reparse
+            // directory and leave it for the descendant restore.
+            open_windows_restore_directory(&backup_path)?;
+            return Ok(false);
+        }
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "materialization backup changed type",
+            ))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => return Err(error),
+    }
+    let _original_ancestors =
+        open_windows_restore_ancestors_with_creation(base, parent, recreate_ancestors)?;
+    let force_basic_delete = force_basic_delete_disposition_for_tests(base);
+    let backup = open_windows_restore_file(&backup_path)?;
+    let backup_identity = windows_file_identity(&backup)
+        .map_err(|error| std::io::Error::other(format!("read backup identity: {error:#}")))?;
+    // The extended disposition API ignores this bit, but the fallback
+    // FILE_DISPOSITION_INFO path does not. Clear it through the retained
+    // handle before linking/deleting, then apply the recorded intent to the
+    // restored destination below.
+    if backup.metadata()?.permissions().readonly() {
+        set_readonly_materialization_handle(&backup, false)?;
+    }
+
+    let existing = match open_windows_restore_file(&original_path) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(existing) = existing {
+        if same_open_file_identity(&backup, &existing).map_err(|error| {
+            std::io::Error::other(format!("compare restore identity: {error:#}"))
+        })? {
+            delete_materialization_handle_with_options(&backup, force_basic_delete)?;
+            set_readonly_materialization_handle(&existing, readonly)?;
+            return Ok(true);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "materialization restore destination is occupied",
+        ));
+    }
+
+    // The final destination was absent under an anchored, non-reparse parent.
+    // hard_link is no-clobber: a concurrent creator causes AlreadyExists and
+    // leaves both the destination and the backup intact for a later retry.
+    std::fs::hard_link(&backup_path, &original_path)?;
+    let restored = match open_windows_restore_file(&original_path) {
+        Ok(file) => file,
+        Err(error) => return Err(error),
+    };
+    let restored_identity = windows_file_identity(&restored)
+        .map_err(|error| std::io::Error::other(format!("read restored identity: {error:#}")))?;
+    if restored_identity != backup_identity {
+        return Err(std::io::Error::other(
+            "restored materialization identity changed",
+        ));
+    }
+    delete_materialization_handle_with_options(&backup, force_basic_delete)?;
+    set_readonly_materialization_handle(&restored, readonly)?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+async fn restore_windows_backup(
+    base: &Path,
+    stage: &Path,
+    relative: &str,
+    readonly: bool,
+    recreate_ancestors: &[String],
+) -> Result<bool> {
+    let base = base.to_path_buf();
+    let stage = stage.to_path_buf();
+    let relative = relative.to_owned();
+    let recreate_ancestors = recreate_ancestors.to_vec();
+    tokio::task::spawn_blocking(move || {
+        restore_windows_backup_blocking(&base, &stage, &relative, readonly, &recreate_ancestors)
+    })
+    .await
+    .context("join Windows materialization backup restoration task")?
+    .map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn cleanup_materialization_directories_windows_blocking(
+    base: &Path,
+    proofs: &[MaterializationDirectoryProof],
+) -> std::io::Result<()> {
+    for proof in proofs.iter().rev() {
+        let Some(identity) = proof.identity.as_ref() else {
+            continue;
+        };
+        let parent = proof.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let _ancestors = match open_windows_restore_ancestors(base, parent) {
+            Ok(chain) => chain,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        let current = base.join(&proof.path);
+        let directory = match open_materialization_directory_for_delete(&current) {
+            Ok(directory) => directory,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        if windows_file_identity(&directory)
+            .map_err(|error| std::io::Error::other(format!("read directory identity: {error:#}")))?
+            != *identity
+        {
+            continue;
+        }
+        match delete_materialization_handle(&directory) {
+            Ok(()) => {
+                if let Some(parent_handle) = _ancestors.last() {
+                    let _ = parent_handle.sync_all();
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn cleanup_materialization_directories(
+    base: &Path,
+    created_directories: &[MaterializationDirectoryProof],
+) -> Result<()> {
+    let base = base.to_path_buf();
+    let created_directories = created_directories.to_vec();
+    tokio::task::spawn_blocking(move || {
+        cleanup_materialization_directories_windows_blocking(&base, &created_directories)
+    })
+    .await
+    .context("join Windows materialization directory cleanup task")?
+    .map_err(Into::into)
 }
 
 fn open_regular_no_follow_absolute(path: &Path) -> Result<std::fs::File> {
@@ -2871,6 +3957,44 @@ fn open_regular_no_follow_absolute(path: &Path) -> Result<std::fs::File> {
     {
         let _ = path;
         anyhow::bail!("stable placeholder identity is unsupported on this platform")
+    }
+}
+
+#[cfg(windows)]
+fn open_directory_no_follow_absolute(path: &Path) -> Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2 | 0x4)
+        .custom_flags(0x0200_0000 | 0x0020_0000)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.file_attributes() & 0x0000_0400 == 0,
+        "path is not a non-reparse directory"
+    );
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+async fn capture_directory_identity(
+    path: &Path,
+) -> Result<Option<MaterializationDirectoryIdentity>> {
+    #[cfg(windows)]
+    {
+        let path = path.to_path_buf();
+        return tokio::task::spawn_blocking(move || {
+            let directory = open_directory_no_follow_absolute(&path)?;
+            Ok(Some(windows_file_identity(&directory)?))
+        })
+        .await
+        .context("join materialization directory identity check")?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(None)
     }
 }
 
@@ -3001,6 +4125,95 @@ fn portable_mode(metadata: &std::fs::Metadata) -> u32 {
         }
     }
     0
+}
+
+#[cfg(not(unix))]
+async fn ensure_materialization_ancestors(
+    base: &Path,
+    path: &str,
+    stage: &Path,
+    journal: &mut MaterializationJournal,
+) -> Result<Vec<MaterializationDirectoryProof>> {
+    anyhow::ensure!(is_safe_rel_path(path), "unsafe materialization path {path}");
+    let components = path.split('/').collect::<Vec<_>>();
+    let mut current = base.to_path_buf();
+    let mut relative = String::new();
+    let mut created = Vec::new();
+
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        if !relative.is_empty() {
+            relative.push('/');
+        }
+        relative.push_str(component);
+        current.push(component);
+        let existing = match fs::symlink_metadata(&current).await {
+            Ok(metadata) => Some(metadata),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(metadata) = existing {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                continue;
+            }
+            anyhow::bail!(
+                "materialization path {path} traverses a non-directory or symlink ancestor"
+            );
+        }
+
+        if journal.created_directories.len() >= MAX_MATERIALIZATION_DIRECTORY_PROOFS {
+            anyhow::bail!("materialization directory proof count exceeds bound");
+        }
+
+        match fs::create_dir(&current).await {
+            Ok(()) => {
+                // Capture immediately after creation. If the platform cannot
+                // provide an exact identity (unsupported non-Unix target),
+                // keep the proof explicitly unowned so rollback will not
+                // guess at ownership. Errors leave the just-created directory
+                // unowned as well and abort activation.
+                let identity = capture_directory_identity(&current)
+                    .await
+                    .with_context(|| {
+                        format!("capture created materialization directory {relative}")
+                    })?;
+                let proof = MaterializationDirectoryProof {
+                    path: relative.clone(),
+                    identity,
+                };
+                journal.created_directories.push(proof.clone());
+                // Persist every proof as soon as it is captured. A later
+                // ancestor failure must not make earlier transaction-owned
+                // directories unknowable to crash recovery.
+                write_materialization_journal(stage, journal).await?;
+                created.push(proof);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A creator racing this activation owns the namespace entry;
+                // re-inspect it and deliberately record no proof. This is the
+                // key boundary that prevents rollback from deleting a user's
+                // directory merely because it appeared after the first check.
+                match fs::symlink_metadata(&current).await {
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                    Ok(_) => anyhow::bail!(
+                        "materialization path {path} traverses a non-directory or symlink ancestor"
+                    ),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create materialization directory {relative}"))
+            }
+        }
+    }
+    Ok(created)
 }
 
 async fn fingerprint_local_path(ctx: &SyncCtx<'_>, path: &str, size: u64) -> Result<FileState> {
@@ -3158,10 +4371,14 @@ async fn create_materialization_stage(ctx: &SyncCtx<'_>) -> Result<PathBuf> {
                 pause_sync_test(ctx, "stage-before-journal").await?;
                 let journal = MaterializationJournal {
                     phase: "preparing".to_string(),
+                    publication_progress_recorded: false,
                     original_paths: Vec::new(),
                     original_readonly: std::collections::BTreeMap::new(),
                     downloads: Vec::new(),
                     delete_paths: Vec::new(),
+                    published_paths: Vec::new(),
+                    publishing_path: None,
+                    created_directories: Vec::new(),
                 };
                 if let Err(error) = write_materialization_journal(&path, &journal).await {
                     let _ = remove_materialization_stage(&path, base).await;
