@@ -997,29 +997,14 @@ fn run_migration_report(current_dir: &Path, json: bool) -> anyhow::Result<()> {
     }
 }
 
-fn registered_program_paths(current_dir: &Path) -> Vec<std::path::PathBuf> {
+fn registered_program_paths(_current_dir: &Path) -> Vec<std::path::PathBuf> {
+    // The single supervisor job is the only registered background executable
+    // in the new model; per-workspace/hub/tray markers are legacy artifacts
+    // removed by migration and must never influence the version check.
     let mut paths = Vec::new();
-    if let Ok(state) = feanorfs_agent_core::ensure_workspace_state(current_dir) {
-        paths.extend(
-            super::util::read_service_identity(&state.join("service-program"))
-                .into_iter()
-                .map(std::path::PathBuf::from),
-        );
-    }
     if let Ok(root) = feanorfs_agent_core::global_state_root() {
         paths.extend(
             super::util::read_service_identity(&root.join("supervisor-service-program"))
-                .into_iter()
-                .map(std::path::PathBuf::from),
-        );
-        // Legacy markers from pre-supervisor installs; removed by migration.
-        paths.extend(
-            super::util::read_service_identity(&root.join("hub-data/service-program"))
-                .into_iter()
-                .map(std::path::PathBuf::from),
-        );
-        paths.extend(
-            super::util::read_service_identity(&root.join("tray-service-program"))
                 .into_iter()
                 .map(std::path::PathBuf::from),
         );

@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
-use super::{HubDb, HubStateV1, LegacyFileV1, ManifestV1, CURRENT_HUB_SCHEMA};
+use super::{HubDb, HubStateV1, LegacyFileV1, ManifestStore, ManifestV1, CURRENT_HUB_SCHEMA};
 use crate::durable::{self, DurableJson};
 
 impl HubDb {
@@ -91,6 +91,33 @@ impl HubDb {
         })
     }
 
+    pub fn tombstone_existing_file(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        hash: &str,
+        mtime: i64,
+    ) -> Result<bool> {
+        let hash = hash.to_string();
+        self.state.with_write(|state| {
+            let Some(file) = state
+                .workspaces
+                .get_mut(workspace_id)
+                .and_then(|workspace| workspace.files.get_mut(path))
+            else {
+                return Ok(false);
+            };
+            *file = LegacyFileV1 {
+                hash,
+                size: 0,
+                mtime,
+                mode: 0,
+                deleted: true,
+            };
+            Ok(true)
+        })
+    }
+
     pub fn get_format(&self, workspace_id: &str) -> Result<u32> {
         self.state.with_read(|state| {
             Ok(state
@@ -106,10 +133,12 @@ impl HubDb {
         self.state.with_write(|state| {
             let workspace = state.workspaces.entry(workspace_key).or_default();
             if version >= 3
-                && !workspace
-                    .head
-                    .as_ref()
-                    .is_some_and(|head| workspace.manifests.contains_key(head))
+                && !workspace.head.as_ref().is_some_and(|head| {
+                    workspace.manifests.get(head).is_some_and(|manifest| {
+                        feanorfs_common::canonical_manifest_hash_list(head, &manifest.hashes)
+                            .is_ok()
+                    })
+                })
             {
                 bail!("format v3 requires a manifested snapshot head in workspace {workspace_id}");
             }
@@ -153,35 +182,43 @@ impl HubDb {
 
     pub fn manifest_exists(&self, workspace_id: &str, snapshot_id: &str) -> Result<bool> {
         self.state.with_read(|state| {
-            Ok(state
-                .workspaces
-                .get(workspace_id)
-                .is_some_and(|workspace| workspace.manifests.contains_key(snapshot_id)))
+            Ok(state.workspaces.get(workspace_id).is_some_and(|workspace| {
+                workspace
+                    .manifests
+                    .get(snapshot_id)
+                    .is_some_and(|manifest| {
+                        feanorfs_common::canonical_manifest_hash_list(snapshot_id, &manifest.hashes)
+                            .is_ok()
+                    })
+            }))
         })
     }
 
-    pub fn store_manifest(
+    pub(crate) fn store_manifest(
         &self,
         workspace_id: &str,
         snapshot_id: &str,
         hashes: Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<ManifestStore> {
         let workspace_id = workspace_id.to_string();
         let snapshot_id = snapshot_id.to_string();
         self.state.with_write(|state| {
-            state
-                .workspaces
-                .entry(workspace_id)
-                .or_default()
-                .manifests
-                .insert(
-                    snapshot_id,
-                    ManifestV1 {
-                        hashes,
-                        created_at_ms: chrono::Utc::now().timestamp_millis(),
-                    },
-                );
-            Ok(())
+            let manifests = &mut state.workspaces.entry(workspace_id).or_default().manifests;
+            if let Some(existing) = manifests.get(&snapshot_id) {
+                return Ok(if existing.hashes == hashes {
+                    ManifestStore::Unchanged
+                } else {
+                    ManifestStore::Conflict
+                });
+            }
+            manifests.insert(
+                snapshot_id,
+                ManifestV1 {
+                    hashes,
+                    created_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            );
+            Ok(ManifestStore::Stored)
         })
     }
 
@@ -228,5 +265,34 @@ impl HubDb {
 
     pub fn blob_exists(&self, hash: &str) -> bool {
         self.blob_path(hash).exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_legacy_rows_can_be_retired_but_not_invented() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = HubDb::open(directory.path()).unwrap();
+        let hash = "a".repeat(64);
+        db.upsert_file("ws", ".jj/repo/store", &hash, 1, 1, 0, false)
+            .unwrap();
+        assert!(db
+            .tombstone_existing_file("ws", ".jj/repo/store", &hash, 2)
+            .unwrap());
+        let file = db
+            .get_files("ws")
+            .unwrap()
+            .into_iter()
+            .find(|(path, _)| path == ".jj/repo/store")
+            .unwrap()
+            .1;
+        assert!(file.deleted);
+        assert_eq!(file.size, 0);
+        assert!(!db
+            .tombstone_existing_file("ws", "../invented", &hash, 2)
+            .unwrap());
     }
 }

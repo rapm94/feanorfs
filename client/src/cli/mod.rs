@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_runner;
 pub mod conflicts;
 pub mod events;
 pub mod history;
@@ -7,7 +8,9 @@ pub mod hydrate;
 pub mod integrator;
 pub mod mcp;
 pub mod pair;
+mod process_tree;
 pub mod recovery;
+pub mod runner;
 pub mod serve;
 pub mod service;
 pub mod start;

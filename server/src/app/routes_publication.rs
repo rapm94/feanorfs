@@ -3,12 +3,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use feanorfs_common::is_valid_hash;
+use feanorfs_common::{canonical_manifest_hashes, is_valid_hash};
 
 use super::guards::{ensure_client_format, ensure_migration_access};
 use super::{AppState, FormatQuery, HeadQuery, ManifestQuery};
-
-const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
+use crate::db::ManifestWrite;
 
 pub(super) async fn handle_manifest(
     State(state): State<AppState>,
@@ -23,16 +22,17 @@ pub(super) async fn handle_manifest(
     ensure_migration_access(&state, &query.workspace_id, &headers)
         .await
         .map_err(|status| (status, String::new()))?;
-    if body.len() > MAX_MANIFEST_BYTES {
+    if body.len() > crate::MAX_MANIFEST_BYTES {
         return Err((StatusCode::PAYLOAD_TOO_LARGE, String::new()));
     }
     let manifest = std::str::from_utf8(&body)
         .map_err(|_| (StatusCode::BAD_REQUEST, "manifest is not UTF-8".to_string()))?;
-    for hash in manifest.lines() {
-        if !is_valid_hash(hash)
-            || !tokio::fs::try_exists(state.storage_dir.join("blobs").join(hash))
-                .await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()))?
+    let hashes = canonical_manifest_hashes(&query.snapshot_id, manifest)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid manifest".to_string()))?;
+    for hash in &hashes {
+        if !tokio::fs::try_exists(state.storage_dir.join("blobs").join(hash))
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()))?
         {
             return Err((
                 StatusCode::PRECONDITION_FAILED,
@@ -40,15 +40,22 @@ pub(super) async fn handle_manifest(
             ));
         }
     }
-    state
+    let stored = state
         .db
-        .upsert_manifest(&query.workspace_id, &query.snapshot_id, &body)
+        .store_canonical_manifest(&query.workspace_id, &query.snapshot_id, &hashes)
         .await
         .map_err(|error| {
-            tracing::warn!(?error, "rejected snapshot reachability manifest");
-            (StatusCode::BAD_REQUEST, "invalid manifest".to_string())
+            tracing::error!(?error, "failed to store snapshot reachability manifest");
+            (StatusCode::INTERNAL_SERVER_ERROR, String::new())
         })?;
-    Ok(StatusCode::OK)
+    match stored {
+        ManifestWrite::Stored | ManifestWrite::Unchanged => Ok(StatusCode::OK),
+        ManifestWrite::Conflict => Err((
+            StatusCode::BAD_REQUEST,
+            "snapshot manifest is immutable".to_string(),
+        )),
+        ManifestWrite::Capacity => Err((StatusCode::INSUFFICIENT_STORAGE, String::new())),
+    }
 }
 
 pub(super) async fn handle_set_format(

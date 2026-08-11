@@ -4,27 +4,176 @@ use feanorfs_client::{
     save_global_config_secure, validate_e2ee_key, Config, GlobalConfig, WorkspaceInvite,
     LOCAL_HUB_URL,
 };
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const LOG_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+fn lock_log_file(file: &File) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + LOG_LOCK_TIMEOUT;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if lock_is_contended(&error) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct BoundedLogWriter {
+    _lock: File,
+    file: File,
+    remaining: u64,
+}
+
+impl BoundedLogWriter {
+    fn open(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
+        let lock_path = path.with_extension("log.lock");
+        let mut lock_options = OpenOptions::new();
+        lock_options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            lock_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let lock = lock_options.open(lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        lock_log_file(&lock)?;
+
+        let rotated = path.with_extension("log.old");
+        if std::fs::metadata(&rotated).is_ok_and(|metadata| metadata.len() > max_bytes) {
+            std::fs::remove_file(&rotated)?;
+        }
+        #[cfg(unix)]
+        if rotated.exists() {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let current_len = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if current_len >= max_bytes {
+            match std::fs::remove_file(&rotated) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if current_len > max_bytes {
+                // Legacy/uncooperative writers may have already exceeded the
+                // cap. Do not preserve an oversized generation indefinitely.
+                std::fs::remove_file(path)?;
+            } else {
+                match std::fs::rename(path, &rotated) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        if rotated.exists() {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        let mut file_options = OpenOptions::new();
+        file_options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            file_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = file_options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        let remaining = max_bytes.saturating_sub(file.metadata()?.len());
+        Ok(Self {
+            _lock: lock,
+            file,
+            remaining,
+        })
+    }
+}
+
+impl std::io::Write for BoundedLogWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let allowed = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        if allowed == 0 {
+            return Ok(buffer.len());
+        }
+        let written = self.file.write(&buffer[..allowed])?;
+        self.remaining = self.remaining.saturating_sub(written as u64);
+        if written == allowed && allowed < buffer.len() {
+            // The suffix is deliberately discarded to maintain the hard cap.
+            // Reporting it consumed prevents formatters from retrying forever.
+            Ok(buffer.len())
+        } else {
+            Ok(written)
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn bounded_log_writer(path: PathBuf) -> impl Fn() -> Box<dyn std::io::Write + Send> {
+    move || match BoundedLogWriter::open(&path, MAX_LOG_BYTES) {
+        Ok(writer) => Box::new(writer),
+        Err(_) => Box::new(std::io::sink()),
+    }
+}
+
 pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
+    let global_root = feanorfs_agent_core::global_state_root()?;
     let log_dir = if feanorfs_agent_core::workspace_is_configured(current_dir) {
         feanorfs_agent_core::ensure_workspace_state(current_dir)?
     } else {
-        feanorfs_agent_core::global_state_root()?.join("logs")
+        global_root.join("logs")
     };
     let _ = std::fs::create_dir_all(&log_dir)
         .map_err(|e| eprintln!("Warning: could not create log directory: {e:?}"));
 
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("feanorfs.log"))?;
-
-    let log_file_clone = log_file.try_clone()?;
+    let log_path = log_dir.join("feanorfs.log");
+    // Older builds wrote one unbounded, broadly readable log directly beneath
+    // the global root. Repair that retired location only when it already
+    // exists; never create it for a fresh installation.
+    let legacy_log = global_root.join("feanorfs.log");
+    if legacy_log != log_path
+        && std::fs::symlink_metadata(&legacy_log).is_ok_and(|metadata| {
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+        })
+    {
+        let _ = BoundedLogWriter::open(&legacy_log, MAX_LOG_BYTES);
+    }
+    // Rotate before installing the subscriber even if this invocation emits no
+    // records. Every subsequent record reopens the current path under the same
+    // cross-process lock, so long-lived workers cannot keep appending through a
+    // rotation to an old inode.
+    let _ = BoundedLogWriter::open(&log_path, MAX_LOG_BYTES);
 
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
@@ -33,15 +182,10 @@ pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
         .with_filter(EnvFilter::new("warn"));
 
     let file_layer = fmt::layer()
-        .with_writer(move || -> Box<dyn std::io::Write + Send> {
-            match log_file_clone.try_clone() {
-                Ok(f) => Box::new(f),
-                Err(_) => Box::new(std::io::sink()),
-            }
-        })
+        .with_writer(bounded_log_writer(log_path))
         .with_target(true)
         .with_ansi(false)
-        .with_filter(EnvFilter::new("debug"));
+        .with_filter(EnvFilter::new("info"));
 
     let _ = Registry::default()
         .with(stderr_layer)
@@ -386,12 +530,24 @@ pub fn invite_from_config(config: &Config) -> Option<WorkspaceInvite> {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HubConnection {
     pub url: String,
     pub token: Option<String>,
     pub tls_ca_pem: Option<String>,
     pub relay: Option<feanorfs_common::RelayConfig>,
+}
+
+impl std::fmt::Debug for HubConnection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HubConnection")
+            .field("url", &self.url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("tls_ca_pem_present", &self.tls_ca_pem.is_some())
+            .field("relay", &self.relay)
+            .finish()
+    }
 }
 
 pub fn print_invite(invite: &WorkspaceInvite) -> anyhow::Result<()> {
@@ -762,8 +918,9 @@ fn confirm_join_preflight() -> anyhow::Result<()> {
 mod tests {
     use super::{
         output_json_to, record_service_identity, resolve_connection_token,
-        service_identity_matches, terminal_line, truncate_password_for_display,
+        service_identity_matches, terminal_line, truncate_password_for_display, BoundedLogWriter,
     };
+    use std::io::Write as _;
 
     struct ClosedPipe;
 
@@ -775,6 +932,78 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn bounded_log_writer_rotates_and_hard_caps_concurrent_records() {
+        const LIMIT: u64 = 128;
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("feanorfs.log");
+
+        let mut first = BoundedLogWriter::open(&log, LIMIT).unwrap();
+        first.write_all(&vec![b'a'; LIMIT as usize + 64]).unwrap();
+        drop(first);
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), LIMIT);
+
+        let mut second = BoundedLogWriter::open(&log, LIMIT).unwrap();
+        second.write_all(b"next record\n").unwrap();
+        drop(second);
+        assert_eq!(
+            std::fs::metadata(log.with_extension("log.old"))
+                .unwrap()
+                .len(),
+            LIMIT
+        );
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let log = log.clone();
+                scope.spawn(move || {
+                    for _ in 0..50 {
+                        let mut writer = BoundedLogWriter::open(&log, LIMIT).unwrap();
+                        writer.write_all(b"bounded record\n").unwrap();
+                    }
+                });
+            }
+        });
+        assert!(std::fs::metadata(&log).unwrap().len() <= LIMIT);
+        assert!(
+            std::fs::metadata(log.with_extension("log.old"))
+                .unwrap()
+                .len()
+                <= LIMIT
+        );
+
+        // A legacy or non-cooperating writer may already have crossed the
+        // limit. Reopening drops, rather than rotates, that oversized file so
+        // the retained generation is bounded too.
+        std::fs::remove_file(&log).unwrap();
+        let oversized = std::fs::File::create(&log).unwrap();
+        oversized.set_len(LIMIT + 1).unwrap();
+        drop(oversized);
+        let repaired = BoundedLogWriter::open(&log, LIMIT).unwrap();
+        drop(repaired);
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        assert!(!log.with_extension("log.old").exists());
+    }
+
+    #[test]
+    #[ignore = "manual 1k per-record bounded-log profile"]
+    fn bounded_log_writer_profile_1k_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("feanorfs.log");
+        let started = std::time::Instant::now();
+        for index in 0..1_000 {
+            let mut writer = BoundedLogWriter::open(&log, super::MAX_LOG_BYTES).unwrap();
+            writeln!(writer, "profile record {index}").unwrap();
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "bounded log: 1000 records in {:.3} ms ({:.3} us/record)",
+            elapsed.as_secs_f64() * 1_000.0,
+            elapsed.as_secs_f64() * 1_000_000.0 / 1_000.0
+        );
+        assert!(std::fs::metadata(&log).unwrap().len() <= super::MAX_LOG_BYTES);
     }
 
     #[test]

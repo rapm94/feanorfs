@@ -413,18 +413,28 @@ The skill cannot wake an inactive model. Long-lived orchestration must monitor N
 
 When this PRD is complete:
 
-- [ ] Documentation consistently explains FeanorFS as shared WIP over a separately managed Git baseline.
-- [ ] macOS and Linux may both remain full Git development clones.
-- [ ] Users understand why synchronized tracked files appear dirty and how publication changes the Git baseline.
-- [ ] `.env` remains synchronized while `.git` and `.jj` remain completely excluded.
-- [ ] FeanorFS performs no Git/Jujutsu command, branch operation, commit, reset, merge, or metadata write.
-- [ ] Named agents can exchange encrypted request/status/result/blocked signals tied to snapshots.
-- [ ] Signal publication cannot roll back concurrent file changes.
-- [ ] Signals create no workspace files and do not alter Git status.
-- [ ] CLI, Rust, C, TypeScript, JSON, MCP, and events expose compatible behavior.
-- [ ] A concise collaboration skill teaches agents the protocol and safety rules.
-- [ ] Hub routes and server-side decision logic remain unchanged.
-- [ ] Contract, concurrency, encryption, and cross-surface tests pass.
+- [x] Documentation consistently explains FeanorFS as shared WIP over a separately managed Git baseline.
+- [x] macOS and Linux may both remain full Git development clones.
+- [x] Users understand why synchronized tracked files appear dirty and how publication changes the Git baseline.
+- [x] `.env` remains synchronized while `.git` and `.jj` remain completely excluded.
+- [x] FeanorFS performs no Git/Jujutsu command, branch operation, commit, reset, merge, or metadata write.
+- [x] Named agents can exchange encrypted request/status/result/blocked signals tied to snapshots.
+- [x] Signal publication cannot roll back concurrent file changes.
+- [x] Signals create no workspace files and do not alter Git status.
+- [x] CLI, Rust, C, TypeScript, JSON, MCP, and events expose compatible behavior.
+- [x] A concise collaboration skill teaches agents the protocol and safety rules.
+- [x] Hub routes and server-side decision logic remain unchanged.
+- [x] Contract, concurrency, encryption, and cross-surface tests pass.
+
+Completion evidence (2026-08-11): the complete locked, all-feature Rust
+workspace suite passes. `messages_engine` exercises the Linux-development to
+macOS-test request, refresh, snapshot validation, correlated result, HTTP-hub
+encryption, cursor, and concurrent-publication flows; runner integration tests
+exercise correlated result and blocked terminals plus ambiguous/no-replay
+handling. CLI/MCP fixtures, C FFI tests, the Node SDK loop, typed NDJSON event
+tests, and the collaboration-skill validator also pass. Native release evidence
+that cannot be produced by a local macOS worktree remains tracked only in
+`TODO.md`.
 
 ---
 
@@ -432,55 +442,55 @@ When this PRD is complete:
 
 ### Shared WIP and Git UX
 
-- [ ] README and usage documentation use the equation `working tree = local Git baseline + shared FeanorFS WIP` or an equivalent unambiguous explanation.
-- [ ] Documentation includes the Linux-development/macOS-simulator workflow with `.env` synchronization.
-- [ ] Documentation explicitly states that both clones being dirty with the same WIP is expected.
-- [ ] Documentation distinguishes switching the active editing machine from publishing a Git commit.
-- [ ] Documentation explains baseline alignment after a commit without implying FeanorFS performs Git operations.
-- [ ] Documentation explains why independent branch switches are unsafe within one actively synchronized workspace.
-- [ ] No FeanorFS UX path reads VCS metadata or inspects Git branches, indexes, remotes, or commits; scanners only recognize `.git`/`.jj` names to prune them without entering them.
-- [ ] Existing tests continue to prove `.git`/`.jj` exclusion and gitignored-file inclusion.
-- [ ] Product copy never calls FeanorFS a VCS, branch manager, merge tool, or Git replacement.
+- [x] README and usage documentation use the equation `working tree = local Git baseline + shared FeanorFS WIP` or an equivalent unambiguous explanation.
+- [x] Documentation includes the Linux-development/macOS-simulator workflow with `.env` synchronization.
+- [x] Documentation explicitly states that both clones being dirty with the same WIP is expected.
+- [x] Documentation distinguishes switching the active editing machine from publishing a Git commit.
+- [x] Documentation explains baseline alignment after a commit without implying FeanorFS performs Git operations.
+- [x] Documentation explains why independent branch switches are unsafe within one actively synchronized workspace.
+- [x] No FeanorFS UX path reads VCS metadata or inspects Git branches, indexes, remotes, or commits; scanners only recognize `.git`/`.jj` names to prune them without entering them.
+- [x] Existing tests continue to prove `.git`/`.jj` exclusion and gitignored-file inclusion.
+- [x] Product copy never calls FeanorFS a VCS, branch manager, merge tool, or Git replacement.
 
 ### Signal publication
 
-- [ ] Sending a signal adds one encrypted no-file-change snapshot whose parent is the latest head and whose root equals the latest head's root.
-- [ ] A CAS retry reloads both latest head and latest root before constructing its next candidate.
-- [ ] Two concurrent signal sends preserve both signals in reachable history.
-- [ ] A concurrent signal and file publication preserve both the signal and the newest file tree.
-- [ ] Sending does not create, modify, delete, stage, or materialize any project path.
-- [ ] No new server route, database table, plaintext index, or routing service is introduced.
-- [ ] The hub cannot find message body, sender, recipient, kind, or snapshot context in plaintext storage.
-- [ ] Body, recipient, kind, snapshot, and reply validation enforce the stated bounds.
+- [x] Sending a signal adds one encrypted no-file-change snapshot whose parent is the latest head and whose root equals the latest head's root.
+- [x] A CAS retry reloads both latest head and latest root before constructing its next candidate.
+- [x] Two concurrent signal sends preserve both signals in reachable history.
+- [x] A concurrent signal and file publication preserve both the signal and the newest file tree.
+- [x] Sending does not create, modify, delete, stage, or materialize any project path.
+- [x] No new server route, database table, plaintext index, or routing service is introduced.
+- [x] The hub cannot find message body, sender, recipient, kind, or snapshot context in plaintext storage.
+- [x] Body, recipient, kind, snapshot, and reply validation enforce the stated bounds.
 
 ### Inbox
 
-- [ ] Inbox returns only messages addressed to the recipient or broadcast to `*`.
-- [ ] Inbox returns a reusable workspace-head cursor.
-- [ ] Graph-delta traversal finds messages across multi-parent agent-land history.
-- [ ] Repeated reads may redeliver but never fabricate exactly-once guarantees.
-- [ ] Cursor loss/reset is explicit and returns only a bounded recent view.
-- [ ] Unknown and malformed snapshot messages cannot crash or permanently block inbox reads.
-- [ ] Message IDs are immutable signal snapshot IDs.
-- [ ] A result can reference and validate its request through `reply_to`.
+- [x] Inbox returns only messages addressed to the recipient or broadcast to `*`.
+- [x] Inbox returns a reusable workspace-head cursor.
+- [x] Graph-delta traversal finds messages across multi-parent agent-land history.
+- [x] Repeated reads may redeliver but never fabricate exactly-once guarantees.
+- [x] Cursor loss/reset is explicit and returns only a bounded recent view.
+- [x] Unknown and malformed snapshot messages cannot crash or permanently block inbox reads.
+- [x] Message IDs are immutable signal snapshot IDs.
+- [x] A result can reference and validate its request through `reply_to`.
 
 ### Agent and orchestrator surfaces
 
-- [ ] Human CLI output is concise and global `--json` matches canonical fixtures.
-- [ ] MCP `tools/list` exposes accurate bounded schemas for `agent_send` and `agent_inbox`.
-- [ ] MCP tool calls delegate to agent-core rather than duplicate persistence or encryption logic.
-- [ ] NDJSON events omit message bodies, support repeatable bounded cursor wakeups, and report reset/overflow.
-- [ ] Rust `Workspace`, C FFI, and TypeScript bindings expose matching operations and result types.
-- [ ] `docs/agent-api.md`, generated headers/types, and contract snapshots agree.
-- [ ] The installed collaboration skill triggers for FeanorFS multi-agent coordination and uses the final tool names.
+- [x] Human CLI output is concise and global `--json` matches canonical fixtures.
+- [x] MCP `tools/list` exposes accurate bounded schemas for `agent_send` and `agent_inbox`.
+- [x] MCP tool calls delegate to agent-core rather than duplicate persistence or encryption logic.
+- [x] NDJSON events omit message bodies, support repeatable bounded cursor wakeups, and report reset/overflow.
+- [x] Rust `Workspace`, C FFI, and TypeScript bindings expose matching operations and result types.
+- [x] `docs/agent-api.md`, generated headers/types, and contract snapshots agree.
+- [x] The installed collaboration skill triggers for FeanorFS multi-agent coordination and uses the final tool names.
 
 ### Security and product boundaries
 
-- [ ] Documentation states that recipient routing is not an access-control boundary.
-- [ ] Documentation states that sender attribution is not cryptographically signed in v1.
-- [ ] Message bodies are bounded and excluded from routine event output.
-- [ ] Secrets and `.env` values are explicitly prohibited in agent signals even though transport is E2EE.
-- [ ] FeanorFS does not interpret task success, assign work, enforce path ownership, wake models, or merge content.
+- [x] Documentation states that recipient routing is not an access-control boundary.
+- [x] Documentation states that sender attribution is not cryptographically signed in v1.
+- [x] Message bodies are bounded and excluded from routine event output.
+- [x] Secrets and `.env` values are explicitly prohibited in agent signals even though transport is E2EE.
+- [x] FeanorFS does not interpret task success, assign work, enforce path ownership, wake models, or merge content.
 
 ---
 
@@ -667,6 +677,35 @@ Also run existing SDK contract snapshots and Node/C smoke tests required by the 
 
 ---
 
+## Architecture amendment: optional unattended runner
+
+The original messaging scope treated process hosting as a non-goal. A later,
+explicitly authorized product increment now supplies one optional local runner
+per workspace. This is a bounded activation adapter, not a general scheduler or
+agent host:
+
+- setup records one fixed executable and fixed arguments for one already-spawned
+  agent, leaves it disabled, and never stores message bodies or process output;
+- explicit `agent runner start` either registers one worker under FeanorFS's
+  existing cross-platform supervisor or runs the same loop in the foreground;
+- the runner admits direct requests only, refreshes before launch, and executes
+  one request at a time under a complete process-tree ownership boundary;
+- a persisted launching/running request becomes `ambiguous_execution` after an
+  interrupted session and is never replayed automatically; reset/removal
+  requires explicit `--discard-pending`;
+- the collaboration skill and signal transport remain passive and cannot wake
+  a model or arbitrary process by themselves.
+
+The authoritative lifecycle and recovery contracts are the
+[runner runbook](docs/usage.md#agent-runner),
+[delivery sequence](docs/agent-communication.md#local-runner-delivery), and
+[CLI projection](docs/agent-api.md#agent-runner-cli-only-current-projection).
+Those documents supersede only the process-hosting part of this PRD's original
+non-goal; sandboxing, general scheduling, and skill-driven wakeup remain out of
+scope.
+
+---
+
 ## Non-Goals
 
 - Keeping multiple Git clones automatically clean.
@@ -682,7 +721,9 @@ Also run existing SDK contract snapshots and Node/C smoke tests required by the 
 - Cryptographic per-agent identity or signatures.
 - Agent discovery, registration, leases, or enforced file ownership.
 - General task planning, scheduling, or semantic interpretation.
-- Agent process hosting, sandboxing, or wakeup by the skill itself.
+- General-purpose agent process hosting, sandboxing, scheduling, or wakeup by
+  the skill itself. The bounded optional runner described in the architecture
+  amendment is the only process-hosting exception.
 - Message attachments, token streams, or raw build-log transport.
 - Automatic conflict merging.
 
@@ -690,15 +731,15 @@ Also run existing SDK contract snapshots and Node/C smoke tests required by the 
 
 ## Documentation Requirements
 
-- [ ] Update `README.md` scope and background-sync copy with the shared-WIP/Git-baseline model.
-- [ ] Add a complete “Git across machines” section to `docs/usage.md`.
-- [ ] Extend `docs/sync-scope.md` with the `.env` plus shared tracked-WIP example.
-- [ ] Add `docs/agent-communication.md` as the canonical human-readable signal protocol.
-- [ ] Extend `docs/agent-api.md` with CLI, Rust, C, TypeScript, JSON, MCP, and cursor contracts.
-- [ ] Extend `docs/threat-model.md` with shared-reader and advisory-attribution limitations.
-- [ ] Ensure tray/onboarding copy says “shared working files/WIP” where “mirror” alone could imply Git cleanliness.
-- [ ] Document generated-output exclusions for platform build/test agents.
-- [ ] Document that a collaboration skill requires an active runner or orchestrator to poll/wake agents.
+- [x] Update `README.md` scope and background-sync copy with the shared-WIP/Git-baseline model.
+- [x] Add a complete “Git across machines” section to `docs/usage.md`.
+- [x] Extend `docs/sync-scope.md` with the `.env` plus shared tracked-WIP example.
+- [x] Add `docs/agent-communication.md` as the canonical human-readable signal protocol.
+- [x] Extend `docs/agent-api.md` with CLI, Rust, C, TypeScript, JSON, MCP, and cursor contracts.
+- [x] Extend `docs/threat-model.md` with shared-reader and advisory-attribution limitations.
+- [x] Ensure tray/onboarding copy says “shared working files/WIP” where “mirror” alone could imply Git cleanliness.
+- [x] Document generated-output exclusions for platform build/test agents.
+- [x] Document that a collaboration skill requires an active runner or orchestrator to poll/wake agents.
 
 ---
 
@@ -706,38 +747,38 @@ Also run existing SDK contract snapshots and Node/C smoke tests required by the 
 
 ### Shared-WIP UX
 
-- [ ] README explanation and example
-- [ ] Usage guide for edit-machine switching, Git publication, baseline alignment, and branch changes
-- [ ] Sync-scope `.env`/tracked-WIP example
-- [ ] Relevant tray copy and copy tests
-- [ ] Regression assertion that FeanorFS remains VCS-agnostic
+- [x] README explanation and example
+- [x] Usage guide for edit-machine switching, Git publication, baseline alignment, and branch changes
+- [x] Sync-scope `.env`/tracked-WIP example
+- [x] Relevant tray copy and copy tests
+- [x] Regression assertion that FeanorFS remains VCS-agnostic
 
 ### Core protocol
 
-- [ ] `ffmsg1` canonical envelope and validation
-- [ ] Message-only snapshot append with fresh-root CAS retry
-- [ ] Reachability-delta inbox traversal
-- [ ] Public input/query/result types and fixtures
-- [ ] Concurrency, malformed-history, cursor, and encryption tests
+- [x] `ffmsg1` canonical envelope and validation
+- [x] Message-only snapshot append with fresh-root CAS retry
+- [x] Reachability-delta inbox traversal
+- [x] Public input/query/result types and fixtures
+- [x] Concurrency, malformed-history, cursor, and encryption tests
 
 ### Product adapters
 
-- [ ] Visible CLI `agent send` and `agent inbox`
-- [ ] Rust `Workspace` methods and client re-exports
-- [ ] C ABI functions/header and smoke tests
-- [ ] TypeScript methods/types and smoke tests
-- [ ] MCP tools and tests
-- [ ] NDJSON wakeup event and tests
-- [ ] Human history rendering for recognized signals
+- [x] Visible CLI `agent send` and `agent inbox`
+- [x] Rust `Workspace` methods and client re-exports
+- [x] C ABI functions/header and smoke tests
+- [x] TypeScript methods/types and smoke tests
+- [x] MCP tools and tests
+- [x] NDJSON wakeup event and tests
+- [x] Human history rendering for recognized signals
 
 ### Agent enablement
 
-- [ ] Canonical protocol documentation
-- [ ] `feanorfs-collaboration` skill initialized with the standard skill scaffold
-- [ ] `SKILL.md`, protocol reference, and generated `agents/openai.yaml`
-- [ ] Skill validation
-- [ ] Forward test: Linux development request to macOS test agent
-- [ ] Forward test: blocked response and stale-snapshot handling
+- [x] Canonical protocol documentation
+- [x] `feanorfs-collaboration` skill initialized with the standard skill scaffold
+- [x] `SKILL.md`, protocol reference, and generated `agents/openai.yaml`
+- [x] Skill validation
+- [x] Forward test: Linux development request to macOS test agent
+- [x] Forward test: blocked response and stale-snapshot handling
 
 ---
 

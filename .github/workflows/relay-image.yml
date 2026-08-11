@@ -11,9 +11,161 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  trust:
+    name: Verify exact trusted release tag
+    if: ${{ github.repository == 'rapm94/feanorfs' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - name: Checkout event commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Verify canonical tag, version, CI, and Security
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INVOCATION_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$REPOSITORY" != "rapm94/feanorfs" ] || [ "$EVENT_NAME" != push ]; then
+            echo "::error::Relay publication requires a trusted rapm94/feanorfs tag push."
+            exit 1
+          fi
+          if [ "$INVOCATION_REF" != "refs/tags/$RELEASE_TAG" ]; then
+            echo "::error::Invocation ref $INVOCATION_REF is not refs/tags/$RELEASE_TAG."
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Relay publication requires a canonical stable tag: $RELEASE_TAG"
+            exit 1
+          fi
+          actual_sha="$(git rev-parse HEAD)"
+          if [ "$actual_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::Checkout is $actual_sha, expected event SHA $EXPECTED_SHA."
+            exit 1
+          fi
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
+            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
+            tag_type="$(jq -r '.object.type' <<<"$annotated")"
+          fi
+          if [ "$tag_type" != commit ] || [ "$tag_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::Tag resolves to $tag_type $tag_sha, expected commit $EXPECTED_SHA."
+            exit 1
+          fi
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$version" ] || [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::Tag $RELEASE_TAG does not match workspace version v$version."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$EXPECTED_SHA" origin/main; then
+            echo "::error::Relay release commit is not reachable from origin/main."
+            exit 1
+          fi
+          trusted_run_id() {
+            local workflow_file="$1"
+            local workflow_name="$2"
+            local runs
+            runs="$(gh api --method GET \
+              "repos/$REPOSITORY/actions/workflows/$workflow_file/runs" \
+              -f branch=main \
+              -f head_sha="$EXPECTED_SHA" \
+              -f event=push \
+              -f status=completed \
+              -f per_page=100)"
+            jq -r \
+              --arg repository "$REPOSITORY" \
+              --arg sha "$EXPECTED_SHA" \
+              --arg workflow "$workflow_name" \
+              '[.workflow_runs[] | select(
+                .name == $workflow and
+                .conclusion == "success" and
+                .event == "push" and
+                .head_branch == "main" and
+                .head_sha == $sha and
+                .head_repository.full_name == $repository and
+                .repository.full_name == $repository
+              )] | first | .id // empty' <<<"$runs"
+          }
+
+          ci_run_id="$(trusted_run_id ci.yml CI)"
+          if [ -z "$ci_run_id" ]; then
+            echo "::error::No successful trusted main-push CI run exists for $EXPECTED_SHA."
+            exit 1
+          fi
+          security_run_id="$(trusted_run_id security.yml Security)"
+          if [ -z "$security_run_id" ]; then
+            echo "::error::No successful trusted Security run exists for $EXPECTED_SHA."
+            exit 1
+          fi
+          security_jobs="$(gh api --method GET \
+            "repos/$REPOSITORY/actions/runs/$security_run_id/jobs?filter=latest&per_page=100")"
+          if ! jq -e --arg sha "$EXPECTED_SHA" \
+            'any(.jobs[];
+              .name == "Security success" and
+              .conclusion == "success" and
+              .head_sha == $sha)' <<<"$security_jobs" >/dev/null; then
+            echo "::error::Security success did not pass for $EXPECTED_SHA."
+            exit 1
+          fi
+
+
+          ready=false
+          for attempt in $(seq 1 60); do
+            if release_json="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null)"; then
+              release_target="$(jq -r '.target_commitish' <<<"$release_json")"
+              release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
+              release_runs="$(gh api --method GET "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
+                -f head_sha="$EXPECTED_SHA" -f event=push -f status=completed -f per_page=100)"
+              if [ "$release_sha" = "$EXPECTED_SHA" ] && \
+                [ "$(jq '.assets | length' <<<"$release_json")" -gt 0 ] && \
+                jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" --arg sha "$EXPECTED_SHA" \
+                  'any(.workflow_runs[];
+                    .conclusion == "success" and
+                    .event == "push" and
+                    .head_branch == $tag and
+                    .head_sha == $sha and
+                    .head_repository.full_name == $repository and
+                    .repository.full_name == $repository)' \
+                  <<<"$release_runs" >/dev/null; then
+                ready=true
+                break
+              fi
+            fi
+            echo "Waiting for successful cargo-dist publication of $RELEASE_TAG ($attempt/60)..."
+            sleep 30
+          done
+          if [ "$ready" != true ]; then
+            echo "::error::Timed out waiting for the exact successful cargo-dist release at $EXPECTED_SHA."
+            exit 1
+          fi
+          {
+            echo "sha=$EXPECTED_SHA"
+            echo "tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
   build-native:
+    needs: trust
     name: Build native relay image (${{ matrix.oci_arch }})
     if: ${{ github.repository == 'rapm94/feanorfs' }}
+    environment: prod
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
@@ -36,6 +188,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+          ref: ${{ needs.trust.outputs.sha }}
       - name: Verify native runner
         env:
           EXPECTED_ARCH: ${{ matrix.runner_arch }}
@@ -73,7 +226,7 @@ jobs:
           context: relay-context
           platforms: linux/${{ matrix.oci_arch }}
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/feanorfs-relay:build-${{ github.sha }}-${{ matrix.oci_arch }}
+          tags: ghcr.io/${{ github.repository_owner }}/feanorfs-relay:build-${{ needs.trust.outputs.sha }}-${{ matrix.oci_arch }}
           sbom: true
           provenance: mode=max
       - name: Attest native architecture image
@@ -82,10 +235,30 @@ jobs:
           subject-name: ghcr.io/${{ github.repository_owner }}/feanorfs-relay
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
+      - name: Record immutable architecture digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          OCI_ARCH: ${{ matrix.oci_arch }}
+        run: |
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Buildx returned an invalid $OCI_ARCH digest: $IMAGE_DIGEST"
+            exit 1
+          fi
+          printf '%s\n' "$IMAGE_DIGEST" > "relay-$OCI_ARCH.digest"
+      - name: Upload immutable architecture digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: relay-digest-${{ needs.trust.outputs.sha }}-${{ matrix.oci_arch }}
+          path: relay-${{ matrix.oci_arch }}.digest
+          if-no-files-found: error
+          retention-days: 1
 
   merge-manifest:
     name: Publish immutable relay manifest
-    needs: build-native
+    needs:
+      - trust
+      - build-native
+    environment: prod
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -102,6 +275,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download amd64 image digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: relay-digest-${{ needs.trust.outputs.sha }}-amd64
+          path: digests/amd64
+      - name: Download arm64 image digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: relay-digest-${{ needs.trust.outputs.sha }}-arm64
+          path: digests/arm64
       - name: Derive final image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -115,18 +298,35 @@ jobs:
         id: merge
         env:
           FINAL_TAGS: ${{ steps.meta.outputs.tags }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE: ghcr.io/${{ github.repository_owner }}/feanorfs-relay
-          SOURCE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ needs.trust.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.trust.outputs.sha }}
         run: |
+          set -euo pipefail
+          tag_sha="$(gh api "repos/$REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')"
+          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
+          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
+          if [ "$tag_sha" != "$SOURCE_SHA" ] || [ "$release_sha" != "$SOURCE_SHA" ]; then
+            echo "::error::Release source changed after validation; refusing to publish the manifest."
+            exit 1
+          fi
           mapfile -t tags <<< "$FINAL_TAGS"
           args=()
           for tag in "${tags[@]}"; do
             [ -n "$tag" ] && args+=(--tag "$tag")
           done
-          amd64_digest="$(docker buildx imagetools inspect "$IMAGE:build-$SOURCE_SHA-amd64" --format '{{.Manifest.Digest}}')"
-          arm64_digest="$(docker buildx imagetools inspect "$IMAGE:build-$SOURCE_SHA-arm64" --format '{{.Manifest.Digest}}')"
-          test -n "$amd64_digest"
-          test -n "$arm64_digest"
+          amd64_digest="$(<digests/amd64/relay-amd64.digest)"
+          arm64_digest="$(<digests/arm64/relay-arm64.digest)"
+          if [[ ! "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid recorded amd64 digest: $amd64_digest"
+            exit 1
+          fi
+          if [[ ! "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid recorded arm64 digest: $arm64_digest"
+            exit 1
+          fi
           docker buildx imagetools create "${args[@]}" \
             "$IMAGE@$amd64_digest" \
             "$IMAGE@$arm64_digest"

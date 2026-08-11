@@ -14,7 +14,7 @@ pub use agent_contract::{
     AgentListEntry, AgentListOfflineResult, AgentListResult, AgentMessage, AgentMessageInput,
     AgentMessageKind, AgentMessagePayload, AgentSendResult, LogEntry, LogResult, SpawnResult,
     UndoResult, AGENT_INBOX_DEFAULT_LIMIT, AGENT_INBOX_MAX_LIMIT, AGENT_MESSAGE_DISCRIMINATOR,
-    AGENT_MESSAGE_MAX_BODY_BYTES,
+    AGENT_MESSAGE_MAX_BODY_BYTES, AGENT_MESSAGE_MAX_ENCODED_BYTES, AGENT_NAME_MAX_BYTES,
 };
 pub use invite::{
     decode_hub_invite, decode_invite, encode_hub_invite, encode_invite, hub_ca_fingerprint,
@@ -31,32 +31,37 @@ pub use integrator_contract::{
     encode_integrator_profile, filter_eligible, generate_assignment_id, generate_selection_nonce,
     is_valid_agent_name, is_valid_hex_id, normalize_capabilities, normalize_capability,
     parse_integrator_profile, rank_candidates, roster_fingerprint, validate_integrator_digest,
-    validate_path_list, ConflictMaterializeEntry, ConflictMaterializeResult, EligibilityResult,
-    IntegratorAssignInput, IntegratorAssignResult, IntegratorAssignmentState, IntegratorAttempt,
-    IntegratorAttemptState, IntegratorAttemptStatus, IntegratorCandidate, IntegratorDigest,
-    IntegratorDraw, IntegratorObserveResult, IntegratorOutcomeState, IntegratorProfile,
-    IntegratorStatusResult, VerificationStatus, VerificationSummary, INTEGRATOR_ALGORITHM_VERSION,
+    validate_path_list, ConflictMaterializeEntry, ConflictMaterializeInput,
+    ConflictMaterializeResult, EligibilityResult, IntegratorAssignInput, IntegratorAssignResult,
+    IntegratorAssignmentState, IntegratorAttempt, IntegratorAttemptState, IntegratorAttemptStatus,
+    IntegratorCandidate, IntegratorDigest, IntegratorDraw, IntegratorObserveInput,
+    IntegratorObserveResult, IntegratorOutcomeState, IntegratorProfile, IntegratorStatusResult,
+    VerificationStatus, VerificationSummary, INTEGRATOR_ALGORITHM_VERSION,
     INTEGRATOR_CAPABILITY_MAX_BYTES, INTEGRATOR_DEFAULT_ACK_TIMEOUT_MS,
     INTEGRATOR_DIGEST_FIELD_BYTES, INTEGRATOR_MAX_AUTHORS, INTEGRATOR_MAX_CANDIDATES,
     INTEGRATOR_MAX_CAPABILITIES, INTEGRATOR_MAX_HISTORY, INTEGRATOR_MAX_PATHS,
-    INTEGRATOR_MAX_RISKS, INTEGRATOR_MAX_TASK_SUMMARY_BYTES, INTEGRATOR_PROFILE_DISCRIMINATOR,
-    INTEGRATOR_RISK_BYTES,
+    INTEGRATOR_MAX_PATH_BYTES, INTEGRATOR_MAX_RISKS, INTEGRATOR_MAX_TASK_SUMMARY_BYTES,
+    INTEGRATOR_PROFILE_DISCRIMINATOR, INTEGRATOR_RISK_BYTES,
 };
 
 pub use sync_delta::compute_sync_delta;
 pub use three_way::{classify_conflict_kind, conflict_candidate_paths, detect_concurrent_edits};
 pub use tree::{
-    Snapshot, Tree, TreeBundle, TreeChange, TreeChangeKind, TreeEntry, TreeEntryKind,
-    EXECUTABLE_MODE,
+    ConflictModes, Snapshot, Tree, TreeBundle, TreeChange, TreeChangeKind, TreeEntry,
+    TreeEntryKind, EXECUTABLE_MODE, MAX_CANONICAL_OBJECT_BYTES, MAX_ENCRYPTED_OBJECT_BYTES,
+    MAX_SNAPSHOT_AUTHOR_BYTES, MAX_SNAPSHOT_MESSAGE_BYTES, MAX_SNAPSHOT_PARENTS, MAX_TREE_DEPTH,
+    MAX_TREE_ENTRIES, MAX_TREE_OBJECTS, MAX_TREE_OUTPUT_PATHS, MAX_TREE_PATH_BYTES_TOTAL,
+    MAX_TREE_WORK_ITEMS,
 };
 pub use tree_convert::{flat_to_tree, flat_to_tree_with_conflicts, tree_to_flat};
 pub use tree_diff::diff_trees;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use unicode_normalization::UnicodeNormalization as _;
 
 /// Insecure legacy default password used when no E2EE password is configured.
 /// Kept as a single constant so all call sites share the same fallback.
@@ -317,31 +322,73 @@ pub fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
-/// Returns true when `path` is a safe workspace-relative path.
+fn is_windows_reserved_component(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+            | "CONIN$"
+            | "CONOUT$"
+    )
+}
+
+/// Maximum UTF-8 byte length of one portable path component.
+pub const MAX_PORTABLE_COMPONENT_BYTES: usize = 255;
+/// Maximum UTF-8 byte length of one complete portable workspace-relative path.
+pub const MAX_PORTABLE_PATH_BYTES: usize = 4_096;
+
+/// Returns true when `path` is one canonical, portable workspace-relative path.
 #[must_use]
 pub fn is_safe_rel_path(path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    let normalized = normalize_path(path);
-    if normalized.starts_with('/') {
-        return false;
-    }
-    for component in normalized.split('/') {
-        if component == ".." {
-            return false;
-        }
-    }
-    if normalized == ".feanorfs"
-        || normalized == ".git"
-        || normalized.starts_with(".feanorfs/")
-        || normalized.starts_with(".git/")
-        || normalized.contains("/.git/")
-        || normalized.contains("/.feanorfs/")
+    if path.is_empty()
+        || path.len() > MAX_PORTABLE_PATH_BYTES
+        || path.starts_with('/')
+        || path.contains('\\')
+        || !path.nfc().eq(path.chars())
     {
         return false;
     }
-    true
+    path.split('/').all(|component| {
+        !component.is_empty()
+            && component.len() <= MAX_PORTABLE_COMPONENT_BYTES
+            && component != "."
+            && component != ".."
+            && !component.eq_ignore_ascii_case(".feanorfs")
+            && !component.eq_ignore_ascii_case(".git")
+            && !component.eq_ignore_ascii_case(".jj")
+            && !component.ends_with([' ', '.'])
+            && !component
+                .chars()
+                .any(|character| character.is_control() || r#"<>:"|?*"#.contains(character))
+            && !is_windows_reserved_component(component)
+    })
 }
 
 pub const AEAD_PREFIX_BYTE: u8 = 1;
@@ -453,10 +500,15 @@ pub fn unpack_bytes_with_policy(
         let key = derive_crypto_key(password, path);
         let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
         let nonce: &Nonce = data[1..13].try_into().expect("12-byte nonce");
-        let plain = cipher.decrypt(nonce, &data[13..]).map_err(|_| {
-            anyhow::anyhow!("wrong encryption key for this workspace (decryption failed)")
-        })?;
-        return Ok(plain);
+        match cipher.decrypt(nonce, &data[13..]) {
+            Ok(plain) => return Ok(plain),
+            Err(_) if policy == LegacyPolicy::AllowXorFallback => {
+                return Ok(crypt_bytes(data, password, path));
+            }
+            Err(_) => {
+                anyhow::bail!("wrong encryption key for this workspace (decryption failed)");
+            }
+        }
     }
     match policy {
         LegacyPolicy::Reject => anyhow::bail!(
@@ -471,6 +523,73 @@ pub fn unpack_bytes_with_policy(
 #[must_use]
 pub fn is_valid_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// Maximum newline-delimited object identifiers accepted in one manifest.
+/// This bounds validation memory and missing-blob filesystem probes even when
+/// the byte-level request limit would permit a duplicate-dense body.
+pub const MANIFEST_MAX_ENTRIES: usize = 250_000;
+
+/// Validates a reachability manifest and returns its canonical sorted object set.
+/// The snapshot object that names the manifest must be part of its own closure.
+///
+/// # Errors
+/// Returns an error for an invalid snapshot id, invalid object id, or rootless
+/// manifest.
+/// Validates and canonicalizes an already-split reachability manifest without
+/// first allocating a duplicate newline-delimited body.
+///
+/// # Errors
+/// Returns an error for excessive entries, invalid ids, or a missing root.
+pub fn canonical_manifest_hash_list(snapshot_id: &str, hashes: &[String]) -> Result<Vec<String>> {
+    ensure!(
+        is_valid_hash(snapshot_id),
+        "invalid snapshot id for manifest"
+    );
+    ensure!(
+        hashes.len() <= MANIFEST_MAX_ENTRIES,
+        "manifest exceeds {MANIFEST_MAX_ENTRIES} object entries"
+    );
+    ensure!(
+        hashes.iter().all(|hash| is_valid_hash(hash)),
+        "manifest contains invalid object id"
+    );
+    ensure!(
+        hashes.iter().any(|hash| hash == snapshot_id),
+        "manifest does not contain its snapshot root"
+    );
+    let mut canonical = hashes.to_vec();
+    canonical.sort_unstable();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+pub fn canonical_manifest_hashes(snapshot_id: &str, manifest: &str) -> Result<Vec<String>> {
+    ensure!(
+        is_valid_hash(snapshot_id),
+        "invalid snapshot id for manifest"
+    );
+    // Sort borrowed slices first so duplicate-dense hostile bodies do not
+    // allocate one owned String per repeated line. Bound raw entries as well
+    // as unique hashes because both validation and blob-presence probes cost
+    // work even when the manifest deduplicates to a tiny closure.
+    let mut hashes =
+        Vec::with_capacity((manifest.len() / 65).min(MANIFEST_MAX_ENTRIES.saturating_add(1)));
+    for hash in manifest.lines() {
+        ensure!(
+            hashes.len() < MANIFEST_MAX_ENTRIES,
+            "manifest exceeds {MANIFEST_MAX_ENTRIES} object entries"
+        );
+        ensure!(is_valid_hash(hash), "manifest contains invalid object id");
+        hashes.push(hash);
+    }
+    hashes.sort_unstable();
+    hashes.dedup();
+    ensure!(
+        hashes.binary_search(&snapshot_id).is_ok(),
+        "manifest does not contain its snapshot root"
+    );
+    Ok(hashes.into_iter().map(str::to_string).collect())
 }
 
 #[cfg(test)]
@@ -570,6 +689,73 @@ mod tests {
         assert!(!is_safe_rel_path("foo/../bar"));
     }
 
+    #[test]
+    fn is_safe_rel_path_requires_one_canonical_spelling() {
+        for path in [
+            ".",
+            "./src/main.rs",
+            "src/./main.rs",
+            "src//main.rs",
+            "src/main.rs/",
+            r"src\main.rs",
+            "docs/re\u{301}sume\u{301}.txt",
+        ] {
+            assert!(!is_safe_rel_path(path), "accepted non-canonical {path:?}");
+        }
+        assert!(is_safe_rel_path("src/main.rs"));
+        assert!(is_safe_rel_path("docs/résumé.txt"));
+    }
+
+    #[test]
+    fn is_safe_rel_path_rejects_control_metadata_on_every_platform() {
+        for path in [
+            ".git/config",
+            "nested/.GIT/config",
+            ".jj/repo/store",
+            "nested/.Jj/repo/store",
+            ".feanorfs/config.json",
+            "nested/.FEANORFS/config.json",
+        ] {
+            assert!(!is_safe_rel_path(path), "accepted control path {path:?}");
+        }
+    }
+
+    #[test]
+    fn is_safe_rel_path_rejects_windows_absolute_alias_and_device_paths() {
+        for path in [
+            "C:/Windows/win.ini",
+            r"C:\Windows\win.ini",
+            "//server/share/file",
+            r"\\server\share\file",
+            "file.txt:stream",
+            "NUL",
+            "aux.txt",
+            "tools/LPT9.log",
+            "COM¹",
+            "COM².txt",
+            "COM³",
+            "LPT¹",
+            "LPT².log",
+            "LPT³",
+            "trailing-dot.",
+            "trailing-space ",
+            "bad?.txt",
+            "bad\0name",
+        ] {
+            assert!(!is_safe_rel_path(path), "accepted Windows alias {path:?}");
+        }
+    }
+
+    #[test]
+    fn is_safe_rel_path_enforces_portable_byte_bounds() {
+        assert!(is_safe_rel_path(&"a".repeat(MAX_PORTABLE_COMPONENT_BYTES)));
+        assert!(!is_safe_rel_path(
+            &"a".repeat(MAX_PORTABLE_COMPONENT_BYTES + 1)
+        ));
+        assert!(is_safe_rel_path(&vec!["a"; 2_048].join("/")));
+        assert!(!is_safe_rel_path(&vec!["a"; 2_049].join("/")));
+    }
+
     // --- hash_bytes ---
 
     #[test]
@@ -598,6 +784,34 @@ mod tests {
             h.chars().all(|c| c.is_ascii_hexdigit()),
             "hash must be hex-encoded: {h}"
         );
+    }
+
+    #[test]
+    fn manifest_entry_count_is_bounded_before_owned_hash_allocation() {
+        let root = "a".repeat(64);
+        let manifest = format!("{}\n", root).repeat(MANIFEST_MAX_ENTRIES + 1);
+        let error = canonical_manifest_hashes(&root, &manifest).unwrap_err();
+        assert!(error.to_string().contains("object entries"));
+    }
+
+    #[test]
+    fn manifest_requires_its_snapshot_root() {
+        let root = "a".repeat(64);
+        assert!(canonical_manifest_hashes(&root, "").is_err());
+        assert!(canonical_manifest_hashes(&root, &format!("{}\n", "b".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn manifest_hashes_are_validated_sorted_and_deduplicated() {
+        let root = "a".repeat(64);
+        let other = "b".repeat(64);
+        let manifest = format!("{other}\n{root}\n{other}\n");
+        assert_eq!(
+            canonical_manifest_hashes(&root, &manifest).unwrap(),
+            vec![root, other]
+        );
+        assert!(canonical_manifest_hashes(&"z".repeat(64), &manifest).is_err());
+        assert!(canonical_manifest_hashes(&"a".repeat(64), "not-a-hash\n").is_err());
     }
 
     #[test]
@@ -727,6 +941,25 @@ mod tests {
         let xored = crypt_bytes(plain, "pw", "legacy.txt");
         let recovered = unpack_bytes(&xored, "pw", "legacy.txt").unwrap();
         assert_eq!(recovered, plain);
+    }
+
+    #[test]
+    fn legacy_xor_with_aead_prefix_byte_still_migrates() {
+        let password = "legacy-password";
+        let path = "legacy.bin";
+        let first_keystream_byte = crypt_bytes(&[0], password, path)[0];
+        let mut plaintext = vec![0x5a; 32];
+        plaintext[0] = first_keystream_byte ^ AEAD_PREFIX_BYTE;
+        let ciphertext = crypt_bytes(&plaintext, password, path);
+        assert_eq!(ciphertext[0], AEAD_PREFIX_BYTE);
+        assert_eq!(
+            unpack_bytes_with_policy(&ciphertext, password, path, LegacyPolicy::AllowXorFallback)
+                .unwrap(),
+            plaintext
+        );
+        assert!(
+            unpack_bytes_with_policy(&ciphertext, password, path, LegacyPolicy::Reject).is_err()
+        );
     }
 
     #[test]

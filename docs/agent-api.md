@@ -1,6 +1,6 @@
 # Agent SDK JSON contract (SDK-1)
 
-Stable wire format for `feanorfs --json agent …`, `feanorfs-agent-core`, `feanorfs-ffi`, and `@feanorfs/agent`. **Semver policy:** additive fields only in minor releases; renames or removals require a major bump.
+Stable wire format for `feanorfs --json agent …`, `feanorfs-agent-core`, `feanorfs-ffi`, and `@feanorfs/agent`. **Semver policy:** additive fields only in minor releases; renames or removals require a major bump. The [agent runner section](#agent-runner-cli-only-current-projection) is explicitly excluded from that SDK-1 promise: it documents a current CLI-only projection, not a frozen SDK result type.
 
 Canonical fixtures live in `common/src/agent_contract.rs`. Snapshot tests in `client/tests/contract_snapshots.rs` fail when serialized shapes drift.
 
@@ -23,6 +23,144 @@ Canonical fixtures live in `common/src/agent_contract.rs`. Snapshot tests in `cl
 | Undo | `undo <snapshot_id>` | `undo(snapshot_id)` | `UndoResult` |
 | Send signal | `agent send <to> --kind <k> [--about <id>] [--reply-to <id>] [--from <name>] <body>` | `send_message(AgentMessageInput)` | `AgentSendResult` |
 | Inbox | `agent inbox [--for <name>] [--after <head>] [--limit <n>]` | `inbox(AgentInboxQuery)` | `AgentInboxResult` |
+| Local runner control (CLI-only) | `agent runner setup|start|stop|status|reset|remove` | — | current redacted control JSON; not an SDK-1 contract |
+
+---
+
+## Agent runner (CLI-only current projection)
+
+The optional local runner's documented public projection is CLI-only today.
+Its current `--json` output is a redacted projection for operators, not a
+public `RunnerControlResult` SDK type and not a compatibility guarantee. See
+the [operator runbook](usage.md#agent-runner) and [local delivery sequence](agent-communication.md#local-runner-delivery).
+
+Every runner control command returns this current shape. `runner` is `null`
+when no runner is configured or after `remove`:
+
+```json
+{
+  "action": "status",
+  "runner": {
+    "configured": true,
+    "enabled": false,
+    "agent": "mac-test",
+    "phase": "idle",
+    "pending_count": 0,
+    "active_message_id": null,
+    "active_session_id": null,
+    "active_started_at_ms": null,
+    "active_spawned_at_ms": null,
+    "last_terminal_kind": "result",
+    "last_terminal_message_id": "<64-hex-signal-id>",
+    "attention": null,
+    "updated_at_ms": 1785852000000,
+    "inbox_failure_count": 0
+  },
+  "supervisor": {
+    "registered": false,
+    "state": "not_installed"
+  }
+}
+```
+
+`action` is one of `setup`, `start`, `stop`, `status`, `reset`, or `remove`.
+`phase` is `idle`, `launching`, `running`, or `needs_attention`.
+`attention` is `null`, `cursor_reset`, `pending_overflow`,
+`ambiguous_execution`, `delivery_unknown`, or `preparation_failed`.
+`preparation_failed` means local refresh/preparation failed before a child was
+launched; the pending request remains preserved for inspection and explicit
+discard/reset. `last_terminal_kind` is `null`, `result`, or `blocked`.
+`supervisor.state` is `not_installed`, `running`, or `stopped`. The active
+ID/session/timestamps and last terminal ID are each `null` when unavailable.
+
+This projection deliberately excludes the configured command and fixed
+arguments, message bodies, child stdout/stderr, and process metadata. The
+durable runtime likewise records bounded cursors, IDs, phases, and timestamps
+instead of task bodies or child output.
+
+### Runner lifecycle and recovery semantics
+
+The runner admits only direct requests for its configured agent and runs one
+fixed command at a time. A child publishes a correlated `result` or `blocked`
+signal through the normal message transport; process exit is not a reply. The
+runner may publish a generic correlated `blocked` fallback for known launch,
+stdin, timeout, cancellation, or exit failures. If it cannot establish one
+correlated terminal, it records `delivery_unknown` and stops. A cursor reset,
+pending overflow, ambiguous launching/running checkpoint, or local
+`preparation_failed` also stops admission. None of these states is replayed
+automatically: stop the runner, inspect/repair local state, and use explicit
+`reset --discard-pending` (or `remove --discard-pending`) to abandon work.
+
+The supervisor restarts hub, watcher, and runner workers after clean exits or
+crashes with bounded backoff. Restarting a runner with a persisted
+`launching`/`running` checkpoint marks `ambiguous_execution` instead of
+launching that request again. Child ownership is native and cross-platform:
+Unix (including macOS) uses a fresh process group with bounded TERM/KILL
+teardown; Windows starts children suspended, adopts and verifies a private
+kill-on-close Job Object, then resumes them. Timeout, cancellation, and
+direct-child exit tear down descendants.
+
+`stop` disables admission before unregistering the runner. If supervisor
+authority exists, it waits for a durable workspace-specific registry
+reconciliation acknowledgement bound to the live supervisor's exact native
+process identity. Fresh or idempotently disabled, unregistered setup/stop with
+no supervisor authority has no possible child acknowledgement and skips that
+wait. Stale registry, status, or acknowledgement authority remains fail-closed.
+This is not an exactly-once
+delivery guarantee: inbox reads can redeliver or reset, and an unobserved
+terminal remains ambiguous.
+
+### Child invocation and terminal reply
+
+The configured child receives one bounded JSON document on stdin and then EOF:
+
+```json
+{
+  "schema_version": 1,
+  "session_id": "<32-hex-session-id>",
+  "agent": "mac-test",
+  "message": {
+    "message_id": "<64-hex-request-id>",
+    "from": "linux-dev",
+    "to": "mac-test",
+    "kind": "request",
+    "body": "Run iOS simulator tests",
+    "about_snapshot": "<64-hex-snapshot-id>",
+    "reply_to": null,
+    "created_at_ms": 1785852000000
+  }
+}
+```
+
+This is `RunnerInvocation` schema version 1. It is current CLI child input,
+separate from SDK-1 wire types. The implementation bounds this input, but this
+document intentionally does not freeze its internal byte limit.
+
+The child publishes its one terminal through the existing `agent send` / MCP
+`agent_send` transport using `AgentMessageInput`; it does not reply on stdout
+or stderr. For example:
+
+```json
+{
+  "to": "linux-dev",
+  "kind": "result",
+  "body": "Passed 42 tests on iPhone 16 simulator",
+  "about_snapshot": "<64-hex-actually-inspected-snapshot-id>",
+  "reply_to": "<64-hex-request-id>",
+  "from": "mac-test"
+}
+```
+
+Use `blocked` instead of `result` when appropriate. The terminal must be from
+the configured agent to the requester's `from`, reference the request ID in
+`reply_to`, and accurately name the inspected snapshot in `about_snapshot`.
+The runner can publish a generic correlated `blocked` fallback for known
+process/invocation failures; failure to establish a terminal delivery becomes
+runner attention rather than a replay.
+
+There is no runner-control MCP tool, C FFI function, TypeScript wrapper, or
+`Workspace` convenience method. Existing `agent_send` surfaces carry the
+child’s terminal message only.
 
 ---
 
@@ -268,7 +406,17 @@ live in `contract.d.ts`; shapes match this document and
 Tool descriptions state that all workspace participants can read messages,
 identity is advisory, and requests/results should carry exact snapshot context.
 The NDJSON `events` stream emits `agent_message` wakeup records (bounded
-metadata, never the body) when new signals appear.
+metadata, never the body) when new signals appear. If the bounded inbox read
+resets its cursor or truncates an overflow, it emits a separate metadata-only
+`agent_message_cursor_reset` record before the returned wakeups:
+
+```json
+{"event":"agent_message_cursor_reset","cursor":"<observed-workspace-head>","cursor_reset":true}
+```
+
+The reset record contains no message body, ID, routing, path, or integrator
+fields; consumers should treat it as evidence that older wakeups may be
+missing and re-read the typed inbox as needed.
 
 `keep` values for `ffs_conflicts_keep(root, path, keep, file_path)`:
 

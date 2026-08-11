@@ -120,6 +120,33 @@ jobs:
           cargo test --workspace --exclude feanorfs-tray
           --all-features --locked
 
+  runner-windows-pr:
+    name: Agent runner lifecycle (Windows PR)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact pull request head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Verify reviewed source identity
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run native runner lifecycle tests
+        run: >-
+          cargo test -p feanorfs-agent-core -p feanorfs-client
+          --all-features --locked
+
   upgrade-smoke:
     name: Upgrade state smoke (previous release -> current bytes)
     if: ${{ github.event_name != 'pull_request' }}
@@ -582,6 +609,7 @@ jobs:
       - msrv
       - test
       - cross-platform
+      - runner-windows-pr
       - upgrade-smoke
       - source-smoke
       - docs
@@ -600,6 +628,7 @@ jobs:
           needs.fmt.result != 'success' ||
           needs.clippy.result != 'success' ||
           needs.test.result != 'success' ||
+          (github.event_name == 'pull_request' && needs.runner-windows-pr.result != 'success') ||
           needs.dependencies.result != 'success' ||
           needs.workflow-lint.result != 'success'
         run: exit 1

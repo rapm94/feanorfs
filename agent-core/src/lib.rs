@@ -3,6 +3,9 @@
 //! Rust consumers call [`Runtime`] / [`Workspace`] directly. FFI and Node bindings
 //! serialize the same JSON shapes documented in `docs/agent-api.md`.
 
+#[cfg(test)]
+feanorfs_test_support::isolate_test_process!();
+
 pub mod agent;
 pub mod api;
 pub mod conflict_artifacts;
@@ -32,10 +35,14 @@ mod tree_reconcile;
 pub mod tunnel;
 mod upload_registry;
 pub mod workspace_layout;
+pub mod workspace_read;
 
 pub use agent::{
     check_agent, clean_agent, commit_agent, land_agent, list_agents, refresh_agent,
-    refresh_agent_with_options, spawn_agent, RefreshOptions,
+    refresh_agent_guarded, refresh_agent_with_options, remove_configured, runner_process_metadata,
+    runner_status, spawn_agent, RefreshOptions, RunnerAdmission, RunnerAttention, RunnerConfig,
+    RunnerExecutionMode, RunnerExecutionSession, RunnerInvocation, RunnerLaunch, RunnerPhase,
+    RunnerProcessMetadata, RunnerStatus, RunnerStore,
 };
 pub use api::{ApiClient, MIN_SUPPORTED_SERVER_VERSION};
 pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
@@ -63,7 +70,7 @@ pub use local::{
 pub use messages::{inbox, send_message, signals_since};
 pub use objects::ObjectStore;
 pub use paths::legacy_policy_for_config;
-pub use paths::{agent_dir, agents_dir, conflicts_dir, validate_name};
+pub use paths::{agent_dir, agent_runner_dir, agents_dir, conflicts_dir, validate_name};
 pub use snapshot::SnapshotEngine;
 pub use snapshot_diff::TreeDiffStats;
 pub use workspace_layout::{
@@ -90,28 +97,58 @@ use std::sync::Arc;
 
 /// Shared Tokio runtime for blocking SDK callers.
 pub struct Runtime {
-    inner: tokio::runtime::Runtime,
+    inner: Option<tokio::runtime::Runtime>,
 }
 
 impl Runtime {
     /// Build a multi-thread Tokio runtime for agent operations.
     pub fn new() -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            inner: tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("failed to build Tokio runtime")?,
+            inner: Some(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build Tokio runtime")?,
+            ),
         }))
     }
 
     /// Run an async future to completion on this runtime.
-    pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
-        self.inner.block_on(fut)
+    pub fn block_on<F>(&self, fut: F) -> F::Output
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        let runtime = self
+            .inner
+            .as_ref()
+            .expect("runtime is available until drop");
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|scope| match scope.spawn(|| runtime.block_on(fut)).join() {
+                Ok(output) => output,
+                Err(payload) => std::panic::resume_unwind(payload),
+            })
+        } else {
+            runtime.block_on(fut)
+        }
     }
 
     /// Open a workspace rooted at `path` (state is resolved under `~/.feanorfs`).
     pub fn open_workspace(self: &Arc<Self>, path: impl AsRef<Path>) -> Result<Workspace> {
         Workspace::open(self, path.as_ref())
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        let Some(runtime) = self.inner.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = std::thread::spawn(move || drop(runtime)).join();
+        } else {
+            drop(runtime);
+        }
     }
 }
 
@@ -341,5 +378,23 @@ impl Workspace {
             about_snapshot,
             paths,
         ))
+    }
+}
+
+#[cfg(test)]
+mod blocking_runtime_tests {
+    use super::Runtime;
+
+    #[test]
+    fn blocking_runtime_can_run_and_drop_inside_an_async_runtime() {
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        outer.block_on(async {
+            let runtime = Runtime::new().unwrap();
+            assert_eq!(runtime.block_on(async { 42 }), 42);
+            drop(runtime);
+        });
     }
 }

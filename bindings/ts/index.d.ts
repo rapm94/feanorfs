@@ -22,7 +22,7 @@ export declare function agentStatus(root: string, name: string): Promise<string>
 
 /**
  * Materialize the encrypted conflict triple for a snapshot.
- * JSON in: object with `about_snapshot` and optional `paths`;
+ * JSON in: object with `about_snapshot` and exactly one of non-empty `paths` or `all: true`;
  * JSON out: `ConflictMaterializeResult`.
  */
 export declare function conflictMaterialize(root: string, inputJson: string): Promise<string>

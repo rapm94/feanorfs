@@ -12,6 +12,7 @@ pub(crate) async fn reconcile(
     ctx: &SyncCtx<'_>,
     local: &HashMap<String, FileState>,
     remote: &HashMap<String, FileState>,
+    server_head: Option<&str>,
 ) -> Result<Reconciliation> {
     let snapshots = SnapshotEngine::new(ctx);
     let Some(base_id) = snapshots.last_synced_id().await? else {
@@ -25,6 +26,37 @@ pub(crate) async fn reconcile(
             remote,
         ));
     };
+    // A restored/fresh hub has no authoritative state while the client holds
+    // an agreed view. The empty remote is an absence of data, not a deletion
+    // of every file: treat it as "upload the whole local view" instead of
+    // deleting the local workspace. Format v3 signals this through the
+    // missing head; legacy flat rows have no head marker, so an empty remote
+    // with a non-empty agreed base takes the same data-loss-safe direction.
+    let restored_hub = if ctx.format_version() >= 3 {
+        server_head.is_none()
+    } else {
+        remote.is_empty()
+    };
+    if restored_hub {
+        let base_files = snapshots.load_files(&base_id).await?;
+        if !base_files.is_empty() {
+            let mut upload_required = local
+                .iter()
+                .filter(|(_, state)| !state.deleted)
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            upload_required.sort_unstable();
+            upload_required.dedup();
+            return Ok(Reconciliation {
+                base: base_files,
+                response: SyncResponse {
+                    upload_required,
+                    download_required: Vec::new(),
+                    delete_local: Vec::new(),
+                },
+            });
+        }
+    }
     let local_changes = snapshots.diff_file_view(&base_id, local).await?.changes;
     let remote_changes = snapshots.diff_file_view(&base_id, remote).await?.changes;
     Ok(reconcile_changes(

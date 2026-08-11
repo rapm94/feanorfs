@@ -50,9 +50,7 @@ impl LocalHub {
         }
         let is_object = params.get("object").is_some_and(|value| value == "true");
         let path = get_param(params, "path")?;
-        if !feanorfs_common::is_safe_rel_path(path) {
-            return Err((StatusCode::BAD_REQUEST, "unsafe path".into()));
-        }
+        let safe_path = feanorfs_common::is_safe_rel_path(path);
         let deleted = params.get("deleted").is_some_and(|value| value == "true");
         if deleted {
             if is_object {
@@ -60,10 +58,23 @@ impl LocalHub {
             }
             check_legacy_compat(&self.db, workspace_id)?;
             let mtime = parse_required_param::<i64>(params, "mtime")?;
+            if !safe_path {
+                if !self
+                    .db
+                    .tombstone_existing_file(workspace_id, path, hash, mtime)
+                    .map_err(status_err)?
+                {
+                    return Err((StatusCode::BAD_REQUEST, "unsafe path".into()));
+                }
+                return Ok(response(StatusCode::OK, Body::empty()));
+            }
             self.db
                 .upsert_file(workspace_id, path, hash, 0, mtime, 0, true)
                 .map_err(status_err)?;
             return Ok(response(StatusCode::OK, Body::empty()));
+        }
+        if !safe_path {
+            return Err((StatusCode::BAD_REQUEST, "unsafe path".into()));
         }
         let computed = feanorfs_common::hash_bytes(body);
         if computed != hash {

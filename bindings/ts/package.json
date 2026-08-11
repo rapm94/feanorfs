@@ -50,7 +50,7 @@
     "verify-metadata": "node scripts/assemble-packages.mjs --verify --metadata-only",
     "publish-packages": "node scripts/publish-packages.mjs",
     "test:publish-packages": "node --test test/publish-packages.mjs",
-    "test": "node test/loop.mjs"
+    "test": "node test/loader-version.mjs && node test/loop.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.3"

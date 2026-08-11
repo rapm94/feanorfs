@@ -13,9 +13,9 @@ use chacha20poly1305::{
 };
 use feanorfs_common::WorkspaceInvite;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::Write as _;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
 use zeroize::{Zeroize as _, Zeroizing};
 
 const FORMAT_VERSION: u32 = 1;
@@ -61,15 +61,20 @@ pub fn export_recovery_kit(
 ) -> Result<()> {
     validate_passphrase(passphrase)?;
     validate_invite(invite)?;
-    validate_destination(destination, replace_destination)?;
+    let destination = resolved_destination(destination)?;
+    validate_destination(&destination, replace_destination)?;
 
     let envelope = seal(invite, passphrase)?;
     let encoded = serde_json::to_vec_pretty(&envelope).context("encode recovery kit")?;
     if encoded.len() > MAX_KIT_BYTES {
         bail!("encrypted recovery kit exceeds {MAX_KIT_BYTES} bytes");
     }
-    atomic_private_write(destination, &encoded)
-        .with_context(|| format!("write recovery kit {}", destination.display()))
+    if replace_destination {
+        atomic_private_write(&destination, &encoded)
+    } else {
+        atomic_private_create_new(&destination, &encoded)
+    }
+    .with_context(|| format!("write recovery kit {}", destination.display()))
 }
 
 /// Decrypt and validate a workspace capability without writing workspace
@@ -77,8 +82,18 @@ pub fn export_recovery_kit(
 /// modified kit before the normal onboarding path creates any local state.
 pub fn open_recovery_kit(source: &Path, passphrase: &str) -> Result<WorkspaceInvite> {
     validate_passphrase(passphrase)?;
-    let encoded =
-        fs::read(source).with_context(|| format!("read recovery kit {}", source.display()))?;
+    let source = fs::canonicalize(source)
+        .with_context(|| format!("resolve recovery kit {}", source.display()))?;
+    let file =
+        File::open(&source).with_context(|| format!("open recovery kit {}", source.display()))?;
+    let length = file.metadata()?.len();
+    if length > MAX_KIT_BYTES as u64 {
+        bail!("recovery kit exceeds {MAX_KIT_BYTES} bytes");
+    }
+    let mut encoded = Vec::with_capacity(usize::try_from(length).unwrap_or(MAX_KIT_BYTES));
+    file.take(MAX_KIT_BYTES as u64 + 1)
+        .read_to_end(&mut encoded)
+        .with_context(|| format!("read recovery kit {}", source.display()))?;
     if encoded.len() > MAX_KIT_BYTES {
         bail!("recovery kit exceeds {MAX_KIT_BYTES} bytes");
     }
@@ -237,6 +252,22 @@ fn decode_exact<const N: usize>(name: &str, encoded: &str) -> Result<[u8; N]> {
         .map_err(|_| anyhow::anyhow!("recovery {name} must contain exactly {N} bytes"))
 }
 
+fn resolved_destination(destination: &Path) -> Result<PathBuf> {
+    if destination.exists() {
+        return fs::canonicalize(destination).context("resolve existing recovery kit");
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = destination
+        .file_name()
+        .context("recovery kit path must name a file")?;
+    Ok(fs::canonicalize(parent)
+        .context("resolve recovery kit directory")?
+        .join(name))
+}
+
 fn validate_destination(destination: &Path, replace_destination: bool) -> Result<()> {
     if destination.exists() && !replace_destination {
         bail!(
@@ -256,6 +287,43 @@ fn validate_destination(destination: &Path, replace_destination: bool) -> Result
         }
     }
     Ok(())
+}
+
+fn atomic_private_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("recovery kit has no parent")?;
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow::anyhow!("generate recovery temp name: {error}"))?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary = parent.join(format!(".feanorfs-recovery-{suffix}.tmp"));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .context("create recovery temp file")?;
+    let result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::hard_link(&temporary, path).with_context(|| {
+            format!("publish recovery kit without replacing {}", path.display())
+        })?;
+        fs::remove_file(&temporary)?;
+        #[cfg(unix)]
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -382,5 +450,41 @@ mod tests {
         bad.encryption_key = "human-passphrase".into();
         assert!(export_recovery_kit(&path, &bad, PASSPHRASE, false).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn non_replace_recovery_publication_has_one_atomic_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("workspace.fnrk");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for bytes in [b"first".as_slice(), b"second".as_slice()] {
+                let destination = destination.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    atomic_private_create_new(&destination, bytes)
+                }));
+            }
+            barrier.wait();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let bytes = fs::read(destination).unwrap();
+        assert!(bytes == b"first" || bytes == b"second");
+    }
+
+    #[test]
+    fn oversized_recovery_kit_is_rejected_from_metadata_before_parsing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oversized.fnrk");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_KIT_BYTES as u64 + 1).unwrap();
+        let error = open_recovery_kit(&path, PASSPHRASE).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
     }
 }

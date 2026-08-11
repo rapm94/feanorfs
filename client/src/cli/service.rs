@@ -1,8 +1,11 @@
 use anyhow::Context as _;
 use clap::Subcommand;
 use serde::Serialize;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use super::process_tree;
 use super::start::{finish_sync_watch, WatchMode};
 use super::supervisor::{self};
 use super::util::output_json;
@@ -40,9 +43,23 @@ pub enum ServiceAction {
     /// Run one supervised workspace watcher
     #[command(hide = true)]
     Run { folder: PathBuf },
+    /// Run one supervised configured agent runner
+    #[command(hide = true)]
+    RunnerRun { workspace: PathBuf },
     /// Run the supervised private hub
     #[command(hide = true)]
     HubRun { data_dir: PathBuf },
+    /// Internal Unix startup gate. The wrapper blocks after process creation,
+    /// then execs the configured target in-place when the supervisor releases
+    /// its inherited descriptor.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    ExecGate {
+        release_fd: i32,
+        program: PathBuf,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Run the single background supervisor job that owns every worker
     #[command(hide = true)]
     Supervise,
@@ -97,11 +114,24 @@ impl ServiceSpec {
 pub async fn run(current_dir: &Path, action: ServiceAction, json: bool) -> anyhow::Result<()> {
     match action {
         ServiceAction::HubRun { data_dir } => super::hub_service::run_supervised(data_dir).await,
+        #[cfg(unix)]
+        ServiceAction::ExecGate {
+            release_fd,
+            program,
+            args,
+        } => process_tree::exec_gate_wait_and_exec(release_fd, &program, &args).map_err(Into::into),
         ServiceAction::Run { folder } => {
             std::env::set_current_dir(&folder)
                 .with_context(|| format!("open background workspace {}", folder.display()))?;
             let workspace = std::env::current_dir()?;
             finish_sync_watch(&workspace, WatchMode::Foreground).await
+        }
+        ServiceAction::RunnerRun { workspace } => {
+            super::agent_runner::run_worker(
+                &workspace,
+                feanorfs_agent_core::RunnerExecutionMode::Supervised,
+            )
+            .await
         }
         ServiceAction::Supervise => supervisor::run_supervisor().await,
         ServiceAction::Install { folder } => {
@@ -295,9 +325,15 @@ pub(crate) fn uninstall_for_workspace_stop(workspace: &Path) -> anyhow::Result<(
     let active = feanorfs_client::is_watching(&spec.workspace)
         || feanorfs_client::lock::is_sync_lock_active(&spec.workspace);
     if active && status != BackgroundStatus::Running {
-        anyhow::bail!(
-            "Sync is running outside the managed background service. Stop that terminal process, then retry `feanorfs stop`."
-        );
+        // A verified managed watcher orphaned by a dead supervisor (crash or
+        // the background item toggled off in System Settings) is still ours:
+        // uninstall proceeds and the stop wait terminates it. Anything else
+        // (a user's own `--foreground` process) must never be killed.
+        if !supervisor::is_managed_watcher(&spec.workspace)? {
+            anyhow::bail!(
+                "Sync is running outside the managed background service. Stop that terminal process, then retry `feanorfs stop`."
+            );
+        }
     }
 
     let _ = supervisor::uninstall_workspace(&spec.workspace)?;
@@ -345,10 +381,20 @@ fn print_result(result: &ServiceResult, json: bool) -> anyhow::Result<()> {
 /// the explicit override, then the directory containing `feanorfs_program`,
 /// then the packaged macOS app bundle, then `PATH`.
 pub(crate) fn find_tray_program(feanorfs_program: &Path) -> Option<PathBuf> {
+    find_tray_program_with_override(
+        feanorfs_program,
+        std::env::var_os("FEANORFS_TRAY_BIN").map(PathBuf::from),
+    )
+}
+
+fn find_tray_program_with_override(
+    feanorfs_program: &Path,
+    override_path: Option<PathBuf>,
+) -> Option<PathBuf> {
     let binary_name = format!("feanorfs-tray{}", std::env::consts::EXE_SUFFIX);
     let mut candidates = Vec::new();
-    if let Some(path) = std::env::var_os("FEANORFS_TRAY_BIN") {
-        candidates.push(PathBuf::from(path));
+    if let Some(path) = override_path {
+        candidates.push(path);
     }
     if let Some(parent) = feanorfs_program.parent() {
         candidates.push(parent.join(&binary_name));
@@ -492,9 +538,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fake_tray = dir.path().join("feanorfs-tray");
         std::fs::write(&fake_tray, "binary").unwrap();
-        std::env::set_var("FEANORFS_TRAY_BIN", &fake_tray);
-        let found = find_tray_program(Path::new("/usr/local/bin/feanorfs"));
-        std::env::remove_var("FEANORFS_TRAY_BIN");
+        let found = find_tray_program_with_override(
+            Path::new("/usr/local/bin/feanorfs"),
+            Some(fake_tray.clone()),
+        );
         assert_eq!(found, Some(fake_tray));
     }
 

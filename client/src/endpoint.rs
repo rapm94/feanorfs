@@ -23,21 +23,16 @@ pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<Ap
         return ApiClient::from_config(workspace, config).await;
     }
 
-    let original = ApiClient::from_config_direct(workspace, config).await?;
     let Some(stable) = stable_endpoint(config) else {
-        return Ok(original);
+        return ApiClient::from_config_direct(workspace, config).await;
     };
 
-    let direct = ApiClient::new_with_tls(
-        &stable.url,
-        config.server_password.as_deref(),
-        config.tls_ca_pem.as_deref(),
-    )?;
-    if probe(&direct).await {
-        persist_stable_url(workspace, config, &stable.url);
-        return Ok(direct);
-    }
-
+    // Prefer an exactly identity-matched managed hub on this machine before
+    // asking the system resolver for its `.local` name. Some resolvers keep a
+    // blocking mDNS lookup alive after the async probe timeout, delaying every
+    // short-lived CLI command until the runtime can shut down. The resolved
+    // client retains the CA-bound SNI and certificate verification; only its
+    // socket address is loopback.
     if let Some(pinned_ca) = config.tls_ca_pem.as_deref() {
         if let Some(address) = same_machine_address(&stable, pinned_ca) {
             let resolved = ApiClient::new_with_tls_resolved(
@@ -54,6 +49,17 @@ pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<Ap
                 return Ok(resolved);
             }
         }
+    }
+
+    let original = ApiClient::from_config_direct(workspace, config).await?;
+    let direct = ApiClient::new_with_tls(
+        &stable.url,
+        config.server_password.as_deref(),
+        config.tls_ca_pem.as_deref(),
+    )?;
+    if probe(&direct).await {
+        persist_stable_url(workspace, config, &stable.url);
+        return Ok(direct);
     }
 
     let fingerprint = stable.fingerprint.clone();

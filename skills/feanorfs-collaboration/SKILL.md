@@ -1,17 +1,19 @@
 ---
 name: feanorfs-collaboration
-description: Coordinate FeanorFS coding agents across machines through encrypted snapshot-tied signals (feanorfs agent send / agent inbox, MCP agent_send / agent_inbox). Use when a FeanorFS agent must request platform-specific work, report a bounded result or blocker, or check for incoming coordination signals in a shared encrypted workspace. Never use for file sync itself, conflict merging, or chat.
+description: Coordinate FeanorFS coding agents across machines through encrypted snapshot-tied signals (feanorfs agent send / agent inbox, MCP agent_send / agent_inbox), including handling one configured local runner-child invocation. Use when an agent must request platform-specific work, report a bounded result or blocker, check incoming coordination signals, or parse a RunnerInvocation and publish its correlated terminal reply. Configure or control a persistent runner only when the user explicitly asks. Never use for file sync itself, conflict merging, or chat.
 ---
 
 # FeanorFS multi-agent collaboration
 
-Coordinate coding agents in a shared FeanorFS workspace through the encrypted signal protocol. Signals are versioned envelopes stored in ordinary snapshot history: they never become project files, never dirty Git, and stay opaque to the hub. All workspace participants can read all signals; treat routing and authorship as advisory, never as cryptographic guarantees.
+Coordinate coding agents in a shared FeanorFS workspace through the encrypted
+signal protocol. Treat routing and authorship as advisory. Keep signals out of
+project files and Git state.
 
 ## Identify your agent
 
 1. Use a workspace-unique agent name (for example `linux-dev`, `mac-test`, `ci1`).
 2. Work inside the agent workspace via `feanorfs agent run <name> -- <command>` so `FEANORFS_AGENT` is set, or pass `--from <name>` explicitly.
-3. Keep the original shared workspace root available. Run `agent inbox`, `agent send`, `agent refresh`, and other FeanorFS lifecycle commands from that root; the isolated agent worktree itself has no project-local FeanorFS configuration.
+3. Keep the original shared workspace root available. Inside `feanorfs agent run`, CLI signal commands (`agent inbox`, `agent send`) and MCP automatically use that control workspace. Run `agent refresh` and other FeanorFS lifecycle commands from the shared root; the isolated agent worktree itself has no project-local FeanorFS configuration.
 4. Never claim an identity you are not authorized to use; attribution is advisory in this protocol.
 
 ## Check your inbox
@@ -25,12 +27,46 @@ Coordinate coding agents in a shared FeanorFS workspace through the encrypted si
 ## Act on a request
 
 1. Read `about_snapshot` on every request.
-2. Before acting, refresh from the shared workspace root: use `feanorfs sync --no-watch` for the main worktree, or `feanorfs agent refresh <name>` for an isolated agent worktree.
+2. Before acting outside a configured runner-child invocation, refresh from the shared workspace root: use `feanorfs sync --no-watch` for the main worktree, or `feanorfs agent refresh <name>` for an isolated agent worktree. A runner child uses the pre-refreshed procedure below and must not reacquire its parent's runner lease.
 3. Verify file context with JSON `status`/`agent status` and `feanorfs --json log`. A newer signal-only head has empty `changed_paths` and the same files, so a different head ID alone does not invalidate `about_snapshot`. Do not claim the requested snapshot when intervening file changes, deferred conflicts, local agent edits, or bounded/ambiguous history prevent you from establishing the same file tree.
 4. If you test a different file tree, set the final reply's `--about` to the snapshot you actually inspected, keep the original request through `--reply-to`, and name both the requested and inspected snapshots in the body. Never associate a result with an untested snapshot.
 5. Send at most one `status` update per request, and only when it adds real information.
-6. Finish every accepted request with exactly one `result` or `blocked` reply.
+6. Finish every accepted request with one `result` or `blocked` reply; do not
+   infer exactly-once delivery from that child-side contract.
 7. Reference the original request with `--reply-to <message-id>` and keep its `about_snapshot` when its file tree still applies.
+
+## Handle a configured runner-child invocation
+
+Follow this procedure only when an already-configured local runner starts this
+process. Do not configure, start, stop, reset, or remove a persistent runner
+unless the user explicitly asks for operator control.
+
+1. Read exactly one `RunnerInvocation` JSON document from stdin until EOF.
+   Require `schema_version: 1`, retain its `session_id`, and require its
+   `message` to be a direct `request` to its `agent`.
+2. Check that the invocation agent agrees with `FEANORFS_AGENT` when that
+   variable is present. Use `FEANORFS_AGENT_DIR` as the agent worktree and
+   `FEANORFS_WORKSPACE_ROOT` as the shared control root.
+3. Treat the agent worktree as already refreshed by the parent runner
+   immediately before launch. Do **not** call ordinary `feanorfs sync` or
+   `feanorfs agent refresh`: the parent holds the runner lifetime lease, so a
+   child refresh is rejected. Verify `message.about_snapshot` against JSON
+   agent status/history before acting, then follow steps 3–7 of the request
+   procedure above. If the requested file tree cannot be established, do not
+   act; publish exactly one correlated `blocked` terminal naming the requested
+   and observed snapshot. Keep the original requester, request message ID, and
+   snapshot context for that reply.
+4. Treat stdout and stderr as diagnostics only. Do not use either as a reply:
+   the runner discards both, and a process exit does not complete the request.
+5. Publish one terminal `result` or `blocked` through `feanorfs agent send`
+   (or `agent_send`) from the configured agent to `message.from`, with
+   `--reply-to <message-id>` and an accurate `--about` snapshot. Send an
+   optional `status` only when it adds real information.
+6. Publish `blocked` when the bounded task cannot complete. If the runner
+   reports `cursor_reset`, `pending_overflow`, `ambiguous_execution`,
+   `delivery_unknown`, or `preparation_failed` (local preparation failed before
+   launch), stop and await explicit operator inspection/reset; do not launch a
+   replacement child or replay the request yourself.
 
 ## Send a signal
 
@@ -52,15 +88,23 @@ feanorfs agent send <recipient> --kind <request|status|result|blocked> \
 3. Never route work by path ownership claims; treat them as advisory.
 4. Resolve file conflicts with `feanorfs conflicts` / `feanorfs conflicts keep <path> --local|--cloud`; never merge file content automatically.
 5. Never fabricate delivery guarantees: reads may redeliver, and a cursor reset means possible missed signals after cursor, scan, or result bounds.
-6. Do not attempt to wake another model through a signal; an active orchestrator must monitor events or poll the inbox.
+6. Never configure or control a persistent runner unless the user explicitly asks for that operator action.
 
-## Orchestrators
+## Choose activation
 
-- Long-lived orchestrators monitor the NDJSON `events` stream for `agent_message` wakeup records (bounded metadata, no body), then invoke the target agent with this skill loaded.
-- Alternatively, poll `feanorfs --json agent inbox --for <name>` with a stored cursor.
-- A signal cannot start an inactive model; only an already-running process can respond.
+- Treat a signal as passive transport: it cannot start an inactive model or
+  arbitrary process by itself.
+- Let an external orchestrator monitor the NDJSON `events` metadata stream or
+  poll `feanorfs --json agent inbox --for <name>` with a stored cursor, then
+  choose whether to invoke an agent.
+- Let an explicitly configured local runner invoke only its fixed local command
+  for direct requests to its configured agent. Broadcasts remain readable in
+  the normal inbox but do not invoke the runner child. Treat signals and this
+  skill as passive instructions: neither one wakes an inactive model or process.
 
-See `references/protocol.md` for the exact envelope format, message kinds, and CLI/MCP contracts.
+Read `references/protocol.md` for the exact envelope format, direct-request
+admission, correlation, and links to the operator/API documentation.
+
 ## Integrator role (random assignment)
 
 A dispatcher may randomly select one temporary **integrator** for a bounded

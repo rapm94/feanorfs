@@ -15,10 +15,12 @@ chat.
 - [ ] Add Developer ID Application/Installer and App Store Connect notarization
   credentials to GitHub Actions for the universal macOS `.dmg`/`.pkg`.
 - [ ] Configure Azure Artifact Signing through GitHub OIDC for the Windows CLI,
-  tray, and installer `.exe`.
+  tray, and installer `.exe`, and provide the stable public signer identities
+  that release verification must enforce.
 
 Done when one immutable tag publishes notarized macOS and Authenticode Windows
-products. Unsigned releases must remain clearly labeled as development builds.
+products whose evidence matches the approved signer identities. Unsigned
+releases must remain clearly labeled as development builds.
 
 ### F2. Provide the production off-LAN relay
 
@@ -40,6 +42,23 @@ encrypted payload contents.
 
 Signed macOS and Windows acceptance is blocked on F1. Off-LAN default pairing
 acceptance is blocked on F2.
+
+### F4. Lock the GitHub release control plane
+
+- [ ] Add rules for every tag ref (not only `v*`) that restrict creation to
+  the approved release automation identity, prevent update/deletion, and apply
+  to administrators as well as other actors. This is the residual gate for
+  cargo-dist's broad generated SemVer-like `release.yml` tag trigger, which must
+  not be hand-edited to add repository-owned CI/Security API checks.
+- [ ] Protect the `prod` environment with required reviewers, release-only
+  deployment policy, and no administrator bypass.
+- [ ] Enable required Code Owner reviews through the repository branch rules for
+  the release/distribution surfaces already mapped in `.github/CODEOWNERS`.
+
+Done when GitHub's rules/environment APIs report these controls enabled, only
+approved release automation can create any tag that matches the generated
+release trigger, no actor can update/delete any tag ref, and a non-release SHA
+cannot obtain production approval.
 
 ## AI tasks
 
@@ -63,6 +82,25 @@ worker, CLI, and tray through each native installer and login manager.
   Rust, C, and TypeScript entry points and require one actionable fail-closed
   minimum-version error. Retain explicit compatibility evidence for the
   previous endpoint-less release.
+
+### AI-2. Eliminate generated cargo-dist workflow trust exceptions
+
+The repository now pins generated action references and attests archives,
+checksums, and `dist-manifest.json` through `dist-workspace.toml`. Cargo-dist
+0.32.0 still generates workflow-wide `contents: write`, dynamic shell template
+expansion, an unpinned optional container expression, and an unverified
+`curl | sh` bootstrap; direct edits to `release.yml` are forbidden.
+
+- [ ] Adopt a maintained cargo-dist release or a pinned, reviewed generator fork
+  that emits per-job least privilege and moves tag/matrix data out of shell
+  template expansion.
+- [ ] Replace the generated bootstrap with a version-and-digest-bound cargo-dist
+  acquisition path and ensure every generated container image is digest-pinned.
+- [ ] Regenerate `release.yml` from `dist-workspace.toml`; do not patch generated
+  YAML after generation.
+
+Done when `dist generate --check` passes and full-workflow pedantic `zizmor`
+reports no medium-or-higher findings for generated `release.yml`.
 
 ### AI-3. Integrate the default relay after F2
 
@@ -94,6 +132,28 @@ Remaining field evidence (not code-complete in the repo):
   `orchestrator/integrator-state.json` and the dispatcher lock (permissions, crash recovery).
 - [ ] Validate the extended `feanorfs-collaboration` skill against cooperative and
   stale-agent scenarios (forward-testing the integrator role rules).
+
+### AI-5. Make workspace-state identity and retirement portable
+
+Unix workspaces with a stable birth identity now relocate safely and reject a
+same-path replacement, and agent runtime state no longer creates top-level
+workspace slots. Windows and filesystems without a stable birth identity still
+need an upgrade-safe identity migration; historical state also lacks the
+provenance required for automatic retirement.
+
+- [ ] Add stable Windows and weak-filesystem identity without silently adopting
+  an existing path-only slot during upgrade or same-path folder replacement.
+- [ ] Replace the bounded O(N) moved-workspace search with a crash-safe identity
+  index and serialize path-hash migration with full-lifetime cross-process state
+  leases.
+- [ ] Record authenticated ephemeral/tombstone provenance prospectively, then
+  quarantine and grace expired state before deletion with fail-closed lease and
+  identity revalidation. Never infer orphanhood from age, a missing location,
+  registry absence, or a temporary-looking path.
+
+Done when same-path replacement and relocation pass on macOS, Linux, and
+Windows; concurrent old/new processes cannot split or retire live state; and
+cleanup deletes only explicitly proven future-ephemeral/tombstoned state.
 
 ## Shipped AI work (removed per closeout)
 

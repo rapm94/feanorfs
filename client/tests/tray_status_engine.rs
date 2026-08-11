@@ -5,6 +5,8 @@
 //! the sync lock. These tests prove polling cannot delay file-change
 //! synchronization even in a large workspace.
 
+feanorfs_test_support::isolate_test_process!();
+
 mod support;
 
 use feanorfs_client::{
@@ -78,9 +80,9 @@ async fn tray_polling_reads_worker_snapshot_without_lock_or_scan() {
 
     // The explicit fresh path must remain available: it scans the project
     // and therefore sees the untracked file, unlike routine snapshot polls.
-    // (The sync lock is re-entrant for the owning process, so the fresh scan
-    // is allowed to run here; the lock exists to serialize against OTHER
-    // processes such as the managed worker.)
+    // Release the deliberately held lock first: the production sync lock is
+    // non-reentrant, and the explicit fresh path intentionally acquires it.
+    drop(_sync_guard);
     let fresh = do_tray_status_with(root, true).await.unwrap();
     assert_eq!(fresh.mirror_state, "out_of_sync");
 }

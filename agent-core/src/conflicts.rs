@@ -4,7 +4,7 @@ use crate::conflict_artifacts::{
 };
 use crate::crypto::seal;
 use crate::ctx::SyncCtx;
-use crate::fs_util::{atomic_write, file_mtime_ms};
+use crate::fs_util::{apply_executable_mode, atomic_write};
 use crate::local::ClientDb;
 use crate::paths::conflicts_dir;
 use anyhow::{bail, Context, Result};
@@ -39,17 +39,20 @@ fn same_content(left: Option<&FileState>, right: Option<&FileState>) -> bool {
     }
 }
 
-/// Load the complete active server view without relying on LWW delta direction.
-pub async fn load_server_view(ctx: &SyncCtx<'_>) -> Result<HashMap<String, FileState>> {
+async fn load_server_view_with_head(
+    ctx: &SyncCtx<'_>,
+) -> Result<(Option<String>, HashMap<String, FileState>)> {
     if ctx.format_version() >= 3 {
-        return match ctx.api.get_head(ctx.workspace_id()).await? {
+        let head = ctx.api.get_head(ctx.workspace_id()).await?;
+        let files = match head.as_deref() {
             Some(head) => {
                 crate::snapshot::SnapshotEngine::new(ctx)
-                    .load_files(&head)
-                    .await
+                    .load_files(head)
+                    .await?
             }
-            None => Ok(HashMap::new()),
+            None => HashMap::new(),
         };
+        return Ok((head, files));
     }
     let response = ctx
         .api
@@ -58,11 +61,19 @@ pub async fn load_server_view(ctx: &SyncCtx<'_>) -> Result<HashMap<String, FileS
             files: Vec::new(),
         })
         .await?;
-    Ok(response
-        .download_required
-        .into_iter()
-        .map(|file| (file.path.clone(), file))
-        .collect())
+    Ok((
+        None,
+        response
+            .download_required
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect(),
+    ))
+}
+
+/// Load the complete active server view without relying on LWW delta direction.
+pub async fn load_server_view(ctx: &SyncCtx<'_>) -> Result<HashMap<String, FileState>> {
+    Ok(load_server_view_with_head(ctx).await?.1)
 }
 
 pub async fn load_last_synced_snapshot(ctx: &SyncCtx<'_>) -> Result<HashMap<String, FileState>> {
@@ -144,10 +155,10 @@ pub async fn register_and_write_conflicts(
     fs::create_dir_all(&dir).await?;
 
     let local_root = ours_base.unwrap_or(ctx.base);
+    let ours_reader = crate::workspace_read::WorkspaceReadRoot::open(local_root)?;
     for (edit, kind) in items {
-        let ours_src = edit.ours.as_ref().map(|o| local_root.join(&o.path));
         let ours_label = ours_missing_label(kind);
-        write_conflict_triple(&dir, edit, ctx, ours_src.as_deref(), ours_label).await?;
+        write_conflict_triple(&dir, edit, ctx, Some(&ours_reader), ours_label).await?;
     }
 
     let paths: Vec<String> = items.iter().map(|(c, _)| c.path.clone()).collect();
@@ -167,7 +178,7 @@ pub async fn register_and_write_conflicts(
 fn ours_missing_label(kind: &ConflictKind) -> &'static str {
     match kind {
         ConflictKind::EditDelete => "deleted-locally",
-        ConflictKind::DeleteEdit => "no-local-changes",
+        ConflictKind::DeleteEdit => "deleted-locally",
         ConflictKind::EditEdit => "no-local-snapshot",
     }
 }
@@ -217,6 +228,54 @@ pub async fn discard_excluded_conflict(db: &ClientDb, path: &str) -> Result<()> 
     Ok(())
 }
 
+async fn current_head_state(ctx: &SyncCtx<'_>) -> Result<Option<crate::objects::LoadedTree>> {
+    if ctx.format_version() < 3 {
+        return Ok(None);
+    }
+    let Some(head) = ctx.api.get_head(ctx.workspace_id()).await? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        crate::snapshot::SnapshotEngine::new(ctx)
+            .load_state(&head)
+            .await?,
+    ))
+}
+
+fn cloud_mode(state: Option<&crate::objects::LoadedTree>, path: &str) -> Option<u32> {
+    let state = state?;
+    if let Some(conflict) = state
+        .conflicts
+        .iter()
+        .find(|conflict| conflict.path == path)
+    {
+        return conflict
+            .theirs
+            .as_ref()
+            .filter(|leg| !leg.deleted)
+            .map(|leg| leg.mode);
+    }
+    state.files.get(path).map(|file| file.mode)
+}
+
+async fn portable_disk_mode(path: &Path) -> Result<u32> {
+    let metadata = fs::metadata(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        Ok(if metadata.permissions().mode() & 0o111 != 0 {
+            feanorfs_common::EXECUTABLE_MODE
+        } else {
+            0
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(0)
+    }
+}
+
 pub async fn resolve_conflict(
     ctx: &SyncCtx<'_>,
     path: &str,
@@ -232,30 +291,43 @@ pub async fn resolve_conflict(
         .await?
         .with_context(|| format!("no pending conflict for {path}"))?;
     let before = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    let read_root = crate::workspace_read::WorkspaceReadRoot::open(ctx.base)?;
     crate::snapshot::SnapshotEngine::new(ctx)
         .snapshot_local_view(&before, "you")
         .await?;
+    let head_state = current_head_state(ctx).await?;
     let conflict_dir = PathBuf::from(&record.conflict_dir);
     let mut additional_paths = Vec::new();
+    let mut selected_modes = HashMap::new();
 
     match keep {
         ResolveKeep::File => {
             let src = file_source.with_context(|| "conflicts keep --file requires a path")?;
             let content = fs::read(src).await?;
+            let mode = portable_disk_mode(src).await?;
             atomic_write(ctx.base, path, &content).await?;
-            upload_sealed(ctx, path, &content, chrono::Utc::now().timestamp_millis()).await?;
+            apply_executable_mode(&ctx.base.join(path), mode).await?;
+            upload_sealed(
+                ctx,
+                path,
+                &content,
+                chrono::Utc::now().timestamp_millis(),
+                mode,
+            )
+            .await?;
+            selected_modes.insert(path.to_string(), mode);
         }
         ResolveKeep::Local => {
-            let ours_path = ctx.base.join(path);
-            if ours_path.exists() {
-                let plain = fs::read(&ours_path).await?;
-                let mtime = file_mtime_ms(&ours_path).await?;
-                upload_sealed(ctx, path, &plain, mtime).await?;
+            if let Some(state) = before.get(path).filter(|state| !state.deleted) {
+                let plain = crate::sync_pass::read_upload_source(&read_root, path, state).await?;
+                upload_sealed(ctx, path, &plain, state.mtime, state.mode).await?;
+                selected_modes.insert(path.to_string(), state.mode);
             } else {
                 upload_tombstone_for(ctx, path).await?;
             }
         }
         ResolveKeep::Cloud => {
+            let mode = cloud_mode(head_state.as_ref(), path).unwrap_or(0);
             let theirs_file = resolve_artifact(&conflict_dir, path, ArtifactRole::Cloud);
             if theirs_file.exists() {
                 let content = fs::read(&theirs_file).await?;
@@ -269,8 +341,16 @@ pub async fn resolve_conflict(
                     bail!("theirs version unavailable on disk; re-run sync while online");
                 } else {
                     atomic_write(ctx.base, path, &content).await?;
-                    upload_sealed(ctx, path, &content, chrono::Utc::now().timestamp_millis())
-                        .await?;
+                    apply_executable_mode(&ctx.base.join(path), mode).await?;
+                    upload_sealed(
+                        ctx,
+                        path,
+                        &content,
+                        chrono::Utc::now().timestamp_millis(),
+                        mode,
+                    )
+                    .await?;
+                    selected_modes.insert(path.to_string(), mode);
                 }
             } else {
                 bail!("cloud version artifact missing for {path}");
@@ -292,33 +372,42 @@ pub async fn resolve_conflict(
                 })
                 .collect();
             let alt_path = format!("{safe_path} (conflicted copy {hostname})");
-            let ours_path = ctx.base.join(path);
-            if ours_path.exists() {
-                let content = fs::read(&ours_path).await?;
-                upload_sealed(ctx, path, &content, file_mtime_ms(&ours_path).await?).await?;
+            if let Some(state) = before.get(path).filter(|state| !state.deleted) {
+                let content = crate::sync_pass::read_upload_source(&read_root, path, state).await?;
+                upload_sealed(ctx, path, &content, state.mtime, state.mode).await?;
+                selected_modes.insert(path.to_string(), state.mode);
             }
             if theirs_file.exists() {
                 let content = fs::read(&theirs_file).await?;
                 if !is_sentinel_content(&content) {
+                    let mode = cloud_mode(head_state.as_ref(), path).unwrap_or(0);
                     atomic_write(ctx.base, &alt_path, &content).await?;
+                    apply_executable_mode(&ctx.base.join(&alt_path), mode).await?;
                     upload_sealed(
                         ctx,
                         &alt_path,
                         &content,
                         chrono::Utc::now().timestamp_millis(),
+                        mode,
                     )
                     .await?;
+                    selected_modes.insert(alt_path.clone(), mode);
                     additional_paths.push(alt_path);
                 }
             }
         }
     }
 
-    let resolved_files = if ctx.format_version() >= 3 {
+    let mut resolved_files = if ctx.format_version() >= 3 {
         crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?
     } else {
         load_server_view(ctx).await?
     };
+    for (selected_path, mode) in selected_modes {
+        if let Some(state) = resolved_files.get_mut(&selected_path) {
+            state.mode = mode;
+        }
+    }
     let resolver = std::env::var("FEANORFS_AGENT").unwrap_or_else(|_| "human".into());
     crate::snapshot::SnapshotEngine::new(ctx)
         .resolve_conflict(path, &resolved_files, &additional_paths, &resolver)
@@ -373,6 +462,8 @@ async fn resolve_all_conflicts(ctx: &SyncCtx<'_>, keep: ResolveKeep) -> Result<V
         }
     }
 
+    let head_state = current_head_state(ctx).await?;
+    let mut selected_modes = HashMap::new();
     let mut cloud_actions = Vec::new();
     if keep == ResolveKeep::Cloud {
         for record in &records {
@@ -385,39 +476,45 @@ async fn resolve_all_conflicts(ctx: &SyncCtx<'_>, keep: ResolveKeep) -> Result<V
                 .await
                 .with_context(|| format!("cloud version unavailable for {}", record.path))?;
             if is_cloud_deleted_sentinel(&content) {
-                cloud_actions.push((record.path.clone(), None));
+                cloud_actions.push((record.path.clone(), None, 0));
             } else if is_sentinel_content(&content) {
                 bail!(
                     "cloud version unavailable for {}; re-run sync while online",
                     record.path
                 );
             } else {
-                cloud_actions.push((record.path.clone(), Some(content)));
+                let mode = cloud_mode(head_state.as_ref(), &record.path).unwrap_or(0);
+                cloud_actions.push((record.path.clone(), Some(content), mode));
             }
         }
     }
 
     let before = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    let read_root = crate::workspace_read::WorkspaceReadRoot::open(ctx.base)?;
     crate::snapshot::SnapshotEngine::new(ctx)
         .snapshot_local_view(&before, "you")
         .await?;
 
     if keep == ResolveKeep::Local {
         for record in &records {
-            let ours_path = ctx.base.join(&record.path);
-            if ours_path.exists() {
-                let plain = fs::read(&ours_path).await?;
-                let mtime = file_mtime_ms(&ours_path).await?;
-                upload_sealed(ctx, &record.path, &plain, mtime).await?;
+            if let Some(state) = before.get(&record.path).filter(|state| !state.deleted) {
+                let plain =
+                    crate::sync_pass::read_upload_source(&read_root, &record.path, state).await?;
+                upload_sealed(ctx, &record.path, &plain, state.mtime, state.mode).await?;
+                selected_modes.insert(record.path.clone(), state.mode);
             } else {
                 upload_tombstone_for(ctx, &record.path).await?;
             }
         }
     } else {
-        for (path, content) in cloud_actions {
+        for (path, content, mode) in cloud_actions {
             let destination = ctx.base.join(&path);
             match content {
-                Some(content) => atomic_write(ctx.base, &path, &content).await?,
+                Some(content) => {
+                    atomic_write(ctx.base, &path, &content).await?;
+                    apply_executable_mode(&destination, mode).await?;
+                    selected_modes.insert(path.clone(), mode);
+                }
                 None => match fs::remove_file(&destination).await {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -427,11 +524,16 @@ async fn resolve_all_conflicts(ctx: &SyncCtx<'_>, keep: ResolveKeep) -> Result<V
         }
     }
 
-    let resolved_files = if ctx.format_version() >= 3 {
+    let mut resolved_files = if ctx.format_version() >= 3 {
         crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?
     } else {
         load_server_view(ctx).await?
     };
+    for (selected_path, mode) in selected_modes {
+        if let Some(state) = resolved_files.get_mut(&selected_path) {
+            state.mode = mode;
+        }
+    }
     let resolver = std::env::var("FEANORFS_AGENT").unwrap_or_else(|_| "human".into());
     let paths: Vec<String> = records.iter().map(|record| record.path.clone()).collect();
     crate::snapshot::SnapshotEngine::new(ctx)
@@ -466,13 +568,18 @@ async fn resolve_all_conflicts(ctx: &SyncCtx<'_>, keep: ResolveKeep) -> Result<V
     Ok(paths)
 }
 
-async fn upload_sealed(ctx: &SyncCtx<'_>, path: &str, content: &[u8], mtime: i64) -> Result<()> {
+async fn upload_sealed(
+    ctx: &SyncCtx<'_>,
+    path: &str,
+    content: &[u8],
+    mtime: i64,
+    mode: u32,
+) -> Result<()> {
     if crate::large_file::uses_chunk_transport(content.len() as u64) {
         if ctx.format_version() < 3 {
             bail!("large-file conflict resolution requires format v3; run `feanorfs migrate`");
         }
-        let fingerprint =
-            crate::large_file::fingerprint(&ctx.base.join(path), ctx.password_str(), path)?;
+        let fingerprint = crate::large_file::fingerprint(ctx.base, ctx.password_str(), path)?;
         crate::large_file::upload(ctx, path, &fingerprint.encrypted_hash).await?;
         return Ok(());
     }
@@ -483,7 +590,7 @@ async fn upload_sealed(ctx: &SyncCtx<'_>, path: &str, content: &[u8], mtime: i64
         size: content.len() as u64,
         mtime,
         deleted: false,
-        mode: 0,
+        mode,
     };
     if ctx.format_version() >= 3 {
         ctx.api
@@ -546,17 +653,38 @@ pub async fn detect_placeholder_corruptions(
     db: &ClientDb,
 ) -> Result<Vec<String>> {
     let cached = db.get_cache_entries().await?;
+    let read_root = crate::workspace_read::WorkspaceReadRoot::open(base_path)?;
     let mut out = Vec::new();
     for (path, entry) in &cached {
         if entry.hydrated || entry.deleted_at.is_some() {
             continue;
         }
-        let full = base_path.join(path);
-        if !full.is_file() {
+        let Ok(file) = read_root.open_regular(path) else {
             continue;
-        }
-        let meta = fs::metadata(&full).await?;
-        if meta.len() > 0 {
+        };
+        let metadata = file.metadata()?;
+        let observed_mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            .unwrap_or(0);
+        #[cfg(unix)]
+        let observed_mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o111 != 0 {
+                feanorfs_common::EXECUTABLE_MODE
+            } else {
+                0
+            }
+        };
+        #[cfg(not(unix))]
+        let observed_mode = entry.mode;
+        if metadata.len() > 0
+            || observed_mtime != entry.mtime
+            || observed_mode != entry.mode
+            || !metadata.permissions().readonly()
+        {
             out.push(path.clone());
         }
     }
@@ -567,10 +695,15 @@ pub async fn register_placeholder_corruption(base: &Path, db: &ClientDb, path: &
     if db.get_conflict_record(path).await?.is_some() {
         return Ok(());
     }
+    if !is_safe_rel_path(path) {
+        bail!("unsafe placeholder path: {path}");
+    }
+    let (stray, _) = crate::workspace_read::WorkspaceReadRoot::open(base)?
+        .read_regular_stable(path, u64::MAX - 1)
+        .await?;
     let ts = chrono::Utc::now().timestamp_millis();
     let dir = conflicts_dir(base)?.join(format!("placeholder_{ts}"));
     fs::create_dir_all(&dir).await?;
-    let stray = fs::read(base.join(path)).await?;
     let local_dest = resolve_artifact(&dir, path, ArtifactRole::Local);
     if let Some(parent) = local_dest.parent() {
         fs::create_dir_all(parent).await?;
@@ -696,10 +829,12 @@ pub async fn negotiate_sync_with_conflict_gate(
     ctx: &SyncCtx<'_>,
     local_files: &HashMap<String, FileState>,
     register: bool,
-) -> Result<(SyncResponse, HashSet<String>)> {
+) -> Result<(SyncResponse, HashSet<String>, Option<String>)> {
     let pending = pending_conflict_paths(ctx.db).await?;
-    let server_files = load_server_view(ctx).await?;
-    let reconciled = crate::tree_reconcile::reconcile(ctx, local_files, &server_files).await?;
+    let (server_head, server_files) = load_server_view_with_head(ctx).await?;
+    let reconciled =
+        crate::tree_reconcile::reconcile(ctx, local_files, &server_files, server_head.as_deref())
+            .await?;
     let last = reconciled.base;
     let mut response = reconciled.response;
     let detected = detect_workspace_conflicts_with_server_view(
@@ -838,7 +973,7 @@ pub async fn negotiate_sync_with_conflict_gate(
     }
 
     filter_blocked_paths(&mut response, &blocked);
-    Ok((response, blocked))
+    Ok((response, blocked, server_head))
 }
 
 #[cfg(test)]
@@ -895,6 +1030,14 @@ mod tests {
             &HashSet::new(),
         );
         assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn missing_local_delete_uses_the_deleted_locally_artifact_label() {
+        assert_eq!(
+            ours_missing_label(&ConflictKind::DeleteEdit),
+            "deleted-locally"
+        );
     }
 
     #[test]

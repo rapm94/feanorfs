@@ -1,5 +1,7 @@
 //! Tray JSON contract snapshots — fail when serialized tray API shapes change.
 
+feanorfs_test_support::isolate_test_process!();
+
 use feanorfs_common::tray_contract::fixtures;
 
 macro_rules! contract_snapshot {

@@ -44,9 +44,8 @@ gate.
 The primary Unix installer inspects the latest release assets. On macOS it uses
 the universal package only when both package and checksum are present, then
 requires checksum, Developer ID Installer, and Gatekeeper verification before
-installation. If an older release has no package it installs only the
-cargo-dist CLI and reports that limitation; a listed but incomplete or invalid
-package fails closed.
+installation. Older, unsupported, incomplete, or invalid desktop releases fail
+closed; cargo-dist does not publish executable installer scripts.
 
 On Linux x86-64 and ARM64, the same installer prefers a release `.deb` on
 Debian/Ubuntu, `.rpm` on Fedora/RHEL, or `.pkg.tar.zst` on Arch/Manjaro. It
@@ -58,16 +57,20 @@ for custom prefixes and is rejected when runtime linkage is missing.
 
 On Windows, the normal Inno Setup EXE and both embedded executables must carry
 valid Authenticode signatures. CI proves exact installed hashes, per-user PATH
-integration, and uninstall before publication. The PowerShell fallback accepts
-only the expected checksummed two-executable bundle and verifies both
-signatures. Azure Artifact Signing is mandatory; there is no unsigned desktop
-fallback.
+integration, and uninstall before publication. The PowerShell automation route
+downloads only that canonical setup EXE, requires a canonical stable tag,
+verifies its exact release checksum, Authenticode signature, matching setup and
+installed CLI versions, and the configured exact signer subject policy before
+acceptance; it never executes a legacy downloaded script. Azure Artifact Signing is
+mandatory for the trusted product; explicitly named unsigned preview artifacts
+are never an installation fallback.
 
-**Current release status:** v0.5.0 contains the attested CLI but no trusted
-desktop artifacts. The first consumer macOS release must include the universal
-DMG/package, accepted notarization JSON, signed-Keychain smoke record, and
-verification evidence described above. The first Windows desktop release must
-likewise include the Authenticode-signed setup EXE and verification evidence.
+**Current signing status:** Linux desktop packages and cargo-dist CLI archives
+are attested. The first credentialed consumer macOS release must include the
+universal DMG/package, accepted notarization JSON, signed-Keychain smoke record,
+and verification evidence described above. The first trusted Windows desktop
+release must likewise include the Authenticode-signed setup EXE and verification
+evidence.
 
 Release artifacts, evidence, and installer scripts also receive a **GitHub
 Artifact Attestation** (SLSA build provenance via Sigstore). An attestation is
@@ -103,9 +106,9 @@ gh attestation verify \
 ```
 
 Use the filename you downloaded (`*.tar.xz`, `*.zip`, `*.dmg`, `*.pkg`,
-`*.deb`, `*.rpm`, `*.pkg.tar.zst`, `*.exe`,
-`feanorfs-client-installer.sh`, or `feanorfs-client-installer.ps1`). This
-includes `FeanorFS-macOS.pkg` and its notarization/verification evidence.
+`*.deb`, `*.rpm`, `*.pkg.tar.zst`, or `*.exe`). This includes
+`FeanorFS-macOS.pkg` and its notarization/verification evidence. Executable
+cargo-dist installer scripts are deliberately not release products.
 Success prints the linked workflow run and commit; failure means do not run the
 binary.
 
@@ -140,8 +143,8 @@ dpkg-deb -f FeanorFS-linux-x86_64.deb Package Architecture Depends
 ```
 
 `Package` must be `feanorfs`, the architecture must match the machine, and the
-dependencies must include GTK 3, Ayatana AppIndicator 3, libxdo, and the XDG
-desktop portal. For an RPM-family system:
+dependencies must include GTK 3, Ayatana AppIndicator 3, and the XDG desktop
+portal, and must not include the unused distro-variant `libxdo` ABI. For an RPM-family system:
 
 ```bash
 sha256sum -c FeanorFS-linux-x86_64.rpm.sha256
@@ -162,8 +165,8 @@ bsdtar -xOf FeanorFS-linux-x86_64.pkg.tar.zst .PKGINFO
 ```
 
 `pkgname` must be `feanorfs`, `arch` must match the machine, and the
-dependencies must name GTK 3, Ayatana AppIndicator, xdotool, the XDG desktop
-portal, and zenity.
+dependencies must name GTK 3, Ayatana AppIndicator, the XDG desktop portal, and
+zenity without `xdotool`/`libxdo`.
 
 ### Verify the Windows installer
 
@@ -219,12 +222,16 @@ must have status `Accepted`.
 - CodeQL scans Rust and GitHub Actions. `actionlint` validates workflow syntax
   and embedded shell, while `zizmor` audits repository-owned workflows.
 - Repository-owned actions are pinned to immutable commit SHAs. Cargo-dist's
-  generated `release.yml` remains generator-owned and is never patched by hand.
+  generated `release.yml` remains generator-owned: its action commits and
+  attestation filters live in `dist-workspace.toml`, followed by regeneration.
 - Dependabot covers Cargo, npm, Docker base images, and GitHub Actions. Version updates use a
   cooldown; security updates are not intentionally delayed.
-- `release-plz` runs only after CI succeeds on a trusted `main` push. Cargo-dist
-  then builds and attests the tag, and both desktop workflows verify that the
-  tag resolves to the exact release commit before uploading their artifacts.
+- `release-plz` tags only an exact SHA with successful trusted main-push CI;
+  manual recovery performs the same API-backed check. Cargo-dist then builds and
+  attests the tag. Desktop and relay workflows bind checkout/artifact names to a
+  canonical tag, matching release target, main-reachable SHA, workspace version,
+  successful CI, and successful cargo-dist run. Repository-owned signing and
+  publication jobs also require the `prod` environment.
 - Apple signing and notarization secrets are available only to their dedicated
   steps. Decoded keys live under the ephemeral runner directory, private keys
   are imported into a temporary keychain, and an unconditional cleanup step

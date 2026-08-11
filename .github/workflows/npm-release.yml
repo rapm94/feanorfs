@@ -39,6 +39,11 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Checked-out source $ACTUAL_SHA does not match event commit $EXPECTED_SHA."
+            exit 1
+          fi
           VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           PACKAGE_VERSION="$(jq -r '.version' bindings/ts/package.json)"
           if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
@@ -76,10 +81,14 @@ jobs:
             fi
             echo "dry-run=false" >>"$GITHUB_OUTPUT"
           else
-            if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$REF" != "refs/heads/main" ]; then
-              echo "::error::Manual dry runs must dispatch from main."
+            if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+              echo "::error::Only a trusted release tag may publish packages."
               exit 1
             fi
+            case "$REF" in
+              refs/heads/*) ;;
+              *) echo "::error::Manual dry runs must dispatch from a repository branch."; exit 1 ;;
+            esac
             echo "dry-run=true" >>"$GITHUB_OUTPUT"
           fi
           echo "sha=$EXPECTED_SHA" >>"$GITHUB_OUTPUT"
@@ -155,9 +164,9 @@ jobs:
           USE_ZIG: ${{ matrix.zig }}
         run: |
           set -euo pipefail
-          args=(build --release -p feanorfs-agent-node --target "$TARGET")
+          args=(build --platform --release -p feanorfs-agent-node --target "$TARGET")
           if [ "$USE_ZIG" = "true" ]; then
-            args+=(--zig)
+            args+=(--cross-compile)
           fi
           ./node_modules/.bin/napi "${args[@]}"
           test -f "$ARTIFACT"

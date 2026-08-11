@@ -1,6 +1,6 @@
-import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
+  copyFileSync,
   existsSync,
   readFileSync,
   readdirSync,
@@ -24,6 +24,7 @@ const targets = [
     artifact: 'feanorfs-agent-node.darwin-x64.node',
     os: 'darwin',
     cpu: 'x64',
+    binary: { format: 'macho', machine: 0x01000007 },
   },
   {
     triple: 'aarch64-apple-darwin',
@@ -32,6 +33,7 @@ const targets = [
     artifact: 'feanorfs-agent-node.darwin-arm64.node',
     os: 'darwin',
     cpu: 'arm64',
+    binary: { format: 'macho', machine: 0x0100000c },
   },
   {
     triple: 'x86_64-unknown-linux-gnu',
@@ -41,6 +43,7 @@ const targets = [
     os: 'linux',
     cpu: 'x64',
     libc: 'glibc',
+    binary: { format: 'elf', machine: 62 },
   },
   {
     triple: 'aarch64-unknown-linux-gnu',
@@ -50,6 +53,7 @@ const targets = [
     os: 'linux',
     cpu: 'arm64',
     libc: 'glibc',
+    binary: { format: 'elf', machine: 183 },
   },
   {
     triple: 'x86_64-pc-windows-msvc',
@@ -58,6 +62,7 @@ const targets = [
     artifact: 'feanorfs-agent-node.win32-x64-msvc.node',
     os: 'win32',
     cpu: 'x64',
+    binary: { format: 'pe', machine: 0x8664 },
   },
 ]
 
@@ -77,6 +82,60 @@ function workspaceVersion() {
   const version = section?.match(/^version\s*=\s*"([^"]+)"/m)?.[1]
   if (!version) throw new AssemblyError('workspace package version is missing')
   return version
+}
+
+function syncGeneratedLoaderVersion(version) {
+  const loaderPath = join(packageRoot, 'index.js')
+  const loader = readFileSync(loaderPath, 'utf8')
+  const expected = loader
+    .replace(/bindingPackageVersion !== '[^']+'/g, `bindingPackageVersion !== '${version}'`)
+    .replace(/expected [0-9]+\.[0-9]+\.[0-9]+ but got/g, `expected ${version} but got`)
+  if (!expected.includes(`bindingPackageVersion !== '${version}'`)) {
+    throw new AssemblyError('generated native loader has no package-version checks')
+  }
+  if (verifyOnly) {
+    if (loader !== expected) {
+      throw new AssemblyError(`native loader version drifted; expected ${version}`)
+    }
+  } else if (loader !== expected) {
+    writeFileSync(loaderPath, expected)
+  }
+}
+
+function validateBinary(path, target) {
+  const bytes = readFileSync(path)
+  let machine
+  if (target.binary.format === 'macho') {
+    if (bytes.length < 8 || bytes.readUInt32LE(0) !== 0xfeedfacf) {
+      throw new AssemblyError(`${target.artifact} is not a 64-bit little-endian Mach-O binary`)
+    }
+    machine = bytes.readUInt32LE(4)
+  } else if (target.binary.format === 'elf') {
+    if (
+      bytes.length < 20 ||
+      bytes[0] !== 0x7f ||
+      bytes.subarray(1, 4).toString('ascii') !== 'ELF' ||
+      bytes[4] !== 2 ||
+      bytes[5] !== 1
+    ) {
+      throw new AssemblyError(`${target.artifact} is not a 64-bit little-endian ELF binary`)
+    }
+    machine = bytes.readUInt16LE(18)
+  } else {
+    if (bytes.length < 64 || bytes.subarray(0, 2).toString('ascii') !== 'MZ') {
+      throw new AssemblyError(`${target.artifact} is not a PE binary`)
+    }
+    const pe = bytes.readUInt32LE(0x3c)
+    if (pe + 6 > bytes.length || bytes.readUInt32LE(pe) !== 0x00004550) {
+      throw new AssemblyError(`${target.artifact} has an invalid PE header`)
+    }
+    machine = bytes.readUInt16LE(pe + 4)
+  }
+  if (machine !== target.binary.machine) {
+    throw new AssemblyError(
+      `${target.artifact} architecture mismatch: expected 0x${target.binary.machine.toString(16)}, got 0x${machine.toString(16)}`,
+    )
+  }
 }
 
 function sha256(path) {
@@ -142,16 +201,18 @@ function collectArtifacts() {
       )
     }
     const sourceHashes = Object.fromEntries(
-      targets.map((target) => [target.artifact, sha256(join(artifactsRoot, target.artifact))]),
+      targets.map((target) => {
+        const path = join(artifactsRoot, target.artifact)
+        validateBinary(path, target)
+        return [target.artifact, sha256(path)]
+      }),
     )
     if (!verifyOnly) {
-      const napi = join(packageRoot, 'node_modules/@napi-rs/cli/scripts/index.js')
-      const result = spawnSync(process.execPath, [napi, 'artifacts'], {
-        cwd: packageRoot,
-        encoding: 'utf8',
-      })
-      if (result.status !== 0) {
-        throw new AssemblyError(`napi artifacts failed: ${result.stderr || result.stdout}`)
+      for (const target of targets) {
+        copyFileSync(
+          join(artifactsRoot, target.artifact),
+          join(npmRoot, target.dir, target.artifact),
+        )
       }
     }
     return sourceHashes
@@ -161,6 +222,7 @@ function collectArtifacts() {
     targets.map((target) => {
       const artifactPath = join(npmRoot, target.dir, target.artifact)
       if (!existsSync(artifactPath)) throw new AssemblyError(`missing artifact: ${target.artifact}`)
+      validateBinary(artifactPath, target)
       return [target.artifact, sha256(artifactPath)]
     }),
   )
@@ -171,6 +233,7 @@ function verifyArtifacts(version, expectedHashes) {
   const artifacts = targets.map((target) => {
     const path = join(npmRoot, target.dir, target.artifact)
     if (!existsSync(path)) throw new AssemblyError(`missing packaged artifact: ${target.artifact}`)
+    validateBinary(path, target)
     const hash = sha256(path)
     if (hash !== expectedHashes[target.artifact]) {
       throw new AssemblyError(`artifact hash changed while collecting: ${target.artifact}`)
@@ -184,6 +247,7 @@ function verifyArtifacts(version, expectedHashes) {
 
 function main() {
   const version = workspaceVersion()
+  syncGeneratedLoaderVersion(version)
   const facadePath = join(packageRoot, 'package.json')
   const facade = readJson(facadePath)
   const optionalDependencies = Object.fromEntries(

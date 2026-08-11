@@ -1,4 +1,4 @@
-use crate::api::ApiClient;
+use crate::api::{request_status_error, ApiClient};
 use anyhow::{bail, Context, Result};
 use feanorfs_common::{HeadResponse, SwapHeadRequest};
 
@@ -21,10 +21,7 @@ impl ApiClient {
             .await?;
         ensure_authorized(status)?;
         if !status.is_success() {
-            bail!(
-                "GET /api/head failed with status {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
+            return Err(request_status_error("GET", "/api/head", status, &bytes));
         }
         let response: HeadResponse =
             serde_json::from_slice(&bytes).context("parse workspace head response")?;
@@ -64,17 +61,16 @@ impl ApiClient {
                     serde_json::from_slice(&bytes).context("parse head swap conflict response")?;
                 Ok(SwapHeadResult::Conflict(response.snapshot_id))
             }
-            other => bail!(
-                "PUT /api/head failed with status {other}: {}",
-                String::from_utf8_lossy(&bytes)
-            ),
+            other => Err(request_status_error("PUT", "/api/head", other, &bytes)),
         }
     }
 }
 
 fn ensure_authorized(status: http::StatusCode) -> Result<()> {
     if status == http::StatusCode::UNAUTHORIZED {
-        bail!("Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`");
+        bail!(
+            "Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`"
+        );
     }
     Ok(())
 }

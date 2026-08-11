@@ -16,111 +16,191 @@ int32_t ffs_runtime_init(void);
 
 /**
  * Free a string previously returned by any `ffs_*` function (including `ffs_last_error`).
+ * The allocation is tracked independently of its contents, so callers may
+ * treat returned strings as immutable and deallocation never scans them.
+ *
+ * # Safety
+ * `s` must be NULL or an outstanding pointer returned by this library. Each
+ * non-NULL pointer must be freed at most once.
  */
-void ffs_string_free(char *s);
+void ffs_string_free(const char *s);
 
 /**
  * Last error on **this thread** from the most recent failing `ffs_*` call.
  * Caller must free with `ffs_string_free`. Never NULL (empty string if no error).
  */
-char *ffs_last_error(void);
+const char *ffs_last_error(void);
 
 /**
  * List agent workspace names. JSON: `AgentListOfflineResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_list(const char *root);
+const char *ffs_agent_list(const char *root);
 
 /**
  * Spawn an isolated agent workspace. JSON: `SpawnResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_spawn(const char *root, const char *name, int32_t no_sync, int32_t replace);
+const char *ffs_agent_spawn(const char *root,
+                            const char *name,
+                            int32_t no_sync,
+                            int32_t replace);
 
 /**
  * Return the absolute worktree path for an existing agent. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_path(const char *root, const char *name);
+const char *ffs_agent_path(const char *root,
+                           const char *name);
 
 /**
  * Preview one agent's changes. JSON: `AgentCheckResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_status(const char *root, const char *name);
+const char *ffs_agent_status(const char *root,
+                             const char *name);
 
 /**
  * Pull cloud changes into the agent. JSON: `AgentRefreshResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_refresh(const char *root, const char *name);
+const char *ffs_agent_refresh(const char *root,
+                              const char *name);
 
 /**
  * Integrate agent work into the main workspace. JSON: `AgentLandResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_land(const char *root, const char *name, int32_t clean, int32_t propose);
+const char *ffs_agent_land(const char *root,
+                           const char *name,
+                           int32_t clean,
+                           int32_t propose);
 
 /**
  * Remove an agent workspace. JSON: `AgentCleanResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_clean(const char *root, const char *name);
+const char *ffs_agent_clean(const char *root,
+                            const char *name);
 
 /**
  * List reachable workspace history. JSON: `LogResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_log(const char *root, uint32_t limit);
+const char *ffs_log(const char *root,
+                    uint32_t limit);
 
 /**
  * Restore a reachable snapshot as a new snapshot. JSON: `UndoResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_undo(const char *root, const char *snapshot_id);
+const char *ffs_undo(const char *root,
+                     const char *snapshot_id);
 
 /**
  * Send an encrypted agent signal. JSON in: `AgentMessageInput`; JSON out:
  * `AgentSendResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_send(const char *root, const char *input_json);
+const char *ffs_agent_send(const char *root,
+                           const char *input_json);
 
 /**
  * Read agent signals. JSON in: `AgentInboxQuery`; JSON out: `AgentInboxResult`.
  * NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_agent_inbox(const char *root, const char *query_json);
+const char *ffs_agent_inbox(const char *root,
+                            const char *query_json);
 
 /**
  * Resolve a pending conflict. Returns `0` on success, `-1` on error.
  * `keep`: 0=local, 1=cloud, 2=both, 3=file (requires non-null `file_path`).
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-int32_t ffs_conflicts_keep(const char *root, const char *path, int32_t keep, const char *file_path);
+int32_t ffs_conflicts_keep(const char *root,
+                           const char *path,
+                           int32_t keep,
+                           const char *file_path);
 
 /**
  * Assign one batch to a randomly ranked integrator. JSON in:
  * `IntegratorAssignInput`; JSON out: `IntegratorAssignResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_integrator_assign(const char *root, const char *input_json);
+const char *ffs_integrator_assign(const char *root,
+                                  const char *input_json);
 
 /**
  * Read the active integrator assignment (or one by id). JSON out:
  * `IntegratorStatusResult`. NULL on error; pass NULL `assignment_id` for the
  * active assignment.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_integrator_status(const char *root, const char *assignment_id);
+const char *ffs_integrator_status(const char *root,
+                                  const char *assignment_id);
 
 /**
  * Explicitly revoke the active integrator assignment. JSON out:
  * `IntegratorStatusResult`. NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_integrator_revoke(const char *root, const char *assignment_id, const char *reason);
+const char *ffs_integrator_revoke(const char *root,
+                                  const char *assignment_id,
+                                  const char *reason);
 
 /**
  * Resume dispatcher observation after a restart. JSON in: object with
  * optional `ack_timeout_ms` (u64) and `fallback_on_blocked` (bool); JSON out:
  * `IntegratorObserveResult`. NULL on error; pass NULL `options_json` for
  * conservative defaults.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_integrator_resume(const char *root, const char *options_json);
+const char *ffs_integrator_resume(const char *root,
+                                  const char *options_json);
 
 /**
  * Materialize the encrypted conflict triple for a snapshot. JSON in: object
- * with `about_snapshot` (string, optional: defaults to the head) and `paths`
- * (array of strings, optional); JSON out: `ConflictMaterializeResult`.
+ * with required `about_snapshot` and exactly one of non-empty `paths` or
+ * `all: true`; JSON out: `ConflictMaterializeResult`.
  * NULL on error.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
-char *ffs_conflict_materialize(const char *root, const char *input_json);
+const char *ffs_conflict_materialize(const char *root,
+                                     const char *input_json);
 
 #endif  /* FEANORFS_H */

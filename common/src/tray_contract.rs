@@ -193,7 +193,7 @@ pub mod fixtures {
                 choices: vec!["local".into(), "cloud".into(), "both".into()],
             }],
             published_at_ms: 1_719_500_000_000,
-            version: "0.7.11".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
         }
     }
 

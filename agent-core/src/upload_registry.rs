@@ -9,7 +9,7 @@
 //! registry so the next pass re-uploads instead of skipping forever.
 
 use anyhow::{Context, Result};
-use feanorfs_common::is_valid_hash;
+use feanorfs_common::{is_valid_hash, MANIFEST_MAX_ENTRIES};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -60,29 +60,33 @@ pub(crate) fn remember(state_dir: &Path, hash: &str) {
         return;
     }
     let key = state_dir.to_path_buf();
-    registries()
-        .lock()
-        .expect("upload registry poisoned")
-        .entry(key)
-        .or_default()
-        .insert(hash.to_string());
+    let mut registries = registries().lock().expect("upload registry poisoned");
+    let set = registries.entry(key).or_default();
+    if set.len() < MANIFEST_MAX_ENTRIES || set.contains(hash) {
+        set.insert(hash.to_string());
+    }
 }
 
-/// Persists the union of `hashes` plus anything already known for this
+/// Persists the latest accepted bounded reachability closure for this
 /// workspace. Failures are non-fatal: the registry is a cache, and a missing
 /// entry only causes a redundant upload later.
 pub(crate) async fn record_many(state_dir: &Path, hashes: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        hashes.len() <= MANIFEST_MAX_ENTRIES,
+        "upload registry input exceeds manifest object limit"
+    );
+    let replacement = hashes
+        .iter()
+        .filter(|hash| is_valid_hash(hash))
+        .cloned()
+        .collect::<HashSet<_>>();
     let key = state_dir.to_path_buf();
     let changed = {
         let mut map = registries().lock().expect("upload registry poisoned");
-        let set = map.entry(key).or_default();
-        let mut changed = false;
-        for hash in hashes {
-            if is_valid_hash(hash) && set.insert(hash.clone()) {
-                changed = true;
-            }
+        map.get(&key) != Some(&replacement) && {
+            map.insert(key, replacement);
+            true
         }
-        changed
     };
     if changed {
         if let Err(error) = persist(state_dir).await {
@@ -127,16 +131,39 @@ async fn persist(state_dir: &Path) -> Result<()> {
 }
 
 async fn read_registry_file(path: &Path) -> Result<HashSet<String>> {
-    let content = match fs::read_to_string(path).await {
-        Ok(content) => content,
+    use tokio::io::AsyncReadExt as _;
+
+    const MAX_REGISTRY_BYTES: usize = MANIFEST_MAX_ENTRIES * 65;
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
         Err(error) => {
             return Err(error).with_context(|| format!("read upload registry {}", path.display()))
         }
     };
-    Ok(content
-        .lines()
-        .filter(|hash| is_valid_hash(hash))
-        .map(str::to_string)
-        .collect())
+    anyhow::ensure!(
+        metadata.len() <= MAX_REGISTRY_BYTES as u64,
+        "upload registry exceeds bounded size"
+    );
+    let file = fs::File::open(path).await?;
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_REGISTRY_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut content)
+        .await?;
+    anyhow::ensure!(
+        content.len() <= MAX_REGISTRY_BYTES,
+        "upload registry exceeds bounded size"
+    );
+    let content = std::str::from_utf8(&content).context("upload registry is not UTF-8")?;
+    let mut hashes = HashSet::new();
+    for hash in content.lines() {
+        if is_valid_hash(hash) {
+            anyhow::ensure!(
+                hashes.len() < MANIFEST_MAX_ENTRIES || hashes.contains(hash),
+                "upload registry exceeds manifest object limit"
+            );
+            hashes.insert(hash.to_string());
+        }
+    }
+    Ok(hashes)
 }

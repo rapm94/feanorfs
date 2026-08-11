@@ -1,7 +1,13 @@
+feanorfs_test_support::isolate_test_process!();
+
+use feanorfs_agent_core::local::ClientDb;
+use feanorfs_agent_core::sync_pass::do_sync;
 use feanorfs_agent_core::{ApiClient, LocalHub, SwapHeadResult};
 use feanorfs_common::{hash_bytes, SwapHeadRequest};
 use http::Method;
 use std::sync::Arc;
+
+const TEST_PASSWORD: &str = "test-key-00000000000000000000000000000000000000000000000000000000";
 
 fn mk_hash(data: &[u8]) -> String {
     hash_bytes(data)
@@ -337,7 +343,10 @@ async fn v3_workspace_rejects_legacy_sync() {
     api.upload_object("ws", &h, b"data".to_vec())
         .await
         .expect("obj");
-    api.upload_manifest("ws", &sid, std::slice::from_ref(&h))
+    api.upload_object("ws", &sid, b"snap".to_vec())
+        .await
+        .expect("snapshot object");
+    api.upload_manifest("ws", &sid, &[h.clone(), sid.clone()])
         .await
         .expect("man");
     api.swap_head("ws", None, &sid).await.expect("head");
@@ -596,6 +605,43 @@ async fn head_cas_requires_manifest() {
 }
 
 #[tokio::test]
+async fn missing_manifest_precedes_stale_expected_head() {
+    let d = tempfile::tempdir().expect("dir");
+    let (hub, api) = open_anon(&d).await;
+    let current = mk_hash(b"current");
+    api.upload_object("ws", &current, b"current".to_vec())
+        .await
+        .expect("current object");
+    api.upload_manifest("ws", &current, std::slice::from_ref(&current))
+        .await
+        .expect("current manifest");
+    api.swap_head("ws", None, &current)
+        .await
+        .expect("current head");
+
+    let missing = mk_hash(b"missing");
+    let stale = mk_hash(b"stale");
+    let body = serde_json::to_vec(&SwapHeadRequest {
+        workspace_id: "ws".into(),
+        expected: Some(stale),
+        new: missing,
+    })
+    .unwrap();
+    let response = hub
+        .request(
+            Method::PUT,
+            "/api/head",
+            "",
+            body,
+            (None, None),
+            Some("application/json"),
+        )
+        .await
+        .expect("stale head request");
+    assert_eq!(response.status(), http::StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
 async fn head_cas_success_and_conflict_json() {
     let d = tempfile::tempdir().expect("dir");
     let (_, api) = open_anon(&d).await;
@@ -605,10 +651,16 @@ async fn head_cas_success_and_conflict_json() {
     api.upload_object("ws", &h, b"b".to_vec())
         .await
         .expect("obj");
-    api.upload_manifest("ws", &sid1, std::slice::from_ref(&h))
+    api.upload_object("ws", &sid1, b"s1".to_vec())
+        .await
+        .expect("first snapshot object");
+    api.upload_object("ws", &sid2, b"s2".to_vec())
+        .await
+        .expect("second snapshot object");
+    api.upload_manifest("ws", &sid1, &[h.clone(), sid1.clone()])
         .await
         .expect("m1");
-    api.upload_manifest("ws", &sid2, std::slice::from_ref(&h))
+    api.upload_manifest("ws", &sid2, &[h.clone(), sid2.clone()])
         .await
         .expect("m2");
     let r1 = api.swap_head("ws", None, &sid1).await.expect("swap1");
@@ -632,7 +684,7 @@ async fn manifest_rejects_invalid_snapshot_id() {
         )
         .await
         .expect("req");
-    assert_eq!(r.status(), http::StatusCode::PRECONDITION_FAILED);
+    assert_eq!(r.status(), http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -645,13 +697,13 @@ async fn manifest_rejects_invalid_line_hash() {
             Method::POST,
             "/api/manifest",
             &format!("workspace_id=ws&snapshot_id={sid}"),
-            b"not-a-hash\n".to_vec(),
+            format!("{sid}\nnot-a-hash\n").into_bytes(),
             (None, None),
             None,
         )
         .await
         .expect("req");
-    assert_eq!(r.status(), http::StatusCode::PRECONDITION_FAILED);
+    assert_eq!(r.status(), http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -665,7 +717,7 @@ async fn manifest_rejects_missing_blob() {
             Method::POST,
             "/api/manifest",
             &format!("workspace_id=ws&snapshot_id={sid}"),
-            format!("{missing}\n").into_bytes(),
+            format!("{sid}\n{missing}\n").into_bytes(),
             (None, None),
             None,
         )
@@ -675,7 +727,7 @@ async fn manifest_rejects_missing_blob() {
 }
 
 #[tokio::test]
-async fn manifest_accepts_empty_body() {
+async fn manifest_rejects_empty_body() {
     let d = tempfile::tempdir().expect("dir");
     let (hub, _) = open_anon(&d).await;
     let sid = mk_hash(b"snap");
@@ -690,7 +742,50 @@ async fn manifest_accepts_empty_body() {
         )
         .await
         .expect("req");
-    assert_eq!(r.status(), http::StatusCode::OK);
+    assert_eq!(r.status(), http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn manifest_is_canonical_and_immutable() {
+    let d = tempfile::tempdir().expect("dir");
+    let (hub, api) = open_anon(&d).await;
+    let root = mk_hash(b"root");
+    let child = mk_hash(b"child");
+    api.upload_object("ws", &root, b"root".to_vec())
+        .await
+        .expect("root object");
+    api.upload_object("ws", &child, b"child".to_vec())
+        .await
+        .expect("child object");
+    api.upload_manifest("ws", &root, &[child.clone(), root.clone()])
+        .await
+        .expect("initial manifest");
+
+    let retry = hub
+        .request(
+            Method::POST,
+            "/api/manifest",
+            &format!("workspace_id=ws&snapshot_id={root}"),
+            format!("{root}\n{child}\n{child}\n").into_bytes(),
+            (None, None),
+            None,
+        )
+        .await
+        .expect("same manifest retry");
+    assert_eq!(retry.status(), http::StatusCode::OK);
+
+    let shrink = hub
+        .request(
+            Method::POST,
+            "/api/manifest",
+            &format!("workspace_id=ws&snapshot_id={root}"),
+            format!("{root}\n").into_bytes(),
+            (None, None),
+            None,
+        )
+        .await
+        .expect("shrunk manifest retry");
+    assert_eq!(shrink.status(), http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -738,7 +833,10 @@ async fn format_stamp_clears_files_and_fence_atomically() {
     api.upload_object("ws", &h, b"data".to_vec())
         .await
         .expect("obj");
-    api.upload_manifest("ws", &sid, std::slice::from_ref(&h))
+    api.upload_object("ws", &sid, b"snap".to_vec())
+        .await
+        .expect("snapshot object");
+    api.upload_manifest("ws", &sid, &[h.clone(), sid.clone()])
         .await
         .expect("man");
     api.swap_head("ws", None, &sid).await.expect("head");
@@ -820,7 +918,10 @@ async fn workspace_list_excludes_manifest_only() {
         .await
         .expect("obj");
     let sid = mk_hash(b"snap");
-    api.upload_manifest("manifest-only", &sid, &[h])
+    api.upload_object("manifest-only", &sid, b"snap".to_vec())
+        .await
+        .expect("snapshot object");
+    api.upload_manifest("manifest-only", &sid, &[h, sid.clone()])
         .await
         .expect("man");
     let workspaces: Vec<String> = api.get_workspaces().await.expect("list");
@@ -903,7 +1004,10 @@ async fn v3_flat_upload_rejected_before_blob_write() {
     api.upload_object("ws", &h, b"data".to_vec())
         .await
         .expect("obj");
-    api.upload_manifest("ws", &sid, std::slice::from_ref(&h))
+    api.upload_object("ws", &sid, b"snap".to_vec())
+        .await
+        .expect("snapshot object");
+    api.upload_manifest("ws", &sid, &[h.clone(), sid.clone()])
         .await
         .expect("man");
     api.swap_head("ws", None, &sid).await.expect("head");
@@ -985,7 +1089,10 @@ async fn new_workspace_format_defaults_to_2() {
         .await
         .expect("obj");
     let sid = mk_hash(b"snap");
-    api.upload_manifest("ws", &sid, std::slice::from_ref(&h))
+    api.upload_object("ws", &sid, b"snap".to_vec())
+        .await
+        .expect("snapshot object");
+    api.upload_manifest("ws", &sid, &[h, sid.clone()])
         .await
         .expect("man");
 
@@ -1063,4 +1170,78 @@ async fn reupload_keeps_referenced_blob() {
         .await
         .expect("dl");
     assert_eq!(dl2.status(), http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn restored_hub_reuploads_local_state_instead_of_deleting_it() {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let state = tempfile::tempdir().expect("state dir");
+    let db = ClientDb::new(state.path()).await.expect("open client db");
+    let file = workspace.path().join("important.txt");
+    std::fs::write(&file, b"precious data").expect("write file");
+
+    // First sync against a healthy hub uploads the file.
+    let hub_one = tempfile::tempdir().expect("hub one dir");
+    let api_one = {
+        let hub = LocalHub::open(hub_one.path().to_path_buf(), None)
+            .await
+            .expect("open first hub");
+        ApiClient::local(hub, None)
+    };
+    let (result, _blocked) = do_sync(
+        &api_one,
+        &db,
+        workspace.path(),
+        "ws",
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .expect("first sync");
+    assert_eq!(result.uploads, 1);
+    assert!(file.exists());
+
+    // A restored hub is an empty data directory: no head, no blobs. The
+    // client must re-upload the local view, never delete local files.
+    let hub_two = tempfile::tempdir().expect("hub two dir");
+    let api_two = {
+        let hub = LocalHub::open(hub_two.path().to_path_buf(), None)
+            .await
+            .expect("open restored hub");
+        ApiClient::local(hub, None)
+    };
+    let (result, _blocked) = do_sync(
+        &api_two,
+        &db,
+        workspace.path(),
+        "ws",
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .expect("sync against restored hub");
+    assert_eq!(
+        result.deletes_local, 0,
+        "restored hub must not delete local files"
+    );
+    assert!(file.exists(), "local file must survive a restored-hub sync");
+    assert!(
+        result.uploads > 0,
+        "restored hub must be re-seeded from the client"
+    );
+
+    // The restored hub is now authoritative: a second sync is idle.
+    let (result, _blocked) = do_sync(
+        &api_two,
+        &db,
+        workspace.path(),
+        "ws",
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .expect("idle sync after reseed");
+    assert_eq!(result.uploads, 0);
+    assert_eq!(result.downloads, 0);
+    assert_eq!(result.deletes_local, 0);
 }

@@ -17,6 +17,7 @@ Own crash-safe local-state persistence and focused tests. `../state.rs` owns sch
 - Reads reload latest committed bytes under shared lock.
 - Writes reload and commit under exclusive lock.
 - Missing state after construction is corruption, not implicit reinitialization.
+- Bound `local_state.json` at 128 MiB before reading or parsing; validate collection cardinalities before accepting or committing state. Parse the schema version without first duplicating the document into a generic JSON value.
 
 ## Work Guidance
 

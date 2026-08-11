@@ -1,46 +1,73 @@
 //! C ABI: JSON strings in/out. See `feanorfs.h` and `docs/agent-api.md`.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#[cfg(test)]
+feanorfs_test_support::isolate_test_process!();
 
 use feanorfs_agent_core::{LandOptions, ResolveKeep, Runtime, SpawnOptions, Workspace};
 use feanorfs_common::agent_contract::AgentListOfflineResult;
 use std::cell::RefCell;
-use std::ffi::{CStr, CString};
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::os::raw::c_char;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 static RUNTIME: Mutex<Option<Arc<Runtime>>> = Mutex::new(None);
+static RETURNED_STRINGS: LazyLock<Mutex<HashMap<usize, Box<[u8]>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const MAX_FFI_INPUT_BYTES: usize = 1024 * 1024;
 
 fn set_error(msg: impl Into<String>) {
-    LAST_ERROR.with(|e| *e.borrow_mut() = Some(msg.into()));
+    let msg = msg.into();
+    let mut safe = String::new();
+    for character in msg.chars().take(4096) {
+        if character.is_control() {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    LAST_ERROR.with(|error| *error.borrow_mut() = Some(safe));
 }
 
 fn clear_error() {
     LAST_ERROR.with(|e| *e.borrow_mut() = None);
 }
 
-fn ok_json<T: serde::Serialize>(value: &T) -> *mut c_char {
-    match serde_json::to_string(value) {
-        Ok(s) => CString::new(s)
-            .map(CString::into_raw)
-            .unwrap_or(ptr::null_mut()),
-        Err(e) => {
-            set_error(e.to_string());
-            ptr::null_mut()
+fn return_string(value: impl Into<Vec<u8>>) -> *const c_char {
+    let cstring = match CString::new(value) {
+        Ok(value) => value,
+        Err(error) => {
+            set_error(error.to_string());
+            return ptr::null();
+        }
+    };
+    let mut allocation = cstring.into_bytes_with_nul().into_boxed_slice();
+    let pointer = allocation.as_mut_ptr().cast::<c_char>() as *const c_char;
+    RETURNED_STRINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(pointer as usize, allocation);
+    pointer
+}
+
+fn ok_json<T: serde::Serialize>(value: &T) -> *const c_char {
+    match serde_json::to_vec(value) {
+        Ok(encoded) => return_string(encoded),
+        Err(error) => {
+            set_error(error.to_string());
+            ptr::null()
         }
     }
 }
 
-fn ok_string(value: impl Into<Vec<u8>>) -> *mut c_char {
-    CString::new(value)
-        .map(CString::into_raw)
-        .unwrap_or(ptr::null_mut())
+fn ok_string(value: impl Into<Vec<u8>>) -> *const c_char {
+    return_string(value)
 }
 
 fn runtime() -> Result<Arc<Runtime>, String> {
@@ -56,79 +83,105 @@ fn runtime() -> Result<Arc<Runtime>, String> {
 fn workspace(root: *const c_char) -> Result<Workspace, String> {
     let root = cstr_req(root)?;
     let rt = runtime()?;
-    Workspace::open(&rt, Path::new(root)).map_err(|e| e.to_string())
+    Workspace::open(&rt, Path::new(&root)).map_err(|e| e.to_string())
+}
+
+fn bounded_cstr(ptr: *const c_char) -> Result<String, String> {
+    if ptr.is_null() {
+        return Err("required string argument is null".to_string());
+    }
+    for length in 0..=MAX_FFI_INPUT_BYTES {
+        let byte = unsafe { ptr.add(length).read() };
+        if byte == 0 {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), length) };
+            return std::str::from_utf8(bytes)
+                .map(str::to_string)
+                .map_err(|error| error.to_string());
+        }
+    }
+    Err(format!(
+        "string argument exceeds {MAX_FFI_INPUT_BYTES} bytes"
+    ))
 }
 
 fn cstr_opt(ptr: *const c_char) -> Result<Option<String>, String> {
     if ptr.is_null() {
         return Ok(None);
     }
-    unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map(|s| Some(s.to_string()))
-        .map_err(|e| e.to_string())
+    bounded_cstr(ptr).map(Some)
 }
 
-/// Read a required C string argument, rejecting NULL (which would be
-/// undefined behavior in `CStr::from_ptr`) before dereferencing. The returned
-/// slice borrows the caller's C string, which must outlive the call.
-fn cstr_req<'a>(ptr: *const c_char) -> Result<&'a str, String> {
-    if ptr.is_null() {
-        return Err("required string argument is null".to_string());
-    }
-    unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map_err(|e| e.to_string())
+/// Read a required bounded UTF-8 C string argument. Exported callers declare
+/// the pointer validity requirement in their `# Safety` contract.
+fn cstr_req(ptr: *const c_char) -> Result<String, String> {
+    bounded_cstr(ptr)
 }
 
 /// Initialize the shared Tokio runtime. Call once before any other `ffs_*` function.
 /// Returns `0` on success, `-1` on error (see `ffs_last_error`).
 #[no_mangle]
 pub extern "C" fn ffs_runtime_init() -> i32 {
-    catch_i32(|| match Runtime::new() {
-        Ok(rt) => match RUNTIME.lock() {
-            Ok(mut guard) => {
-                *guard = Some(rt);
+    catch_i32(|| {
+        let mut guard = match RUNTIME.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                set_error(error.to_string());
+                return -1;
+            }
+        };
+        if guard.is_some() {
+            clear_error();
+            return 0;
+        }
+        match Runtime::new() {
+            Ok(runtime) => {
+                *guard = Some(runtime);
                 clear_error();
                 0
             }
-            Err(e) => {
-                set_error(e.to_string());
+            Err(error) => {
+                set_error(error.to_string());
                 -1
             }
-        },
-        Err(e) => {
-            set_error(e.to_string());
-            -1
         }
     })
 }
 
 /// Free a string previously returned by any `ffs_*` function (including `ffs_last_error`).
+/// The allocation is tracked independently of its contents, so callers may
+/// treat returned strings as immutable and deallocation never scans them.
+///
+/// # Safety
+/// `s` must be NULL or an outstanding pointer returned by this library. Each
+/// non-NULL pointer must be freed at most once.
 #[no_mangle]
-pub extern "C" fn ffs_string_free(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            drop(CString::from_raw(s));
-        }
+pub unsafe extern "C" fn ffs_string_free(s: *const c_char) {
+    if s.is_null() {
+        return;
     }
+    let allocation = RETURNED_STRINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(s as usize));
+    drop(allocation);
 }
 
 /// Last error on **this thread** from the most recent failing `ffs_*` call.
 /// Caller must free with `ffs_string_free`. Never NULL (empty string if no error).
 #[no_mangle]
-pub extern "C" fn ffs_last_error() -> *mut c_char {
+pub extern "C" fn ffs_last_error() -> *const c_char {
     catch_ptr(|| {
         let msg = LAST_ERROR.with(|e| e.borrow().clone()).unwrap_or_default();
-        CString::new(msg)
-            .map(CString::into_raw)
-            .unwrap_or(ptr::null_mut())
+        return_string(msg.into_bytes())
     })
 }
 
 /// List agent workspace names. JSON: `AgentListOfflineResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_list(root: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ffs_agent_list(root: *const c_char) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         match workspace(root) {
@@ -136,37 +189,40 @@ pub extern "C" fn ffs_agent_list(root: *const c_char) -> *mut c_char {
                 Ok(names) => ok_json(&AgentListOfflineResult { agents: names }),
                 Err(e) => {
                     set_error(e.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(e) => {
                 set_error(e.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
 }
 
 /// Spawn an isolated agent workspace. JSON: `SpawnResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_spawn(
+pub unsafe extern "C" fn ffs_agent_spawn(
     root: *const c_char,
     name: *const c_char,
     no_sync: i32,
     replace: i32,
-) -> *mut c_char {
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let name = match cstr_req(name) {
             Ok(s) => s,
             Err(e) => {
                 set_error(e);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
             Ok(ws) => match ws.spawn(
-                name,
+                &name,
                 SpawnOptions {
                     no_sync: no_sync != 0,
                     replace: replace != 0,
@@ -175,72 +231,102 @@ pub extern "C" fn ffs_agent_spawn(
                 Ok(r) => ok_json(&r),
                 Err(e) => {
                     set_error(e.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(e) => {
                 set_error(e.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
 }
 
+fn exact_path_bytes(path: &std::path::Path) -> Result<&[u8], String> {
+    path.to_str()
+        .map(str::as_bytes)
+        .ok_or_else(|| "agent path cannot be represented exactly as UTF-8".to_string())
+}
+
 /// Return the absolute worktree path for an existing agent. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_path(root: *const c_char, name: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ffs_agent_path(root: *const c_char, name: *const c_char) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let name = match cstr_req(name) {
             Ok(name) => name,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
-        match workspace(root).and_then(|ws| ws.agent_path(name).map_err(|error| error.to_string()))
+        match workspace(root).and_then(|ws| ws.agent_path(&name).map_err(|error| error.to_string()))
         {
-            Ok(path) => ok_string(path.to_string_lossy().as_bytes()),
+            Ok(path) => match exact_path_bytes(&path) {
+                Ok(bytes) => ok_string(bytes),
+                Err(error) => {
+                    set_error(error);
+                    ptr::null()
+                }
+            },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
 }
 
 /// Preview one agent's changes. JSON: `AgentCheckResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_status(root: *const c_char, name: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ffs_agent_status(
+    root: *const c_char,
+    name: *const c_char,
+) -> *const c_char {
     catch_ptr(|| agent_by_name(root, name, |ws, name| ws.status(name)))
 }
 
 /// Pull cloud changes into the agent. JSON: `AgentRefreshResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_refresh(root: *const c_char, name: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ffs_agent_refresh(
+    root: *const c_char,
+    name: *const c_char,
+) -> *const c_char {
     catch_ptr(|| agent_by_name(root, name, |ws, name| ws.refresh(name)))
 }
 
 /// Integrate agent work into the main workspace. JSON: `AgentLandResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_land(
+pub unsafe extern "C" fn ffs_agent_land(
     root: *const c_char,
     name: *const c_char,
     clean: i32,
     propose: i32,
-) -> *mut c_char {
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let name = match cstr_req(name) {
             Ok(s) => s,
             Err(e) => {
                 set_error(e);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
             Ok(ws) => match ws.land(
-                name,
+                &name,
                 LandOptions {
                     clean: clean != 0,
                     propose: propose != 0,
@@ -249,26 +335,35 @@ pub extern "C" fn ffs_agent_land(
                 Ok(r) => ok_json(&r),
                 Err(e) => {
                     set_error(e.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(e) => {
                 set_error(e.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
 }
 
 /// Remove an agent workspace. JSON: `AgentCleanResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_clean(root: *const c_char, name: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ffs_agent_clean(
+    root: *const c_char,
+    name: *const c_char,
+) -> *const c_char {
     catch_ptr(|| agent_by_name(root, name, |ws, name| ws.clean(name)))
 }
 
 /// List reachable workspace history. JSON: `LogResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_log(root: *const c_char, limit: u32) -> *mut c_char {
+pub unsafe extern "C" fn ffs_log(root: *const c_char, limit: u32) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         match workspace(root) {
@@ -276,40 +371,46 @@ pub extern "C" fn ffs_log(root: *const c_char, limit: u32) -> *mut c_char {
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
 }
 
 /// Restore a reachable snapshot as a new snapshot. JSON: `UndoResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_undo(root: *const c_char, snapshot_id: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ffs_undo(
+    root: *const c_char,
+    snapshot_id: *const c_char,
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let snapshot_id = match cstr_req(snapshot_id) {
             Ok(value) => value,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
-            Ok(ws) => match ws.undo(snapshot_id) {
+            Ok(ws) => match ws.undo(&snapshot_id) {
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
@@ -317,22 +418,28 @@ pub extern "C" fn ffs_undo(root: *const c_char, snapshot_id: *const c_char) -> *
 
 /// Send an encrypted agent signal. JSON in: `AgentMessageInput`; JSON out:
 /// `AgentSendResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_send(root: *const c_char, input_json: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ffs_agent_send(
+    root: *const c_char,
+    input_json: *const c_char,
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let input_json = match cstr_req(input_json) {
             Ok(value) => value,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
-        let input: feanorfs_common::AgentMessageInput = match serde_json::from_str(input_json) {
+        let input: feanorfs_common::AgentMessageInput = match serde_json::from_str(&input_json) {
             Ok(value) => value,
             Err(error) => {
                 set_error(format!("invalid agent_send input: {error}"));
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
@@ -340,12 +447,12 @@ pub extern "C" fn ffs_agent_send(root: *const c_char, input_json: *const c_char)
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
@@ -353,22 +460,28 @@ pub extern "C" fn ffs_agent_send(root: *const c_char, input_json: *const c_char)
 
 /// Read agent signals. JSON in: `AgentInboxQuery`; JSON out: `AgentInboxResult`.
 /// NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_agent_inbox(root: *const c_char, query_json: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn ffs_agent_inbox(
+    root: *const c_char,
+    query_json: *const c_char,
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let query_json = match cstr_req(query_json) {
             Ok(value) => value,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
-        let query: feanorfs_common::AgentInboxQuery = match serde_json::from_str(query_json) {
+        let query: feanorfs_common::AgentInboxQuery = match serde_json::from_str(&query_json) {
             Ok(value) => value,
             Err(error) => {
                 set_error(format!("invalid agent_inbox input: {error}"));
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
@@ -376,12 +489,12 @@ pub extern "C" fn ffs_agent_inbox(root: *const c_char, query_json: *const c_char
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
@@ -389,8 +502,11 @@ pub extern "C" fn ffs_agent_inbox(root: *const c_char, query_json: *const c_char
 
 /// Resolve a pending conflict. Returns `0` on success, `-1` on error.
 /// `keep`: 0=local, 1=cloud, 2=both, 3=file (requires non-null `file_path`).
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_conflicts_keep(
+pub unsafe extern "C" fn ffs_conflicts_keep(
     root: *const c_char,
     path: *const c_char,
     keep: i32,
@@ -429,7 +545,7 @@ pub extern "C" fn ffs_conflicts_keep(
         };
         let file_ref = file_source.as_deref();
         match workspace(root) {
-            Ok(ws) => match ws.resolve(path, keep, file_ref) {
+            Ok(ws) => match ws.resolve(&path, keep, file_ref) {
                 Ok(()) => 0,
                 Err(e) => {
                     set_error(e.to_string());
@@ -448,36 +564,36 @@ fn agent_by_name<T: serde::Serialize>(
     root: *const c_char,
     name: *const c_char,
     f: impl FnOnce(&Workspace, &str) -> Result<T, anyhow::Error>,
-) -> *mut c_char {
+) -> *const c_char {
     clear_error();
     let name = match cstr_req(name) {
         Ok(s) => s,
         Err(e) => {
             set_error(e.to_string());
-            return ptr::null_mut();
+            return ptr::null();
         }
     };
     match workspace(root) {
-        Ok(ws) => match f(&ws, name) {
+        Ok(ws) => match f(&ws, &name) {
             Ok(r) => ok_json(&r),
             Err(e) => {
                 set_error(e.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         },
         Err(e) => {
             set_error(e.to_string());
-            ptr::null_mut()
+            ptr::null()
         }
     }
 }
 
-fn catch_ptr(f: impl FnOnce() -> *mut c_char + panic::UnwindSafe) -> *mut c_char {
+fn catch_ptr(f: impl FnOnce() -> *const c_char + panic::UnwindSafe) -> *const c_char {
     match panic::catch_unwind(f) {
         Ok(ptr) => ptr,
         Err(_) => {
             set_error("internal panic");
-            ptr::null_mut()
+            ptr::null()
         }
     }
 }
@@ -494,25 +610,29 @@ fn catch_i32(f: impl FnOnce() -> i32 + panic::UnwindSafe) -> i32 {
 
 /// Assign one batch to a randomly ranked integrator. JSON in:
 /// `IntegratorAssignInput`; JSON out: `IntegratorAssignResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_integrator_assign(
+pub unsafe extern "C" fn ffs_integrator_assign(
     root: *const c_char,
     input_json: *const c_char,
-) -> *mut c_char {
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let input_json = match cstr_req(input_json) {
             Ok(value) => value,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
-        let input: feanorfs_common::IntegratorAssignInput = match serde_json::from_str(input_json) {
+        let input: feanorfs_common::IntegratorAssignInput = match serde_json::from_str(&input_json)
+        {
             Ok(value) => value,
             Err(error) => {
                 set_error(format!("invalid integrator_assign input: {error}"));
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
@@ -520,12 +640,12 @@ pub extern "C" fn ffs_integrator_assign(
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
@@ -534,18 +654,21 @@ pub extern "C" fn ffs_integrator_assign(
 /// Read the active integrator assignment (or one by id). JSON out:
 /// `IntegratorStatusResult`. NULL on error; pass NULL `assignment_id` for the
 /// active assignment.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_integrator_status(
+pub unsafe extern "C" fn ffs_integrator_status(
     root: *const c_char,
     assignment_id: *const c_char,
-) -> *mut c_char {
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let assignment_id = match cstr_opt(assignment_id) {
             Ok(value) => value,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
@@ -553,12 +676,12 @@ pub extern "C" fn ffs_integrator_status(
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
@@ -566,39 +689,42 @@ pub extern "C" fn ffs_integrator_status(
 
 /// Explicitly revoke the active integrator assignment. JSON out:
 /// `IntegratorStatusResult`. NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_integrator_revoke(
+pub unsafe extern "C" fn ffs_integrator_revoke(
     root: *const c_char,
     assignment_id: *const c_char,
     reason: *const c_char,
-) -> *mut c_char {
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let assignment_id = match cstr_req(assignment_id) {
             Ok(value) => value,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         let reason = match cstr_req(reason) {
             Ok(value) => value,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
-            Ok(ws) => match ws.integrator_revoke(assignment_id, reason) {
+            Ok(ws) => match ws.integrator_revoke(&assignment_id, &reason) {
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
@@ -608,34 +734,32 @@ pub extern "C" fn ffs_integrator_revoke(
 /// optional `ack_timeout_ms` (u64) and `fallback_on_blocked` (bool); JSON out:
 /// `IntegratorObserveResult`. NULL on error; pass NULL `options_json` for
 /// conservative defaults.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_integrator_resume(
+pub unsafe extern "C" fn ffs_integrator_resume(
     root: *const c_char,
     options_json: *const c_char,
-) -> *mut c_char {
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let (ack_timeout_ms, fallback_on_blocked) = match cstr_opt(options_json) {
             Ok(None) => (None, false),
             Ok(Some(json)) => {
-                let value: serde_json::Value = match serde_json::from_str(&json) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        set_error(format!("invalid integrator_resume options: {error}"));
-                        return ptr::null_mut();
-                    }
-                };
-                (
-                    value.get("ack_timeout_ms").and_then(|v| v.as_u64()),
-                    value
-                        .get("fallback_on_blocked")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                )
+                let input: feanorfs_common::IntegratorObserveInput =
+                    match serde_json::from_str(&json) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            set_error(format!("invalid integrator_resume options: {error}"));
+                            return ptr::null();
+                        }
+                    };
+                (input.ack_timeout_ms, input.fallback_on_blocked)
             }
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
         match workspace(root) {
@@ -646,70 +770,64 @@ pub extern "C" fn ffs_integrator_resume(
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
 }
 
 /// Materialize the encrypted conflict triple for a snapshot. JSON in: object
-/// with `about_snapshot` (string, optional: defaults to the head) and `paths`
-/// (array of strings, optional); JSON out: `ConflictMaterializeResult`.
+/// with required `about_snapshot` and exactly one of non-empty `paths` or
+/// `all: true`; JSON out: `ConflictMaterializeResult`.
 /// NULL on error.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
 #[no_mangle]
-pub extern "C" fn ffs_conflict_materialize(
+pub unsafe extern "C" fn ffs_conflict_materialize(
     root: *const c_char,
     input_json: *const c_char,
-) -> *mut c_char {
+) -> *const c_char {
     catch_ptr(|| {
         clear_error();
         let input_json = match cstr_req(input_json) {
             Ok(value) => value,
             Err(error) => {
                 set_error(error);
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
-        let value: serde_json::Value = match serde_json::from_str(input_json) {
-            Ok(value) => value,
+        let input: feanorfs_common::ConflictMaterializeInput =
+            match serde_json::from_str(&input_json) {
+                Ok(value) => value,
+                Err(error) => {
+                    set_error(format!("invalid conflict_materialize input: {error}"));
+                    return ptr::null();
+                }
+            };
+        let (about_snapshot, paths) = match input.validate() {
+            Ok(selection) => selection,
             Err(error) => {
                 set_error(format!("invalid conflict_materialize input: {error}"));
-                return ptr::null_mut();
+                return ptr::null();
             }
         };
-        let about = match value.get("about_snapshot").and_then(|v| v.as_str()) {
-            Some(snapshot) => snapshot.to_string(),
-            None => {
-                set_error("conflict_materialize requires about_snapshot");
-                return ptr::null_mut();
-            }
-        };
-        let paths: Vec<String> = value
-            .get("paths")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
         match workspace(root) {
-            Ok(ws) => match ws.materialize_conflicts(&about, &paths) {
+            Ok(ws) => match ws.materialize_conflicts(&about_snapshot, &paths) {
                 Ok(result) => ok_json(&result),
                 Err(error) => {
                     set_error(error.to_string());
-                    ptr::null_mut()
+                    ptr::null()
                 }
             },
             Err(error) => {
                 set_error(error.to_string());
-                ptr::null_mut()
+                ptr::null()
             }
         }
     })
@@ -727,7 +845,7 @@ mod smoke {
 
     use super::*;
 
-    fn cstr(ptr: *mut c_char) -> String {
+    fn cstr(ptr: *const c_char) -> String {
         unsafe {
             let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
             ffs_string_free(ptr);
@@ -739,15 +857,67 @@ mod smoke {
         cstr(ffs_last_error())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn agent_path_rejects_non_utf8_without_lossy_aliasing() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0xff]));
+        assert_eq!(
+            exact_path_bytes(&path).unwrap_err(),
+            "agent path cannot be represented exactly as UTF-8"
+        );
+    }
+
     #[test]
     fn null_required_strings_fail_cleanly_instead_of_crashing() {
         // NULL root / name must never reach CStr::from_ptr (undefined
         // behavior); the ABI returns NULL plus a thread-local error instead.
         assert_eq!(ffs_runtime_init(), 0);
-        let result = ffs_agent_list(std::ptr::null());
+        let result = unsafe { ffs_agent_list(std::ptr::null()) };
         assert!(result.is_null());
         assert!(!last_err().is_empty());
-        ffs_string_free(result);
+        unsafe { ffs_string_free(result) };
+    }
+
+    #[test]
+    fn returned_strings_free_by_registered_allocation_even_after_mutation() {
+        let pointer = ok_string("secret");
+        assert!(!pointer.is_null());
+        unsafe {
+            pointer.cast_mut().write(b'x' as c_char);
+            pointer.cast_mut().add(1).write(0);
+            ffs_string_free(pointer);
+        }
+        assert!(!RETURNED_STRINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(pointer as usize)));
+    }
+
+    #[test]
+    fn last_error_is_non_null_and_sanitizes_interior_nul() {
+        set_error("before\0after");
+        let pointer = ffs_last_error();
+        assert!(!pointer.is_null());
+        assert_eq!(cstr(pointer), r"before\u{0}after");
+    }
+
+    #[test]
+    fn oversized_c_input_is_rejected_before_workspace_work() {
+        let mut bytes = vec![b'a'; MAX_FFI_INPUT_BYTES + 1];
+        bytes.push(0);
+        let result = unsafe { ffs_agent_list(bytes.as_ptr().cast::<c_char>()) };
+        assert!(result.is_null());
+        assert!(last_err().contains("exceeds"));
+    }
+
+    #[test]
+    fn malformed_conflict_subset_does_not_broaden_to_all_paths() {
+        let malformed = CString::new(r#"{"about_snapshot":"head","paths":["one",42]}"#).unwrap();
+        let result = unsafe { ffs_conflict_materialize(ptr::null(), malformed.as_ptr()) };
+        assert!(result.is_null());
+        assert!(last_err().contains("invalid conflict_materialize input"));
     }
 
     fn setup_ws() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -773,6 +943,19 @@ mod smoke {
         (tmp, ws)
     }
 
+    #[test]
+    fn agent_path_rejects_absolute_and_parent_names() {
+        let (_temp, workspace) = setup_ws();
+        assert_eq!(ffs_runtime_init(), 0);
+        let root = CString::new(workspace.to_str().unwrap()).unwrap();
+        for name in ["../outside", "/tmp/outside", "nested/name"] {
+            let name = CString::new(name).unwrap();
+            let result = unsafe { ffs_agent_path(root.as_ptr(), name.as_ptr()) };
+            assert!(result.is_null());
+            assert!(last_err().to_ascii_lowercase().contains("agent name"));
+        }
+    }
+
     fn prepare_format_v3_workspace(ws: &Path) {
         let runtime = Runtime::new().unwrap();
         let mut config = load_config(ws).unwrap();
@@ -791,6 +974,28 @@ mod smoke {
     }
 
     #[test]
+    fn ffi_calls_succeed_from_current_and_multithread_tokio_contexts() {
+        let (_temp, workspace) = setup_ws();
+        let root = CString::new(workspace.to_str().unwrap()).unwrap();
+        assert_eq!(ffs_runtime_init(), 0);
+        for multithread in [false, true] {
+            let mut builder = if multithread {
+                tokio::runtime::Builder::new_multi_thread()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+            };
+            let outer = builder.enable_all().build().unwrap();
+            outer.block_on(async {
+                assert_eq!(ffs_runtime_init(), 0);
+                let result = unsafe { ffs_agent_list(root.as_ptr()) };
+                assert!(!result.is_null(), "agent list failed: {}", last_err());
+                let _: feanorfs_common::AgentListOfflineResult =
+                    serde_json::from_str(&cstr(result)).unwrap();
+            });
+        }
+    }
+
+    #[test]
     fn spawn_land_local_hub() {
         let (_tmp, ws) = setup_ws();
         assert_eq!(ffs_runtime_init(), 0);
@@ -798,11 +1003,11 @@ mod smoke {
         let root = CString::new(ws.to_string_lossy().as_ref()).unwrap();
         let name = CString::new("ffi1").unwrap();
 
-        let spawn_json = ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0);
+        let spawn_json = unsafe { ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0) };
         assert!(!spawn_json.is_null(), "spawn failed: {}", last_err());
         assert!(cstr(spawn_json).contains("files_copied"));
 
-        let agent_path = ffs_agent_path(root.as_ptr(), name.as_ptr());
+        let agent_path = unsafe { ffs_agent_path(root.as_ptr(), name.as_ptr()) };
         assert!(!agent_path.is_null(), "agent path failed: {}", last_err());
         let agent_dir = PathBuf::from(cstr(agent_path));
         assert!(agent_dir.is_dir());
@@ -810,21 +1015,21 @@ mod smoke {
         assert!(!ws.join(".feanorfs").exists());
         fs::write(agent_dir.join("note.txt"), b"ffi edit").unwrap();
 
-        let land_json = ffs_agent_land(root.as_ptr(), name.as_ptr(), 0, 0);
+        let land_json = unsafe { ffs_agent_land(root.as_ptr(), name.as_ptr(), 0, 0) };
         assert!(!land_json.is_null(), "land failed: {}", last_err());
         let _ = cstr(land_json);
 
-        let log_json = ffs_log(root.as_ptr(), 10);
+        let log_json = unsafe { ffs_log(root.as_ptr(), 10) };
         assert!(!log_json.is_null(), "log failed: {}", last_err());
         let log: feanorfs_common::LogResult = serde_json::from_str(&cstr(log_json)).unwrap();
         let target = log.entries[0].parents.last().unwrap();
         let target = CString::new(target.as_str()).unwrap();
-        let undo_json = ffs_undo(root.as_ptr(), target.as_ptr());
+        let undo_json = unsafe { ffs_undo(root.as_ptr(), target.as_ptr()) };
         assert!(!undo_json.is_null(), "undo failed: {}", last_err());
         let undo: feanorfs_common::UndoResult = serde_json::from_str(&cstr(undo_json)).unwrap();
         assert_eq!(undo.restored_snapshot_id, target.to_str().unwrap());
 
-        let clean_json = ffs_agent_clean(root.as_ptr(), name.as_ptr());
+        let clean_json = unsafe { ffs_agent_clean(root.as_ptr(), name.as_ptr()) };
         assert!(!clean_json.is_null());
         let _ = cstr(clean_json);
     }
@@ -837,8 +1042,8 @@ mod smoke {
         let root = CString::new(ws.to_string_lossy().as_ref()).unwrap();
         let name = CString::new("dup").unwrap();
 
-        assert!(!ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0).is_null());
-        let second = ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0);
+        assert!(!unsafe { ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0) }.is_null());
+        let second = unsafe { ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0) };
         assert!(second.is_null());
         assert!(!last_err().is_empty());
     }
@@ -851,7 +1056,7 @@ mod smoke {
         let root = CString::new(ws.to_string_lossy().as_ref()).unwrap();
         let path = CString::new("missing.txt").unwrap();
         assert_eq!(
-            ffs_conflicts_keep(root.as_ptr(), path.as_ptr(), 99, ptr::null()),
+            unsafe { ffs_conflicts_keep(root.as_ptr(), path.as_ptr(), 99, ptr::null()) },
             -1
         );
         assert!(!last_err().is_empty());
@@ -861,10 +1066,10 @@ mod smoke {
     fn ops_before_init_fail() {
         let root = CString::new("/tmp/nope").unwrap();
         let name = CString::new("x").unwrap();
-        assert!(ffs_agent_list(root.as_ptr()).is_null());
+        assert!(unsafe { ffs_agent_list(root.as_ptr()) }.is_null());
         assert!(!last_err().is_empty());
         clear_error();
-        assert!(ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0).is_null());
+        assert!(unsafe { ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0) }.is_null());
         assert!(!last_err().is_empty());
     }
 
@@ -876,8 +1081,8 @@ mod smoke {
 
         let root = CString::new(ws.to_string_lossy().as_ref()).unwrap();
         let name = CString::new("ffi2").unwrap();
-        assert!(!ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0).is_null());
-        let land_json = ffs_agent_land(root.as_ptr(), name.as_ptr(), 0, 0);
+        assert!(!unsafe { ffs_agent_spawn(root.as_ptr(), name.as_ptr(), 0, 0) }.is_null());
+        let land_json = unsafe { ffs_agent_land(root.as_ptr(), name.as_ptr(), 0, 0) };
         assert!(!land_json.is_null(), "land failed: {}", last_err());
         let _ = cstr(land_json);
 
@@ -891,7 +1096,7 @@ mod smoke {
         })
         .unwrap();
         let input = CString::new(input).unwrap();
-        let send_json = ffs_agent_send(root.as_ptr(), input.as_ptr());
+        let send_json = unsafe { ffs_agent_send(root.as_ptr(), input.as_ptr()) };
         assert!(!send_json.is_null(), "send failed: {}", last_err());
         let send: feanorfs_common::AgentSendResult =
             serde_json::from_str(&cstr(send_json)).unwrap();
@@ -903,7 +1108,7 @@ mod smoke {
         })
         .unwrap();
         let query = CString::new(query).unwrap();
-        let inbox_json = ffs_agent_inbox(root.as_ptr(), query.as_ptr());
+        let inbox_json = unsafe { ffs_agent_inbox(root.as_ptr(), query.as_ptr()) };
         assert!(!inbox_json.is_null(), "inbox failed: {}", last_err());
         let inbox: feanorfs_common::AgentInboxResult =
             serde_json::from_str(&cstr(inbox_json)).unwrap();
@@ -914,7 +1119,7 @@ mod smoke {
         assert!(!inbox.cursor_reset);
 
         let bad = CString::new("not json").unwrap();
-        assert!(ffs_agent_send(root.as_ptr(), bad.as_ptr()).is_null());
+        assert!(unsafe { ffs_agent_send(root.as_ptr(), bad.as_ptr()) }.is_null());
         assert!(!last_err().is_empty());
     }
 
@@ -950,7 +1155,7 @@ mod smoke {
             "ack_timeout_ms": 300000
         });
         let input = CString::new(serde_json::to_string(&input).unwrap()).unwrap();
-        let assign_json = ffs_integrator_assign(root.as_ptr(), input.as_ptr());
+        let assign_json = unsafe { ffs_integrator_assign(root.as_ptr(), input.as_ptr()) };
         assert!(
             !assign_json.is_null(),
             "integrator assign failed: {}",
@@ -966,7 +1171,7 @@ mod smoke {
         );
 
         let id = CString::new(assign.assignment_id.clone()).unwrap();
-        let status_json = ffs_integrator_status(root.as_ptr(), id.as_ptr());
+        let status_json = unsafe { ffs_integrator_status(root.as_ptr(), id.as_ptr()) };
         assert!(
             !status_json.is_null(),
             "integrator status failed: {}",
@@ -992,10 +1197,11 @@ mod smoke {
             .unwrap(),
         )
         .unwrap();
-        assert!(ffs_integrator_assign(root.as_ptr(), again.as_ptr()).is_null());
+        assert!(unsafe { ffs_integrator_assign(root.as_ptr(), again.as_ptr()) }.is_null());
 
         let reason = CString::new("integrator went quiet").unwrap();
-        let revoke_json = ffs_integrator_revoke(root.as_ptr(), id.as_ptr(), reason.as_ptr());
+        let revoke_json =
+            unsafe { ffs_integrator_revoke(root.as_ptr(), id.as_ptr(), reason.as_ptr()) };
         assert!(
             !revoke_json.is_null(),
             "integrator revoke failed: {}",
@@ -1010,7 +1216,7 @@ mod smoke {
         );
 
         // Resume with no active assignment is a no-op.
-        let resume_json = ffs_integrator_resume(root.as_ptr(), ptr::null());
+        let resume_json = unsafe { ffs_integrator_resume(root.as_ptr(), ptr::null()) };
         assert!(
             !resume_json.is_null(),
             "integrator resume failed: {}",

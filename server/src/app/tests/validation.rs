@@ -43,6 +43,65 @@ async fn version_probe_requires_auth_and_reports_this_build() {
 }
 
 #[tokio::test]
+async fn protected_request_permits_live_until_response_bodies_are_dropped() {
+    let router = build_router(app_state().await);
+    let mut responses = Vec::new();
+    for _ in 0..super::super::MAX_PROTECTED_REQUESTS {
+        let response = router
+            .clone()
+            .oneshot(Request::get("/api/version").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        responses.push(response);
+    }
+    let saturated = router
+        .clone()
+        .oneshot(Request::get("/api/version").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(responses.pop());
+    let admitted = router
+        .oneshot(Request::get("/api/version").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn manifest_content_length_is_capped_before_body_extraction() {
+    let response = build_router(app_state().await)
+        .oneshot(
+            Request::post("/api/manifest?workspace_id=ws&snapshot_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .header("content-length", (crate::MAX_MANIFEST_BYTES + 1).to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn chunked_manifest_body_is_capped_by_the_route_limit() {
+    let chunk = axum::body::Bytes::from(vec![b'a'; 1024 * 1024]);
+    let stream = futures_util::stream::iter(
+        (0..65).map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone())),
+    );
+    let response = build_router(app_state().await)
+        .oneshot(
+            Request::post("/api/manifest?workspace_id=ws&snapshot_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .body(Body::from_stream(stream))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn upload_rejects_unsafe_path() {
     let request =
         Request::post("/api/upload?workspace_id=ws&path=../etc/passwd&hash=a&size=0&mtime=0")
@@ -56,6 +115,63 @@ async fn upload_rejects_unsafe_path() {
             .status(),
         StatusCode::BAD_REQUEST
     );
+}
+
+#[tokio::test]
+async fn unsafe_legacy_path_can_only_tombstone_an_existing_row() {
+    let state = app_state().await;
+    let hash = "a".repeat(64);
+    state
+        .db
+        .upsert_file(
+            "ws",
+            &feanorfs_common::FileState {
+                path: ".jj/repo/store".into(),
+                hash: hash.clone(),
+                size: 1,
+                mtime: 1,
+                deleted: false,
+                mode: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let db = std::sync::Arc::clone(&state.db);
+    let router = build_router(state);
+
+    let retired = router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/upload?workspace_id=ws&path=.jj/repo/store&hash={hash}&size=0&mtime=2&deleted=true"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retired.status(), StatusCode::OK);
+    assert!(
+        db.get_workspace_files("ws")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path == ".jj/repo/store")
+            .unwrap()
+            .deleted
+    );
+
+    let invented = router
+        .oneshot(
+            Request::post(format!(
+                "/api/upload?workspace_id=ws&path=../invented&hash={hash}&size=0&mtime=2&deleted=true"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invented.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

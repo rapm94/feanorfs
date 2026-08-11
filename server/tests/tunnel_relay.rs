@@ -55,6 +55,17 @@ async fn public_tunnel_relay_forwards_only_bounded_opaque_binary_frames() {
         encrypted_response
     );
 
+    client
+        .send(Message::Binary(vec![0x42; 64 * 1024 + 1].into()))
+        .await
+        .unwrap();
+    let oversized = tokio::time::timeout(Duration::from_secs(2), host.next()).await;
+    match oversized {
+        Ok(Some(Ok(Message::Binary(_)))) => panic!("oversized tunnel frame was forwarded"),
+        Ok(_) => {}
+        Err(_) => panic!("oversized tunnel frame did not close the relay promptly"),
+    }
+
     let invalid = tokio_tungstenite::connect_async(format!(
         "ws://127.0.0.1:{port}/api/tunnel-relay/not-a-route/host"
     ))

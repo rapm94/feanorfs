@@ -94,8 +94,42 @@ fn packaged_cli_candidates() -> Vec<PathBuf> {
     }
 }
 
+/// TTL for cached config-presence results. Config presence changes only
+/// through tray/CLI start-stop actions, so the cache removes a full CLI
+/// process spawn per folder from every menu rebuild; tray-driven changes
+/// invalidate it explicitly, and external changes self-heal within the TTL.
+const CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
+
+fn config_presence_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (Instant, bool)>> {
+    static CACHE: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (Instant, bool)>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    &CACHE
+}
+
 pub fn workspace_has_config(path: &Path) -> bool {
-    run_in(path, &["--json", "config"]).is_ok_and(|output| output.status.success())
+    let mut cache = config_presence_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((checked_at, configured)) = cache.get(path) {
+        if checked_at.elapsed() < CONFIG_CACHE_TTL {
+            return *configured;
+        }
+    }
+    let configured =
+        run_in(path, &["--json", "config"]).is_ok_and(|output| output.status.success());
+    cache.insert(path.to_path_buf(), (Instant::now(), configured));
+    configured
+}
+
+/// Clears cached config-presence results after a tray-driven start/stop so
+/// the next menu rebuild re-checks the affected folders.
+pub fn invalidate_config_cache() {
+    config_presence_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 fn home_dir() -> PathBuf {
@@ -1144,5 +1178,52 @@ mod tests {
         assert!(saw_ready);
         assert_eq!(done, Some((false, true, None)));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn config_presence_is_cached_and_invalidated() {
+        let root = std::env::temp_dir().join(format!(
+            "feanorfs-tray-config-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let counter = root.join("calls");
+        let fake = root.join("fake-feanorfs");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\nprintf x >> '{}'\nexit 0\n", counter.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        std::env::set_var("FEANORFS_BIN", &fake);
+        invalidate_config_cache();
+        assert!(workspace_has_config(&workspace));
+        // The second check must reuse the cached result: one CLI spawn total.
+        assert!(workspace_has_config(&workspace));
+        let calls = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(
+            calls.len(),
+            1,
+            "config check must be cached after the first call"
+        );
+
+        invalidate_config_cache();
+        assert!(workspace_has_config(&workspace));
+        let calls = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(calls.len(), 2, "invalidation must force a fresh check");
+        std::env::remove_var("FEANORFS_BIN");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

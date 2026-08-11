@@ -69,6 +69,17 @@ async fn public_pair_relay_forwards_only_opaque_binary_frames() {
         second.as_slice()
     );
 
+    offer
+        .send(Message::Binary(vec![0x42; 16 * 1024 + 1].into()))
+        .await
+        .unwrap();
+    let oversized = tokio::time::timeout(Duration::from_secs(2), join.next()).await;
+    match oversized {
+        Ok(Some(Ok(Message::Binary(_)))) => panic!("oversized pair frame was forwarded"),
+        Ok(_) => {}
+        Err(_) => panic!("oversized pair frame did not close the relay promptly"),
+    }
+
     let invalid = tokio_tungstenite::connect_async(format!(
         "ws://127.0.0.1:{port}/api/pair-relay/not-a-session/offer"
     ))

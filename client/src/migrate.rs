@@ -303,8 +303,14 @@ async fn reseal_files(api: &ApiClient, db: &ClientDb, base: &Path, config: &Conf
         .as_deref()
         .context("no migration target key")?;
     let files = crate::local::scan_local_directory(base, db, Some(password)).await?;
+    let read_root = feanorfs_agent_core::workspace_read::WorkspaceReadRoot::open(base)?;
     for state in files.values().filter(|state| !state.deleted) {
-        let content = tokio::fs::read(base.join(&state.path)).await?;
+        let (content, _) = read_root
+            .read_regular_stable(
+                &state.path,
+                feanorfs_agent_core::large_file::LEGACY_SINGLE_BLOB_LIMIT_BYTES,
+            )
+            .await?;
         let packed = feanorfs_common::pack_bytes(&content, password, &state.path)?;
         anyhow::ensure!(
             feanorfs_common::hash_bytes(&packed) == state.hash,
@@ -336,12 +342,18 @@ async fn reseal_v3_files(
 ) -> Result<()> {
     let files = scan_rekeyed_view(db, base, config).await?;
     let ctx = feanorfs_agent_core::SyncCtx::from_config(api, db, base, config)?;
+    let read_root = feanorfs_agent_core::workspace_read::WorkspaceReadRoot::open(base)?;
     for state in files.values().filter(|state| !state.deleted) {
         if feanorfs_agent_core::large_file::uses_chunk_transport(state.size) {
             feanorfs_agent_core::large_file::upload(&ctx, &state.path, &state.hash).await?;
             continue;
         }
-        let content = tokio::fs::read(base.join(&state.path)).await?;
+        let (content, _) = read_root
+            .read_regular_stable(
+                &state.path,
+                feanorfs_agent_core::large_file::CHUNK_THRESHOLD_BYTES,
+            )
+            .await?;
         let packed = feanorfs_common::pack_bytes(&content, ctx.password_str(), &state.path)?;
         anyhow::ensure!(
             feanorfs_common::hash_bytes(&packed) == state.hash,

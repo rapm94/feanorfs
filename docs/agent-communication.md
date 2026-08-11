@@ -18,6 +18,15 @@ The hub observes only ordinary ciphertext objects, object sizes, manifests,
 head changes, and timing — never plaintext routing, bodies, or snapshot
 context.
 
+### Transport is not activation
+
+`ffmsg1`, the CLI, MCP, SDKs, and the inbox only transport or read signals. A
+standalone signal cannot wake an arbitrary model or process. An external
+orchestrator may monitor events or poll an inbox and decide what to invoke.
+Separately, an operator may explicitly configure a local agent runner; it
+invokes only that runner's fixed local command and only for direct requests to
+its configured agent. See [the operator runbook](usage.md#agent-runner).
+
 ## Envelope
 
 The encoded message uses an exact versioned discriminator followed by
@@ -37,7 +46,7 @@ Fields derived from the enclosing snapshot are not duplicated in the payload:
 
 | Kind | Meaning | Expected follow-up |
 |---|---|---|
-| `request` | Ask another agent to perform bounded work against a snapshot | `status`, then `result` or `blocked` |
+| `request` | Ask another agent to perform bounded work against a snapshot | optional `status`; exactly one correlated `result` or `blocked` terminal |
 | `status` | Short progress update | none |
 | `result` | Final bounded outcome | the requester consumes it |
 | `blocked` | Final explanation of why the request cannot complete | the requester decides next action |
@@ -96,6 +105,53 @@ overflow, delivery is explicitly best-effort and older signals may be missed:
   `cursor_reset=true` means the caller may have missed older signals.
 - Reading never publishes acknowledgements, mutates history, or reveals read
   state to other participants.
+
+## Local runner delivery
+
+The optional runner is a local activation mechanism, not a new signal kind or
+transport. Its compact sequence is:
+
+1. A requester sends a direct `request` to the configured agent. Broadcasts
+   remain readable through the normal inbox but are not runner work.
+2. The configured runner durably admits that direct request, refreshes its
+   agent worktree, and invokes its one fixed local command with one bounded
+   JSON invocation on stdin.
+3. The child uses the ordinary signal surface to publish one terminal `result`
+   or `blocked` from the configured agent to the requester, correlated by
+   `reply_to` and describing the snapshot actually inspected. A `status` is
+   optional. This one-terminal child contract is not an exactly-once transport
+   guarantee.
+4. The runner observes that correlated terminal before completing the request.
+   For a known child/invocation failure it attempts a generic correlated
+   `blocked` fallback. If terminal delivery cannot be established, or its
+   durable inbox/execution state is unsafe, it stops for attention; it does
+   not replay the request. A local refresh/preparation failure before launch
+   is `preparation_failed`: no child ran, but the pending request remains
+   pinned until an operator repairs or inspects local state and explicitly
+   discards/resets it.
+
+Only explicit runner setup and start can enable this path. Events and polling
+remain the alternative for an external orchestrator. The full lifecycle,
+attention reasons, process ownership, foreground ownership, stop
+acknowledgements, and recovery commands are in [Usage: Agent runner](usage.md#agent-runner).
+
+The runner owns the complete child process tree. Unix (including macOS) uses a
+fresh process group and bounded `TERM`/`KILL` escalation; Windows creates the
+child suspended, assigns and verifies a private kill-on-close Job Object, then
+resumes it. Timeout, cancellation, and direct-child exit tear down descendants
+before the cycle is reported. The supervisor restarts workers after crashes or
+clean exits with bounded backoff, but a persisted launching/running checkpoint
+is marked ambiguous on restart rather than replayed.
+
+`agent runner stop` disables admission before removing registry intent. When a
+workspace-specific supervisor authority exists, it waits for a durable
+registry-generation acknowledgement bound to the supervisor's exact native
+process identity. A genuinely fresh or already-disabled, unregistered runner
+with no supervisor authority has no possible child acknowledgement, so
+stop/setup skips that wait. Stale registry, status, or acknowledgement
+authority remains fail-closed. Inbox
+delivery remains best-effort rather than exactly-once: reads can redeliver or
+reset, and the runner does not claim exactly-once execution.
 
 ## Example exchange
 
@@ -177,11 +233,14 @@ Human output is concise. Global `--json` emits the stable result types below.
   descriptions explain that all workspace participants can read messages,
   identity is advisory, and requests/results should carry exact snapshot
   context.
-- NDJSON `events`: one `agent_message` wakeup record per new signal with
+- NDJSON `events`: one `agent_message` metadata record per new signal with
   `message_id`, `from`, `to`, `kind`, and `about_snapshot` — never the body.
   Normal bounded delivery may redeliver; IDs are deduplicated in a bounded
-  in-process cache. A reset/overflow is logged because older wakeups may have
-  been missed.
+  in-process cache. A reset/overflow emits a separate metadata-only
+  `agent_message_cursor_reset` record before the bounded wakeups:
+  `{"event":"agent_message_cursor_reset","cursor":"<observed-workspace-head>","cursor_reset":true}`.
+  It contains no message body, ID, routing, path, or integrator fields and
+  means older wakeups may have been missed.
 
 ## Collaboration skill
 
@@ -190,9 +249,9 @@ teaches agents to identify themselves, check the inbox at lifecycle points,
 refresh before acting on a request, send one bounded `status` update only when
 useful, finish each request with exactly one `result` or `blocked` reply,
 state the snapshot actually tested, avoid secrets and raw logs, and treat
-routing/authorship/path claims as advisory. The skill cannot wake an inactive
-model; long-lived orchestration must monitor NDJSON events or poll
-`agent inbox`, then invoke the agent with the skill loaded.
+routing/authorship/path claims as advisory. For activation choices, see
+[Transport is not activation](#transport-is-not-activation) and
+[Local runner delivery](#local-runner-delivery).
 
 ## Safety and privacy
 

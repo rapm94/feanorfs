@@ -44,3 +44,6 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAp
 tray-icon = { version = "0.24.1", default-features = false, features = ["common-controls-v6"] }
 muda = { version = "0.19.3", default-features = false, features = ["common-controls-v6"] }
 rfd = { version = "0.17.2", default-features = false, features = ["common-controls-v6"] }
+
+[dev-dependencies]
+feanorfs-test-support = { workspace = true }

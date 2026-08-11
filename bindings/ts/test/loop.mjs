@@ -6,6 +6,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+const demo = fs.mkdtempSync(path.join(os.tmpdir(), 'feanorfs-node-'));
+process.env.FEANORFS_HOME = path.join(demo, 'profile');
+process.env.FEANORFS_CREDENTIAL_STORE = 'file';
+
 const agentModule = process.env.FEANORFS_AGENT_IMPORT ?? '../api.mjs';
 const {
   spawn,
@@ -31,7 +35,6 @@ function runFeanorfs(cwd, ...args) {
   execFileSync(feanorfs, args, { cwd, stdio: 'inherit' });
 }
 
-const demo = fs.mkdtempSync(path.join(os.tmpdir(), 'feanorfs-node-'));
 const ws = path.join(demo, 'workspace');
 fs.mkdirSync(ws, { recursive: true });
 
@@ -46,6 +49,13 @@ try {
   }
 
   const agentDir = await agentPath(ws, 'worker');
+  let escapedAgentRejected = false;
+  try {
+    await agentPath(ws, '../outside');
+  } catch (_) {
+    escapedAgentRejected = true;
+  }
+  if (!escapedAgentRejected) throw new Error('agentPath traversal should have thrown');
   if (agentDir.startsWith(ws) || fs.existsSync(path.join(ws, '.feanorfs'))) {
     throw new Error(`agent state leaked into project: ${agentDir}`);
   }
@@ -83,6 +93,19 @@ try {
   if (!sent.message_id || !sent.about_snapshot) {
     throw new Error(`sendMessage failed: ${JSON.stringify(sent)}`);
   }
+  let oversizedRejected = false;
+  try {
+    await sendMessage(ws, {
+      to: 'mac-test',
+      kind: 'request',
+      body: 'x'.repeat(1024 * 1024),
+      from: 'node-agent',
+    });
+  } catch (error) {
+    oversizedRejected = String(error).includes('exceeds 1048576')
+  }
+  if (!oversizedRejected) throw new Error('oversized raw Node JSON should fail at the adapter cap');
+
   const inboxResult = await inbox(ws, { recipient: 'mac-test', limit: 50 });
   const delivered = inboxResult.messages.find((m) => m.message_id === sent.message_id);
   if (!delivered || delivered.from !== 'node-agent' || delivered.body !== 'Run iOS simulator tests') {
@@ -126,7 +149,20 @@ try {
   if (revoked.state !== 'cancelled' && revoked.state !== 'offered') {
     throw new Error(`integratorRevoke failed: ${JSON.stringify(revoked)}`);
   }
-  const materialized = await conflictMaterialize(ws, { about_snapshot: head, paths: [] });
+  for (const malformed of [
+    { about_snapshot: head, path: 'one.txt' },
+    { about_snapshot: head, paths: ['one.txt', 42] },
+    { about_snapshot: head, paths: [] },
+  ]) {
+    let rejected = false;
+    try {
+      await conflictMaterialize(ws, malformed);
+    } catch (_) {
+      rejected = true;
+    }
+    if (!rejected) throw new Error(`malformed conflict subset was accepted: ${JSON.stringify(malformed)}`);
+  }
+  const materialized = await conflictMaterialize(ws, { about_snapshot: head, all: true });
   if (!Array.isArray(materialized.entries)) {
     throw new Error(`conflictMaterialize failed: ${JSON.stringify(materialized)}`);
   }

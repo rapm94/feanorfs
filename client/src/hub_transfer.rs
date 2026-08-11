@@ -91,7 +91,7 @@ pub async fn transfer_hub(
     let copied =
         transfer_snapshot_history(&source_api, &destination_api, &source_ctx, &destination_ctx)
             .await?;
-    let local_objects_seeded = seed_local_file_objects(&destination_api, &source_ctx).await?;
+    let local_objects_seeded = seed_local_file_objects(&destination_ctx).await?;
 
     // Endpoint selection may have safely refreshed the destination workspace URL. Reload its
     // authenticated configuration before copying only the connection fields.
@@ -116,29 +116,69 @@ pub async fn transfer_hub(
     })
 }
 
-async fn seed_local_file_objects(destination_api: &ApiClient, ctx: &SyncCtx<'_>) -> Result<usize> {
+async fn seed_local_file_objects(ctx: &SyncCtx<'_>) -> Result<usize> {
     let mut seeded_paths = BTreeSet::new();
+    let read_root = feanorfs_agent_core::workspace_read::WorkspaceReadRoot::open(ctx.base)?;
     for _ in 0..3 {
         let files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
-        let mut paths: Vec<_> = files.keys().cloned().collect();
+        let placeholder_corruptions =
+            feanorfs_agent_core::conflicts::detect_placeholder_corruptions(ctx.base, ctx.db)
+                .await?;
+        if !placeholder_corruptions.is_empty() {
+            bail!(
+                "lazy placeholder changed before hub transfer; hydrate or resolve: {}",
+                placeholder_corruptions.join(", ")
+            );
+        }
+        let cache = ctx.db.get_cache_entries().await?;
+        let mut paths = files
+            .iter()
+            .filter(|(path, state)| {
+                !state.deleted
+                    && !cache
+                        .get(*path)
+                        .is_some_and(|entry| !entry.hydrated && entry.deleted_at.is_none())
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
         paths.sort();
         let mut changed_during_pass = false;
         for path in &paths {
             let state = &files[path];
-            let content = match tokio::fs::read(ctx.base.join(path)).await {
-                Ok(content) => content,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if feanorfs_agent_core::large_file::uses_chunk_transport(state.size) {
+                match feanorfs_agent_core::large_file::upload_all_chunks(ctx, path, &state.hash)
+                    .await
+                {
+                    Ok(()) => {
+                        seeded_paths.insert(path.clone());
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "large local file {path} changed during transfer: {error:#}"
+                        );
+                        changed_during_pass = true;
+                    }
+                }
+                continue;
+            }
+            let content = match read_root
+                .read_regular_stable(path, feanorfs_agent_core::large_file::CHUNK_THRESHOLD_BYTES)
+                .await
+            {
+                Ok((content, _)) => content,
+                Err(error) => {
+                    tracing::warn!("local file {path} changed during transfer: {error:#}");
                     changed_during_pass = true;
                     continue;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("read current local file {path}"))
                 }
             };
             let (hash, ciphertext) =
                 feanorfs_agent_core::crypto::seal(&content, ctx.password_str(), path)?;
-            changed_during_pass |= hash != state.hash;
-            destination_api
+            if hash != state.hash {
+                changed_during_pass = true;
+                continue;
+            }
+            ctx.api
                 .upload_object(ctx.workspace_id(), &hash, ciphertext)
                 .await
                 .with_context(|| {
@@ -290,25 +330,75 @@ async fn collect_reachable_history(ctx: &SyncCtx<'_>, head: &str) -> Result<Reac
         }
 
         let mut hashes = BTreeSet::from([snapshot_id.clone()]);
-        let mut pending_trees = vec![snapshot.root];
-        while let Some(tree_id) = pending_trees.pop() {
+        let mut pending_trees = vec![(snapshot.root, String::new(), 0_usize)];
+        let mut expanded_trees = BTreeSet::new();
+        let mut work_items = 0_usize;
+        let mut path_bytes = 0_usize;
+        while let Some((tree_id, prefix, depth)) = pending_trees.pop() {
+            if depth > feanorfs_common::MAX_TREE_DEPTH {
+                bail!("snapshot {snapshot_id} exceeds the maximum tree depth");
+            }
+            work_items = work_items.saturating_add(1);
+            if work_items > feanorfs_common::MAX_TREE_WORK_ITEMS {
+                bail!("snapshot {snapshot_id} exceeds the bounded tree expansion budget");
+            }
             if !is_valid_hash(&tree_id) {
                 bail!("snapshot {snapshot_id} contains an invalid tree id");
             }
-            if !hashes.insert(tree_id.clone()) {
+            hashes.insert(tree_id.clone());
+            if !expanded_trees.insert((tree_id.clone(), prefix.clone())) {
                 continue;
             }
             for entry in objects.get_tree(&tree_id).await?.entries {
+                let path = if prefix.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{prefix}/{}", entry.name)
+                };
+                path_bytes = path_bytes.saturating_add(path.len());
+                if path_bytes > feanorfs_common::MAX_TREE_PATH_BYTES_TOTAL {
+                    bail!("snapshot {snapshot_id} exceeds the bounded path expansion budget");
+                }
                 match entry.kind {
-                    TreeEntryKind::Dir => pending_trees.push(entry.hash),
-                    TreeEntryKind::File => {
-                        hashes.insert(entry.hash);
+                    TreeEntryKind::Dir => {
+                        pending_trees.push((entry.hash, path, depth.saturating_add(1)));
                     }
-                    TreeEntryKind::Conflict { base, ours, theirs } => {
-                        hashes.insert(entry.hash);
-                        hashes.extend(base);
-                        hashes.extend(ours);
-                        hashes.extend(theirs);
+                    TreeEntryKind::File => {
+                        hashes.insert(entry.hash.clone());
+                        hashes.extend(
+                            feanorfs_agent_core::large_file::reachable_chunks(
+                                ctx,
+                                &path,
+                                &entry.hash,
+                                Some(entry.size),
+                            )
+                            .await?,
+                        );
+                    }
+                    TreeEntryKind::Conflict {
+                        base, ours, theirs, ..
+                    } => {
+                        hashes.insert(entry.hash.clone());
+                        hashes.extend(
+                            feanorfs_agent_core::large_file::reachable_chunks(
+                                ctx,
+                                &path,
+                                &entry.hash,
+                                Some(entry.size),
+                            )
+                            .await?,
+                        );
+                        for leg in [base, ours, theirs].into_iter().flatten() {
+                            hashes.insert(leg.clone());
+                            if leg != entry.hash {
+                                hashes.extend(
+                                    feanorfs_agent_core::large_file::reachable_chunks(
+                                        ctx, &path, &leg, None,
+                                    )
+                                    .await?,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -544,5 +634,188 @@ mod tests {
                 .unwrap(),
             Some(descendant)
         );
+    }
+    #[tokio::test]
+    async fn transfers_authenticated_chunks_and_references_them_in_the_manifest() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source_state = tempfile::tempdir().unwrap();
+        let source_hub_dir = tempfile::tempdir().unwrap();
+        let destination_hub_dir = tempfile::tempdir().unwrap();
+        let source_api = ApiClient::local(
+            LocalHub::open(source_hub_dir.path().to_path_buf(), None)
+                .await
+                .unwrap(),
+            None,
+        );
+        let destination_api = ApiClient::local(
+            LocalHub::open(destination_hub_dir.path().to_path_buf(), None)
+                .await
+                .unwrap(),
+            None,
+        );
+        let db = ClientDb::new(source_state.path()).await.unwrap();
+        let config = crate::Config {
+            server_url: "http://127.0.0.1:1".into(),
+            workspace_id: "workspace-large-transfer-test".into(),
+            encryption_password: Some("22".repeat(32)),
+            server_password: None,
+            tls_ca_pem: None,
+            format_version: 3,
+            hub_local: false,
+            relay: None,
+        };
+        let source_ctx =
+            SyncCtx::from_config(&source_api, &db, source_root.path(), &config).unwrap();
+        let destination_ctx =
+            SyncCtx::from_config(&destination_api, &db, source_root.path(), &config).unwrap();
+        let path = "large.bin";
+        let size = feanorfs_agent_core::large_file::CHUNK_THRESHOLD_BYTES + 1;
+        std::fs::write(source_root.path().join(path), vec![0x5a; size as usize]).unwrap();
+        let fingerprint = feanorfs_agent_core::large_file::fingerprint(
+            source_root.path(),
+            source_ctx.password_str(),
+            path,
+        )
+        .unwrap();
+        feanorfs_agent_core::large_file::upload_all_chunks(
+            &source_ctx,
+            path,
+            &fingerprint.encrypted_hash,
+        )
+        .await
+        .unwrap();
+        let chunk_hashes = feanorfs_agent_core::large_file::reachable_chunks(
+            &source_ctx,
+            path,
+            &fingerprint.encrypted_hash,
+            Some(size),
+        )
+        .await
+        .unwrap();
+        assert!(!chunk_hashes.is_empty());
+
+        let objects = ObjectStore::new(&source_ctx);
+        let tree = objects
+            .put_tree(&Tree {
+                entries: vec![TreeEntry {
+                    name: path.into(),
+                    kind: TreeEntryKind::File,
+                    hash: fingerprint.encrypted_hash.clone(),
+                    size,
+                    mode: 0,
+                }],
+            })
+            .await
+            .unwrap();
+        let snapshot = objects
+            .put_snapshot(&Snapshot {
+                root: tree.clone(),
+                parents: Vec::new(),
+                author: "test".into(),
+                created_at_ms: 1,
+                message: None,
+            })
+            .await
+            .unwrap();
+        let mut source_manifest = chunk_hashes.clone();
+        source_manifest.extend([
+            fingerprint.encrypted_hash.clone(),
+            tree.clone(),
+            snapshot.clone(),
+        ]);
+        source_api
+            .upload_manifest(&config.workspace_id, &snapshot, &source_manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            source_api
+                .swap_head(&config.workspace_id, None, &snapshot)
+                .await
+                .unwrap(),
+            SwapHeadResult::Swapped
+        );
+        source_api
+            .set_workspace_format(&config.workspace_id, 3)
+            .await
+            .unwrap();
+
+        let copied =
+            transfer_snapshot_history(&source_api, &destination_api, &source_ctx, &destination_ctx)
+                .await
+                .unwrap();
+        for hash in &chunk_hashes {
+            assert!(copied.hashes.contains(hash));
+            let bytes = destination_api.download_file(hash).await.unwrap();
+            assert_eq!(hash_bytes(&bytes), *hash);
+        }
+        let manifest = copied
+            .manifests
+            .iter()
+            .find(|manifest| manifest.snapshot_id == snapshot)
+            .unwrap();
+        for hash in chunk_hashes {
+            assert!(manifest.hashes.contains(&hash));
+        }
+    }
+    #[tokio::test]
+    async fn seeding_skips_validated_small_and_large_lazy_placeholders() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let hub_dir = tempfile::tempdir().unwrap();
+        let api = ApiClient::local(
+            LocalHub::open(hub_dir.path().to_path_buf(), None)
+                .await
+                .unwrap(),
+            None,
+        );
+        let db = ClientDb::new(state.path()).await.unwrap();
+        let config = crate::Config {
+            server_url: "http://127.0.0.1:1".into(),
+            workspace_id: "workspace-lazy-transfer-test".into(),
+            encryption_password: Some("33".repeat(32)),
+            server_password: None,
+            tls_ca_pem: None,
+            format_version: 3,
+            hub_local: false,
+            relay: None,
+        };
+        let ctx = SyncCtx::from_config(&api, &db, workspace.path(), &config).unwrap();
+        for (path, size) in [
+            ("small.txt", 12_u64),
+            (
+                "large.bin",
+                feanorfs_agent_core::large_file::CHUNK_THRESHOLD_BYTES + 1,
+            ),
+        ] {
+            let destination = workspace.path().join(path);
+            std::fs::write(&destination, b"").unwrap();
+            let mut permissions = std::fs::metadata(&destination).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&destination, permissions).unwrap();
+            let metadata = std::fs::metadata(&destination).unwrap();
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+                .unwrap_or(0);
+            db.upsert_cache_entry(&feanorfs_agent_core::local::CacheEntry {
+                path: path.to_string(),
+                plaintext_hash: "a".repeat(64),
+                encrypted_hash: "b".repeat(64),
+                size,
+                mtime,
+                server_mtime: 1,
+                mode: 0,
+                hydrated: false,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(seed_local_file_objects(&ctx).await.unwrap(), 0);
+        assert!(workspace.path().join("small.txt").exists());
+        assert!(workspace.path().join("large.bin").exists());
     }
 }

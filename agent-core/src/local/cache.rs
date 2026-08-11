@@ -87,9 +87,46 @@ impl ClientDb {
         })
     }
 
+    /// Records server mtimes for many paths in one locked state rewrite.
+    ///
+    /// Upload passes used to rewrite the whole JSON state file once per
+    /// uploaded file; batching turns an O(n) state-size write per file into a
+    /// single write for the whole pass.
+    pub async fn set_cache_server_mtimes(&self, updates: &[(String, i64)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.state.with_write(|state| {
+            for (path, server_mtime) in updates {
+                if let Some(entry) = state.local_files.get_mut(path) {
+                    entry.server_mtime = *server_mtime;
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub async fn bulk_upsert_cache_entries(&self, entries: &[CacheEntry]) -> Result<()> {
         self.state.with_write(|state| {
             for entry in entries {
+                state
+                    .local_files
+                    .insert(entry.path.clone(), cache_to_v1(entry));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) async fn apply_cache_changes(
+        &self,
+        upserts: &[CacheEntry],
+        deletes: &[String],
+    ) -> Result<()> {
+        self.state.with_write(|state| {
+            for path in deletes {
+                state.local_files.remove(path);
+            }
+            for entry in upserts {
                 state
                     .local_files
                     .insert(entry.path.clone(), cache_to_v1(entry));

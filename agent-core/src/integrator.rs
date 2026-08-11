@@ -18,19 +18,19 @@ use crate::conflict_artifacts::{
 use crate::ctx::SyncCtx;
 use crate::durable::DurableJson;
 use crate::lock::DispatcherLock;
-use crate::messages::{inbox, send_message};
+use crate::messages::{inbox, send_message, signals_since};
 use crate::paths::validate_name;
 use crate::snapshot::SnapshotEngine;
 use anyhow::{bail, ensure, Context, Result};
 use feanorfs_common::{
     classify_conflict_kind, encode_integrator_profile, filter_eligible, generate_assignment_id,
     generate_selection_nonce, is_safe_rel_path, is_valid_hash, is_valid_hex_id,
-    parse_integrator_profile, rank_candidates, roster_fingerprint, AgentInboxQuery,
-    AgentMessageInput, AgentMessageKind, ConcurrentEdit, ConflictKind, ConflictMaterializeEntry,
-    ConflictMaterializeResult, IntegratorAssignInput, IntegratorAssignResult,
-    IntegratorAssignmentState, IntegratorAttempt, IntegratorAttemptState, IntegratorAttemptStatus,
-    IntegratorDigest, IntegratorObserveResult, IntegratorOutcomeState, IntegratorProfile,
-    IntegratorStatusResult, INTEGRATOR_MAX_HISTORY,
+    normalize_capabilities, parse_integrator_profile, rank_candidates, roster_fingerprint,
+    AgentInboxQuery, AgentMessageInput, AgentMessageKind, ConcurrentEdit, ConflictKind,
+    ConflictMaterializeEntry, ConflictMaterializeResult, IntegratorAssignInput,
+    IntegratorAssignResult, IntegratorAssignmentState, IntegratorAttempt, IntegratorAttemptState,
+    IntegratorAttemptStatus, IntegratorDigest, IntegratorObserveResult, IntegratorOutcomeState,
+    IntegratorProfile, IntegratorStatusResult, INTEGRATOR_MAX_HISTORY,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -53,6 +53,8 @@ pub struct PersistedIntegratorAssignment {
     pub eligible: Vec<String>,
     pub task_summary: String,
     pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub ack_timeout_ms: Option<u64>,
     pub conflict_authors: Vec<String>,
     pub excluded: Vec<String>,
     pub state: IntegratorAssignmentState,
@@ -289,16 +291,22 @@ pub async fn integrator_assign(
     );
     ensure_reachable_snapshot(ctx, &input.about_snapshot).await?;
 
+    let selection_pool = if eligibility.neutral_integrator {
+        &eligibility.neutral
+    } else {
+        &eligibility.eligible
+    };
+    let normalized_requirements = normalize_capabilities(&input.required_capabilities)?;
     let assignment_id = generate_assignment_id()?;
     let selection_nonce = generate_selection_nonce()?;
-    let fingerprint = roster_fingerprint(&eligibility.eligible)?;
+    let fingerprint = roster_fingerprint(selection_pool)?;
     let ranked = rank_candidates(
         ctx.workspace_id(),
         &input.about_snapshot,
         &assignment_id,
         &selection_nonce,
         &fingerprint,
-        &eligibility.eligible,
+        selection_pool,
     )?;
 
     let _lock = DispatcherLock::acquire(ctx.base)?;
@@ -321,9 +329,10 @@ pub async fn integrator_assign(
             roster_fingerprint: fingerprint.clone(),
             ranked: ranked.clone(),
             neutral_integrator: eligibility.neutral_integrator,
-            eligible: eligibility.eligible.clone(),
+            eligible: selection_pool.clone(),
             task_summary: input.task_summary.clone(),
-            required_capabilities: input.required_capabilities.clone(),
+            required_capabilities: normalized_requirements.clone(),
+            ack_timeout_ms: input.ack_timeout_ms,
             conflict_authors: input.conflict_authors.clone(),
             excluded: input.excluded.clone(),
             state: IntegratorAssignmentState::Created,
@@ -431,10 +440,11 @@ async fn offer_next(
     )
     .await?;
     if let Some(attempt) = assignment.attempts.last_mut() {
-        attempt.request_message_id = Some(message_id);
+        attempt.request_message_id = Some(message_id.clone());
     }
-    let head = ctx.api.get_head(ctx.workspace_id()).await?;
-    assignment.inbox_cursor = head;
+    // The immutable request snapshot is the exact causal boundary. Reading a
+    // later head here can skip a fast reply published immediately after it.
+    assignment.inbox_cursor = Some(message_id);
     store.update(|state| {
         if let Some(active) = &mut state.active {
             *active = assignment.clone();
@@ -557,6 +567,79 @@ fn archive(state: &mut IntegratorStateFile, assignment: &PersistedIntegratorAssi
     state.active = None;
 }
 
+enum PendingOfferRecovery {
+    Published(String),
+    Absent,
+    Uncertain(String),
+}
+
+fn is_assignment_request(
+    assignment: &PersistedIntegratorAssignment,
+    attempt: &IntegratorAttempt,
+    dispatcher: &str,
+    message: &feanorfs_common::AgentMessage,
+) -> bool {
+    if message.from != dispatcher
+        || message.to != attempt.selected
+        || message.kind != AgentMessageKind::Request
+        || message.about_snapshot != assignment.about_snapshot
+        || message.reply_to.is_some()
+    {
+        return false;
+    }
+    matches!(
+        parse_integrator_profile(&message.body),
+        Some(IntegratorProfile::Assignment {
+            assignment_id,
+            attempt: profile_attempt,
+            selected,
+            about_snapshot,
+            roster_fingerprint,
+            neutral_integrator,
+            task,
+        }) if assignment_id == assignment.assignment_id
+            && profile_attempt == attempt.attempt
+            && selected == attempt.selected
+            && about_snapshot == assignment.about_snapshot
+            && roster_fingerprint == assignment.roster_fingerprint
+            && neutral_integrator == assignment.neutral_integrator
+            && task == assignment.task_summary
+    )
+}
+
+async fn recover_pending_offer(
+    ctx: &SyncCtx<'_>,
+    assignment: &PersistedIntegratorAssignment,
+    attempt: &IntegratorAttempt,
+    dispatcher: &str,
+) -> Result<PendingOfferRecovery> {
+    let read = signals_since(
+        ctx,
+        assignment.inbox_cursor.as_deref(),
+        INTEGRATOR_OBSERVE_LIMIT,
+    )
+    .await?;
+    if read.cursor_reset {
+        return Ok(PendingOfferRecovery::Uncertain(
+            "offer recovery scan was bounded or lost its cursor; refusing to republish blindly"
+                .to_string(),
+        ));
+    }
+    let matches = read
+        .messages
+        .iter()
+        .filter(|message| is_assignment_request(assignment, attempt, dispatcher, message))
+        .map(|message| message.message_id.clone())
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(PendingOfferRecovery::Absent),
+        [message_id] => Ok(PendingOfferRecovery::Published(message_id.clone())),
+        _ => Ok(PendingOfferRecovery::Uncertain(
+            "multiple matching assignment requests exist; human review is required".to_string(),
+        )),
+    }
+}
+
 /// One dispatcher observation pass (INT-5, INT-6): reads new ffint1 replies
 /// since the persisted cursor, applies state transitions, and (with the
 /// configured options) falls back on pre-acceptance timeout or a
@@ -598,21 +681,53 @@ pub async fn integrator_observe(
     });
     if needs_send {
         let attempt = assignment.attempts.last().cloned().context("no attempt")?;
-        let message_id = send_assignment_request(
-            ctx,
-            &dispatcher,
-            &assignment,
-            attempt.attempt,
-            &attempt.selected,
-            assignment.neutral_integrator,
-        )
-        .await?;
+        let recovered = recover_pending_offer(ctx, &assignment, &attempt, &dispatcher).await?;
+        let (message_id, recovered_existing) = match recovered {
+            PendingOfferRecovery::Published(message_id) => (message_id, true),
+            PendingOfferRecovery::Absent => (
+                send_assignment_request(
+                    ctx,
+                    &dispatcher,
+                    &assignment,
+                    attempt.attempt,
+                    &attempt.selected,
+                    assignment.neutral_integrator,
+                )
+                .await?,
+                false,
+            ),
+            PendingOfferRecovery::Uncertain(reason) => {
+                assignment.state = IntegratorAssignmentState::RequiresHuman;
+                assignment.updated_at_ms = now_ms();
+                if let Some(current) = assignment.attempts.last_mut() {
+                    current.reason = Some(reason);
+                }
+                let terminal = assignment.clone();
+                store.update(|current| {
+                    archive(current, &terminal);
+                    Ok(())
+                })?;
+                return Ok(IntegratorObserveResult {
+                    assignment_id: Some(terminal.assignment_id),
+                    state: Some(IntegratorAssignmentState::RequiresHuman),
+                    messages_processed: 0,
+                    cursor: next_cursor,
+                    cursor_reset: true,
+                    action: "requires_human".to_string(),
+                });
+            }
+        };
         if let Some(current) = assignment.attempts.last_mut() {
-            current.request_message_id = Some(message_id);
+            current.request_message_id = Some(message_id.clone());
         }
-        assignment.inbox_cursor = ctx.api.get_head(ctx.workspace_id()).await?;
+        assignment.inbox_cursor = Some(message_id);
         next_cursor = assignment.inbox_cursor.clone();
-        action = "offered".to_string();
+        action = if recovered_existing {
+            "recovered_offer"
+        } else {
+            "offered"
+        }
+        .to_string();
         store.update(|current| {
             if let Some(active) = &mut current.active {
                 *active = assignment.clone();
@@ -625,7 +740,7 @@ pub async fn integrator_observe(
     let read = inbox(
         ctx,
         AgentInboxQuery {
-            recipient: dispatcher,
+            recipient: dispatcher.clone(),
             after: next_cursor.clone(),
             limit: INTEGRATOR_OBSERVE_LIMIT,
         },
@@ -658,12 +773,39 @@ pub async fn integrator_observe(
         });
     }
 
-    for message in &read.messages {
-        let Some(profile) = parse_integrator_profile(&message.body) else {
+    let mut replies = read
+        .messages
+        .iter()
+        .filter_map(|message| {
+            parse_integrator_profile(&message.body).map(|profile| (message, profile))
+        })
+        .collect::<Vec<_>>();
+    // Inbox delivery is newest-first. Apply acceptance checkpoints before
+    // terminal replies from the same read so a fast Accepted -> Result pair
+    // cannot be consumed in reverse and lost behind the advanced cursor.
+    replies.sort_by(
+        |(left_message, left_profile), (right_message, right_profile)| {
+            profile_apply_order(left_profile)
+                .cmp(&profile_apply_order(right_profile))
+                .then_with(|| left_message.created_at_ms.cmp(&right_message.created_at_ms))
+                .then_with(|| left_message.message_id.cmp(&right_message.message_id))
+        },
+    );
+    for (message, profile) in replies {
+        if !profile_message_matches(&assignment, &profile, message, &dispatcher) {
             continue;
-        };
-        if apply_profile(&mut assignment, &profile, message, now_ms())? {
+        }
+        if let IntegratorProfile::Result { digest, .. } = &profile {
+            if ensure_reachable_snapshot(ctx, &digest.inspected_snapshot)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+        }
+        if apply_profile(&mut assignment, &profile, message, &dispatcher, now_ms())? {
             messages_processed += 1;
+            action = assignment_action(assignment.state).to_string();
             store.update(|current| {
                 if let Some(active) = &mut current.active {
                     *active = assignment.clone();
@@ -679,13 +821,13 @@ pub async fn integrator_observe(
 
     // Pre-acceptance timeout: advance to the next recorded candidate.
     if assignment.state == IntegratorAssignmentState::Offered {
-        if let Some(timeout) = options.ack_timeout_ms {
+        if let Some(timeout) = options.ack_timeout_ms.or(assignment.ack_timeout_ms) {
             let offered_at = assignment
                 .attempts
                 .last()
                 .map(|attempt| attempt.offered_at_ms)
                 .unwrap_or(0);
-            let elapsed = now_ms().saturating_sub(offered_at) as u64;
+            let elapsed = now_ms().saturating_sub(offered_at).max(0) as u64;
             if elapsed >= timeout {
                 if let Some(attempt) = assignment.attempts.last_mut() {
                     attempt.state = IntegratorAttemptState::TimedOut;
@@ -786,6 +928,97 @@ pub async fn integrator_observe(
     })
 }
 
+fn profile_apply_order(profile: &IntegratorProfile) -> u8 {
+    match profile {
+        IntegratorProfile::Accepted { .. } => 0,
+        IntegratorProfile::Result { .. } | IntegratorProfile::Blocked { .. } => 1,
+        IntegratorProfile::Assignment { .. } => 2,
+    }
+}
+
+fn assignment_action(state: IntegratorAssignmentState) -> &'static str {
+    match state {
+        IntegratorAssignmentState::Accepted => "accepted",
+        IntegratorAssignmentState::Active => "active",
+        IntegratorAssignmentState::Completed => "completed",
+        IntegratorAssignmentState::Blocked => "blocked",
+        IntegratorAssignmentState::RequiresHuman => "requires_human",
+        IntegratorAssignmentState::Cancelled => "cancelled",
+        IntegratorAssignmentState::Revoked => "revoked",
+        IntegratorAssignmentState::Created => "created",
+        IntegratorAssignmentState::Offered => "offered",
+    }
+}
+
+fn profile_message_matches(
+    assignment: &PersistedIntegratorAssignment,
+    profile: &IntegratorProfile,
+    message: &feanorfs_common::AgentMessage,
+    dispatcher: &str,
+) -> bool {
+    let (assignment_id, attempt_number, about_snapshot, expected_kind) = match profile {
+        IntegratorProfile::Assignment { .. } => return false,
+        IntegratorProfile::Accepted {
+            assignment_id,
+            attempt,
+            about_snapshot,
+        } => (
+            assignment_id,
+            *attempt,
+            about_snapshot,
+            AgentMessageKind::Status,
+        ),
+        IntegratorProfile::Result {
+            assignment_id,
+            attempt,
+            about_snapshot,
+            ..
+        } => (
+            assignment_id,
+            *attempt,
+            about_snapshot,
+            AgentMessageKind::Result,
+        ),
+        IntegratorProfile::Blocked {
+            assignment_id,
+            attempt,
+            about_snapshot,
+            ..
+        } => (
+            assignment_id,
+            *attempt,
+            about_snapshot,
+            AgentMessageKind::Blocked,
+        ),
+    };
+    let Some(attempt) = assignment
+        .attempts
+        .iter()
+        .find(|candidate| candidate.attempt == attempt_number)
+    else {
+        return false;
+    };
+    if assignment_id != &assignment.assignment_id
+        || about_snapshot != &assignment.about_snapshot
+        || message.about_snapshot != assignment.about_snapshot
+        || message.from != attempt.selected
+        || message.to != dispatcher
+        || message.kind != expected_kind
+        || message.reply_to.as_deref() != attempt.request_message_id.as_deref()
+    {
+        return false;
+    }
+    match profile {
+        IntegratorProfile::Result { digest, .. } => {
+            digest.assignment_id == assignment.assignment_id
+                && digest.about_snapshot == assignment.about_snapshot
+                && digest.integrator == attempt.selected
+        }
+        IntegratorProfile::Accepted { .. } | IntegratorProfile::Blocked { .. } => true,
+        IntegratorProfile::Assignment { .. } => false,
+    }
+}
+
 /// Applies one `ffint1` reply to the assignment state machine. Returns true
 /// when the assignment changed. Stale, duplicate, and superseded replies are
 /// harmless no-ops; terminal replies must reference the original request.
@@ -793,8 +1026,12 @@ fn apply_profile(
     assignment: &mut PersistedIntegratorAssignment,
     profile: &IntegratorProfile,
     message: &feanorfs_common::AgentMessage,
+    dispatcher: &str,
     now: i64,
 ) -> Result<bool> {
+    if !profile_message_matches(assignment, profile, message, dispatcher) {
+        return Ok(false);
+    }
     let (profile_id, profile_attempt) = match profile {
         IntegratorProfile::Assignment { .. } => return Ok(false),
         IntegratorProfile::Accepted {
@@ -833,20 +1070,15 @@ fn apply_profile(
         return Ok(false);
     }
     match profile {
-        IntegratorProfile::Accepted { about_snapshot, .. } => {
+        IntegratorProfile::Accepted { .. } => {
             if assignment.state != IntegratorAssignmentState::Offered {
                 return Ok(false);
             }
             attempt.state = IntegratorAttemptState::Accepted;
             attempt.acceptance_message_id = Some(message.message_id.clone());
             assignment.state = IntegratorAssignmentState::Accepted;
-            let _ = about_snapshot;
         }
-        IntegratorProfile::Result {
-            digest,
-            about_snapshot,
-            ..
-        } => {
+        IntegratorProfile::Result { digest, .. } => {
             if !matches!(
                 assignment.state,
                 IntegratorAssignmentState::Accepted | IntegratorAssignmentState::Active
@@ -876,13 +1108,8 @@ fn apply_profile(
                 IntegratorOutcomeState::RequiresHuman => IntegratorAssignmentState::RequiresHuman,
                 IntegratorOutcomeState::Cancelled => IntegratorAssignmentState::Cancelled,
             };
-            let _ = about_snapshot;
         }
-        IntegratorProfile::Blocked {
-            reason,
-            about_snapshot,
-            ..
-        } => {
+        IntegratorProfile::Blocked { reason, .. } => {
             if !matches!(
                 assignment.state,
                 IntegratorAssignmentState::Offered
@@ -895,7 +1122,6 @@ fn apply_profile(
             attempt.reason = Some(reason.clone());
             attempt.terminal_message_id = Some(message.message_id.clone());
             assignment.state = IntegratorAssignmentState::Blocked;
-            let _ = about_snapshot;
         }
         IntegratorProfile::Assignment { .. } => unreachable!(),
     }
@@ -946,14 +1172,25 @@ pub async fn materialize_conflicts(
     let state = engine.objects.get_tree_state(&snapshot.root).await?;
 
     let requested: HashSet<&str> = paths.iter().map(String::as_str).collect();
-    let mut edits: Vec<(ConcurrentEdit, ConflictKind)> = Vec::new();
-    for edit in &state.conflicts {
-        if !is_safe_rel_path(&edit.path) {
-            continue;
-        }
-        if !requested.is_empty() && !requested.contains(edit.path.as_str()) {
-            continue;
-        }
+    let selected = state
+        .conflicts
+        .iter()
+        .filter(|edit| {
+            is_safe_rel_path(&edit.path)
+                && (requested.is_empty() || requested.contains(edit.path.as_str()))
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        selected.len() <= feanorfs_common::INTEGRATOR_MAX_PATHS,
+        "snapshot contains more than {} requested conflicts; supply an explicit bounded subset",
+        feanorfs_common::INTEGRATOR_MAX_PATHS
+    );
+    ensure!(
+        requested.is_empty() || selected.len() == requested.len(),
+        "one or more requested conflict paths do not exist in the selected snapshot"
+    );
+    let mut edits: Vec<(ConcurrentEdit, ConflictKind)> = Vec::with_capacity(selected.len());
+    for edit in selected {
         // Refuse stale materialization: the conflict must still exist with
         // identical legs in the current head.
         ensure_current_conflict(ctx, &about, edit).await?;
@@ -1033,7 +1270,11 @@ async fn ensure_current_conflict(
     };
     let legs_equal = |left: &Option<feanorfs_common::FileState>,
                       right: &Option<feanorfs_common::FileState>| {
-        left.as_ref().map(|l| l.hash.as_str()) == right.as_ref().map(|r| r.hash.as_str())
+        left.as_ref()
+            .map(|leg| (&leg.hash, leg.size, leg.deleted, leg.mode))
+            == right
+                .as_ref()
+                .map(|leg| (&leg.hash, leg.size, leg.deleted, leg.mode))
     };
     if !(legs_equal(&edit.base, &current.base)
         && legs_equal(&edit.ours, &current.ours)
@@ -1093,6 +1334,7 @@ async fn write_leg(
         Some(state) if !state.deleted && !state.hash.is_empty() => {
             let plain = crate::large_file::read_bytes(ctx, path, &state.hash, state.size).await?;
             tokio::fs::write(dest, &plain).await?;
+            crate::fs_util::apply_executable_mode(dest, state.mode).await?;
         }
         _ => {
             tokio::fs::write(dest, sentinel(absent_label)).await?;
@@ -1154,6 +1396,7 @@ mod tests {
             eligible: vec!["agent-a".to_string(), "agent-b".to_string()],
             task_summary: "Integrate parser implementation and tests".to_string(),
             required_capabilities: vec![],
+            ack_timeout_ms: None,
             conflict_authors: vec![],
             excluded: vec![],
             state,
@@ -1173,7 +1416,12 @@ mod tests {
             message_id: "c".repeat(64),
             from: "agent-b".to_string(),
             to: "human".to_string(),
-            kind: AgentMessageKind::Result,
+            kind: match profile {
+                IntegratorProfile::Accepted { .. } => AgentMessageKind::Status,
+                IntegratorProfile::Result { .. } => AgentMessageKind::Result,
+                IntegratorProfile::Blocked { .. } => AgentMessageKind::Blocked,
+                IntegratorProfile::Assignment { .. } => AgentMessageKind::Request,
+            },
             body: encode_integrator_profile(profile).unwrap(),
             about_snapshot: "a".repeat(64),
             reply_to: reply_to.map(str::to_string),
@@ -1197,7 +1445,8 @@ mod tests {
             },
             outcome: "Integrated parser implementation and tests.".to_string(),
             risks: vec![],
-            decision_required: None,
+            decision_required: (state == IntegratorOutcomeState::RequiresHuman)
+                .then(|| "Choose which conflict version to keep".to_string()),
         }
     }
 
@@ -1210,10 +1459,59 @@ mod tests {
             attempt: 0,
             about_snapshot: a.about_snapshot.clone(),
         };
-        assert!(apply_profile(&mut a, &profile, &message(&profile, None), 2).unwrap());
+        assert!(apply_profile(
+            &mut a,
+            &profile,
+            &message(&profile, Some(&"a".repeat(64))),
+            "human",
+            2
+        )
+        .unwrap());
         assert_eq!(a.state, IntegratorAssignmentState::Accepted);
         assert_eq!(a.attempts[0].state, IntegratorAttemptState::Accepted);
         assert!(a.attempts[0].acceptance_message_id.is_some());
+    }
+
+    #[test]
+    fn reply_envelope_and_digest_are_bound_to_the_current_attempt() {
+        let a = assignment(IntegratorAssignmentState::Accepted);
+        let profile = IntegratorProfile::Result {
+            assignment_id: a.assignment_id.clone(),
+            attempt: 0,
+            about_snapshot: a.about_snapshot.clone(),
+            digest: digest(IntegratorOutcomeState::Completed),
+        };
+        let request_id = "a".repeat(64);
+        let valid = message(&profile, Some(&request_id));
+        assert!(profile_message_matches(&a, &profile, &valid, "human"));
+
+        let mut wrong = valid.clone();
+        wrong.from = "agent-a".into();
+        assert!(!profile_message_matches(&a, &profile, &wrong, "human"));
+        let mut wrong = valid.clone();
+        wrong.to = "other-dispatcher".into();
+        assert!(!profile_message_matches(&a, &profile, &wrong, "human"));
+        let mut wrong = valid.clone();
+        wrong.kind = AgentMessageKind::Blocked;
+        assert!(!profile_message_matches(&a, &profile, &wrong, "human"));
+        let mut wrong = valid.clone();
+        wrong.about_snapshot = "b".repeat(64);
+        assert!(!profile_message_matches(&a, &profile, &wrong, "human"));
+        let mut wrong = valid;
+        wrong.reply_to = Some("b".repeat(64));
+        assert!(!profile_message_matches(&a, &profile, &wrong, "human"));
+
+        let mut wrong_profile = profile.clone();
+        let IntegratorProfile::Result { digest, .. } = &mut wrong_profile else {
+            unreachable!()
+        };
+        digest.integrator = "agent-a".into();
+        assert!(!profile_message_matches(
+            &a,
+            &wrong_profile,
+            &message(&wrong_profile, Some(&request_id)),
+            "human",
+        ));
     }
 
     #[test]
@@ -1226,25 +1524,41 @@ mod tests {
             digest: digest(IntegratorOutcomeState::Completed),
         };
         // Missing reply_to: rejected.
-        assert!(!apply_profile(&mut a, &result, &message(&result, None), 2).unwrap());
+        assert!(!apply_profile(&mut a, &result, &message(&result, None), "human", 2).unwrap());
         // Wrong assignment id: rejected.
         let mut other = result.clone();
-        let IntegratorProfile::Result { assignment_id, .. } = &mut other else {
+        let IntegratorProfile::Result {
+            assignment_id,
+            digest,
+            ..
+        } = &mut other
+        else {
             unreachable!()
         };
         *assignment_id = "11111111111111111111111111111111".to_string();
-        assert!(
-            !apply_profile(&mut a, &other, &message(&other, Some(&"a".repeat(64))), 2).unwrap()
-        );
+        digest.assignment_id = assignment_id.clone();
+        assert!(!apply_profile(
+            &mut a,
+            &other,
+            &message(&other, Some(&"a".repeat(64))),
+            "human",
+            2
+        )
+        .unwrap());
         // Wrong attempt: rejected.
         let mut stale = result.clone();
         let IntegratorProfile::Result { attempt, .. } = &mut stale else {
             unreachable!()
         };
         *attempt = 7;
-        assert!(
-            !apply_profile(&mut a, &stale, &message(&stale, Some(&"a".repeat(64))), 2).unwrap()
-        );
+        assert!(!apply_profile(
+            &mut a,
+            &stale,
+            &message(&stale, Some(&"a".repeat(64))),
+            "human",
+            2
+        )
+        .unwrap());
         // Superseded attempt: rejected.
         let mut superseded = assignment(IntegratorAssignmentState::Offered);
         superseded.attempts[0].state = IntegratorAttemptState::Superseded;
@@ -1252,7 +1566,8 @@ mod tests {
             &mut superseded,
             &result,
             &message(&result, Some(&"a".repeat(64))),
-            2
+            "human",
+            2,
         )
         .unwrap());
     }
@@ -1266,9 +1581,14 @@ mod tests {
             about_snapshot: a.about_snapshot.clone(),
             digest: digest(IntegratorOutcomeState::Completed),
         };
-        assert!(
-            apply_profile(&mut a, &result, &message(&result, Some(&"a".repeat(64))), 2).unwrap()
-        );
+        assert!(apply_profile(
+            &mut a,
+            &result,
+            &message(&result, Some(&"a".repeat(64))),
+            "human",
+            2
+        )
+        .unwrap());
         assert_eq!(a.state, IntegratorAssignmentState::Completed);
         assert!(a.digest.is_some());
         assert_eq!(
@@ -1283,7 +1603,14 @@ mod tests {
             about_snapshot: b.about_snapshot.clone(),
             reason: "Missing iOS toolchain".to_string(),
         };
-        assert!(apply_profile(&mut b, &blocked, &message(&blocked, None), 2).unwrap());
+        assert!(apply_profile(
+            &mut b,
+            &blocked,
+            &message(&blocked, Some(&"a".repeat(64))),
+            "human",
+            2,
+        )
+        .unwrap());
         assert_eq!(b.state, IntegratorAssignmentState::Blocked);
         assert_eq!(
             b.attempts[0].reason.as_deref(),
@@ -1297,7 +1624,14 @@ mod tests {
             about_snapshot: c.about_snapshot.clone(),
             digest: digest(IntegratorOutcomeState::RequiresHuman),
         };
-        assert!(apply_profile(&mut c, &human, &message(&human, Some(&"a".repeat(64))), 2).unwrap());
+        assert!(apply_profile(
+            &mut c,
+            &human,
+            &message(&human, Some(&"a".repeat(64))),
+            "human",
+            2
+        )
+        .unwrap());
         assert_eq!(c.state, IntegratorAssignmentState::RequiresHuman);
     }
 
@@ -1314,8 +1648,37 @@ mod tests {
             attempt: 0,
             about_snapshot: a.about_snapshot.clone(),
         };
-        assert!(!apply_profile(&mut a, &profile, &message(&profile, None), 2).unwrap());
+        assert!(!apply_profile(
+            &mut a,
+            &profile,
+            &message(&profile, Some(&"a".repeat(64))),
+            "human",
+            2,
+        )
+        .unwrap());
         assert_eq!(a.state, IntegratorAssignmentState::Offered);
+    }
+
+    #[test]
+    fn published_assignment_request_is_recoverable_by_exact_context() {
+        let a = assignment(IntegratorAssignmentState::Offered);
+        let attempt = &a.attempts[0];
+        let profile = IntegratorProfile::Assignment {
+            assignment_id: a.assignment_id.clone(),
+            attempt: 0,
+            selected: attempt.selected.clone(),
+            about_snapshot: a.about_snapshot.clone(),
+            roster_fingerprint: a.roster_fingerprint.clone(),
+            neutral_integrator: a.neutral_integrator,
+            task: a.task_summary.clone(),
+        };
+        let mut request = message(&profile, None);
+        request.from = "human".into();
+        request.to = attempt.selected.clone();
+        request.kind = AgentMessageKind::Request;
+        assert!(is_assignment_request(&a, attempt, "human", &request));
+        request.to = "agent-a".into();
+        assert!(!is_assignment_request(&a, attempt, "human", &request));
     }
 
     #[test]
@@ -1385,7 +1748,7 @@ mod tests {
             neutral_integrator: true,
             task: "Integrate parser implementation and tests".to_string(),
         };
-        assert!(!apply_profile(&mut a, &profile, &message(&profile, None), 2).unwrap());
+        assert!(!apply_profile(&mut a, &profile, &message(&profile, None), "human", 2).unwrap());
         assert_eq!(a.state, IntegratorAssignmentState::Offered);
     }
 }

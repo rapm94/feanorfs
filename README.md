@@ -57,7 +57,8 @@ It syncs files on disk (including gitignored/untracked paths — often the point
 - **Deployable opaque relay** — trusted tags publish a non-root amd64/arm64 OCI image with a read-only runtime, protected persistent identity, authenticated health check, SBOM, and provenance. It runs the same `feanorfs serve --relay` binary behind an operator-owned TLS proxy; see [deploy-relay.md](docs/deploy-relay.md).
 - **Single binary** — install `feanorfs` once; `start` owns the normal client/hub lifecycle, `serve` remains the advanced foreground/server path, and `start --local` keeps the non-portable in-process mode.
 - **Agent loop** — `spawn` → `status` → `refresh` → `land` → `conflicts keep`. Data isolation, not process sandboxing.
-- **Encrypted agent signals** — agents on different machines exchange bounded `request`/`status`/`result`/`blocked` signals tied to exact snapshots through `feanorfs agent send` / `agent inbox`, MCP `agent_send`/`agent_inbox`, the Rust/C/TypeScript SDKs, and NDJSON `agent_message` wakeups. Signals live in encrypted snapshot history, never in project files, and the hub stays opaque. See [docs/agent-communication.md](docs/agent-communication.md) and the `feanorfs-collaboration` skill.
+- **Encrypted agent signals (transport)** — `ffmsg1` signals carry bounded `request`/`status`/`result`/`blocked` coordination through the CLI, MCP `agent_send`/`agent_inbox`, SDKs, and NDJSON events. They live in encrypted snapshot history, never in project files; a signal by itself does not start a model. See [agent communication](docs/agent-communication.md).
+- **Optional local agent runner (explicit activation)** — an operator can configure one fixed local command for one spawned agent, then explicitly start it to consume that agent’s direct requests. It never automatically replays uncertain work; stop/reset recovery is explicit. This is separate from signal transport; see the [runner runbook](docs/usage.md#agent-runner) and [local delivery rules](docs/agent-communication.md#local-runner-delivery).
 - **Conflict surfacing** — `.original`/`.local`/`.cloud` triples; bare `feanorfs conflicts` lists pending paths.
 - **Operational history** — `feanorfs log` inspects reachable snapshots and `feanorfs undo` records a restored tree without rewriting history.
 - **Crash-safe migration** — durable client journal and server write fence make format-v3 migration and rekey resumable.
@@ -103,14 +104,18 @@ notarized universal CLI/tray package. On Linux x86-64 and ARM64 it selects a
 verified native `.deb` on Debian/Ubuntu, `.rpm` on Fedora/RHEL, or
 `.pkg.tar.zst` on Arch/Manjaro so the system package manager installs the
 tray's desktop dependencies automatically. A checksummed tar bundle remains the
-custom-prefix fallback. Older or unsupported releases fall back to the attested
-cargo-dist CLI installer and say explicitly that the tray was not installed.
+custom-prefix fallback. Older, incomplete, or unsupported desktop releases fail
+closed instead of downloading and executing a weaker legacy installer.
 
 Windows users download the normal signed installer:
 
 [Download FeanorFS for Windows (.exe)](https://github.com/rapm94/feanorfs/releases/latest/download/FeanorFS-windows-x86_64-setup.exe)
 
-The PowerShell route remains a verified automation fallback:
+The PowerShell route remains a verified automation wrapper around that exact
+native installer; it requires a canonical stable tag, the setup EXE's checksum,
+Authenticode signature, matching ProductVersion and installed CLI version, plus
+an exact signer subject when the production signer policy is configured. It
+never executes a legacy downloaded script:
 
 ```powershell
 irm https://github.com/rapm94/feanorfs/releases/latest/download/feanorfs-windows-installer.ps1 | iex
@@ -163,7 +168,8 @@ Tagged releases build native Linux x86-64/ARM64 `.deb`, `.rpm`, and
 `.pkg.tar.zst` packages, portable tar fallbacks, and a Windows x86-64
 installer EXE. Linux packages are
 checksummed and GitHub-attested; their metadata declares GTK 3, Ayatana
-AppIndicator 3, libxdo, and XDG desktop portal dependencies, and the installer
+AppIndicator 3, XDG desktop portal, and native picker/discovery dependencies
+while explicitly excluding the unused distro-variant `libxdo` ABI. The installer
 rejects unexpected package names, architectures, or install scripts. Before
 publication, the exact packages must install cleanly on Debian 13, Fedora 44,
 and Arch Linux,
@@ -193,12 +199,9 @@ Linux GNU x64/ARM64, and Windows x64. Application release tags currently ship
 the app rather than publishing Node packages. Build the SDK from `bindings/ts/`
 or install local tarballs until public SDK distribution is separately approved.
 
-CLI-only release installer (advanced):
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/rapm94/feanorfs/releases/latest/download/feanorfs-client-installer.sh | sh
-```
+CLI-only users can download the matching attested cargo-dist archive from the
+GitHub Release and place its `feanorfs` binary on `PATH`; no executable
+cargo-dist installer scripts are published.
 
 ### From source
 

@@ -4,6 +4,11 @@ Encrypted, low-volume coordination signals for coding agents sharing one FeanorF
 workspace. Signals are format-v3 snapshots with no file-tree changes; the hub
 never sees plaintext routing, bodies, or workspace metadata.
 
+For local activation rather than signal transport, use the
+[Agent runner runbook](../../../docs/usage.md#agent-runner),
+[local delivery sequence](../../../docs/agent-communication.md#local-runner-delivery),
+and [CLI runner projection](../../../docs/agent-api.md#agent-runner-cli-only-current-projection).
+
 ## Envelope
 
 A signal lives in `Snapshot.message` as an exact versioned discriminator
@@ -27,7 +32,7 @@ timing.
 
 | Kind | Meaning | Expected follow-up |
 |---|---|---|
-| `request` | Ask another agent to perform bounded work against a snapshot | `status`, then `result` or `blocked` |
+| `request` | Ask another agent to perform bounded work against a snapshot | optional `status`; exactly one correlated `result` or `blocked` terminal |
 | `status` | Short progress update | none |
 | `result` | Final bounded outcome | requester consumes it |
 | `blocked` | Final explanation of why the request cannot complete | requester decides next action |
@@ -75,6 +80,34 @@ succeed.
   exhausted scan, or result-limit overflow sets `cursor_reset=true` and
   returns a bounded recent view — the caller may have missed older signals.
 
+## Configured local runner
+
+This is the short delivery rule, not a second lifecycle or JSON reference.
+
+- Admit only a direct `request` whose recipient exactly equals the configured
+  agent. Exclude broadcasts, nonrequests, duplicates, and completed request
+  IDs from runner execution; normal `agent inbox` reads still return broadcasts.
+- Invoke only the operator-configured fixed local command, one request at a
+  time. Require one terminal `result` or `blocked` to the requester with
+  `reply_to` set to the request ID and `about_snapshot` set to the snapshot
+  actually inspected; `status` is optional. This child contract is not an
+  exactly-once transport guarantee.
+- Observe that correlated terminal before completion. For known child or
+  invocation failures, attempt a generic correlated `blocked` fallback.
+- Stop for attention on `cursor_reset`, `pending_overflow`,
+  `ambiguous_execution`, `delivery_unknown`, or `preparation_failed`.
+  `preparation_failed` means local refresh/preparation failed before launch;
+  preserve the pending request for inspection and explicit discard/reset. Do
+  not replay any attention state; follow the linked operator runbook.
+- Own the complete child tree: Unix/macOS uses a fresh process group with
+  bounded TERM/KILL teardown; Windows creates children suspended, adopts and
+  verifies a private kill-on-close Job Object, then resumes them. Timeout,
+  cancellation, and direct-child exit tear down descendants. A supervised
+  stop waits for a durable workspace-specific registry acknowledgement bound
+  to the supervisor's exact native process identity when authority exists; a
+  fresh disabled/unregistered stop with no supervisor authority skips an
+  impossible acknowledgement, while stale authority fails closed.
+
 ## CLI
 
 ```text
@@ -104,8 +137,18 @@ identity is advisory, and requests/results should carry exact snapshot context.
 The NDJSON `events` stream emits one `agent_message` wakeup record per new
 signal with `message_id`, `from`, `to`, `kind`, and `about_snapshot` — never
 the body. Normal bounded delivery may redeliver and is deduplicated through a
-bounded in-process ID cache; reset/overflow can miss older wakeups. An
-authorized orchestrator calls `agent inbox` for the typed message.
+bounded in-process ID cache. When cursor reset or bounded overflow may have
+missed older wakeups, the stream first emits this metadata-only record before
+the bounded wakeups returned by that poll:
+
+```json
+{"event":"agent_message_cursor_reset","cursor":"<observed-workspace-head>","cursor_reset":true}
+```
+
+On this event, do not infer complete delivery. Immediately reread the typed
+inbox without the stale `--after` cursor, reconcile the bounded recent view,
+and replace the stored cursor with the inbox result. An authorized
+orchestrator also calls `agent inbox` for each ordinary wakeup's typed message.
 
 ## Safety
 
@@ -114,8 +157,9 @@ authorized orchestrator calls `agent inbox` for the typed message.
 - Never send credentials, recovery kits, pairing codes, `.env` values, or
   secrets intended for fewer than all workspace participants.
 - Signals are coordination checkpoints, not chat, token streams, or build logs.
-- A signal cannot wake an inactive model; an active orchestrator must monitor
-  events or poll the inbox.
+- Signals are passive transport; use an external events/polling orchestrator
+  or the explicitly configured local runner described above for activation.
+  Neither a signal nor this reference wakes an inactive model or process.
 
 ## `ffint1` integrator profiles
 

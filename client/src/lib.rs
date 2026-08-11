@@ -1,3 +1,6 @@
+#[cfg(test)]
+feanorfs_test_support::isolate_test_process!();
+
 pub mod agent;
 pub mod api;
 pub mod commands;

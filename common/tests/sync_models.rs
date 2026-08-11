@@ -239,6 +239,44 @@ fn no_base_leg_same_content_no_conflict() {
 }
 
 #[test]
+fn missing_local_and_remote_delete_converge_without_conflict() {
+    let base = HashMap::from([("gone.txt".to_string(), fs("gone.txt", "base", false))]);
+    let their_deleted = HashSet::from(["gone.txt".to_string()]);
+
+    let conflicts = detect_concurrent_edits(
+        &base,
+        &HashMap::new(),
+        &HashMap::new(),
+        &their_deleted,
+        vec!["gone.txt".to_string()],
+        &HashSet::new(),
+    );
+
+    assert!(conflicts.is_empty());
+}
+
+#[test]
+fn missing_local_base_entry_is_a_delete_and_conflicts_with_remote_edit() {
+    let base = HashMap::from([("gone.txt".to_string(), fs("gone.txt", "base", false))]);
+    let local = HashMap::new();
+    let cloud = HashMap::from([("gone.txt".to_string(), fs("gone.txt", "remote", false))]);
+
+    let conflicts = detect_concurrent_edits(
+        &base,
+        &local,
+        &cloud,
+        &HashSet::new(),
+        vec!["gone.txt".to_string()],
+        &HashSet::new(),
+    );
+
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].0.ours, None);
+    assert_eq!(conflicts[0].0.theirs.as_ref().unwrap().hash, "remote");
+    assert_eq!(conflicts[0].1, feanorfs_common::ConflictKind::DeleteEdit);
+}
+
+#[test]
 fn both_changed_to_same_content_converges_despite_mtime_skew() {
     let mut base = HashMap::new();
     base.insert("same.txt".into(), fs("same.txt", "base", false));

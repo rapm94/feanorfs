@@ -204,3 +204,96 @@ for future installs.
 - `cargo test --workspace --exclude feanorfs-tray --all-features --locked` — 568 passed, 0 failed (including supervisor S1/S2/S5/S3/S14 regression tests); clippy `-D warnings` clean; fmt clean. S15/S16/S17 covered by review (supervisor-loop behavior; not unit-testable without spawning a live supervisor).
 - `cargo clippy --workspace --exclude feanorfs-tray --all-targets --all-features --locked -- -D warnings` — clean.
 - `cargo fmt --all -- --check` — clean.
+
+
+## Optimization pass — parallel blob transport and batched cache writes
+
+Measured on a 3000-file workspace over loopback HTTP against the release
+binary (`v0.8.1` as baseline, same server, same encryption key):
+
+| Direction | Baseline | After | Speedup |
+| :--- | ---: | ---: | ---: |
+| Upload 3000 files (first sync) | 67.2 s | 20.6 s | 3.3× |
+| Download 3000 files (fresh pull) | 116.0 s | 47.4 s | 2.4× |
+| Idle sync (no changes) | 0.23 s | 0.20 s | unchanged |
+
+- [x] **O1 — Uploads/downloads were one hub round trip per file.**
+  `process_uploads` and the materialization download loop awaited each blob
+  transfer sequentially, so many-small-file syncs were latency-bound.
+  *Fix (`agent-core/src/sync_pass.rs`): bounded concurrency via
+  `buffer_unordered` — 4 parallel uploads (matching the hub's protected
+  upload permit cap, which rejects saturation with 503) and 8 parallel
+  staged downloads. Activation, per-file authentication/fsync, rollback
+  backups, and the single atomic cache commit are unchanged; `prepared` was
+  already re-sorted by path before the journal, and `prefetch_downloads`
+  (agent land / undo cache warming) uses the same bounded batch.*
+- [x] **O2 — Uploads rewrote the whole JSON state file once per file.**
+  Each uploaded file called `set_cache_server_mtime`, which acquires the
+  exclusive lock, parses `local_state.json`, serializes it back, and
+  fsyncs the directory (~16 ms measured per write for a 10k-entry state).
+  *Fix (`agent-core/src/local/cache.rs` + `sync_pass.rs`): new batched
+  `set_cache_server_mtimes` applies all server-mtime updates in one locked
+  rewrite after the upload pass; a crash mid-pass only costs idempotent
+  re-uploads of already-accepted CAS blobs on retry.*
+
+## Notes (not changed)
+
+- The remaining download cost is the durability contract: every staged
+  file and directory chain is fsynced before activation and the worktree
+  mutations are journaled, per `agent-core/AGENTS.md`.
+- Tree-object closures are fetched one object at a time, but tree objects
+  are small and cache-first; steady-state syncs never re-fetch them, so
+  parallelizing the closure walk was not worth the traversal restructuring.
+- Server-side blob writes keep their per-upload atomic-private-write fsync
+  (crash durability for manifest-accepted blobs); no change.
+
+## Verification
+
+- `cargo test --workspace --all-features --locked` — all suites pass
+  (agent-core 185, client 165+87+19+13+…, common, server, tray contract,
+  FFI, bindings); clippy `-D warnings` clean; fmt clean.
+- Benchmarks above rerun against the final release build.
+
+
+## Logic-gap sweep — silent data-loss paths
+
+Two logic gaps that silently destroyed user data were found by adversarial
+review, reproduced end-to-end against a real hub, and fixed with regression
+tests. Both were cases where the scanner/negotiator treated "I cannot see
+this path" as "this path was deleted".
+
+- [x] **L2 — Adding an ignore rule deleted the remote copy.**
+  `feanorfs ignore out/` made the walker skip `out/`, and the scanner's
+  tombstone loop then treated every previously-tracked skipped path as a
+  local deletion, so the next sync dropped it from the tree and deleted it
+  from the hub ("Remote Deletes 1"; a fresh pull no longer contained the
+  file). *Fix (`agent-core/src/local/scan.rs` + `walker.rs`): the scanner now
+  reuses the walker's exact ignore matcher (`build_ignore_matcher`) plus
+  ancestor-directory patterns and CACHEDIR.TAG ancestry; policy-excluded
+  paths with cached state are **frozen** — reported with their cached
+  identity, never tombstoned. Docs updated in `docs/sync-scope.md`.*
+- [x] **L3 — A restored/fresh hub deleted the local workspace.**
+  With an agreed last-synced view and a hub whose head is missing (wiped or
+  restored data dir), negotiation diffed the base against an empty remote,
+  produced `delete_local` for every file, and the materializer removed them
+  from disk ("Local Deletes N" — file gone). The code even documents
+  fresh/restored-hub recovery, but that path never ran because deletion
+  happens before the manifest rejection. *Fix (`agent-core/src/tree_reconcile.rs`
+  + `conflicts.rs`): a missing v3 head (or an empty legacy remote) with a
+  non-empty agreed base is treated as "hub has no data" — the response
+  becomes upload-everything with zero downloads/deletes, re-seeding the
+  restored hub from the client. Intentional empty heads (head exists, tree
+  empty) still diff normally.*
+
+## Verification
+
+- New regression tests: `ignored_paths_with_cached_state_are_frozen_not_tombstoned`
+  (scan-level) and `restored_hub_reuploads_local_state_instead_of_deleting_it`
+  (full sync against LocalHub); each fails on the pre-fix code and passes
+  after.
+- End-to-end against a real hub: ignore-rule sync reports `Remote Deletes 0`
+  and a fresh pull still receives the file; a wiped-hub sync reports
+  `Local Deletes 0`, keeps the file, re-uploads it, and the following sync is
+  idle.
+- `cargo test --workspace --all-features --locked` — all suites pass;
+  clippy `-D warnings` clean; fmt clean.

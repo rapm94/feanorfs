@@ -21,6 +21,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const MAX_SEND_RETRIES: usize = 8;
 const MAX_SIGNAL_SCAN: usize = 10_000;
 
+/// Result of attempting to append one signal against an exact observed head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadConditionalSendResult {
+    /// The signal became the workspace head.
+    Sent(AgentSendResult),
+    /// The head changed before publication. No retry was attempted.
+    Conflict(Option<String>),
+}
+
 /// Publishes one encrypted agent signal and returns its immutable snapshot id.
 ///
 /// The signal's `about_snapshot` defaults to the head observed when sending
@@ -33,44 +42,9 @@ const MAX_SIGNAL_SCAN: usize = 10_000;
 /// references, offline transport, or repeated concurrent head changes.
 pub async fn send_message(ctx: &SyncCtx<'_>, input: AgentMessageInput) -> Result<AgentSendResult> {
     ensure_signal_format(ctx)?;
-    let from = resolve_sender(input.from.as_deref())?;
-    validate_recipient(&input.to)?;
-    let body = input.body.trim();
-    ensure!(
-        !body.is_empty() && body.len() <= AGENT_MESSAGE_MAX_BODY_BYTES,
-        "signal body must be non-empty UTF-8 of at most 8 KiB"
-    );
-
     let engine = SnapshotEngine::new(ctx);
     let initial_head = ctx.api.get_head(ctx.workspace_id()).await?;
-    let about = match input.about_snapshot {
-        Some(id) => {
-            ensure!(
-                is_valid_hash(&id),
-                "about_snapshot must be a full snapshot id"
-            );
-            ensure_reachable(ctx, initial_head.as_deref(), &id).await?;
-            id
-        }
-        None => initial_head
-            .clone()
-            .context("workspace has no snapshot to attach a signal to")?,
-    };
-    if let Some(reply_to) = &input.reply_to {
-        ensure!(
-            is_valid_hash(reply_to),
-            "reply_to must be a full snapshot id"
-        );
-        ensure_signal(ctx, initial_head.as_deref(), reply_to).await?;
-    }
-
-    let envelope = encode_agent_message(&AgentMessagePayload {
-        to: input.to,
-        kind: input.kind,
-        body: body.to_string(),
-        about_snapshot: about.clone(),
-        reply_to: input.reply_to,
-    })?;
+    let prepared = prepare_message(ctx, input, initial_head.as_deref()).await?;
 
     let mut expected = initial_head;
     for _ in 0..MAX_SEND_RETRIES {
@@ -78,8 +52,14 @@ pub async fn send_message(ctx: &SyncCtx<'_>, input: AgentMessageInput) -> Result
             bail!("workspace head disappeared while sending signal");
         };
         let parent_snapshot = engine.load_snapshot(parent).await?;
-        let candidate =
-            write_message_snapshot(ctx, &parent_snapshot, parent, &from, &envelope).await?;
+        let candidate = write_message_snapshot(
+            ctx,
+            &parent_snapshot,
+            parent,
+            &prepared.from,
+            &prepared.envelope,
+        )
+        .await?;
         match ctx
             .api
             .swap_head(ctx.workspace_id(), expected.as_deref(), &candidate)
@@ -88,13 +68,109 @@ pub async fn send_message(ctx: &SyncCtx<'_>, input: AgentMessageInput) -> Result
             SwapHeadResult::Swapped => {
                 return Ok(AgentSendResult {
                     message_id: candidate,
-                    about_snapshot: about,
+                    about_snapshot: prepared.about_snapshot,
                 })
             }
             SwapHeadResult::Conflict(current) => expected = current,
         }
     }
     bail!("workspace head changed too many times while sending signal")
+}
+
+/// Attempts one signal append against `expected_head` without CAS retries.
+///
+/// A known head conflict is returned separately from transport errors so a
+/// caller can reread history before deciding whether another append is safe.
+/// The candidate object may already be uploaded when a conflict is returned,
+/// but it is never made reachable by this operation.
+///
+/// # Errors
+/// Returns an error for invalid input, unreadable references, or transport
+/// failures whose publication outcome cannot be established.
+pub async fn send_message_if_head(
+    ctx: &SyncCtx<'_>,
+    expected_head: &str,
+    input: AgentMessageInput,
+) -> Result<HeadConditionalSendResult> {
+    ensure_signal_format(ctx)?;
+    ensure!(
+        is_valid_hash(expected_head),
+        "expected_head must be a full snapshot id"
+    );
+    let prepared = prepare_message(ctx, input, Some(expected_head)).await?;
+    let engine = SnapshotEngine::new(ctx);
+    let parent_snapshot = engine.load_snapshot(expected_head).await?;
+    let candidate = write_message_snapshot(
+        ctx,
+        &parent_snapshot,
+        expected_head,
+        &prepared.from,
+        &prepared.envelope,
+    )
+    .await?;
+    match ctx
+        .api
+        .swap_head(ctx.workspace_id(), Some(expected_head), &candidate)
+        .await?
+    {
+        SwapHeadResult::Swapped => Ok(HeadConditionalSendResult::Sent(AgentSendResult {
+            message_id: candidate,
+            about_snapshot: prepared.about_snapshot,
+        })),
+        SwapHeadResult::Conflict(current) => Ok(HeadConditionalSendResult::Conflict(current)),
+    }
+}
+
+struct PreparedMessage {
+    from: String,
+    envelope: String,
+    about_snapshot: String,
+}
+
+async fn prepare_message(
+    ctx: &SyncCtx<'_>,
+    input: AgentMessageInput,
+    observed_head: Option<&str>,
+) -> Result<PreparedMessage> {
+    let from = resolve_sender(input.from.as_deref())?;
+    validate_recipient(&input.to)?;
+    let body = input.body.trim();
+    ensure!(
+        !body.is_empty() && body.len() <= AGENT_MESSAGE_MAX_BODY_BYTES,
+        "signal body must be non-empty UTF-8 of at most 8 KiB"
+    );
+    let about_snapshot = match input.about_snapshot {
+        Some(id) => {
+            ensure!(
+                is_valid_hash(&id),
+                "about_snapshot must be a full snapshot id"
+            );
+            ensure_reachable(ctx, observed_head, &id).await?;
+            id
+        }
+        None => observed_head
+            .map(str::to_string)
+            .context("workspace has no snapshot to attach a signal to")?,
+    };
+    if let Some(reply_to) = &input.reply_to {
+        ensure!(
+            is_valid_hash(reply_to),
+            "reply_to must be a full snapshot id"
+        );
+        ensure_signal(ctx, observed_head, reply_to).await?;
+    }
+    let envelope = encode_agent_message(&AgentMessagePayload {
+        to: input.to,
+        kind: input.kind,
+        body: body.to_string(),
+        about_snapshot: about_snapshot.clone(),
+        reply_to: input.reply_to,
+    })?;
+    Ok(PreparedMessage {
+        from,
+        envelope,
+        about_snapshot,
+    })
 }
 
 /// Reads signals addressed to `query.recipient` (or broadcast `*`).

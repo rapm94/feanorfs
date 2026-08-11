@@ -121,6 +121,11 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         self.objects.get_flat_tree(&snapshot.root).await
     }
 
+    pub(crate) async fn load_files_local(&self, id: &str) -> Result<HashMap<String, FileState>> {
+        let snapshot = self.objects.get_snapshot_local(id).await?;
+        self.objects.get_flat_tree_local(&snapshot.root).await
+    }
+
     pub(crate) async fn load_state(&self, id: &str) -> Result<crate::objects::LoadedTree> {
         let snapshot = self.load_snapshot(id).await?;
         self.objects.get_tree_state(&snapshot.root).await
@@ -268,12 +273,15 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
                 .upload_manifest(self.ctx.workspace_id(), &id, &hashes)
                 .await
             {
-                // The hub validated every referenced blob; a rejection means
-                // some skipped upload is genuinely missing (fresh/restored hub
-                // data or a GC race). Drop the registry so the retry re-uploads
-                // instead of skipping forever, then surface the failure.
-                if let Ok(state_dir) = self.ctx.state_dir() {
-                    let _ = crate::upload_registry::clear(&state_dir).await;
+                // Only a missing-blob precondition means the upload registry
+                // is stale. Capacity, immutability, authentication, and hub
+                // failures must not trigger a full reachable-object reupload.
+                if crate::api::request_error_status(&error)
+                    == Some(http::StatusCode::PRECONDITION_FAILED)
+                {
+                    if let Ok(state_dir) = self.ctx.state_dir() {
+                        let _ = crate::upload_registry::clear(&state_dir).await;
+                    }
                 }
                 return Err(error);
             }

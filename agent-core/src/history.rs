@@ -1,11 +1,15 @@
 use crate::snapshot::{SnapshotEngine, SnapshotInput};
 use crate::{SwapHeadResult, SyncCtx};
 use anyhow::{bail, Context, Result};
-use feanorfs_common::{FileState, LogEntry, LogResult, SyncResponse, UndoResult};
+use feanorfs_common::{
+    FileState, LogEntry, LogResult, SyncResponse, UndoResult, MAX_TREE_OUTPUT_PATHS,
+    MAX_TREE_PATH_BYTES_TOTAL,
+};
 use std::collections::{HashMap, HashSet};
 
 const MAX_LOG_LIMIT: usize = 1_000;
 const MAX_UNDO_RETRIES: usize = 8;
+const MAX_HISTORY_SNAPSHOTS: usize = 250_000;
 
 /// Lists reachable snapshots from current workspace head.
 ///
@@ -21,6 +25,8 @@ pub async fn log(ctx: &SyncCtx<'_>, limit: usize) -> Result<LogResult> {
     let mut pending = vec![head];
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
+    let mut changed_path_count = 0_usize;
+    let mut changed_path_bytes = 0_usize;
     while let Some(id) = pending.pop() {
         if entries.len() >= limit.min(MAX_LOG_LIMIT) || !seen.insert(id.clone()) {
             continue;
@@ -41,7 +47,25 @@ pub async fn log(ctx: &SyncCtx<'_>, limit: usize) -> Result<LogResult> {
             }
             paths.into_iter().collect()
         };
+        changed_path_count = changed_path_count
+            .checked_add(changed_paths.len())
+            .context("history path counter overflow")?;
+        changed_path_bytes = changed_paths
+            .iter()
+            .try_fold(changed_path_bytes, |total, path| {
+                total
+                    .checked_add(path.len())
+                    .context("history path byte counter overflow")
+            })?;
+        if changed_path_count > MAX_TREE_OUTPUT_PATHS
+            || changed_path_bytes > MAX_TREE_PATH_BYTES_TOTAL
+        {
+            bail!("history output exceeds aggregate path limit");
+        }
         pending.extend(snapshot.parents.iter().rev().cloned());
+        if seen.len().saturating_add(pending.len()) > MAX_HISTORY_SNAPSHOTS {
+            bail!("snapshot history exceeds traversal limit");
+        }
         entries.push(LogEntry {
             snapshot_id: id,
             parents: snapshot.parents,
@@ -69,9 +93,29 @@ pub async fn undo(ctx: &SyncCtx<'_>, selector: &str) -> Result<UndoResult> {
     let restored_snapshot_id = resolve_reachable(&snapshots, &expected, selector).await?;
     let target = snapshots.load_state(&restored_snapshot_id).await?;
     let local_before = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    let materialization = SyncResponse {
+        upload_required: Vec::new(),
+        download_required: target.files.values().cloned().collect(),
+        delete_local: local_before
+            .keys()
+            .filter(|path| !target.files.contains_key(*path))
+            .cloned()
+            .collect(),
+    };
+    crate::sync_pass::preflight_download_projection(ctx.base, &local_before, &materialization)
+        .await?;
+    // Authenticate and fsync the complete target before the head CAS. The
+    // subsequent activation reuses the verified object cache, so missing or
+    // corrupt historical blobs cannot commit an unmaterializable undo.
+    crate::sync_pass::prefetch_downloads(ctx, &materialization).await?;
     let state_dir = ctx.state_dir()?;
+    let read_root = crate::workspace_read::WorkspaceReadRoot::open(ctx.base)?;
     for state in local_before.values().filter(|state| !state.deleted) {
-        let content = tokio::fs::read(ctx.base.join(&state.path)).await?;
+        if crate::large_file::uses_chunk_transport(state.size) {
+            crate::large_file::upload(ctx, &state.path, &state.hash).await?;
+            continue;
+        }
+        let content = crate::sync_pass::read_upload_source(&read_root, &state.path, state).await?;
         let (hash, ciphertext) = crate::crypto::seal(&content, ctx.password_str(), &state.path)?;
         anyhow::ensure!(hash == state.hash, "worktree changed during undo");
         if !crate::upload_registry::known(&state_dir, &hash).await {
@@ -116,6 +160,7 @@ pub async fn undo(ctx: &SyncCtx<'_>, selector: &str) -> Result<UndoResult> {
         }
     }
     let snapshot_id = committed.context("workspace head changed too many times during undo")?;
+    crate::sync_pass::pause_sync_test(ctx, "undo-after-cas").await?;
     let changed_paths: Vec<_> = snapshots
         .diff_snapshots(&backup, &restored_snapshot_id)
         .await?
@@ -123,7 +168,7 @@ pub async fn undo(ctx: &SyncCtx<'_>, selector: &str) -> Result<UndoResult> {
         .into_iter()
         .map(|change| change.path)
         .collect();
-    materialize_and_project(ctx, &target.files).await?;
+    materialize_and_project(ctx, &target.files, &local_before).await?;
     snapshots.record_committed_refs(&snapshot_id).await?;
     Ok(UndoResult {
         snapshot_id,
@@ -147,11 +192,17 @@ async fn resolve_reachable(
         if !seen.insert(id.clone()) {
             continue;
         }
+        if seen.len() > MAX_HISTORY_SNAPSHOTS {
+            bail!("snapshot history exceeds traversal limit");
+        }
         let snapshot = snapshots.load_snapshot(&id).await?;
         if id.starts_with(selector) {
             matches.push(id.clone());
         }
         pending.extend(snapshot.parents);
+        if pending.len() > MAX_HISTORY_SNAPSHOTS {
+            bail!("snapshot history frontier exceeds traversal limit");
+        }
     }
     match matches.as_slice() {
         [id] => Ok(id.clone()),
@@ -163,18 +214,18 @@ async fn resolve_reachable(
 async fn materialize_and_project(
     ctx: &SyncCtx<'_>,
     target: &HashMap<String, FileState>,
+    local_before: &HashMap<String, FileState>,
 ) -> Result<()> {
-    let local = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     let response = SyncResponse {
         upload_required: Vec::new(),
         download_required: target.values().cloned().collect(),
-        delete_local: local
+        delete_local: local_before
             .keys()
             .filter(|path| !target.contains_key(*path))
             .cloned()
             .collect(),
     };
-    crate::sync_pass::process_downloads(ctx, &response, &local, false).await?;
+    crate::sync_pass::process_downloads(ctx, &response, local_before, false).await?;
     crate::sync_pass::process_delete_local(&response, ctx.base, ctx.db).await?;
 
     if ctx.format_version() >= 3 {

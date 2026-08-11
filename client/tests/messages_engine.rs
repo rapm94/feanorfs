@@ -2,6 +2,8 @@
 //! roundtrips, cursor deltas, multi-parent history, project-path isolation,
 //! and hub-storage plaintext absence.
 
+feanorfs_test_support::isolate_test_process!();
+
 mod support;
 
 use feanorfs_client::{

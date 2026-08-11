@@ -12,29 +12,57 @@ use std::time::Duration;
 const EVENT_INBOX_LIMIT: usize = feanorfs_common::AGENT_INBOX_MAX_LIMIT;
 const MAX_EMITTED_MESSAGE_IDS: usize = 10_000;
 
-#[derive(Serialize)]
-struct FeanorEvent {
-    event: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mirror_state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snapshot_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    from: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    to: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    about_snapshot: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    assignment_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attempt: Option<u32>,
+#[derive(Debug, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum FeanorEvent {
+    SyncState {
+        mirror_state: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot_id: Option<String>,
+    },
+    FolderChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot_id: Option<String>,
+    },
+    ConflictRisk {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot_id: Option<String>,
+    },
+    ConflictRegistered {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot_id: Option<String>,
+    },
+    AgentMessage {
+        message_id: String,
+        from: String,
+        to: String,
+        kind: String,
+        about_snapshot: String,
+    },
+    AgentMessageCursorReset {
+        cursor: String,
+        cursor_reset: bool,
+    },
+    IntegratorAssigned(IntegratorEvent),
+    IntegratorAccepted(IntegratorEvent),
+    IntegratorCompleted(IntegratorEvent),
+    IntegratorRequiresHuman(IntegratorEvent),
+    IntegratorBlocked(IntegratorEvent),
+}
+
+#[derive(Debug, Serialize)]
+struct IntegratorEvent {
+    message_id: String,
+    from: String,
+    to: String,
+    kind: String,
+    about_snapshot: String,
+    assignment_id: String,
+    attempt: u32,
 }
 
 struct EventPayload {
@@ -45,18 +73,12 @@ struct EventPayload {
 
 /// Bounded wakeup record for one new agent signal; deliberately omits the body.
 fn agent_message_event(message: &feanorfs_common::AgentMessage) -> FeanorEvent {
-    FeanorEvent {
-        event: "agent_message",
-        mirror_state: None,
-        path: None,
-        snapshot_id: None,
-        message_id: Some(message.message_id.clone()),
-        from: Some(message.from.clone()),
-        to: Some(message.to.clone()),
-        kind: Some(message.kind.as_str().to_string()),
-        about_snapshot: Some(message.about_snapshot.clone()),
-        assignment_id: None,
-        attempt: None,
+    FeanorEvent::AgentMessage {
+        message_id: message.message_id.clone(),
+        from: message.from.clone(),
+        to: message.to.clone(),
+        kind: message.kind.as_str().to_string(),
+        about_snapshot: message.about_snapshot.clone(),
     }
 }
 
@@ -97,19 +119,50 @@ fn integrator_event(message: &feanorfs_common::AgentMessage) -> Option<FeanorEve
             ..
         } => ("integrator_blocked", assignment_id, attempt),
     };
-    Some(FeanorEvent {
-        event,
-        mirror_state: None,
-        path: None,
-        snapshot_id: None,
-        message_id: Some(message.message_id.clone()),
-        from: Some(message.from.clone()),
-        to: Some(message.to.clone()),
-        kind: Some(message.kind.as_str().to_string()),
-        about_snapshot: Some(message.about_snapshot.clone()),
-        assignment_id: Some(assignment_id),
-        attempt: Some(attempt),
+    let payload = IntegratorEvent {
+        message_id: message.message_id.clone(),
+        from: message.from.clone(),
+        to: message.to.clone(),
+        kind: message.kind.as_str().to_string(),
+        about_snapshot: message.about_snapshot.clone(),
+        assignment_id,
+        attempt,
+    };
+    Some(match event {
+        "integrator_assigned" => FeanorEvent::IntegratorAssigned(payload),
+        "integrator_accepted" => FeanorEvent::IntegratorAccepted(payload),
+        "integrator_completed" => FeanorEvent::IntegratorCompleted(payload),
+        "integrator_requires_human" => FeanorEvent::IntegratorRequiresHuman(payload),
+        "integrator_blocked" => FeanorEvent::IntegratorBlocked(payload),
+        _ => unreachable!("integrator event names are closed above"),
     })
+}
+
+/// Bounded metadata-only notification that the signal cursor was reset or the
+/// result was truncated; older wakeups may have been missed.
+fn agent_message_cursor_reset_event(cursor: &str) -> FeanorEvent {
+    FeanorEvent::AgentMessageCursorReset {
+        cursor: cursor.to_string(),
+        cursor_reset: true,
+    }
+}
+
+fn update_snapshot_after_poll(
+    current: &mut Option<String>,
+    result: anyhow::Result<Option<String>>,
+) -> bool {
+    match result {
+        Ok(snapshot) => {
+            *current = snapshot;
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                "events poll: head read failed; preserving cursor and retrying: {error:#}"
+            );
+            false
+        }
+    }
 }
 
 fn remember_message_id(
@@ -128,6 +181,23 @@ fn remember_message_id(
         }
     }
     true
+}
+
+fn signal_events(
+    signals: &feanorfs_common::AgentInboxResult,
+    seen: &mut HashSet<String>,
+    order: &mut VecDeque<String>,
+) -> Vec<FeanorEvent> {
+    let mut events = Vec::new();
+    if signals.cursor_reset {
+        events.push(agent_message_cursor_reset_event(&signals.cursor));
+    }
+    for message in &signals.messages {
+        if remember_message_id(seen, order, &message.message_id, MAX_EMITTED_MESSAGE_IDS) {
+            events.push(integrator_event(message).unwrap_or_else(|| agent_message_event(message)));
+        }
+    }
+    events
 }
 
 pub async fn run_events(current_dir: &Path) -> anyhow::Result<()> {
@@ -206,7 +276,12 @@ pub async fn run_events(current_dir: &Path) -> anyhow::Result<()> {
                     tracing::warn!("events poll: status check failed; will retry");
                     continue;
                 };
-                current_snapshot = api.get_head(&config.workspace_id).await?;
+                if !update_snapshot_after_poll(
+                    &mut current_snapshot,
+                    api.get_head(&config.workspace_id).await,
+                ) {
+                    continue;
+                }
                 emit("sync_state", EventPayload {
                     path: None,
                     mirror_state: Some(status.mirror_state),
@@ -257,24 +332,17 @@ pub async fn run_events(current_dir: &Path) -> anyhow::Result<()> {
                 )
                 .await
                 {
-                    for message in &signals.messages {
-                        if remember_message_id(
-                            &mut last_emitted_messages,
-                            &mut emitted_message_order,
-                            &message.message_id,
-                            MAX_EMITTED_MESSAGE_IDS,
-                        ) {
-                            if let Some(integrator) = integrator_event(message) {
-                                emit_record(&integrator);
-                            } else {
-                                emit_record(&agent_message_event(message));
-                            }
-                        }
-                    }
                     if signals.cursor_reset {
                         tracing::warn!(
                             "events poll: signal cursor reset or bounded result overflow; older wakeups may have been missed"
                         );
+                    }
+                    for event in signal_events(
+                        &signals,
+                        &mut last_emitted_messages,
+                        &mut emitted_message_order,
+                    ) {
+                        emit_record(&event);
                     }
                     if !signals.cursor.is_empty() {
                         last_signal_cursor = Some(signals.cursor);
@@ -292,18 +360,24 @@ fn emit(event: &'static str, payload: EventPayload) {
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "idle".into())
     });
-    let ev = FeanorEvent {
-        event,
-        mirror_state: mirror_str,
-        path: payload.path,
-        snapshot_id: payload.snapshot_id,
-        message_id: None,
-        from: None,
-        to: None,
-        kind: None,
-        about_snapshot: None,
-        assignment_id: None,
-        attempt: None,
+    let ev = match event {
+        "sync_state" => FeanorEvent::SyncState {
+            mirror_state: mirror_str.unwrap_or_else(|| "idle".into()),
+            snapshot_id: payload.snapshot_id,
+        },
+        "folder_changed" => FeanorEvent::FolderChanged {
+            path: payload.path,
+            snapshot_id: payload.snapshot_id,
+        },
+        "conflict_risk" => FeanorEvent::ConflictRisk {
+            path: payload.path.expect("conflict risk requires a path"),
+            snapshot_id: payload.snapshot_id,
+        },
+        "conflict_registered" => FeanorEvent::ConflictRegistered {
+            path: payload.path.expect("registered conflict requires a path"),
+            snapshot_id: payload.snapshot_id,
+        },
+        _ => unreachable!("ordinary event names are closed at call sites"),
     };
     emit_record(&ev);
 }
@@ -316,9 +390,13 @@ fn emit_record(ev: &FeanorEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_message_event, integrator_event, remember_message_id, FeanorEvent};
+    use super::{
+        agent_message_cursor_reset_event, agent_message_event, integrator_event,
+        remember_message_id, signal_events, update_snapshot_after_poll, FeanorEvent,
+    };
     use feanorfs_common::{
-        encode_integrator_profile, AgentMessage, AgentMessageKind, IntegratorProfile,
+        encode_integrator_profile, AgentInboxResult, AgentMessage, AgentMessageKind,
+        IntegratorProfile,
     };
     use std::collections::{HashSet, VecDeque};
 
@@ -360,26 +438,117 @@ mod tests {
 
     #[test]
     fn ordinary_events_omit_agent_message_fields() {
-        let ev = FeanorEvent {
-            event: "sync_state",
-            mirror_state: Some("syncing".into()),
-            path: None,
+        let ev = FeanorEvent::SyncState {
+            mirror_state: "syncing".into(),
             snapshot_id: Some("abc".into()),
-            message_id: None,
-            from: None,
-            to: None,
-            kind: None,
-            about_snapshot: None,
-            assignment_id: None,
-            attempt: None,
         };
         let value: serde_json::Value = serde_json::to_value(ev).unwrap();
+        assert!(value.get("cursor").is_none());
+        assert!(value.get("cursor_reset").is_none());
         assert!(value.get("message_id").is_none());
         assert!(value.get("from").is_none());
         assert!(value.get("to").is_none());
         assert!(value.get("kind").is_none());
         assert!(value.get("about_snapshot").is_none());
         assert_eq!(value["snapshot_id"], "abc");
+    }
+
+    #[test]
+    fn cursor_reset_event_is_bounded_metadata() {
+        let cursor = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        let value = serde_json::to_value(agent_message_cursor_reset_event(cursor)).unwrap();
+        assert_eq!(value["event"], "agent_message_cursor_reset");
+        assert_eq!(value["cursor"], cursor);
+        assert_eq!(value["cursor_reset"], true);
+        for forbidden in [
+            "body",
+            "message_id",
+            "from",
+            "to",
+            "kind",
+            "about_snapshot",
+            "path",
+            "snapshot_id",
+            "assignment_id",
+            "attempt",
+            "mirror_state",
+        ] {
+            assert!(
+                value.get(forbidden).is_none(),
+                "cursor reset events must omit {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_variants_preserve_the_shipped_ndjson_shapes() {
+        assert_eq!(
+            serde_json::to_string(&FeanorEvent::SyncState {
+                mirror_state: "idle".into(),
+                snapshot_id: Some("abc".into()),
+            })
+            .unwrap(),
+            r#"{"event":"sync_state","mirror_state":"idle","snapshot_id":"abc"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FeanorEvent::FolderChanged {
+                path: Some("src/lib.rs".into()),
+                snapshot_id: None,
+            })
+            .unwrap(),
+            r#"{"event":"folder_changed","path":"src/lib.rs"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&agent_message_cursor_reset_event("abc")).unwrap(),
+            r#"{"event":"agent_message_cursor_reset","cursor":"abc","cursor_reset":true}"#
+        );
+    }
+
+    #[test]
+    fn transient_head_failure_preserves_the_last_snapshot() {
+        let mut current = Some("previous".to_string());
+        assert!(!update_snapshot_after_poll(
+            &mut current,
+            Err(anyhow::anyhow!("temporary head failure")),
+        ));
+        assert_eq!(current.as_deref(), Some("previous"));
+        assert!(update_snapshot_after_poll(
+            &mut current,
+            Ok(Some("recovered".to_string())),
+        ));
+        assert_eq!(current.as_deref(), Some("recovered"));
+    }
+
+    #[test]
+    fn cursor_reset_is_emitted_before_associated_wakeups() {
+        let message = AgentMessage {
+            message_id: "a".repeat(64),
+            from: "human".into(),
+            to: "worker".into(),
+            kind: AgentMessageKind::Request,
+            body: "work".into(),
+            about_snapshot: "b".repeat(64),
+            reply_to: None,
+            created_at_ms: 1,
+        };
+        let mut seen = HashSet::new();
+        let mut order = VecDeque::new();
+        let events = signal_events(
+            &AgentInboxResult {
+                cursor: "c".repeat(64),
+                cursor_reset: true,
+                messages: vec![message],
+            },
+            &mut seen,
+            &mut order,
+        );
+        let values = events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["event"], "agent_message_cursor_reset");
+        assert_eq!(values[1]["event"], "agent_message");
     }
 
     #[test]
@@ -444,6 +613,9 @@ mod tests {
         let mut plain = message;
         plain.body = "ordinary signal".into();
         assert!(integrator_event(&plain).is_none());
-        assert_eq!(agent_message_event(&plain).event, "agent_message");
+        assert!(matches!(
+            agent_message_event(&plain),
+            FeanorEvent::AgentMessage { .. }
+        ));
     }
 }

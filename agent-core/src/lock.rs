@@ -97,7 +97,11 @@ fn break_stale(path: &Path, max_age_secs: u64, label: &str) {
     }
 }
 
-/// Process-wide sync lock in global workspace state. Re-entrant for the owning pid.
+/// Cross-process and process-local sync lock in global workspace state.
+///
+/// Acquisitions are deliberately non-reentrant: same-PID concurrent futures
+/// must serialize just like separate processes. Callers that already hold a
+/// guard use an explicitly guarded internal operation instead of reacquiring.
 pub struct SyncLock {
     path: Option<PathBuf>,
     _file: File,
@@ -108,21 +112,6 @@ impl SyncLock {
         let dir = crate::workspace_layout::ensure_workspace_state(base)?;
         std::fs::create_dir_all(&dir)?;
         let path = lock_path(base, "sync.lock")?;
-        let self_pid = std::process::id();
-
-        if let Some((pid, _)) = read_lock_meta(&path) {
-            if pid == self_pid {
-                // Re-entrant for the owning process: refresh the timestamp so
-                // nested acquires keep the lock fresh for long-running syncs.
-                let mut file = OpenOptions::new().write(true).open(&path)?;
-                write_pid_ts(&mut file)?;
-                return Ok(Self {
-                    path: None,
-                    _file: file,
-                });
-            }
-        }
-
         break_stale(&path, STALE_SYNC_SECS, "sync");
 
         let mut opts = OpenOptions::new();

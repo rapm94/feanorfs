@@ -1,3 +1,5 @@
+feanorfs_test_support::isolate_test_process!();
+
 mod support;
 
 use feanorfs_client::{do_sync, ClientDb, Config};
@@ -42,25 +44,32 @@ async fn encrypted_kit_restores_through_real_start_without_secret_arguments() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("hello.txt"), b"encrypted recovery payload").unwrap();
 
-    let config = Config {
-        server_url: server.url.clone(),
-        workspace_id: "fsw1-recovery-integration".into(),
-        encryption_password: Some(E2EE_KEY.into()),
-        server_password: None,
-        tls_ca_pem: None,
-        format_version: 3,
-        hub_local: false,
-        relay: None,
-    };
+    let setup = Command::new(env!("CARGO_BIN_EXE_feanorfs"))
+        .args([
+            std::ffi::OsStr::new("setup"),
+            std::ffi::OsStr::new("--workspace"),
+            std::ffi::OsStr::new("fsw1-recovery-integration"),
+            std::ffi::OsStr::new("--encryption-key"),
+            std::ffi::OsStr::new(E2EE_KEY),
+            std::ffi::OsStr::new("--"),
+            std::ffi::OsStr::new(&server.url),
+        ])
+        .current_dir(&source)
+        .env("HOME", &home)
+        .env("FEANORFS_HOME", home.join(".feanorfs"))
+        .env("FEANORFS_CREDENTIAL_STORE", "file")
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "setup failed: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
     let state = home
         .join(".feanorfs/workspaces")
         .join(feanorfs_agent_core::workspace_state_id(&source).unwrap());
-    std::fs::create_dir_all(&state).unwrap();
-    std::fs::write(
-        state.join("config.json"),
-        serde_json::to_vec_pretty(&config).unwrap(),
-    )
-    .unwrap();
+    let config: Config =
+        serde_json::from_slice(&std::fs::read(state.join("config.json")).unwrap()).unwrap();
     let db = ClientDb::new(&state).await.unwrap();
     do_sync(
         &server.api,

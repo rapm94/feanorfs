@@ -194,3 +194,120 @@ async fn scan_profile_10k() {
         "scan_profile_10k: cold={cold_elapsed:.2?} warm={warm_elapsed:.2?} one-change={changed_elapsed:.2?}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_backslash_filename_is_not_aliased_to_a_portable_path() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    fs::create_dir_all(workspace.path().join("literal")).expect("create nested directory");
+    fs::write(workspace.path().join("literal/name.txt"), b"nested").expect("write nested file");
+    fs::write(workspace.path().join(r"literal\name.txt"), b"backslash")
+        .expect("write backslash file");
+
+    let files = scanned_files(workspace.path()).await;
+    assert_eq!(files, HashSet::from(["literal/name.txt".to_string()]));
+}
+
+#[tokio::test]
+async fn resurrected_file_with_preserved_mtime_clears_stale_tombstone() {
+    // Deleting a file tombstone it; recreating the same bytes with the same
+    // mtime (rsync -a / cp -p / backup restore) used to match the cached
+    // entry and keep the stale `deleted_at`, which later made `hydrate`/`cat`
+    // and predictive hydration treat the live file as deleted.
+    let root = tempfile::tempdir().expect("create workspace");
+    let state = tempfile::tempdir().expect("create scanner state");
+    let db = ClientDb::new(state.path())
+        .await
+        .expect("create scanner DB");
+
+    let path = root.path().join("note.txt");
+    let original_mtime = 1_700_000_000_000_i64;
+    fs::write(&path, b"same bytes").expect("write file");
+    set_mtime_ms(&path, original_mtime);
+
+    let scanned = scan_local_directory(root.path(), &db, Some("test-key"))
+        .await
+        .expect("scan live file");
+    assert!(scanned.contains_key("note.txt"));
+    assert!(db.get_cache_entries().await.unwrap()["note.txt"]
+        .deleted_at
+        .is_none());
+
+    // Delete the file and scan: tombstone recorded.
+    fs::remove_file(&path).expect("delete file");
+    let scanned = scan_local_directory(root.path(), &db, Some("test-key"))
+        .await
+        .expect("scan deletion");
+    assert!(scanned["note.txt"].deleted);
+    assert!(db.get_cache_entries().await.unwrap()["note.txt"]
+        .deleted_at
+        .is_some());
+
+    // Resurrect identical bytes with the preserved mtime.
+    fs::write(&path, b"same bytes").expect("restore file");
+    set_mtime_ms(&path, original_mtime);
+    let scanned = scan_local_directory(root.path(), &db, Some("test-key"))
+        .await
+        .expect("scan resurrection");
+    assert!(!scanned["note.txt"].deleted);
+    let entry = db.get_cache_entries().await.unwrap()["note.txt"].clone();
+    assert!(
+        entry.deleted_at.is_none(),
+        "stale tombstone survived same-mtime resurrection"
+    );
+    assert_eq!(entry.encrypted_hash, scanned["note.txt"].hash);
+}
+
+fn set_mtime_ms(path: &std::path::Path, millis: i64) {
+    let seconds = millis.div_euclid(1000);
+    let nanos = millis.rem_euclid(1000) as u32 * 1_000_000;
+    let times = std::fs::FileTimes::new()
+        .set_accessed(std::time::UNIX_EPOCH)
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(seconds as u64, nanos));
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open file to set mtime")
+        .set_times(times)
+        .expect("set mtime");
+}
+
+#[tokio::test]
+async fn ignored_paths_with_cached_state_are_frozen_not_tombstoned() {
+    // Adding an ignore rule for a previously-synced path used to tombstone it
+    // in the scan, which deleted the remote copy on the next sync. The scan
+    // must freeze the cached state instead: live FileState, no tombstone.
+    let root = tempfile::tempdir().expect("create workspace");
+    let state = tempfile::tempdir().expect("create scanner state");
+    let db = ClientDb::new(state.path())
+        .await
+        .expect("create scanner DB");
+
+    fs::create_dir_all(root.path().join("out")).expect("create dir");
+    fs::write(root.path().join("out/a.txt"), b"important").expect("write file");
+    fs::write(root.path().join("keep.txt"), b"keep").expect("write file");
+
+    let scanned = scan_local_directory(root.path(), &db, Some("test-key"))
+        .await
+        .expect("scan without policy");
+    assert!(scanned.contains_key("out/a.txt"));
+    let original_hash = scanned["out/a.txt"].hash.clone();
+
+    // Add an ignore rule and rescan with the same policy the sync applies.
+    let scanned =
+        scan_local_directory_with_policy(root.path(), &db, Some("test-key"), false, Some("out/"))
+            .await
+            .expect("scan with policy");
+    let file = &scanned["out/a.txt"];
+    assert!(!file.deleted, "ignored tracked file must not be tombstoned");
+    assert_eq!(
+        file.hash, original_hash,
+        "frozen file keeps its cached identity"
+    );
+    assert!(scanned.contains_key("keep.txt"));
+    let entry = db.get_cache_entries().await.unwrap()["out/a.txt"].clone();
+    assert!(
+        entry.deleted_at.is_none(),
+        "ignored tracked file must not receive a tombstone"
+    );
+}

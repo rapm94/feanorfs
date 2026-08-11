@@ -1,3 +1,5 @@
+feanorfs_test_support::isolate_test_process!();
+
 use std::sync::Arc;
 
 use feanorfs_agent_core::LocalHub;
@@ -75,14 +77,14 @@ impl Harness {
         (s, b.to_vec())
     }
 
-    async fn http_req(
+    fn http_request(
         &self,
         m: Method,
         path: &str,
         q: &str,
         body: Vec<u8>,
         migration_token: Option<&str>,
-    ) -> (u16, Vec<u8>) {
+    ) -> reqwest::RequestBuilder {
         let url = if q.is_empty() {
             format!("{}{path}", self.http_url)
         } else {
@@ -99,10 +101,38 @@ impl Harness {
         if !body.is_empty() {
             req = req.header("Content-Type", "application/json").body(body);
         }
+        req
+    }
+
+    async fn http_req(
+        &self,
+        m: Method,
+        path: &str,
+        q: &str,
+        body: Vec<u8>,
+        migration_token: Option<&str>,
+    ) -> (u16, Vec<u8>) {
+        let req = self.http_request(m, path, q, body, migration_token);
         let r = req.send().await.unwrap();
         let s = r.status().as_u16();
-        let b = r.bytes().await.unwrap_or_default();
+        let b = r.bytes().await.expect("read HTTP response body");
         (s, b.to_vec())
+    }
+
+    async fn http_status(
+        &self,
+        m: Method,
+        path: &str,
+        q: &str,
+        body: Vec<u8>,
+        migration_token: Option<&str>,
+    ) -> u16 {
+        self.http_request(m, path, q, body, migration_token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
     }
 
     /// Assert exact parity: same status and same canonicalized body.
@@ -458,8 +488,8 @@ async fn parity_body_over_100mb_rejected() {
             None,
         )
         .await;
-    let (hs, hb_body) = h
-        .http_req(
+    let hs = h
+        .http_status(
             Method::POST,
             "/api/upload",
             "workspace_id=ws&path=x&hash=aa&size=0&mtime=0&mode=0",
@@ -469,7 +499,11 @@ async fn parity_body_over_100mb_rejected() {
         .await;
     assert_eq!(ls, 413);
     assert_eq!(hs, 413);
-    assert_eq!(canonicalize(&lb_body), canonicalize(&hb_body));
+    assert!(!lb_body.is_empty());
+    // An HTTP server can reject a known-oversized request before the client
+    // finishes transmitting it, so the connection may close before the
+    // incidental Axum rejection text is readable. Status and unchanged state
+    // are the stable parity contract for this case.
 
     let (_, lb_after) = h
         .local_req(&Method::GET, "/api/workspaces", "", vec![], None)

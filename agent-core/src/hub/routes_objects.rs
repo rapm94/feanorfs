@@ -3,7 +3,8 @@ use http::StatusCode;
 use std::collections::HashMap;
 
 use super::http::{check_fence, get_param, json_body, response, status_err, RouteResult};
-use super::{LocalHub, MAX_MANIFEST_BYTES};
+use super::{LocalHub, MAX_BODY_BYTES, MAX_MANIFEST_BYTES};
+use crate::hub_state::ManifestStore;
 
 impl LocalHub {
     pub(super) fn route_download(&self, hash: &str) -> RouteResult {
@@ -13,7 +14,23 @@ impl LocalHub {
         if !feanorfs_common::is_valid_hash(hash) {
             return Err((StatusCode::BAD_REQUEST, String::new()));
         }
-        match std::fs::read(self.db.blob_path(hash)) {
+        let path = self.db.blob_path(hash);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > MAX_BODY_BYTES as u64 => {
+                return Err((StatusCode::PAYLOAD_TOO_LARGE, "blob too large".into()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err((StatusCode::NOT_FOUND, String::new()));
+            }
+            Err(error) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("metadata error: {error}"),
+                ));
+            }
+        }
+        match std::fs::read(path) {
             Ok(data) => Ok(response(StatusCode::OK, Body::from(data))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Err((StatusCode::NOT_FOUND, String::new()))
@@ -55,7 +72,7 @@ impl LocalHub {
             .manifest_exists(&request.workspace_id, &request.new)
             .map_err(status_err)?
         {
-            return Err((StatusCode::PRECONDITION_FAILED, "manifest required".into()));
+            return Err((StatusCode::PRECONDITION_FAILED, String::new()));
         }
         let previous = self
             .db
@@ -96,26 +113,28 @@ impl LocalHub {
         }
         let manifest = std::str::from_utf8(body)
             .map_err(|_| (StatusCode::BAD_REQUEST, "manifest not UTF-8".into()))?;
-        let mut hashes = Vec::new();
-        for hash in manifest
-            .lines()
-            .map(str::trim)
-            .filter(|hash| !hash.is_empty())
-        {
-            if !feanorfs_common::is_valid_hash(hash) || !self.db.blob_exists(hash) {
+        let hashes = feanorfs_common::canonical_manifest_hashes(snapshot_id, manifest)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid manifest".into()))?;
+        for hash in &hashes {
+            if !self.db.blob_exists(hash) {
                 return Err((
                     StatusCode::PRECONDITION_FAILED,
                     format!("manifest references missing blob {hash}"),
                 ));
             }
-            hashes.push(hash.to_string());
         }
-        if !feanorfs_common::is_valid_hash(snapshot_id) {
-            return Err((StatusCode::BAD_REQUEST, "invalid manifest".into()));
-        }
-        self.db
+        match self
+            .db
             .store_manifest(workspace_id, snapshot_id, hashes)
-            .map_err(status_err)?;
-        Ok(response(StatusCode::OK, Body::empty()))
+            .map_err(status_err)?
+        {
+            ManifestStore::Stored | ManifestStore::Unchanged => {
+                Ok(response(StatusCode::OK, Body::empty()))
+            }
+            ManifestStore::Conflict => Err((
+                StatusCode::BAD_REQUEST,
+                "snapshot manifest is immutable".into(),
+            )),
+        }
     }
 }

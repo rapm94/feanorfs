@@ -1,3 +1,6 @@
+#[cfg(test)]
+feanorfs_test_support::isolate_test_process!();
+
 mod cli;
 
 use clap::{Parser, Subcommand};
@@ -133,6 +136,38 @@ mod cli_tests {
         Cli::try_parse_from([
             "feanorfs",
             "agent",
+            "runner",
+            "setup",
+            "worker",
+            "--timeout",
+            "120",
+            "--",
+            "/usr/bin/env",
+            "python3",
+            "--fixed-flag",
+        ])
+        .unwrap();
+        Cli::try_parse_from(["feanorfs", "agent", "runner", "start"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "agent", "runner", "start", "--foreground"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "agent", "runner", "stop"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "--json", "agent", "runner", "status"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "agent", "runner", "reset", "--discard-pending"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "agent", "runner", "remove", "--discard-pending"])
+            .unwrap();
+        assert!(Cli::try_parse_from([
+            "feanorfs",
+            "agent",
+            "runner",
+            "setup",
+            "worker",
+            "/usr/bin/env",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["feanorfs", "agent", "runner", "reset"]).is_err());
+        assert!(Cli::try_parse_from(["feanorfs", "agent", "runner", "remove"]).is_err());
+        Cli::try_parse_from([
+            "feanorfs",
+            "agent",
             "integrator",
             "resume",
             "--ack-timeout",
@@ -176,6 +211,7 @@ mod cli_tests {
         .unwrap();
         Cli::try_parse_from(["feanorfs", "service", "status"]).unwrap();
         Cli::try_parse_from(["feanorfs", "service", "hub-run", "/tmp/hub"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "service", "runner-run", "/tmp/workspace"]).unwrap();
         Cli::try_parse_from(["feanorfs", "service", "supervise"]).unwrap();
         Cli::try_parse_from(["feanorfs", "pair"]).unwrap();
         Cli::try_parse_from(["feanorfs", "pair", "--tray", "--expires", "300"]).unwrap();

@@ -3,11 +3,158 @@ use feanorfs_client::{
     check_agent, land_agent, load_config, refresh_agent, spawn_agent, AgentInboxQuery,
     AgentMessageInput, AgentMessageKind, ResolveKeep, StatusResult, SyncCtx,
 };
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+#[derive(Debug)]
+struct InvalidParams(String);
+
+impl std::fmt::Display for InvalidParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid params: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidParams {}
+
+fn parse_params<T: DeserializeOwned>(tool: &str, params: &Value) -> anyhow::Result<T> {
+    serde_json::from_value(params.clone())
+        .map_err(|error| anyhow::Error::new(InvalidParams(format!("{tool}: {error}"))))
+}
+
+fn response_error_code(error: &anyhow::Error) -> i32 {
+    if error.downcast_ref::<InvalidParams>().is_some() {
+        -32602
+    } else {
+        -32000
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsCallParams {
+    name: String,
+    #[serde(default = "empty_object")]
+    arguments: Value,
+}
+
+fn empty_object() -> Value {
+    json!({})
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyParams {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NameParams {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSpawnParams {
+    name: String,
+    #[serde(default)]
+    no_sync: bool,
+    #[serde(default)]
+    replace: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentLandParams {
+    name: String,
+    #[serde(default)]
+    clean: bool,
+    #[serde(default)]
+    propose: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictsKeepParams {
+    path: String,
+    keep: String,
+    #[serde(default)]
+    file: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceLogParams {
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceUndoParams {
+    snapshot_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSendParams {
+    #[serde(default)]
+    from: Option<String>,
+    to: String,
+    kind: String,
+    body: String,
+    #[serde(default)]
+    about_snapshot: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentInboxParams {
+    #[serde(default, rename = "for")]
+    recipient: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegratorStatusParams {
+    #[serde(default)]
+    assignment_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegratorRevokeParams {
+    assignment_id: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegratorResumeParams {
+    #[serde(default)]
+    ack_timeout_ms: Option<u64>,
+    #[serde(default)]
+    fallback_on_blocked: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictMaterializeParams {
+    #[serde(default)]
+    about_snapshot: Option<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+}
 
 pub async fn run_mcp(current_dir: &Path) -> anyhow::Result<()> {
     let stdin = io::stdin();
@@ -48,7 +195,7 @@ fn write_response(
         Err(e) => json!({
             "jsonrpc": "2.0",
             "id": id,
-            "error": { "code": -32000, "message": e.to_string() }
+            "error": { "code": response_error_code(&e), "message": e.to_string() }
         }),
     };
     writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
@@ -186,7 +333,10 @@ fn tool_list() -> Value {
     })
 }
 
-fn tool(name: &str, description: &str, schema: Value) -> Value {
+fn tool(name: &str, description: &str, mut schema: Value) -> Value {
+    if let Some(object) = schema.as_object_mut() {
+        object.insert("additionalProperties".into(), Value::Bool(false));
+    }
     json!({
         "name": name,
         "description": description,
@@ -211,11 +361,8 @@ async fn dispatch(current_dir: &Path, method: &str, params: &Value) -> anyhow::R
         })),
         "tools/list" => Ok(tool_list()),
         "tools/call" => {
-            let name = params["name"]
-                .as_str()
-                .context("tools/call requires name")?;
-            let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            call_tool(current_dir, name, &args).await
+            let params: ToolsCallParams = parse_params("tools/call", params)?;
+            call_tool(current_dir, &params.name, &params.arguments).await
         }
         // Legacy direct RPC (MCP-1 compat)
         other => call_tool(current_dir, other, params).await,
@@ -223,139 +370,159 @@ async fn dispatch(current_dir: &Path, method: &str, params: &Value) -> anyhow::R
 }
 
 async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Result<Value> {
-    let config = load_config(current_dir)?;
-    let db = crate::open_client_db(current_dir).await?;
-    let api = crate::open_api_client(current_dir, &config).await?;
-    let ctx = SyncCtx::from_config(&api, &db, current_dir, &config)?;
+    let control_root = super::agent::control_workspace_root(current_dir)?;
+    let config = load_config(&control_root)?;
+    let db = crate::open_client_db(&control_root).await?;
+    let api = crate::open_api_client(&control_root, &config).await?;
+    let ctx = SyncCtx::from_config(&api, &db, &control_root, &config)?;
     let pw = config.encryption_password.as_deref();
 
     match tool {
         "agent_spawn" => {
-            let name = params["name"].as_str().context("name required")?;
-            let no_sync = params["no_sync"].as_bool().unwrap_or(false);
-            let replace = params["replace"].as_bool().unwrap_or(false);
+            let params: AgentSpawnParams = parse_params(tool, params)?;
             let count = spawn_agent(
-                current_dir,
+                &control_root,
                 &db,
                 &api,
                 &config.workspace_id,
-                name,
+                &params.name,
                 pw,
-                no_sync,
-                replace,
+                params.no_sync,
+                params.replace,
             )
             .await?;
             Ok(json!({ "files_copied": count }))
         }
         "agent_check" => {
-            let name = params["name"].as_str().context("name required")?;
-            let r = check_agent(current_dir, &db, &api, &config.workspace_id, name, pw).await?;
-            Ok(serde_json::to_value(r)?)
-        }
-        "agent_refresh" => {
-            let name = params["name"].as_str().context("name required")?;
-            let r = refresh_agent(current_dir, &db, &api, &config.workspace_id, name, pw).await?;
-            Ok(serde_json::to_value(r)?)
-        }
-        "agent_land" => {
-            let name = params["name"].as_str().context("name required")?;
-            let clean = params["clean"].as_bool().unwrap_or(false);
-            let propose = params["propose"].as_bool().unwrap_or(false);
-            let r = land_agent(
-                current_dir,
+            let params: NameParams = parse_params(tool, params)?;
+            let r = check_agent(
+                &control_root,
                 &db,
                 &api,
                 &config.workspace_id,
-                name,
+                &params.name,
                 pw,
-                clean,
-                propose,
+            )
+            .await?;
+            Ok(serde_json::to_value(r)?)
+        }
+        "agent_refresh" => {
+            let params: NameParams = parse_params(tool, params)?;
+            let r = refresh_agent(
+                &control_root,
+                &db,
+                &api,
+                &config.workspace_id,
+                &params.name,
+                pw,
+            )
+            .await?;
+            Ok(serde_json::to_value(r)?)
+        }
+        "agent_land" => {
+            let params: AgentLandParams = parse_params(tool, params)?;
+            let r = land_agent(
+                &control_root,
+                &db,
+                &api,
+                &config.workspace_id,
+                &params.name,
+                pw,
+                params.clean,
+                params.propose,
             )
             .await?;
             Ok(serde_json::to_value(r)?)
         }
         "conflicts_list" => {
+            let _: EmptyParams = parse_params(tool, params)?;
             let records = db.list_conflict_records().await?;
             Ok(serde_json::to_value(records)?)
         }
         "conflicts_keep" => {
-            let path = params["path"]
-                .as_str()
-                .context("path required")?
-                .to_string();
-            let keep_str = params["keep"].as_str().unwrap_or("local");
-            let keep = match keep_str {
+            let params: ConflictsKeepParams = parse_params(tool, params)?;
+            let keep = match params.keep.as_str() {
                 "local" => ResolveKeep::Local,
                 "cloud" => ResolveKeep::Cloud,
                 "both" => ResolveKeep::Both,
                 "file" => ResolveKeep::File,
                 other => anyhow::bail!("unknown keep value: {other}"),
             };
-            let file_source = params["file"].as_str().map(std::path::Path::new);
+            let file_source = params.file.as_deref().map(|source| {
+                let source = PathBuf::from(source);
+                if source.is_absolute() {
+                    source
+                } else {
+                    control_root.join(source)
+                }
+            });
             if matches!(keep, ResolveKeep::File) && file_source.is_none() {
                 anyhow::bail!("conflicts_keep with keep=file requires a `file` param");
             }
-            feanorfs_client::conflicts::resolve_conflict(&ctx, &path, keep, file_source).await?;
-            Ok(json!({ "resolved": path }))
+            feanorfs_client::conflicts::resolve_conflict(
+                &ctx,
+                &params.path,
+                keep,
+                file_source.as_deref(),
+            )
+            .await?;
+            Ok(json!({ "resolved": params.path }))
         }
         "sync_status" => {
-            let r = feanorfs_client::do_status(&api, &db, current_dir, &config.workspace_id, pw)
+            let _: EmptyParams = parse_params(tool, params)?;
+            let r = feanorfs_client::do_status(&api, &db, &control_root, &config.workspace_id, pw)
                 .await?;
             Ok(compact_sync_status(r))
         }
         "workspace_log" => {
-            let limit = params["limit"]
-                .as_u64()
+            let params: WorkspaceLogParams = parse_params(tool, params)?;
+            let limit = params
+                .limit
                 .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
                 .unwrap_or(20);
             let result = feanorfs_agent_core::history::log(&ctx, limit).await?;
             Ok(serde_json::to_value(result)?)
         }
         "workspace_undo" => {
-            let snapshot_id = params["snapshot_id"]
-                .as_str()
-                .context("snapshot_id required")?;
-            let result = feanorfs_agent_core::history::undo(&ctx, snapshot_id).await?;
+            let params: WorkspaceUndoParams = parse_params(tool, params)?;
+            let result = feanorfs_agent_core::history::undo(&ctx, &params.snapshot_id).await?;
             Ok(serde_json::to_value(result)?)
         }
         "agent_send" => {
-            let to = params["to"].as_str().context("to required")?.to_string();
-            let kind = match params["kind"].as_str() {
-                Some("request") => AgentMessageKind::Request,
-                Some("status") => AgentMessageKind::Status,
-                Some("result") => AgentMessageKind::Result,
-                Some("blocked") => AgentMessageKind::Blocked,
+            let params: AgentSendParams = parse_params(tool, params)?;
+            let kind = match params.kind.as_str() {
+                "request" => AgentMessageKind::Request,
+                "status" => AgentMessageKind::Status,
+                "result" => AgentMessageKind::Result,
+                "blocked" => AgentMessageKind::Blocked,
                 _ => anyhow::bail!("kind must be request, status, result, or blocked"),
             };
-            let body = params["body"]
-                .as_str()
-                .context("body required")?
-                .to_string();
             let result = feanorfs_agent_core::send_message(
                 &ctx,
                 AgentMessageInput {
-                    to,
+                    to: params.to,
                     kind,
-                    body,
-                    about_snapshot: params["about_snapshot"].as_str().map(str::to_string),
-                    reply_to: params["reply_to"].as_str().map(str::to_string),
-                    from: Some(agent_identity(params["from"].as_str())),
+                    body: params.body,
+                    about_snapshot: params.about_snapshot,
+                    reply_to: params.reply_to,
+                    from: Some(agent_identity(params.from.as_deref())),
                 },
             )
             .await?;
             Ok(serde_json::to_value(result)?)
         }
         "agent_inbox" => {
-            let recipient = agent_identity(params["for"].as_str());
-            let limit = params["limit"]
-                .as_u64()
+            let params: AgentInboxParams = parse_params(tool, params)?;
+            let recipient = agent_identity(params.recipient.as_deref());
+            let limit = params
+                .limit
                 .map(|value| usize::try_from(value).unwrap_or(50))
                 .unwrap_or(50);
             let result = feanorfs_agent_core::inbox(
                 &ctx,
                 AgentInboxQuery {
                     recipient,
-                    after: params["after"].as_str().map(str::to_string),
+                    after: params.after,
                     limit,
                 },
             )
@@ -363,55 +530,47 @@ async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Re
             Ok(serde_json::to_value(result)?)
         }
         "integrator_assign" => {
-            let input: feanorfs_client::IntegratorAssignInput =
-                serde_json::from_value(params.clone())
-                    .context("invalid integrator_assign input")?;
+            let input: feanorfs_client::IntegratorAssignInput = parse_params(tool, params)?;
             let result = feanorfs_client::integrator_assign(&ctx, input).await?;
             Ok(serde_json::to_value(result)?)
         }
         "integrator_status" => {
+            let params: IntegratorStatusParams = parse_params(tool, params)?;
             let result =
-                feanorfs_client::integrator_status(&ctx, params["assignment_id"].as_str()).await?;
+                feanorfs_client::integrator_status(&ctx, params.assignment_id.as_deref()).await?;
             Ok(serde_json::to_value(result)?)
         }
         "integrator_revoke" => {
-            let assignment_id = params["assignment_id"]
-                .as_str()
-                .context("assignment_id required")?;
-            let reason = params["reason"].as_str().context("reason required")?;
-            let result = feanorfs_client::integrator_revoke(&ctx, assignment_id, reason).await?;
+            let params: IntegratorRevokeParams = parse_params(tool, params)?;
+            let result =
+                feanorfs_client::integrator_revoke(&ctx, &params.assignment_id, &params.reason)
+                    .await?;
             Ok(serde_json::to_value(result)?)
         }
         "integrator_resume" => {
+            let params: IntegratorResumeParams = parse_params(tool, params)?;
             let result = feanorfs_client::integrator_resume(
                 &ctx,
                 feanorfs_client::IntegratorObserveOptions {
-                    ack_timeout_ms: params["ack_timeout_ms"].as_u64(),
-                    fallback_on_blocked: params["fallback_on_blocked"].as_bool().unwrap_or(false),
+                    ack_timeout_ms: params.ack_timeout_ms,
+                    fallback_on_blocked: params.fallback_on_blocked,
                 },
             )
             .await?;
             Ok(serde_json::to_value(result)?)
         }
         "conflict_materialize" => {
-            let about = match params["about_snapshot"].as_str() {
-                Some(snapshot) => snapshot.to_string(),
+            let params: ConflictMaterializeParams = parse_params(tool, params)?;
+            let about = match params.about_snapshot {
+                Some(snapshot) => snapshot,
                 None => ctx
                     .api
                     .get_head(ctx.workspace_id())
                     .await?
                     .context("workspace has no snapshot to materialize conflicts from")?,
             };
-            let paths: Vec<String> = params["paths"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let result = feanorfs_client::materialize_conflicts(&ctx, &about, &paths).await?;
+            let result =
+                feanorfs_client::materialize_conflicts(&ctx, &about, &params.paths).await?;
             Ok(serde_json::to_value(result)?)
         }
         other => anyhow::bail!("unknown method: {other}"),
@@ -438,7 +597,10 @@ fn compact_sync_status(status: StatusResult) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_identity, compact_sync_status, tool_list};
+    use super::{
+        agent_identity, compact_sync_status, parse_params, response_error_code, tool_list,
+        AgentInboxParams, AgentSendParams, IntegratorResumeParams,
+    };
     use feanorfs_client::{MirrorState, StatusResult};
     use feanorfs_common::FileState;
     use serde_json::json;
@@ -494,6 +656,7 @@ mod tests {
             .find(|tool| tool["name"] == "agent_send")
             .expect("agent_send tool must be declared");
         let send_schema = &send["inputSchema"];
+        assert_eq!(send_schema["additionalProperties"], false);
         assert_eq!(
             send_schema["properties"]["kind"]["enum"],
             json!(["request", "status", "result", "blocked"])
@@ -506,6 +669,7 @@ mod tests {
             .find(|tool| tool["name"] == "agent_inbox")
             .expect("agent_inbox tool must be declared");
         let inbox_schema = &inbox["inputSchema"];
+        assert_eq!(inbox_schema["additionalProperties"], false);
         assert_eq!(inbox_schema["properties"]["limit"]["maximum"], 1000);
         assert!(inbox_schema["properties"]["for"].is_object());
         assert!(inbox_schema["properties"]["after"].is_object());
@@ -519,5 +683,43 @@ mod tests {
     fn explicit_agent_identity_uses_human_for_blank_values() {
         assert_eq!(agent_identity(Some("mac-test")), "mac-test");
         assert_eq!(agent_identity(Some("")), "human");
+    }
+
+    #[test]
+    fn strict_params_reject_unknown_and_wrong_optional_fields() {
+        let unknown = match parse_params::<AgentSendParams>(
+            "agent_send",
+            &json!({
+                "to": "worker",
+                "kind": "request",
+                "body": "work",
+                "unexpected": true
+            }),
+        ) {
+            Ok(_) => panic!("unknown field was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(response_error_code(&unknown), -32602);
+        assert!(unknown.to_string().contains("unknown field `unexpected`"));
+
+        let wrong_type =
+            match parse_params::<AgentInboxParams>("agent_inbox", &json!({ "limit": "50" })) {
+                Ok(_) => panic!("wrong optional-field type was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(response_error_code(&wrong_type), -32602);
+        assert!(wrong_type.to_string().contains("invalid type"));
+    }
+
+    #[test]
+    fn absent_optional_params_keep_documented_defaults() {
+        let inbox: AgentInboxParams = parse_params("agent_inbox", &json!({})).unwrap();
+        assert!(inbox.recipient.is_none());
+        assert!(inbox.after.is_none());
+        assert!(inbox.limit.is_none());
+
+        let resume: IntegratorResumeParams = parse_params("integrator_resume", &json!({})).unwrap();
+        assert!(resume.ack_timeout_ms.is_none());
+        assert!(!resume.fallback_on_blocked);
     }
 }

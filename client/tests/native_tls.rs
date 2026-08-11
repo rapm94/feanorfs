@@ -1,3 +1,5 @@
+feanorfs_test_support::isolate_test_process!();
+
 use feanorfs_client::{ApiClient, Config};
 use feanorfs_server::{prepare_tls, run_http_server, ServeOptions};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};

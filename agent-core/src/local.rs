@@ -21,6 +21,7 @@ pub use config::{
 pub use scan::{
     scan_local_directory, scan_local_directory_with_opts, scan_local_directory_with_policy,
 };
+pub(crate) use walker::portable_rel_path;
 pub use walker::{
     build_workspace_walker, build_workspace_walker_with_ignore_policy, collect_symlink_warnings,
     is_always_excluded, normalize_path_nfc, DEFAULT_IGNORES,

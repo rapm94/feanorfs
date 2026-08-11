@@ -1,5 +1,7 @@
 //! Real CLI/MCP adapter coverage for encrypted agent signals.
 
+feanorfs_test_support::isolate_test_process!();
+
 use feanorfs_agent_core::local::{save_config, Config};
 use feanorfs_agent_core::{
     ensure_workspace_state, ApiClient, ClientDb, SnapshotEngine, SyncCtx, LOCAL_HUB_URL,
@@ -22,10 +24,11 @@ fn run_cli(workspace: &std::path::Path, state_root: &std::path::Path, args: &[&s
 #[tokio::test]
 async fn cli_json_human_and_mcp_signal_adapters_roundtrip() {
     let root = tempfile::tempdir().unwrap();
-    let state_root = root.path().join("state");
+    let state_root = std::path::PathBuf::from(
+        std::env::var_os("FEANORFS_HOME").expect("isolated FEANORFS_HOME"),
+    );
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    std::env::set_var("FEANORFS_HOME", &state_root);
 
     let config = Config {
         server_url: LOCAL_HUB_URL.into(),
@@ -150,9 +153,38 @@ async fn cli_json_human_and_mcp_signal_adapters_roundtrip() {
             }
         }
     });
-    let inbox_request = json!({
+    let unknown_field_request = json!({
         "jsonrpc": "2.0",
         "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "agent_send",
+            "arguments": {
+                "from": "mcp-agent",
+                "to": "mac-test",
+                "kind": "status",
+                "body": "must not publish unknown",
+                "unexpected": true
+            }
+        }
+    });
+    let wrong_optional_type_request = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "agent_send",
+            "arguments": {
+                "from": 42,
+                "to": "mac-test",
+                "kind": "status",
+                "body": "must not publish wrong type"
+            }
+        }
+    });
+    let inbox_request = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
         "method": "tools/call",
         "params": {
             "name": "agent_inbox",
@@ -162,6 +194,8 @@ async fn cli_json_human_and_mcp_signal_adapters_roundtrip() {
     {
         let stdin = mcp.stdin.as_mut().unwrap();
         writeln!(stdin, "{send_request}").unwrap();
+        writeln!(stdin, "{unknown_field_request}").unwrap();
+        writeln!(stdin, "{wrong_optional_type_request}").unwrap();
         writeln!(stdin, "{inbox_request}").unwrap();
     }
     drop(mcp.stdin.take());
@@ -176,15 +210,20 @@ async fn cli_json_human_and_mcp_signal_adapters_roundtrip() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(responses.len(), 2);
+    assert_eq!(responses.len(), 4);
     assert!(responses[0]["result"]["message_id"].is_string());
-    assert!(responses[1]["result"]["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|message| {
-            message["from"] == "mcp-agent"
-                && message["kind"] == "status"
-                && message["body"] == "MCP dispatch works"
-        }));
+    assert_eq!(responses[1]["error"]["code"], -32602);
+    assert_eq!(responses[2]["error"]["code"], -32602);
+    let messages = responses[3]["result"]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| {
+        message["from"] == "mcp-agent"
+            && message["kind"] == "status"
+            && message["body"] == "MCP dispatch works"
+    }));
+    assert!(!messages.iter().any(|message| {
+        matches!(
+            message["body"].as_str(),
+            Some("must not publish unknown" | "must not publish wrong type")
+        )
+    }));
 }

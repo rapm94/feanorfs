@@ -26,12 +26,21 @@ fn private_dir(path: &Path) -> Result<()> {
 
 pub fn global_state_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("FEANORFS_HOME") {
-        return Ok(PathBuf::from(root));
+        let root = PathBuf::from(root);
+        ensure_utf8_state_root(&root)?;
+        return Ok(root);
     }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .context("HOME or USERPROFILE environment variable not set")?;
     Ok(PathBuf::from(home).join(".feanorfs"))
+}
+
+fn ensure_utf8_state_root(root: &Path) -> Result<()> {
+    if root.to_str().is_none() {
+        bail!("FEANORFS_HOME is not valid UTF-8 and cannot expose portable state paths");
+    }
+    Ok(())
 }
 
 fn canonical_workspace(workspace: &Path) -> Result<PathBuf> {
@@ -51,44 +60,128 @@ fn canonical_workspace(workspace: &Path) -> Result<PathBuf> {
 pub fn workspace_state_id(workspace: &Path) -> Result<String> {
     let canonical = canonical_workspace(workspace)?;
     let mut hasher = blake3::Hasher::new_derive_key("feanorfs global workspace state v1");
-    hasher.update(canonical.to_string_lossy().as_bytes());
+    let canonical = canonical
+        .to_str()
+        .context("workspace path is not valid UTF-8 and cannot have a portable state identity")?;
+    hasher.update(canonical.as_bytes());
     Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn workspace_state_path(workspace: &Path) -> Result<PathBuf> {
-    workspace_state_path_in(workspace, &global_state_root()?)
+    workspace_state_path_in(workspace, &global_state_root()?, false)
 }
 
-fn workspace_state_path_in(workspace: &Path, root: &Path) -> Result<PathBuf> {
+pub(crate) fn legacy_workspace_state_path(workspace: &Path) -> Result<PathBuf> {
+    workspace_state_path_in(workspace, &global_state_root()?, true)
+}
+
+const MAX_WORKSPACE_STATE_SLOTS: usize = 100_000;
+const MAX_WORKSPACE_IDENTITY_BYTES: u64 = 512;
+
+fn workspace_state_path_in(
+    workspace: &Path,
+    root: &Path,
+    allow_mismatched_preferred: bool,
+) -> Result<PathBuf> {
     let workspaces = root.join("workspaces");
     let preferred = workspaces.join(workspace_state_id(workspace)?);
-    if preferred.exists() {
-        return Ok(preferred);
-    }
+    let preferred_exists = match fs::symlink_metadata(&preferred) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+        Ok(_) => bail!(
+            "preferred workspace state is not a regular directory: {}",
+            preferred.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("inspect preferred workspace state"),
+    };
     let Some(identity) = workspace_identity(workspace)? else {
         return Ok(preferred);
     };
+    if preferred_exists
+        && read_workspace_identity(&preferred)?.as_deref() == Some(identity.as_str())
+    {
+        return Ok(preferred);
+    }
+
     let entries = match fs::read_dir(&workspaces) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(preferred),
         Err(error) => return Err(error).context("search global workspace registry"),
     };
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+    let mut matches = Vec::new();
+    let mut scanned = 0usize;
+    for entry in entries {
+        let entry = entry.context("read global workspace registry entry")?;
+        if !entry
+            .file_type()
+            .context("inspect global workspace registry entry")?
+            .is_dir()
+        {
             continue;
         }
-        let candidate = entry.path();
-        if fs::read_to_string(candidate.join("identity"))
-            .ok()
-            .is_some_and(|stored| stored.trim() == identity.as_str())
-        {
-            return Ok(candidate);
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_WORKSPACE_STATE_SLOTS {
+            bail!("global workspace registry exceeds bounded slot count");
         }
+        let candidate = entry.path();
+        if read_workspace_identity(&candidate)?.as_deref() == Some(identity.as_str()) {
+            matches.push(candidate);
+            if matches.len() > 1 {
+                bail!("workspace identity is ambiguous across multiple state directories");
+            }
+        }
+    }
+    if let Some(candidate) = matches.pop() {
+        return Ok(candidate);
+    }
+    if preferred_exists {
+        if allow_mismatched_preferred {
+            // Compatibility migration must inspect the exact legacy slot even
+            // when its identity is stale, so it can preserve rather than adopt
+            // the bytes. Ordinary workspace resolution still fails closed.
+            return Ok(preferred);
+        }
+        // A project-local legacy store is positive evidence that migration,
+        // rather than path reuse, owns this transition. The migration path
+        // compares/quarantines the overlapping global bytes before writing.
+        if workspace.join(LEGACY_STATE_DIR).is_dir() {
+            return Ok(preferred);
+        }
+        bail!(
+            "workspace path now identifies a different folder; refusing to reuse state at {}",
+            preferred.display()
+        );
     }
     Ok(preferred)
 }
 
-fn workspace_identity(workspace: &Path) -> Result<Option<String>> {
+fn read_workspace_identity(state: &Path) -> Result<Option<String>> {
+    let path = state.join("identity");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => bail!(
+            "workspace identity is not a regular file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect workspace identity"),
+    };
+    if metadata.len() > MAX_WORKSPACE_IDENTITY_BYTES {
+        bail!("workspace identity exceeds bounded size");
+    }
+    let mut stored = String::with_capacity(metadata.len() as usize);
+    fs::File::open(&path)
+        .context("open workspace identity")?
+        .take(MAX_WORKSPACE_IDENTITY_BYTES + 1)
+        .read_to_string(&mut stored)
+        .context("read workspace identity")?;
+    if stored.len() as u64 > MAX_WORKSPACE_IDENTITY_BYTES {
+        bail!("workspace identity exceeds bounded size");
+    }
+    Ok(Some(stored.trim().to_string()))
+}
+
+pub(crate) fn workspace_identity(workspace: &Path) -> Result<Option<String>> {
     let metadata = match fs::metadata(workspace) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -133,13 +226,17 @@ pub fn ensure_workspace_state(workspace: &Path) -> Result<PathBuf> {
 }
 
 fn ensure_workspace_state_in(workspace: &Path, root: &Path) -> Result<PathBuf> {
-    let state = workspace_state_path_in(workspace, root)?;
+    let state = workspace_state_path_in(workspace, root, false)?;
     let workspaces = state
         .parent()
         .context("global workspace state has no parent")?;
     private_dir(workspaces)?;
     let id = workspace_state_id(workspace)?;
-    let lock = workspaces.join(format!(".{id}.migration.lock"));
+    let state_slot = state
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("global workspace state slot is not UTF-8")?;
+    let lock = workspaces.join(format!(".{state_slot}.migration.lock"));
     let _guard = MigrationLock::acquire(&lock)?;
 
     let legacy = workspace.join(LEGACY_STATE_DIR);
@@ -439,10 +536,10 @@ fn import_legacy_ignore(workspace: &Path, state: &Path) -> Result<()> {
 
 fn write_location(state: &Path, workspace: &Path) -> Result<()> {
     let canonical = canonical_workspace(workspace)?;
-    write_private(
-        &state.join("location"),
-        canonical.to_string_lossy().as_bytes(),
-    )
+    let canonical = canonical
+        .to_str()
+        .context("workspace path is not valid UTF-8 and cannot be persisted portably")?;
+    write_private(&state.join("location"), canonical.as_bytes())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -599,6 +696,40 @@ fn purge_old_children(directory: &Path, max_age: Duration) -> Result<()> {
 }
 
 fn rotate_log(log: &Path, retention: Duration) -> Result<()> {
+    let lock_path = log.with_extension("log.lock");
+    let mut lock_options = OpenOptions::new();
+    lock_options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        lock_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = lock_options.open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let rotated = log.with_extension("log.old");
+    if fs::metadata(&rotated).is_ok_and(|metadata| metadata.len() > MAX_LOG_BYTES) {
+        fs::remove_file(&rotated)?;
+    }
+    #[cfg(unix)]
+    if rotated.exists() {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&rotated, fs::Permissions::from_mode(0o600))?;
+    }
     let Ok(metadata) = fs::metadata(log) else {
         return Ok(());
     };
@@ -610,9 +741,24 @@ fn rotate_log(log: &Path, retention: Duration) -> Result<()> {
     if metadata.len() <= MAX_LOG_BYTES && !expired {
         return Ok(());
     }
-    let rotated = log.with_extension("log.old");
-    let _ = fs::remove_file(&rotated);
-    fs::rename(log, rotated)?;
+    match fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if metadata.len() > MAX_LOG_BYTES {
+        // Never retain an oversized generation produced by an older or
+        // uncooperative writer. Active descriptors may finish their current
+        // record on the unlinked inode; bounded writers reopen the live path.
+        fs::remove_file(log)?;
+    } else {
+        fs::rename(log, &rotated)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(rotated, fs::Permissions::from_mode(0o600))?;
+        }
+    }
     Ok(())
 }
 
@@ -684,7 +830,7 @@ mod tests {
         let legacy = project.join(LEGACY_STATE_DIR);
         fs::create_dir_all(&legacy).unwrap();
         fs::write(legacy.join("config.json"), b"active legacy").unwrap();
-        let state = workspace_state_path_in(&project, global.path()).unwrap();
+        let state = workspace_state_path_in(&project, global.path(), false).unwrap();
         fs::create_dir_all(&state).unwrap();
         fs::write(state.join("config.json"), b"partial global").unwrap();
 
@@ -730,6 +876,43 @@ mod tests {
             fs::read_to_string(relocated.join("location")).unwrap(),
             fs::canonicalize(renamed).unwrap().to_string_lossy()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_path_identity_mismatch_never_inherits_existing_state() {
+        let project_parent = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let project = project_parent.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let state = ensure_workspace_state_in(&project, global.path()).unwrap();
+        fs::write(state.join("config.json"), b"old capability").unwrap();
+        fs::write(state.join("identity"), b"unix:0:0:0:0").unwrap();
+
+        let error = ensure_workspace_state_in(&project, global.path()).unwrap_err();
+        assert!(error.to_string().contains("different folder"));
+        assert_eq!(
+            fs::read(state.join("config.json")).unwrap(),
+            b"old capability"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moved_lookup_rejects_duplicate_identity_matches() {
+        let project_parent = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let original = project_parent.path().join("before");
+        let renamed = project_parent.path().join("after");
+        fs::create_dir(&original).unwrap();
+        let state = ensure_workspace_state_in(&original, global.path()).unwrap();
+        let duplicate = global.path().join("workspaces").join("f".repeat(64));
+        fs::create_dir(&duplicate).unwrap();
+        fs::copy(state.join("identity"), duplicate.join("identity")).unwrap();
+        fs::rename(&original, &renamed).unwrap();
+
+        let error = workspace_state_path_in(&renamed, global.path(), false).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"));
     }
 
     #[test]
@@ -783,6 +966,53 @@ mod tests {
         file.set_len(MAX_LOG_BYTES + 1).unwrap();
         rotate_log(&log, Duration::from_secs(u64::MAX)).unwrap();
         assert!(!log.exists());
-        assert!(state.path().join("feanorfs.log.old").is_file());
+        assert!(!state.path().join("feanorfs.log.old").exists());
+    }
+
+    #[test]
+    fn log_maintenance_skips_a_writer_holding_the_shared_rotation_lock() {
+        let state = tempfile::tempdir().unwrap();
+        let log = state.path().join("feanorfs.log");
+        let file = fs::File::create(&log).unwrap();
+        file.set_len(MAX_LOG_BYTES + 1).unwrap();
+        drop(file);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(log.with_extension("log.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+
+        rotate_log(&log, Duration::from_secs(u64::MAX)).unwrap();
+        assert!(log.exists(), "maintenance must not race an active writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_workspace_paths_and_utf8_symlink_aliases_fail_closed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory
+            .path()
+            .join(OsString::from_vec(b"workspace-\xff".to_vec()));
+        let second = directory
+            .path()
+            .join(OsString::from_vec(b"workspace-\xfe".to_vec()));
+        assert!(workspace_state_id(&first).is_err());
+        assert!(workspace_state_id(&second).is_err());
+
+        // Some filesystems (including common macOS APFS configurations)
+        // reject non-UTF-8 names before FeanorFS can observe them. Platforms
+        // that permit such names also exercise the canonicalized symlink case.
+        if fs::create_dir(&first).is_ok() {
+            let alias = directory.path().join("utf8-alias");
+            symlink(&first, &alias).unwrap();
+            assert!(workspace_state_id(&alias).is_err());
+        }
     }
 }

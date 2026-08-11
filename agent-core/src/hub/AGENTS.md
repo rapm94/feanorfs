@@ -15,9 +15,12 @@ Own embedded LocalHub request dispatch, response construction, authentication ch
 
 - Keep auth and migration-token comparisons constant-time.
 - Hold shared publication lock from fence check through upload/manifest/head mutation; migration start and format stamp take exclusive lock.
-- Enforce 100 MiB request and 8 MiB manifest limits.
+- Enforce 100 MiB request/response-blob and 64 MiB manifest limits. Check embedded blob metadata before reading bytes into memory.
+- Manifest bodies are canonical root-containing object sets capped at `MANIFEST_MAX_ENTRIES` raw entries. Exact-set retries are idempotent, mutations are rejected, and every head swap requires its workspace-qualified manifest.
 - Validate hashes and safe paths before writing blobs.
+- Permit an unsafe legacy path only for an atomic tombstone update of an already-existing exact row; never insert a new unsafe row.
 - Preserve referenced blobs after committed-but-durability-uncertain metadata writes.
+- Match the HTTP hub's status and response bytes for every route; precondition failures with no HTTP body stay empty locally.
 
 ## Work Guidance
 

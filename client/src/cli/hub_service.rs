@@ -517,16 +517,28 @@ async fn wait_until_ready(connection: &HubConnection) -> anyhow::Result<()> {
     anyhow::bail!("timed out waiting for the private hub")
 }
 
-/// After a relay or port change the supervisor restarts the hub worker: first
-/// wait for the old process to stop serving, then for the replacement to
-/// become ready again.
+/// After a relay or port change the supervisor restarts the hub worker: wait
+/// a bounded moment for the old process to stop serving, then for the
+/// replacement to become ready again.
+///
+/// When nothing actually changed (plain LAN pairing, unchanged relay), no
+/// restart happens and the still-serving hub is exactly what the caller
+/// needs; waiting out the full grace period would stall every `pair` by
+/// several seconds for no effect.
 async fn wait_for_hub_restart(connection: &HubConnection) -> anyhow::Result<()> {
-    let deadline = Instant::now() + super::supervisor::STOP_GRACE;
-    while Instant::now() < deadline {
-        if !endpoint_ready(connection).await {
-            break;
+    if endpoint_ready(connection).await {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut restarted = false;
+        while Instant::now() < deadline {
+            if !endpoint_ready(connection).await {
+                restarted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !restarted {
+            return Ok(());
+        }
     }
     wait_until_ready(connection).await
 }

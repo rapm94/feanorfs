@@ -8,7 +8,7 @@
 //! canonicalization, ranking, or lifecycle transitions.
 
 use crate::{hash_bytes, is_valid_hash};
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 
 /// Version string domain-separating every integrator selection draw.
@@ -38,6 +38,8 @@ pub const INTEGRATOR_DIGEST_FIELD_BYTES: usize = 512;
 pub const INTEGRATOR_RISK_BYTES: usize = 256;
 /// Maximum number of paths in an on-demand bounded path list.
 pub const INTEGRATOR_MAX_PATHS: usize = 256;
+/// Maximum UTF-8 bytes for one canonical materialization path.
+pub const INTEGRATOR_MAX_PATH_BYTES: usize = 4096;
 /// Default acknowledgement timeout before the dispatcher may fall back.
 pub const INTEGRATOR_DEFAULT_ACK_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
@@ -46,6 +48,7 @@ pub const INTEGRATOR_DEFAULT_ACK_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 #[must_use]
 pub fn is_valid_agent_name(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= crate::AGENT_NAME_MAX_BYTES
         && !name.chars().any(char::is_control)
         && !name.contains(['/', '\\'])
         && name != "."
@@ -61,6 +64,7 @@ pub fn is_valid_hex_id(value: &str, bytes: usize) -> bool {
 
 /// One candidate descriptor supplied by the authorized dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntegratorCandidate {
     pub name: String,
     #[serde(default)]
@@ -77,6 +81,7 @@ const fn default_true() -> bool {
 
 /// Full dispatcher input for one integrator assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntegratorAssignInput {
     /// Full reachable format-v3 snapshot ID the batch concerns.
     pub about_snapshot: String,
@@ -345,6 +350,47 @@ pub struct IntegratorObserveResult {
     pub action: String,
 }
 
+/// Strict adapter input for resuming dispatcher observation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegratorObserveInput {
+    #[serde(default)]
+    pub ack_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub fallback_on_blocked: bool,
+}
+
+/// Strict adapter input for materializing conflict artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConflictMaterializeInput {
+    pub about_snapshot: String,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+impl ConflictMaterializeInput {
+    /// Resolve the explicit selection without allowing malformed or omitted
+    /// subsets to inherit core's empty-list-means-all convention.
+    pub fn validate(self) -> Result<(String, Vec<String>)> {
+        match (self.all, self.paths) {
+            (true, None) => Ok((self.about_snapshot, Vec::new())),
+            (false, Some(paths)) => {
+                ensure!(
+                    !paths.is_empty(),
+                    "conflict materialization paths must not be empty; use all=true explicitly"
+                );
+                validate_path_list(&paths)?;
+                Ok((self.about_snapshot, paths))
+            }
+            (true, Some(_)) => bail!("choose either all=true or paths, not both"),
+            (false, None) => bail!("conflict materialization requires paths or all=true"),
+        }
+    }
+}
+
 /// Result of materializing encrypted conflict legs on a third machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictMaterializeEntry {
@@ -373,19 +419,22 @@ pub struct ConflictMaterializeResult {
 /// # Errors
 /// Returns an error for empty, non-lowercase-ASCII, or oversized identifiers.
 pub fn normalize_capability(capability: &str) -> Result<String> {
-    let trimmed = capability.trim();
-    ensure!(!trimmed.is_empty(), "capability must not be empty");
+    ensure!(!capability.is_empty(), "capability must not be empty");
     ensure!(
-        trimmed.len() <= INTEGRATOR_CAPABILITY_MAX_BYTES,
+        capability.len() <= INTEGRATOR_CAPABILITY_MAX_BYTES,
         "capability exceeds {INTEGRATOR_CAPABILITY_MAX_BYTES} bytes"
     );
     ensure!(
-        trimmed
+        capability.trim() == capability,
+        "capability must already be in canonical unpadded form"
+    );
+    ensure!(
+        capability
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b == b'-' || b.is_ascii_digit()),
         "capability must be lowercase ASCII letters, digits, or '-'"
     );
-    Ok(trimmed.to_string())
+    Ok(capability.to_string())
 }
 
 /// Normalizes a capability list: trims, validates, deduplicates, sorts.
@@ -400,9 +449,11 @@ pub fn normalize_capabilities(capabilities: &[String]) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for capability in capabilities {
         let normalized = normalize_capability(capability)?;
-        if !out.contains(&normalized) {
-            out.push(normalized);
-        }
+        ensure!(
+            !out.contains(&normalized),
+            "duplicate capability {normalized:?}"
+        );
+        out.push(normalized);
     }
     out.sort();
     Ok(out)
@@ -654,6 +705,9 @@ pub fn encode_integrator_profile(profile: &IntegratorProfile) -> Result<String> 
 /// ordinary signal text and cannot break typed inbox reads.
 #[must_use]
 pub fn parse_integrator_profile(body: &str) -> Option<IntegratorProfile> {
+    if body.len() > crate::AGENT_MESSAGE_MAX_BODY_BYTES {
+        return None;
+    }
     let json = body.strip_prefix(INTEGRATOR_PROFILE_DISCRIMINATOR)?;
     let json = json.strip_prefix(':')?;
     let profile: IntegratorProfile = serde_json::from_str(json).ok()?;
@@ -728,7 +782,18 @@ fn validate_profile(profile: &IntegratorProfile) -> Result<()> {
             Ok(())
         }
         IntegratorProfile::Accepted { .. } => Ok(()),
-        IntegratorProfile::Result { digest, .. } => validate_integrator_digest(digest),
+        IntegratorProfile::Result {
+            assignment_id,
+            about_snapshot,
+            digest,
+            ..
+        } => {
+            ensure!(
+                digest.assignment_id == *assignment_id && digest.about_snapshot == *about_snapshot,
+                "ffint1 result digest must match its assignment and about snapshot"
+            );
+            validate_integrator_digest(digest)
+        }
         IntegratorProfile::Blocked { reason, .. } => {
             ensure!(
                 !reason.trim().is_empty() && reason.len() <= INTEGRATOR_DIGEST_FIELD_BYTES,
@@ -781,6 +846,19 @@ pub fn validate_integrator_digest(digest: &IntegratorDigest) -> Result<()> {
             "digest decision question must be non-empty and at most {INTEGRATOR_DIGEST_FIELD_BYTES} bytes"
         );
     }
+    match digest.state {
+        IntegratorOutcomeState::Completed => ensure!(
+            digest.verification.status == VerificationStatus::Passed
+                && digest.remaining_conflicts == 0
+                && digest.decision_required.is_none(),
+            "completed digest requires passed verification, zero remaining conflicts, and no decision"
+        ),
+        IntegratorOutcomeState::RequiresHuman => ensure!(
+            digest.decision_required.is_some(),
+            "requires_human digest must include one decision question"
+        ),
+        IntegratorOutcomeState::Blocked | IntegratorOutcomeState::Cancelled => {}
+    }
     Ok(())
 }
 
@@ -793,6 +871,14 @@ pub fn validate_path_list(paths: &[String]) -> Result<()> {
         paths.len() <= INTEGRATOR_MAX_PATHS,
         "path list exceeds {INTEGRATOR_MAX_PATHS} entries"
     );
+    let mut seen = std::collections::HashSet::with_capacity(paths.len());
+    for path in paths {
+        ensure!(
+            path.len() <= INTEGRATOR_MAX_PATH_BYTES && crate::is_safe_rel_path(path),
+            "materialization path must be canonical, safe, and at most {INTEGRATOR_MAX_PATH_BYTES} bytes"
+        );
+        ensure!(seen.insert(path), "duplicate materialization path {path:?}");
+    }
     Ok(())
 }
 
@@ -858,14 +944,18 @@ mod tests {
         for name in ["agent-a", "mac-test", "ci1", "a"] {
             assert!(is_valid_agent_name(name), "{name:?} must be accepted");
         }
+        assert!(!is_valid_agent_name(
+            &"a".repeat(crate::AGENT_NAME_MAX_BYTES + 1)
+        ));
     }
 
     #[test]
     fn capability_normalization_is_stable() {
         assert_eq!(
-            normalize_capabilities(&["rust".into(), "rust".into(), "ios".into()]).unwrap(),
+            normalize_capabilities(&["rust".into(), "ios".into()]).unwrap(),
             vec!["ios".to_string(), "rust".to_string()]
         );
+        assert!(normalize_capabilities(&["rust".into(), "rust".into()]).is_err());
         assert!(normalize_capabilities(&[" Rust ".into()]).is_err());
         assert!(normalize_capabilities(&["Rust".into()]).is_err());
         assert!(normalize_capabilities(&["".into()]).is_err());
@@ -1142,6 +1232,56 @@ mod tests {
             neutral_integrator: true,
             task: "Integrate parser implementation and tests".to_string(),
         }
+    }
+
+    #[test]
+    fn contradictory_terminal_digests_are_rejected() {
+        let mut failed = digest(ASSIGNMENT);
+        failed.verification.status = VerificationStatus::Failed;
+        assert!(validate_integrator_digest(&failed).is_err());
+
+        let mut conflicts = digest(ASSIGNMENT);
+        conflicts.remaining_conflicts = 1;
+        assert!(validate_integrator_digest(&conflicts).is_err());
+
+        let mut human = digest(ASSIGNMENT);
+        human.state = IntegratorOutcomeState::RequiresHuman;
+        assert!(validate_integrator_digest(&human).is_err());
+        human.decision_required = Some("Choose the local or cloud version".into());
+        assert!(validate_integrator_digest(&human).is_ok());
+    }
+
+    #[test]
+    fn materialization_paths_are_canonical_bounded_and_unique() {
+        assert!(validate_path_list(&["src/main.rs".into()]).is_ok());
+        assert!(validate_path_list(&["../escape".into()]).is_err());
+        assert!(validate_path_list(&["same".into(), "same".into()]).is_err());
+        assert!(validate_path_list(&["a".repeat(INTEGRATOR_MAX_PATH_BYTES + 1)]).is_err());
+    }
+
+    #[test]
+    fn adapter_inputs_reject_unknown_fields_and_require_explicit_conflict_scope() {
+        assert!(serde_json::from_str::<IntegratorObserveInput>(r#"{"ack_timeout":1}"#).is_err());
+        assert!(serde_json::from_str::<ConflictMaterializeInput>(
+            r#"{"about_snapshot":"head","path":"one"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ConflictMaterializeInput>(
+            r#"{"about_snapshot":"head","paths":["one",42]}"#
+        )
+        .is_err());
+
+        for invalid in [
+            r#"{"about_snapshot":"head"}"#,
+            r#"{"about_snapshot":"head","paths":[]}"#,
+            r#"{"about_snapshot":"head","paths":["one"],"all":true}"#,
+        ] {
+            let input: ConflictMaterializeInput = serde_json::from_str(invalid).unwrap();
+            assert!(input.validate().is_err());
+        }
+        let all: ConflictMaterializeInput =
+            serde_json::from_str(r#"{"about_snapshot":"head","all":true}"#).unwrap();
+        assert_eq!(all.validate().unwrap(), ("head".to_string(), Vec::new()));
     }
 
     #[test]

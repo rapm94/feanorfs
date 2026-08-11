@@ -29,7 +29,6 @@ fn hub_cache() -> &'static Mutex<HashMap<CacheKey, Arc<LocalHub>>> {
     HUB_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[derive(Debug)]
 pub struct LocalHub {
     db: HubDb,
     auth_token: Option<String>,
@@ -43,6 +42,15 @@ struct RoutedRequest<'a> {
     body: &'a [u8],
     params: &'a HashMap<String, String>,
     migration_header: Option<&'a str>,
+}
+
+impl std::fmt::Debug for LocalHub {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalHub")
+            .field("auth_required", &self.auth_token.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalHub {
@@ -181,6 +189,17 @@ impl LocalHub {
         let bytes = axum::body::to_bytes(response.into_body(), MAX_BODY_BYTES)
             .await
             .context("read response body")?;
+        Ok((status, bytes.to_vec()))
+    }
+
+    pub async fn read_body_bounded(
+        response: Response<Body>,
+        max_bytes: usize,
+    ) -> anyhow::Result<(StatusCode, Vec<u8>)> {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), max_bytes)
+            .await
+            .context("read bounded response body")?;
         Ok((status, bytes.to_vec()))
     }
 }
