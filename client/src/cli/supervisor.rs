@@ -4588,6 +4588,7 @@ mod tests {
     use super::*;
 
     static ACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static RUNNER_FIXTURE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static RUNNER_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(unix)]
@@ -5381,15 +5382,34 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn spawn_term_ignoring_child() -> tokio::process::Child {
+    async fn spawn_term_ignoring_child() -> tokio::process::Child {
+        use tokio::io::AsyncReadExt as _;
+
         // Ignored SIGTERM forces terminate_child through its bounded force
-        // path. `exec` keeps the shell PID as the owned process, so the test
-        // never leaves a helper descendant behind.
-        tokio::process::Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM; while :; do :; done"])
+        // path. The readiness byte proves the trap is installed before the
+        // caller can signal the child, and the builtin loop leaves no helper
+        // descendant behind.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; printf 1; while :; do :; done"])
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .spawn()
-            .expect("spawn termination test child")
+            .expect("spawn termination test child");
+        let mut ready = [0_u8; 1];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            child
+                .stdout
+                .as_mut()
+                .expect("termination test child has readiness pipe")
+                .read_exact(&mut ready),
+        )
+        .await
+        .expect("termination test child became ready")
+        .expect("read termination test child readiness");
+        assert_eq!(ready, [b'1']);
+        child.stdout.take();
+        child
     }
 
     #[cfg(unix)]
@@ -5498,9 +5518,8 @@ mod tests {
         SUPERVISOR_CHILD_REAPER.fail_worker_start_for_test(false);
         SUPERVISOR_CHILD_REAPER.fail_next_enqueue_for_test();
 
-        let child = spawn_term_ignoring_child();
+        let child = spawn_term_ignoring_child().await;
         let pid = child.id().expect("termination test child pid");
-        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(feanorfs_agent_core::lock::pid_alive(pid));
         let spec = ChildSpec {
             kind: ChildKind::Workspace("/reconcile-removal".to_string()),
@@ -5541,15 +5560,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn deferred_runner_stop_withholds_reconcile_until_reaper_completion() {
+        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let _guard = REAPER_TEST_LOCK.lock().await;
         let _reset = ReaperTestReset;
         TEST_TERMINATION_GRACE_MILLIS.store(1, AtomicOrdering::Release);
         TEST_FORCE_REAP_TIMEOUT.store(true, AtomicOrdering::Release);
 
         let (_dir, workspace, _store) = configured_runner_fixture();
-        let child = spawn_term_ignoring_child();
+        let child = spawn_term_ignoring_child().await;
         let pid = child.id().expect("runner termination test child pid");
-        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(feanorfs_agent_core::lock::pid_alive(pid));
         let spec = ChildSpec {
             kind: ChildKind::Runner(workspace.to_string_lossy().into_owned()),
@@ -5611,7 +5630,7 @@ mod tests {
         TEST_FORCE_REAP_TIMEOUT.store(true, AtomicOrdering::Release);
         SUPERVISOR_CHILD_REAPER.fail_worker_start_for_test(true);
 
-        let child = spawn_term_ignoring_child();
+        let child = spawn_term_ignoring_child().await;
         let pid = child.id().expect("shutdown test child pid");
         let spec = ChildSpec {
             kind: ChildKind::Hub,
@@ -5640,7 +5659,7 @@ mod tests {
         TEST_TERMINATION_GRACE_MILLIS.store(1, AtomicOrdering::Release);
         TEST_SHUTDOWN_PANIC_ONCE.store(true, AtomicOrdering::Release);
 
-        let child = spawn_term_ignoring_child();
+        let child = spawn_term_ignoring_child().await;
         let pid = child.id().expect("panic recovery child pid");
         let spec = ChildSpec {
             kind: ChildKind::Hub,
@@ -5673,7 +5692,7 @@ mod tests {
         TEST_FORCE_REAP_TIMEOUT.store(true, AtomicOrdering::Release);
         SUPERVISOR_CHILD_REAPER.fail_worker_start_for_test(false);
 
-        let child = spawn_term_ignoring_child();
+        let child = spawn_term_ignoring_child().await;
         let pid = child.id().expect("normal handoff child pid");
         let spec = ChildSpec {
             kind: ChildKind::Hub,
@@ -5693,6 +5712,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unresolved_startup_runner_authority_retries_and_then_clears() {
+        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, _store) = configured_runner_fixture();
         let canonical = workspace.to_string_lossy().into_owned();
         let program = std::env::current_exe().unwrap();
@@ -5814,7 +5834,7 @@ mod tests {
     #[tokio::test]
     async fn pending_reaper_status_roundtrip_preserves_exact_handoff_identity() {
         let _guard = REAPER_TEST_LOCK.lock().await;
-        let mut child = spawn_term_ignoring_child();
+        let mut child = spawn_term_ignoring_child().await;
         let pid = child.id().expect("pending reaper child pid");
         let process_start_id = exact_child_process_start_id(pid).expect("native child identity");
         let since = now_epoch();
@@ -5905,7 +5925,7 @@ mod tests {
     async fn owned_child_falls_back_to_direct_kill_when_identity_probe_is_unavailable() {
         let _guard = REAPER_TEST_LOCK.lock().await;
         TEST_IDENTITY_UNAVAILABLE.store(true, AtomicOrdering::Release);
-        let child = spawn_term_ignoring_child();
+        let child = spawn_term_ignoring_child().await;
         let pid = child.id().expect("identity fallback child pid");
         let spec = ChildSpec {
             kind: ChildKind::Hub,
@@ -5937,8 +5957,9 @@ mod tests {
         assert!(!terminate_verified_runner_group(&metadata));
     }
 
-    #[test]
-    fn runner_exit_cleanup_waits_for_the_exact_session_then_checkpoints() {
+    #[tokio::test]
+    async fn runner_exit_cleanup_waits_for_the_exact_session_then_checkpoints() {
+        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, store) = configured_runner_fixture();
         let session = store
             .execution_session(
@@ -6102,6 +6123,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_runner_exit_enters_bounded_restart_backoff() {
+        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, store) = configured_runner_fixture();
         store.set_enabled(true).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
@@ -6152,6 +6174,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_desired_runner_is_not_spawned_after_disable() {
+        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, store) = configured_runner_fixture();
         store.set_enabled(true).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
@@ -6382,8 +6405,9 @@ mod tests {
         assert_eq!(status.runners.len(), 1);
     }
 
-    #[test]
-    fn desired_runner_spec_is_exact_redacted_and_state_gated() {
+    #[tokio::test]
+    async fn desired_runner_spec_is_exact_redacted_and_state_gated() {
+        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, store) = configured_runner_fixture();
         store.set_enabled(true).unwrap();
         let canonical = workspace.to_string_lossy().into_owned();
