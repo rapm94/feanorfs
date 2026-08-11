@@ -5568,6 +5568,11 @@ mod tests {
             children.values().next().unwrap().state,
             ChildState::Stopping
         );
+        let reap_ticket = children
+            .values()
+            .next()
+            .and_then(|managed| managed.pending_reap.clone())
+            .expect("deferred runner termination retains its reaper ticket");
         assert!(
             !runner_reconciliation_complete(&children, &SupervisorRegistry::default()),
             "durable runner stop acknowledgement must remain gated"
@@ -5580,6 +5585,7 @@ mod tests {
         )
         .is_err());
 
+        await_reap_ticket(&reap_ticket).await;
         assert_pid_reaped(pid).await;
         reconcile(&mut children, &BTreeMap::new(), false)
             .await
