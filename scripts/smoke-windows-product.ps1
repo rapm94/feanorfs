@@ -243,17 +243,22 @@ function Assert-HealthyProduct {
         $expectedChecks = @(
             "automatic_sync",
             "e2ee",
+            "executable_version",
             "global_config",
             "local_state",
             "private_hub",
             "remote_workspace",
             "server",
             "tray_registration",
+            "update_available",
             "workspace_config",
             "workspace_format"
         ) | Sort-Object
         $actualChecks = @($doctor.checks.name) | Sort-Object
-        if (-not $doctor.ok -or (Compare-Object $expectedChecks $actualChecks) -or @($doctor.checks | Where-Object status -ne "ok").Count -ne 0) {
+        $unexpectedStatuses = @($doctor.checks | Where-Object {
+            $_.status -ne "ok" -and -not ($_.name -eq "update_available" -and $_.status -eq "info")
+        })
+        if (-not $doctor.ok -or (Compare-Object $expectedChecks $actualChecks) -or $unexpectedStatuses.Count -ne 0) {
             throw "Windows doctor checks did not all pass."
         }
 
@@ -323,8 +328,9 @@ try {
         throw "Windows stop did not preserve the working file and encrypted setup."
     }
     Wait-For {
-        (Get-SupervisedChildState $workspace) -ne "running"
-    } "workspace removal from the supervisor"
+        $serviceStatus = (& $cli --json service status $workspace) | ConvertFrom-Json
+        $LASTEXITCODE -eq 0 -and $serviceStatus.status -eq "not_installed"
+    } "workspace service to become uninstalled"
 
     Invoke-Start
     Assert-HealthyProduct
