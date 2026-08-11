@@ -1,6 +1,6 @@
 feanorfs_test_support::isolate_test_process!();
 
-use std::sync::Arc;
+use std::{error::Error as _, sync::Arc};
 
 use feanorfs_agent_core::LocalHub;
 use feanorfs_common::{hash_bytes, SwapHeadRequest, SyncRequest};
@@ -23,6 +23,23 @@ fn canonicalize(body: &[u8]) -> String {
     } else {
         String::from_utf8_lossy(body).into_owned()
     }
+}
+
+fn is_early_oversize_rejection(error: &reqwest::Error) -> bool {
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        source = cause.source();
+    }
+    false
 }
 
 struct Harness {
@@ -126,13 +143,11 @@ impl Harness {
         q: &str,
         body: Vec<u8>,
         migration_token: Option<&str>,
-    ) -> u16 {
+    ) -> Result<u16, reqwest::Error> {
         self.http_request(m, path, q, body, migration_token)
             .send()
             .await
-            .unwrap()
-            .status()
-            .as_u16()
+            .map(|response| response.status().as_u16())
     }
 
     /// Assert exact parity: same status and same canonicalized body.
@@ -498,12 +513,18 @@ async fn parity_body_over_100mb_rejected() {
         )
         .await;
     assert_eq!(ls, 413);
-    assert_eq!(hs, 413);
+    match hs {
+        Ok(status) => assert_eq!(status, 413),
+        Err(error) => assert!(
+            is_early_oversize_rejection(&error),
+            "unexpected HTTP error while rejecting oversized body: {error:#}"
+        ),
+    }
     assert!(!lb_body.is_empty());
     // An HTTP server can reject a known-oversized request before the client
-    // finishes transmitting it, so the connection may close before the
-    // incidental Axum rejection text is readable. Status and unchanged state
-    // are the stable parity contract for this case.
+    // finishes transmitting it. Depending on the platform's socket timing,
+    // the client observes either the 413 or a connection-level refusal. The
+    // unchanged server state below is the stable fail-closed contract.
 
     let (_, lb_after) = h
         .local_req(&Method::GET, "/api/workspaces", "", vec![], None)
