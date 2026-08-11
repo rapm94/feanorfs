@@ -4588,6 +4588,7 @@ mod tests {
     use super::*;
 
     static ACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static RUNNER_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(unix)]
     static REAPER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -4616,11 +4617,12 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().canonicalize().unwrap();
+        let fixture_sequence = RUNNER_FIXTURE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
         feanorfs_client::save_config(
             &workspace,
             &feanorfs_client::Config {
                 server_url: "http://127.0.0.1:1".to_string(),
-                workspace_id: "supervisor-runner-test".to_string(),
+                workspace_id: format!("supervisor-runner-test-{fixture_sequence}"),
                 encryption_password: Some("e".repeat(64)),
                 server_password: None,
                 tls_ca_pem: None,
@@ -4875,6 +4877,7 @@ mod tests {
             ]),
             ..SupervisorRegistry::default()
         };
+        create_store_dir(&registry_file).unwrap();
         save_registry(&registry_file, &registry).unwrap();
         let child_b = ChildSpec {
             kind: ChildKind::Runner("/store-b".to_string()),
@@ -5342,6 +5345,8 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_reaper_handoff_reaps_owned_child() {
+        #[cfg(unix)]
+        let _guard = REAPER_TEST_LOCK.lock().await;
         let mut child = spawn_long_running_test_child();
         let pid = child.id().expect("reaper child pid");
         let _ = child.start_kill();

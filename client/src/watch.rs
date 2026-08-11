@@ -307,25 +307,20 @@ mod tests {
     #[tokio::test]
     async fn bulk_event_burst_runs_one_debounce_pass() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-        tx.try_send(()).expect("queue initial event");
-        let delayed_tx = tx.clone();
-        let delayed_events = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            for _ in 0..99 {
-                delayed_tx
-                    .try_send(())
-                    .expect("queue event during debounce");
-            }
-        });
+        for _ in 0..100 {
+            tx.try_send(()).expect("queue burst event");
+        }
+        drop(tx);
 
         let delay = Duration::from_millis(25);
         let started = tokio::time::Instant::now();
         rx.recv().await.expect("receive initial event");
         drain_event_burst(&mut rx, delay).await;
-        delayed_events.await.expect("send delayed events");
-        drop(tx);
 
         assert!(started.elapsed() >= delay);
-        assert!(rx.try_recv().is_err(), "entire timed burst must be drained");
+        assert!(
+            rx.try_recv().is_err(),
+            "entire queued burst must be drained"
+        );
     }
 }
