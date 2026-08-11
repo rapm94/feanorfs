@@ -205,16 +205,19 @@ fi
   and ([.checks[].name] | sort == [
     "automatic_sync",
     "e2ee",
+    "executable_version",
     "global_config",
     "local_state",
     "private_hub",
     "remote_workspace",
     "server",
     "tray_registration",
+    "update_available",
     "workspace_config",
     "workspace_format"
   ])
-  and all(.checks[]; .status == "ok")
+  and ([.checks[] | select(.name == "update_available" and .status == "info")] | length == 1)
+  and all(.checks[] | select(.name != "update_available"); .status == "ok")
 ' >/dev/null
 TRAY_STATUS="$ROOT/tray-status.json"
 tray_ready=false
@@ -244,7 +247,7 @@ MCP_OUT="$ROOT/mcp.jsonl"
     "$FEANORFS" mcp >"$MCP_OUT"
 )
 jq -s -e \
-  'length == 3 and .[0].result.serverInfo.name == "feanorfs" and (.[1].result.tools | length) == 9 and .[2].result.mirror_state == "idle"' \
+  'length == 3 and .[0].result.serverInfo.name == "feanorfs" and (.[1].result.tools | length) == 16 and .[2].result.mirror_state == "idle"' \
   "$MCP_OUT" >/dev/null
 
 echo "Smoke: encrypted workspace recovery"
