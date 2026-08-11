@@ -350,7 +350,11 @@ jobs:
           chmod +x "$CARGO_WRAPPER"
 
       - name: Carry external product changes into the release package
+        id: carry
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
+          set -euo pipefail
           scripts/update-release-product-state.sh --write
           if git diff --quiet -- common/release-product-state.txt; then
             exit 0
@@ -366,6 +370,12 @@ jobs:
           git config user.email "release-plz[bot]@users.noreply.github.com"
           git add common/release-product-state.txt
           git commit -m "$kind(release): carry product changes"
+          # release-plz creates its branch through the API, so HEAD must already
+          # be reachable from a remote ref before the action starts.
+          carry_branch="release-plz-carry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh auth setup-git
+          git push origin "HEAD:refs/heads/$carry_branch"
+          echo "branch=$carry_branch" >> "$GITHUB_OUTPUT"
 
       - name: Run release-plz (release-pr)
         id: release-plz
@@ -400,3 +410,12 @@ jobs:
           git add bindings/ts/package.json bindings/ts/package-lock.json bindings/ts/index.js bindings/ts/npm/*/package.json
           git commit -m "chore(release): sync npm package versions"
           git push
+
+      - name: Remove temporary carry branch
+        if: ${{ always() && steps.carry.outputs.branch != '' }}
+        env:
+          CARRY_BRANCH: ${{ steps.carry.outputs.branch }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: >-
+          gh api --method DELETE
+          "repos/$GITHUB_REPOSITORY/git/refs/heads/$CARRY_BRANCH"
