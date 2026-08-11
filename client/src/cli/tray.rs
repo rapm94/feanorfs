@@ -2,8 +2,9 @@ use clap::Subcommand;
 use feanorfs_client::{
     do_tray_status_with, forget_unavailable_workspaces, invalidate_worker_status,
     list_recent_workspaces, load_config, register_workspace, set_active_workspace, set_paused,
+    try_list_recent_workspaces,
 };
-use feanorfs_common::TrayPauseResult;
+use feanorfs_common::{TrayOverviewResult, TrayPauseResult};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -29,6 +30,9 @@ pub enum TrayAction {
         #[arg(long)]
         fresh: bool,
     },
+    /// Combined bounded refresh used by the desktop tray.
+    #[command(hide = true)]
+    Overview,
     /// Stop automatic sync until `tray resume`.
     Pause,
     /// Resume automatic sync.
@@ -72,6 +76,20 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                     );
                 }
             }
+        }
+        TrayAction::Overview => {
+            if !json {
+                anyhow::bail!("tray overview requires --json");
+            }
+            let status = do_tray_status_with(current_dir, false).await?;
+            let result = TrayOverviewResult {
+                status,
+                // Status remains useful if the independent global registry
+                // is briefly locked or unreadable; the tray retains its last
+                // good folder list when this field is absent.
+                recent: try_list_recent_workspaces().ok().flatten(),
+            };
+            output_json(&result)?;
         }
         TrayAction::Pause => {
             load_config(current_dir)?;

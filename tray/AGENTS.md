@@ -14,12 +14,12 @@ macOS, Linux, and Windows system-tray companion for FeanorFS. Shells `feanorfs -
 
 ## Local Contracts
 
-- All sync state comes from `feanorfs --json tray status` (`TrayStatusResult` in `common/src/tray_contract.rs`).
+- Recurring configured-workspace refreshes use one background `feanorfs --json tray overview` process (`TrayOverviewResult` in `common/src/tray_contract.rs`), combining worker-published sync status with the recent-folder registry. The stable `tray status` / `TrayStatusResult` surface remains available for individual status reads. An unconfigured tray fetches `tray recent` on a worker thread.
 - CLI discovery prefers an explicit `FEANORFS_BIN`, then a colocated binary, then the native package location (`/usr/local/bin/feanorfs` on macOS or `/usr/bin/feanorfs` on Linux), then `PATH`. This order is required for first launch from Finder/LaunchServices, whose `PATH` may omit `/usr/local/bin`.
 - Status subprocess failures retain the last good state but set the error visual and surface a bounded cause, explicit file-preservation reassurance, and the native **Check System Health…** recovery path. Never collapse a known failure into generic “feanorfs failed” copy or send a normal desktop user to Terminal.
 - Action subprocesses use global `--json` (`tray pause`, `conflicts keep`, `agent land`, `sync --no-watch`) so failures surface structured errors.
 - Background sync normally belongs to the per-workspace OS service installed by `feanorfs start`. The tray detects that managed external watcher, stops/restarts the service around Keep/Land/Sync Now, and refuses only unmanaged terminal watchers. It may spawn a legacy `feanorfs sync` child for workspaces without an installed service.
-- `StatusReady` carries `task_generation` + workspace path — stale fetches after workspace switch are ignored.
+- `StatusReady` carries `task_generation` + workspace path plus the combined overview — stale fetches after workspace switch are ignored, and a temporarily unavailable optional recent registry retains the last good folder list.
 - Pause = `feanorfs tray pause`; its marker lives in private global workspace state. The watch loop in `feanorfs-client` respects it, and on pause CLI failure the tray re-reads that global marker.
 - Recent workspaces live in locked, atomically replaced `~/.feanorfs/recent.json` (`start`/hidden `tray register` add entries; `stop` removes them and selects the next active workspace).
 - Unavailable recent workspaces remain visible as disabled **— unavailable** entries. **Remove Unavailable Folders…** must warn about disconnected external drives, require confirmation, and shell hidden `feanorfs --json tray forget-unavailable`; the CLI alone owns the locked/atomic mutation. Cleanup removes only tray records and must not delete files, `.feanorfs`, credentials, services, hubs, or remote snapshots.

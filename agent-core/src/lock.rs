@@ -70,14 +70,23 @@ pub fn is_stale(path: &Path, max_age_secs: u64) -> bool {
 }
 
 /// Check whether the sync lock is actively held (not stale) by another process.
-pub fn is_sync_lock_active(base: &Path) -> bool {
-    let Ok(path) = lock_path(base, "sync.lock") else {
-        return false;
-    };
+///
+/// The argument is an already-resolved private workspace state directory.
+/// Unlike [`is_sync_lock_active`], this helper does not resolve, migrate, or
+/// maintain a workspace path.
+pub fn is_sync_lock_active_at_state(state: &Path) -> bool {
+    let path = state.join("sync.lock");
     if !path.exists() || is_stale(&path, STALE_SYNC_SECS) {
         return false;
     }
     read_lock_meta(&path).is_some_and(|(pid, _)| pid != std::process::id())
+}
+
+pub fn is_sync_lock_active(base: &Path) -> bool {
+    let Ok(state) = crate::workspace_layout::ensure_workspace_state(base) else {
+        return false;
+    };
+    is_sync_lock_active_at_state(&state)
 }
 
 fn write_pid_ts(file: &mut File) -> Result<()> {
@@ -257,7 +266,7 @@ impl Drop for DispatcherLock {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stale, pid_alive};
+    use super::{is_stale, is_sync_lock_active_at_state, pid_alive};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -293,5 +302,19 @@ mod tests {
         let path = directory.path().join("garbage.lock");
         fs::write(&path, b"not-a-lock").unwrap();
         assert!(is_stale(&path, 600));
+    }
+
+    #[test]
+    fn pre_resolved_sync_lock_probe_uses_state_directory_directly() {
+        let state = tempfile::tempdir().unwrap();
+        fs::write(
+            state.path().join("sync.lock"),
+            format!("{}\n{}\n", i32::MAX, 0),
+        )
+        .unwrap();
+
+        // The helper receives the private state directory itself. It must not
+        // reinterpret it as a project path and run workspace migration.
+        assert!(!is_sync_lock_active_at_state(state.path()));
     }
 }

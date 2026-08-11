@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The desktop tray now refreshes mirror status and recent folders through one
+  bounded `tray overview` response, so polling no longer performs synchronous
+  recent-workspace reads or resolves protected workspace credentials merely to
+  label a folder. A fresh profile with no global state remains read-only and
+  returns an empty recent-workspace projection.
+
+### Performance
+
+- Large `local_state.json` updates now stream deterministic, size-bounded JSON
+  directly into the existing crash-safe atomic replacement instead of cloning
+  the complete state and allocating a second full JSON document. Routine tray
+  refreshes also hash their visible state structurally rather than serializing
+  it on every polling interval.
+
 ## [0.9.0](https://github.com/rapm94/feanorfs/compare/v0.8.1...v0.9.0) - 2026-08-11
 
 ### Added

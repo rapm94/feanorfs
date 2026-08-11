@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Aggregate dashboard for the tray app — one subprocess call instead of three.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct TrayStatusResult {
     /// `idle` | `out_of_sync` | `offline` | `conflict` | `error` | `syncing`
     pub mirror_state: String,
@@ -18,7 +18,19 @@ pub struct TrayStatusResult {
     pub agents: TrayAgentsSummary,
 }
 
+/// One bounded desktop refresh: status plus the global folder registry.
+///
+/// Keeping this as a separate additive contract preserves the shipped
+/// `TrayStatusResult` JSON shape while allowing the tray to use one CLI
+/// process per refresh instead of separate status and recent-list processes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrayOverviewResult {
+    pub status: TrayStatusResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent: Option<RecentWorkspacesResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct TrayConflictEntry {
     pub path: String,
     /// `edit_edit` | `edit_delete` | `delete_edit`
@@ -43,14 +55,14 @@ pub struct WorkerStatusSnapshot {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct TrayAgentsSummary {
     pub working: u32,
     pub need_attention: u32,
     pub entries: Vec<TrayAgentEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct TrayAgentEntry {
     pub name: String,
     /// `clean` | `changes` | `conflicts` | `offline`
@@ -59,13 +71,13 @@ pub struct TrayAgentEntry {
     pub conflict_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct RecentWorkspacesResult {
     pub active: Option<String>,
     pub workspaces: Vec<RecentWorkspaceEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct RecentWorkspaceEntry {
     pub path: String,
     pub workspace_id: String,
@@ -137,6 +149,13 @@ pub mod fixtures {
         }
     }
 
+    pub fn tray_overview_result() -> TrayOverviewResult {
+        TrayOverviewResult {
+            status: tray_status_result(),
+            recent: Some(recent_workspaces_result()),
+        }
+    }
+
     pub fn tray_pause_result() -> TrayPauseResult {
         TrayPauseResult { paused: true }
     }
@@ -168,6 +187,10 @@ pub mod fixtures {
 
     pub fn recent_workspaces_json() -> String {
         serde_json::to_string(&recent_workspaces_result()).unwrap()
+    }
+
+    pub fn tray_overview_json() -> String {
+        serde_json::to_string(&tray_overview_result()).unwrap()
     }
 
     pub fn tray_pause_json() -> String {

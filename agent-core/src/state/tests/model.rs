@@ -1,4 +1,7 @@
-use super::super::{AccessEntryV1, LocalStateV1, ACCESS_LOG_MAX_ENTRIES, CURRENT_SCHEMA_VERSION};
+use super::super::{
+    AccessEntryV1, ConflictResolutionV1, LocalStateV1, ACCESS_LOG_MAX_ENTRIES,
+    CURRENT_SCHEMA_VERSION,
+};
 use super::{cache_entry, empty_state};
 
 #[test]
@@ -14,6 +17,116 @@ fn serde_roundtrip_is_deterministic() {
     let first = state.to_json().expect("serialize");
     let second = state.to_json().expect("serialize again");
     assert_eq!(first, second);
+}
+
+#[test]
+fn streaming_serialization_matches_to_json_bytes() {
+    let mut state = empty_state();
+    state
+        .local_files
+        .insert("a.txt".into(), cache_entry("a", 100));
+    state.file_access_log.push(AccessEntryV1 {
+        path: "b.txt".into(),
+        sibling_path: "a.txt".into(),
+        weight: 1.0,
+        updated_at: 1,
+    });
+
+    let canonical = state
+        .canonical_for_serialize()
+        .expect("build canonical serialization view");
+    let expected = serde_json::to_string_pretty(&canonical).expect("serialize canonical state");
+    assert_eq!(state.to_json().expect("serialize via public API"), expected);
+    let mut streamed = Vec::new();
+    let bytes = state
+        .write_json(&mut streamed)
+        .expect("stream canonical state");
+
+    assert_eq!(bytes, expected.len());
+    assert_eq!(streamed, expected.as_bytes());
+}
+
+#[test]
+fn streaming_serialization_rejects_overflow_without_writing_past_limit() {
+    let mut state = empty_state();
+    state
+        .local_files
+        .insert("a.txt".into(), cache_entry("a", 100));
+    let expected = state.to_json().expect("serialize canonical state");
+    let limit = expected.len() - 1;
+    let mut streamed = Vec::new();
+
+    let error = state
+        .write_json_with_limit(&mut streamed, limit)
+        .expect_err("serialization should reject a bounded overflow");
+
+    assert!(error.to_string().contains("exceeds"));
+    assert!(streamed.len() <= limit);
+}
+
+#[test]
+fn serialization_sorts_borrowed_vectors_without_mutating_state() {
+    let mut state = empty_state();
+    state.file_access_log = vec![
+        AccessEntryV1 {
+            path: "z.txt".into(),
+            sibling_path: "a.txt".into(),
+            weight: 1.0,
+            updated_at: 1,
+        },
+        AccessEntryV1 {
+            path: "a.txt".into(),
+            sibling_path: "z.txt".into(),
+            weight: 1.0,
+            updated_at: 2,
+        },
+    ];
+    state.conflict_resolutions = vec![
+        ConflictResolutionV1 {
+            path: "z.txt".into(),
+            method: "local".into(),
+            source_file_hash: None,
+            resolved_at: 2,
+            resolver: "human".into(),
+        },
+        ConflictResolutionV1 {
+            path: "a.txt".into(),
+            method: "cloud".into(),
+            source_file_hash: None,
+            resolved_at: 1,
+            resolver: "human".into(),
+        },
+    ];
+
+    let json = state.to_json().expect("serialize canonical state");
+    let serialized: serde_json::Value = serde_json::from_str(&json).expect("parse state JSON");
+
+    assert_eq!(serialized["file_access_log"][0]["path"], "a.txt");
+    assert_eq!(serialized["conflict_resolutions"][0]["path"], "a.txt");
+    assert_eq!(state.file_access_log[0].path, "z.txt");
+    assert_eq!(state.conflict_resolutions[0].path, "z.txt");
+}
+
+#[test]
+#[ignore = "manual 100k-entry local-state serialization profile"]
+fn local_state_serialization_profile_100k() {
+    let mut state = empty_state();
+    for index in 0..100_000 {
+        let path = format!("src/file_{index:06}.txt");
+        state
+            .local_files
+            .insert(path, cache_entry(&format!("entry-{index:06}"), index));
+    }
+
+    let started = std::time::Instant::now();
+    let json = state.to_json().expect("serialize large local state");
+    let elapsed = started.elapsed();
+
+    assert!(json.len() > 10_000_000);
+    eprintln!(
+        "local_state_serialization_profile_100k: elapsed={elapsed:.2?} bytes={}",
+        json.len()
+    );
 }
 
 #[test]

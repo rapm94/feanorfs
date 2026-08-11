@@ -26,6 +26,38 @@ fn legacy_format_keeps_loading_historical_keys() {
     validate_e2ee_key("historical-human-passphrase", 1).expect("legacy key remains readable");
 }
 
+#[test]
+fn workspace_id_probe_does_not_resolve_os_credentials() {
+    let workspace = tempfile::tempdir().unwrap();
+    let state = crate::workspace_layout::ensure_workspace_state(workspace.path()).unwrap();
+    std::fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "server_url": "https://hub.example",
+            "workspace_id": "public-workspace-id",
+            "format_version": 3,
+            "hub_local": false,
+            "credential_store": "os",
+            "credential_id": "fsc1-unavailable-in-test"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        crate::local::load_workspace_id(workspace.path()).unwrap(),
+        "public-workspace-id"
+    );
+    assert_eq!(
+        crate::local::load_workspace_id_from_state(&state).unwrap(),
+        "public-workspace-id"
+    );
+    let error = crate::local::load_config(workspace.path())
+        .expect_err("full config loading must still fail closed");
+    let message = error.to_string();
+    assert!(message.contains("credential") || message.contains("Keychain"));
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_credentials_are_private() {

@@ -9,6 +9,7 @@ Shared data models, canonical Merkle tree/snapshot objects, sync delta (`compute
 - Crate: `feanorfs-common` (library only; no binary).
 - `release-product-state.txt` is a content-only release-selection carrier maintained by `scripts/update-release-product-state.sh`; it is not compiled or read at runtime.
 - `integrator_contract.rs` — canonical randomized-integrator contract (candidates, strict canonical capabilities, neutral-only selection/fallback whenever a neutral candidate exists, length-prefixed Blake3 ranking, context-bound `ffint1` encode/parse, bounded paths, and internally consistent terminal digests). Pure and testable; reused verbatim by CLI, SDK, FFI, TS, and MCP.
+- `tray_contract.rs` — bounded secret-free desktop projections. `TrayOverviewResult` additively wraps the stable `TrayStatusResult` plus an optional recent-workspace registry so one refresh needs one CLI process; fixtures are snapshot-tested by the client.
 - Public surface: every item in `src/lib.rs` is `pub` and re-exported through downstream crates. Treat the wire types as a binding contract — changing field names or types requires server AND client releases in lockstep.
 - No file system, network, or sqlite dependencies. Dependencies stay leaf-only: serialization, hashing, randomness/time/error, ChaCha20-Poly1305, and Unicode normalization for canonical portable paths. This crate must remain embeddable in server and client without their heavy transitive stacks.
 

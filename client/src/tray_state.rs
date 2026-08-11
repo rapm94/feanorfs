@@ -14,8 +14,12 @@ fn feanorfs_dir(base: &Path) -> std::io::Result<std::path::PathBuf> {
         .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
+pub(crate) fn is_paused_at_state(state: &Path) -> bool {
+    state.join(PAUSED_FILE).is_file()
+}
+
 pub fn is_paused(base: &Path) -> bool {
-    feanorfs_dir(base).is_ok_and(|dir| dir.join(PAUSED_FILE).is_file())
+    feanorfs_dir(base).is_ok_and(|state| is_paused_at_state(&state))
 }
 
 pub fn set_paused(base: &Path, paused: bool) -> std::io::Result<()> {
@@ -42,29 +46,8 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn write_watch_pid(base: &Path) {
-    let Ok(dir) = feanorfs_dir(base) else {
-        return;
-    };
-    let _ = fs::create_dir_all(&dir);
-    let pid = std::process::id();
-    let now = now_secs();
-    let started_at = *WATCH_PROCESS_STARTED_AT.get_or_init(|| now);
-    let content = format!("{pid}\n{now}\n{started_at}\n");
-    let _ = fs::write(dir.join(WATCH_PID_FILE), content);
-}
-
-pub fn clear_watch_pid(base: &Path) {
-    if let Ok(dir) = feanorfs_dir(base) {
-        let _ = fs::remove_file(dir.join(WATCH_PID_FILE));
-    }
-}
-
-pub fn is_watching(base: &Path) -> bool {
-    let Ok(dir) = feanorfs_dir(base) else {
-        return false;
-    };
-    let path = dir.join(WATCH_PID_FILE);
+pub(crate) fn is_watching_at_state(state: &Path) -> bool {
+    let path = state.join(WATCH_PID_FILE);
     let Ok(content) = fs::read_to_string(&path) else {
         return false;
     };
@@ -90,8 +73,37 @@ pub fn is_watching(base: &Path) -> bool {
     age < 86_400
 }
 
+pub fn write_watch_pid(base: &Path) {
+    let Ok(dir) = feanorfs_dir(base) else {
+        return;
+    };
+    let _ = fs::create_dir_all(&dir);
+    let pid = std::process::id();
+    let now = now_secs();
+    let started_at = *WATCH_PROCESS_STARTED_AT.get_or_init(|| now);
+    let content = format!("{pid}\n{now}\n{started_at}\n");
+    let _ = fs::write(dir.join(WATCH_PID_FILE), content);
+}
+
+pub fn clear_watch_pid(base: &Path) {
+    if let Ok(dir) = feanorfs_dir(base) {
+        let _ = fs::remove_file(dir.join(WATCH_PID_FILE));
+    }
+}
+
+pub fn is_watching(base: &Path) -> bool {
+    let Ok(state) = feanorfs_dir(base) else {
+        return false;
+    };
+    is_watching_at_state(&state)
+}
+
+pub(crate) fn is_syncing_at_state(state: &Path) -> bool {
+    feanorfs_agent_core::lock::is_sync_lock_active_at_state(state)
+}
+
 pub fn is_syncing(base: &Path) -> bool {
-    feanorfs_agent_core::lock::is_sync_lock_active(base)
+    feanorfs_dir(base).is_ok_and(|state| is_syncing_at_state(&state))
 }
 
 #[cfg(test)]

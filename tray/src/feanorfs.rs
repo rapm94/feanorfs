@@ -1,7 +1,9 @@
 //! Spawn `feanorfs` subprocesses — the tray never duplicates sync logic.
 
 use crate::ui::dialog_text;
-use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
+use feanorfs_common::tray_contract::{
+    RecentWorkspacesResult, TrayOverviewResult, TrayStatusResult,
+};
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -187,19 +189,57 @@ pub fn tray_status(workspace: &Path) -> Result<TrayStatusResult, String> {
         ))
     })?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let detail = stderr
-            .trim()
-            .strip_prefix("Error:")
-            .map(str::trim)
-            .filter(|detail| !detail.is_empty());
-        return Err(status_failure_message(detail));
+        return Err(status_command_failure(&out.stderr));
     }
     serde_json::from_slice(&out.stdout).map_err(|_| {
         status_failure_message(Some(
             "the installed CLI returned unreadable status data; reinstall FeanorFS",
         ))
     })
+}
+
+/// Fetches the complete recurring desktop projection in one CLI process.
+pub fn tray_overview(workspace: &Path) -> Result<TrayOverviewResult, String> {
+    let out = run_in(workspace, &["--json", "tray", "overview"]).map_err(|error| {
+        truncate_error(&format!(
+            "Sync status is unavailable because the FeanorFS command could not start. Your files were not changed. Reinstall FeanorFS and try again. Details: {error}"
+        ))
+    })?;
+    overview_or_fallback(out.status.success(), &out.stdout, || {
+        // Desktop and CLI installers can be replaced independently. Preserve
+        // the stable status contract when a newer tray temporarily runs beside
+        // a CLI that predates the additive `overview` subcommand.
+        tray_status(workspace).map(|status| TrayOverviewResult {
+            status,
+            // Keep the last good folder list. Calling the legacy `recent`
+            // command here could block behind its registry writer and defeat
+            // the bounded status fallback.
+            recent: None,
+        })
+    })
+}
+
+fn overview_or_fallback(
+    command_succeeded: bool,
+    stdout: &[u8],
+    fallback: impl FnOnce() -> Result<TrayOverviewResult, String>,
+) -> Result<TrayOverviewResult, String> {
+    if command_succeeded {
+        if let Ok(overview) = serde_json::from_slice(stdout) {
+            return Ok(overview);
+        }
+    }
+    fallback()
+}
+
+fn status_command_failure(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let detail = stderr
+        .trim()
+        .strip_prefix("Error:")
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty());
+    status_failure_message(detail)
 }
 
 fn status_failure_message(detail: Option<&str>) -> String {
@@ -1002,6 +1042,34 @@ mod tests {
     }
 
     #[test]
+    fn overview_uses_the_additive_contract_when_available() {
+        let expected = feanorfs_common::tray_contract::fixtures::tray_overview_result();
+        let json = serde_json::to_vec(&expected).unwrap();
+
+        let actual = overview_or_fallback(true, &json, || {
+            panic!("valid overview must not invoke the compatibility fallback")
+        })
+        .unwrap();
+
+        assert_eq!(actual.status.workspace_id, expected.status.workspace_id);
+        assert_eq!(
+            actual.recent.unwrap().workspaces.len(),
+            expected.recent.unwrap().workspaces.len()
+        );
+    }
+
+    #[test]
+    fn overview_falls_back_to_stable_status_for_an_older_cli() {
+        let mut expected = feanorfs_common::tray_contract::fixtures::tray_overview_result();
+        expected.recent = None;
+
+        let actual = overview_or_fallback(false, b"", || Ok(expected.clone())).unwrap();
+
+        assert_eq!(actual.status.workspace_id, expected.status.workspace_id);
+        assert!(actual.recent.is_none());
+    }
+
+    #[test]
     fn health_report_reads_only_named_statuses_from_doctor_json() {
         let report: HealthReport = serde_json::from_str(
             r#"{
@@ -1225,5 +1293,64 @@ mod tests {
         std::env::remove_var("FEANORFS_BIN");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "manual profile; run with --ignored --nocapture"]
+    fn profile_cli_discovery_and_subprocess_spawn() {
+        let root = std::env::temp_dir().join(format!(
+            "feanorfs-tray-cli-profile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let sibling = root.join(format!("fake-feanorfs{}", std::env::consts::EXE_SUFFIX));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        const DISCOVERY_ITERATIONS: usize = 50_000;
+        let previous_bin = std::env::var_os("FEANORFS_BIN");
+        std::env::remove_var("FEANORFS_BIN");
+        let started = Instant::now();
+        let mut discovered = 0_usize;
+        for _ in 0..DISCOVERY_ITERATIONS {
+            if std::hint::black_box(feanorfs_bin()).is_empty() {
+                // A real discovery result is always non-empty; retain the
+                // branch so the benchmark consumes each returned value.
+            } else {
+                discovered = discovered.saturating_add(1);
+            }
+        }
+        let discovery_elapsed = started.elapsed();
+
+        std::env::set_var("FEANORFS_BIN", &sibling);
+        const SPAWN_ITERATIONS: usize = 100;
+        let started = Instant::now();
+        let mut successful = 0_usize;
+        for _ in 0..SPAWN_ITERATIONS {
+            if run_in(&workspace, &["--json", "config"]).is_ok() {
+                successful = successful.saturating_add(1);
+            }
+        }
+        let spawn_elapsed = started.elapsed();
+        if let Some(previous_bin) = previous_bin {
+            std::env::set_var("FEANORFS_BIN", previous_bin);
+        } else {
+            std::env::remove_var("FEANORFS_BIN");
+        }
+
+        eprintln!(
+            "CLI profile: discovery={discovery_elapsed:?} ({discovered}/{DISCOVERY_ITERATIONS}), run_in={spawn_elapsed:?} ({successful}/{SPAWN_ITERATIONS})"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -58,7 +58,8 @@ pub use feanorfs_common::{
 };
 pub use feanorfs_common::{
     ConflictKeepResult, ConflictShowResult, RecentWorkspaceEntry, RecentWorkspacesResult,
-    TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayStatusResult, WorkerStatusSnapshot,
+    TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayOverviewResult, TrayStatusResult,
+    WorkerStatusSnapshot,
 };
 pub use feanorfs_common::{
     ConflictMaterializeEntry, ConflictMaterializeResult, EligibilityResult, IntegratorAssignInput,
@@ -70,14 +71,14 @@ pub use feanorfs_common::{
 pub use hub_transfer::{transfer_hub, HubTransferResult};
 pub use join_preflight::{preview_join, JoinPathGroup, JoinPreflight};
 pub use local::{
-    load_config, load_global_config, save_config, save_config_secure, save_global_config,
-    save_global_config_secure, validate_e2ee_key, ClientDb, Config, CredentialProtection,
-    GlobalConfig, LOCAL_HUB_URL,
+    load_config, load_global_config, load_workspace_id, save_config, save_config_secure,
+    save_global_config, save_global_config_secure, validate_e2ee_key, ClientDb, Config,
+    CredentialProtection, GlobalConfig, LOCAL_HUB_URL,
 };
 pub use migrate::{legacy_policy_for_config, migrate_workspace};
 pub use recent::{
     forget_unavailable_workspaces, list_recent_workspaces, register_workspace,
-    set_active_workspace, unregister_workspace,
+    set_active_workspace, try_list_recent_workspaces, unregister_workspace,
 };
 pub use recovery::{export_recovery_kit, open_recovery_kit};
 pub use tray::{build_conflict_show, do_tray_status, invalidate_agent_cache};

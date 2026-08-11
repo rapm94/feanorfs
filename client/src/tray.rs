@@ -7,7 +7,10 @@ use crate::commands::{do_status, MirrorState};
 use crate::conflict_artifacts::{is_binary_content, resolve_artifact, ArtifactRole};
 use crate::local::{load_config, ClientDb};
 use crate::lock::try_acquire_sync_lock;
-use crate::tray_state::{is_paused, is_syncing, is_watching};
+use crate::tray_state::{
+    is_paused, is_paused_at_state, is_syncing, is_syncing_at_state, is_watching,
+    is_watching_at_state,
+};
 use anyhow::Result;
 use feanorfs_common::tray_contract::{
     TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayStatusResult, WorkerStatusSnapshot,
@@ -34,13 +37,21 @@ struct CachedAgents {
 fn agent_cache_path(current_dir: &Path) -> Option<PathBuf> {
     feanorfs_agent_core::ensure_workspace_state(current_dir)
         .ok()
-        .map(|state| state.join(AGENT_CACHE_FILE))
+        .map(|state| agent_cache_path_at_state(&state))
+}
+
+fn agent_cache_path_at_state(state: &Path) -> PathBuf {
+    state.join(AGENT_CACHE_FILE)
 }
 
 fn worker_status_path(current_dir: &Path) -> Option<PathBuf> {
     feanorfs_agent_core::ensure_workspace_state(current_dir)
         .ok()
-        .map(|state| state.join(WORKER_STATUS_FILE))
+        .map(|state| worker_status_path_at_state(&state))
+}
+
+fn worker_status_path_at_state(state: &Path) -> PathBuf {
+    state.join(WORKER_STATUS_FILE)
 }
 
 /// Publishes the bounded secret-free status snapshot after one sync pass.
@@ -69,12 +80,14 @@ pub async fn publish_worker_status(
         published_at_ms: chrono::Utc::now().timestamp_millis(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    if worker_status_path(current_dir).is_none() {
+    let Some(status_path) = worker_status_path(current_dir) else {
         return Ok(());
-    }
-    let state = feanorfs_agent_core::ensure_workspace_state(current_dir)?;
+    };
+    let Some(state) = status_path.parent() else {
+        return Ok(());
+    };
     feanorfs_agent_core::fs_util::atomic_write(
-        &state,
+        state,
         WORKER_STATUS_FILE,
         serde_json::to_vec(&snapshot)?.as_slice(),
     )
@@ -91,8 +104,14 @@ pub fn invalidate_worker_status(current_dir: &Path) {
     }
 }
 
+#[cfg(test)]
 fn load_worker_status(current_dir: &Path) -> Option<WorkerStatusSnapshot> {
-    let content = read_bounded(worker_status_path(current_dir)?.as_path())?;
+    let state = feanorfs_agent_core::ensure_workspace_state(current_dir).ok()?;
+    load_worker_status_at_state(&state)
+}
+
+fn load_worker_status_at_state(state: &Path) -> Option<WorkerStatusSnapshot> {
+    let content = read_bounded(worker_status_path_at_state(state).as_path())?;
     let snapshot: WorkerStatusSnapshot = serde_json::from_slice(&content).ok()?;
     if snapshot.version != env!("CARGO_PKG_VERSION")
         || snapshot.pending_conflicts.len() > MAX_TRAY_CONFLICT_ENTRIES
@@ -113,14 +132,24 @@ fn cache_agents(current_dir: &Path, summary: &TrayAgentsSummary) {
         summary: summary.clone(),
     };
     if let Ok(json) = serde_json::to_vec(&entry) {
-        if let Some(path) = agent_cache_path(current_dir) {
-            let _ = write_atomic(&path, &json);
+        if let Ok(state) = feanorfs_agent_core::ensure_workspace_state(current_dir) {
+            cache_agents_at_state(&state, &json);
         }
     }
 }
 
+fn cache_agents_at_state(state: &Path, json: &[u8]) {
+    let path = agent_cache_path_at_state(state);
+    let _ = write_atomic(&path, json);
+}
+
 fn cached_agents(current_dir: &Path) -> Option<TrayAgentsSummary> {
-    let content = read_bounded(agent_cache_path(current_dir)?.as_path())?;
+    let state = feanorfs_agent_core::ensure_workspace_state(current_dir).ok()?;
+    cached_agents_at_state(&state)
+}
+
+fn cached_agents_at_state(state: &Path) -> Option<TrayAgentsSummary> {
+    let content = read_bounded(agent_cache_path_at_state(state).as_path())?;
     let mut entry: CachedAgents = serde_json::from_slice(&content).ok()?;
     entry.summary.entries.truncate(MAX_TRAY_AGENT_ENTRIES);
     let age_ms = chrono::Utc::now()
@@ -323,20 +352,27 @@ pub async fn do_tray_status(current_dir: &Path) -> Result<TrayStatusResult> {
 /// constant-cost even in large workspaces. `fresh=true` forces the explicit
 /// fresh-status path (bounded lock wait plus a real scan).
 pub async fn do_tray_status_with(current_dir: &Path, fresh: bool) -> Result<TrayStatusResult> {
-    let config = load_config(current_dir)?;
-
     if !fresh {
-        if let Some(snapshot) = load_worker_status(current_dir) {
+        let state = feanorfs_agent_core::ensure_workspace_state(current_dir)?;
+        let workspace_id = feanorfs_agent_core::load_workspace_id_from_state(&state)?;
+        let syncing = is_syncing_at_state(&state);
+        if let Some(snapshot) = load_worker_status_at_state(&state) {
             return Ok(snapshot_tray_status(
                 current_dir,
-                &config,
+                &state,
+                &workspace_id,
                 &snapshot,
-                is_syncing(current_dir),
+                syncing,
             ));
         }
-        return Ok(missing_snapshot_tray_status(current_dir, &config));
+        return Ok(missing_snapshot_tray_status(
+            current_dir,
+            &state,
+            &workspace_id,
+        ));
     }
 
+    let config = load_config(current_dir)?;
     let db = crate::open_client_db(current_dir).await?;
 
     if is_syncing(current_dir) {
@@ -378,11 +414,12 @@ pub async fn do_tray_status_with(current_dir: &Path, fresh: bool) -> Result<Tray
 /// Builds a tray result from the worker snapshot plus local tray state only.
 fn snapshot_tray_status(
     current_dir: &Path,
-    config: &crate::local::Config,
+    state: &Path,
+    workspace_id: &str,
     snapshot: &WorkerStatusSnapshot,
     syncing: bool,
 ) -> TrayStatusResult {
-    let agents = cached_agents(current_dir).unwrap_or(TrayAgentsSummary {
+    let agents = cached_agents_at_state(state).unwrap_or(TrayAgentsSummary {
         working: 0,
         need_attention: 0,
         entries: vec![],
@@ -393,10 +430,10 @@ fn snapshot_tray_status(
         } else {
             snapshot.mirror_state.clone()
         },
-        paused: is_paused(current_dir),
-        watching: is_watching(current_dir),
+        paused: is_paused_at_state(state),
+        watching: is_watching_at_state(state),
         workspace_path: current_dir.to_string_lossy().into_owned(),
-        workspace_id: config.workspace_id.clone(),
+        workspace_id: workspace_id.to_string(),
         workspace_label: workspace_label(current_dir),
         pending_conflict_count: snapshot.pending_conflict_count,
         pending_conflicts: snapshot.pending_conflicts.clone(),
@@ -406,18 +443,19 @@ fn snapshot_tray_status(
 
 fn missing_snapshot_tray_status(
     current_dir: &Path,
-    config: &crate::local::Config,
+    state: &Path,
+    workspace_id: &str,
 ) -> TrayStatusResult {
     TrayStatusResult {
         mirror_state: "syncing".into(),
-        paused: is_paused(current_dir),
-        watching: is_watching(current_dir),
+        paused: is_paused_at_state(state),
+        watching: is_watching_at_state(state),
         workspace_path: current_dir.to_string_lossy().into_owned(),
-        workspace_id: config.workspace_id.clone(),
+        workspace_id: workspace_id.to_string(),
         workspace_label: workspace_label(current_dir),
         pending_conflict_count: 0,
         pending_conflicts: Vec::new(),
-        agents: cached_agents(current_dir).unwrap_or(TrayAgentsSummary {
+        agents: cached_agents_at_state(state).unwrap_or(TrayAgentsSummary {
             working: 0,
             need_attention: 0,
             entries: Vec::new(),

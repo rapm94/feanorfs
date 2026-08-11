@@ -67,9 +67,19 @@ pub fn open_lock_exclusive(lock_path: &Path) -> Result<File> {
     Ok(file)
 }
 
-pub fn atomic_overwrite(path: &Path, data: &[u8]) -> Result<()> {
+/// Stream a replacement into an [`AtomicWriteFile`] and commit it with the
+/// same durability and fault-injection semantics as [`atomic_overwrite`].
+///
+/// The callback runs while the destination still contains its old bytes. Any
+/// callback error drops the temporary file without committing it. This keeps
+/// callers from having to allocate the complete replacement before entering
+/// the atomic-write path.
+pub(crate) fn atomic_overwrite_with<F>(path: &Path, write: F) -> Result<()>
+where
+    F: FnOnce(&mut AtomicWriteFile) -> Result<()>,
+{
     let mut awf = AtomicWriteFile::open(path).context("create atomic write file")?;
-    awf.write_all(data).context("write atomic temp file")?;
+    write(&mut awf)?;
 
     #[cfg(test)]
     {
@@ -112,6 +122,12 @@ pub fn atomic_overwrite(path: &Path, data: &[u8]) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn atomic_overwrite(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_overwrite_with(path, |awf| {
+        awf.write_all(data).context("write atomic temp file")
+    })
 }
 
 pub fn create_lock_acquire_exclusive(lock_path: &Path) -> Result<File> {

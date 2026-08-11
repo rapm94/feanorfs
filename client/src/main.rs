@@ -330,6 +330,7 @@ mod cli_tests {
             _ => panic!("expected workspace start command"),
         }
         Cli::try_parse_from(["feanorfs", "--json", "tray", "status"]).unwrap();
+        Cli::try_parse_from(["feanorfs", "--json", "tray", "overview"]).unwrap();
         Cli::try_parse_from(["feanorfs", "tray", "pause"]).unwrap();
         Cli::try_parse_from(["feanorfs", "--json", "tray", "pause"]).unwrap();
         Cli::try_parse_from(["feanorfs", "tray", "resume"]).unwrap();
