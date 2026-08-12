@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/rapm94/feanorfs/compare/v0.9.1...v0.9.2) - 2026-08-12
+
+### Fixed
+
+- *(ci)* avoid stale workflow status index
+- *(ci)* await Windows runner reconciliation
+- *(ci)* make release gates deterministic
+
 ## [0.9.1](https://github.com/rapm94/feanorfs/compare/v0.9.0...v0.9.1) - 2026-08-12
 
 ### Other
