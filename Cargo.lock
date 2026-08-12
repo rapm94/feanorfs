@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "feanorfs-agent-core"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "feanorfs-agent-node"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "feanorfs-agent-core",
  "feanorfs-common",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "feanorfs-client"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1520,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "feanorfs-common"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1534,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "feanorfs-ffi"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "cbindgen",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "feanorfs-server"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1587,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "feanorfs-test-support"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "ctor",
  "dtor",
@@ -1596,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "feanorfs-tray"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "arboard",
  "feanorfs-common",
