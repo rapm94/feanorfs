@@ -88,7 +88,6 @@ jobs:
               -f branch=main \
               -f head_sha="$EXPECTED_SHA" \
               -f event=push \
-              -f status=completed \
               -f per_page=100)"
             jq -r \
               --arg repository "$REPOSITORY" \
@@ -133,7 +132,7 @@ jobs:
               release_target="$(jq -r '.target_commitish' <<<"$release_json")"
               release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
               release_runs="$(gh api --method GET "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
-                -f head_sha="$EXPECTED_SHA" -f event=push -f status=completed -f per_page=100)"
+                -f head_sha="$EXPECTED_SHA" -f event=push -f per_page=100)"
               if [ "$release_sha" = "$EXPECTED_SHA" ] && \
                 [ "$(jq '.assets | length' <<<"$release_json")" -gt 0 ] && \
                 jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" --arg sha "$EXPECTED_SHA" \

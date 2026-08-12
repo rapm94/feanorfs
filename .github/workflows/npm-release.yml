@@ -72,7 +72,7 @@ jobs:
               exit 1
             fi
             RUNS="$(gh api --method GET "repos/$REPOSITORY/actions/workflows/ci.yml/runs" \
-              -f head_sha="$EXPECTED_SHA" -f event=push -f status=completed -f per_page=100)"
+              -f head_sha="$EXPECTED_SHA" -f event=push -f per_page=100)"
             if ! jq -e --arg repository "$REPOSITORY" \
               'any(.workflow_runs[]; .conclusion == "success" and .head_branch == "main" and .head_repository.full_name == $repository)' \
               <<<"$RUNS" >/dev/null; then
