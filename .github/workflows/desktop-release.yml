@@ -1,31 +1,28 @@
-# Build platform-native desktop bundles after cargo-dist publishes the core CLI.
-# Linux bundles are checksummed and attested. Signed Windows publication is
-# opt-in until the production Azure credentials are configured: set the
-# repository variable RELEASE_SIGNING_ENABLED to exactly "true" to enable it.
+# Build platform-native desktop bundles inside the cargo-dist release graph.
+# Final products are staged as Actions artifacts; cargo-dist creates the public
+# release only after the combined manifest passes. Signed Windows publication
+# remains opt-in until production Azure credentials are configured.
 name: Linux and Windows desktop release
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      release_tag:
-        description: Existing stable release tag to recover from trusted main
+      plan:
+        description: Exact cargo-dist release plan
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: desktop-package-${{ inputs.release_tag || github.ref_name }}
+  group: desktop-package-${{ github.repository }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
-  wait-for-release:
-    name: Verify exact cargo-dist release source
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  verify-release:
+    name: Verify exact trusted release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       actions: read
       contents: read
@@ -34,14 +31,13 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Wait for successful cargo-dist release
+      - name: Resolve exact cargo-dist release source
         id: release
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          DIST_PLAN: ${{ inputs.plan }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INVOCATION_REF: ${{ github.ref }}
           INVOCATION_SHA: ${{ github.sha }}
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -49,30 +45,17 @@ jobs:
             echo "::error::Release packaging runs only in rapm94/feanorfs."
             exit 1
           fi
-          case "$EVENT_NAME" in
-            push)
-              if [ "$INVOCATION_REF" != "refs/tags/$RELEASE_TAG" ]; then
-                echo "::error::Tag publication must run at refs/tags/$RELEASE_TAG, not $INVOCATION_REF."
-                exit 1
-              fi
-              ;;
-            workflow_dispatch)
-              if [ "$INVOCATION_REF" != refs/heads/main ]; then
-                echo "::error::Manual desktop recovery must be dispatched from main."
-                exit 1
-              fi
-              ;;
-            *)
-              echo "::error::Release packaging requires a tag push or manual recovery from main."
-              exit 1
-              ;;
-          esac
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tag must be canonical stable SemVer (vMAJOR.MINOR.PATCH): $RELEASE_TAG"
+          release_tag="$(jq -r '.announcement_tag // empty' <<<"$DIST_PLAN")"
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::cargo-dist planned a non-canonical stable tag: $release_tag"
+            exit 1
+          fi
+          if [ "$INVOCATION_REF" != "refs/tags/$release_tag" ]; then
+            echo "::error::Release plan is for $release_tag, but invocation ref is $INVOCATION_REF."
             exit 1
           fi
 
-          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$release_tag")"
           tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
           tag_type="$(jq -r '.object.type' <<<"$tag_object")"
           if [ "$tag_type" = tag ]; then
@@ -84,52 +67,14 @@ jobs:
             echo "::error::Release tag does not resolve directly to a commit."
             exit 1
           fi
-
-          ready=false
-          release_json=''
-          for attempt in $(seq 1 60); do
-            if release_json="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null)"; then
-              release_target="$(jq -r '.target_commitish' <<<"$release_json")"
-              release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-              if [ "$tag_sha" != "$release_sha" ]; then
-                echo "::error::Release targets $release_sha, but $RELEASE_TAG resolves to $tag_sha."
-                exit 1
-              fi
-              release_runs="$(gh api --method GET \
-                "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
-                -f head_sha="$tag_sha" \
-                -f event=push \
-                -f per_page=100)"
-              if [ "$(jq '.assets | length' <<<"$release_json")" -gt 0 ] && \
-                jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" --arg sha "$tag_sha" \
-                  'any(.workflow_runs[];
-                    .conclusion == "success" and
-                    .event == "push" and
-                    .head_branch == $tag and
-                    .head_sha == $sha and
-                    .head_repository.full_name == $repository and
-                    .repository.full_name == $repository)' \
-                  <<<"$release_runs" >/dev/null; then
-                ready=true
-                break
-              fi
-            fi
-            echo "Waiting for successful cargo-dist publication of $RELEASE_TAG ($attempt/60)..."
-            sleep 30
-          done
-          if [ "$ready" != true ]; then
-            echo "::error::Timed out waiting for a successful cargo-dist release of $RELEASE_TAG."
-            exit 1
-          fi
-
-          if [ "$EVENT_NAME" = push ] && [ "$tag_sha" != "$INVOCATION_SHA" ]; then
+          if [ "$tag_sha" != "$INVOCATION_SHA" ]; then
             echo "::error::Tag resolves to $tag_sha, expected invocation SHA $INVOCATION_SHA."
             exit 1
           fi
           {
             echo "sha=$tag_sha"
-            echo "tag=$RELEASE_TAG"
-            echo "version=${RELEASE_TAG#v}"
+            echo "tag=$release_tag"
+            echo "version=${release_tag#v}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout verified release commit
@@ -141,10 +86,8 @@ jobs:
 
       - name: Require trusted main CI, Security, and matching version
         env:
-          EVENT_NAME: ${{ github.event_name }}
           EXPECTED_SHA: ${{ steps.release.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INVOCATION_REF: ${{ github.ref }}
           INVOCATION_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
@@ -224,28 +167,14 @@ jobs:
           }
 
           require_trusted_sha "$EXPECTED_SHA" "release commit"
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then
-            if [ "$INVOCATION_REF" != refs/heads/main ]; then
-              echo "::error::Manual desktop recovery must be dispatched from main."
-              exit 1
-            fi
-            if ! git merge-base --is-ancestor "$INVOCATION_SHA" origin/main; then
-              echo "::error::Manual recovery commit $INVOCATION_SHA is not reachable from origin/main."
-              exit 1
-            fi
-            if ! git merge-base --is-ancestor "$EXPECTED_SHA" "$INVOCATION_SHA"; then
-              echo "::error::Manual recovery commit $INVOCATION_SHA predates release commit $EXPECTED_SHA."
-              exit 1
-            fi
-            require_trusted_sha "$INVOCATION_SHA" "manual recovery commit"
-          elif [ "$INVOCATION_SHA" != "$EXPECTED_SHA" ]; then
+          if [ "$INVOCATION_SHA" != "$EXPECTED_SHA" ]; then
             echo "::error::Tag invocation SHA $INVOCATION_SHA does not match release commit $EXPECTED_SHA."
             exit 1
           fi
 
 
   build-linux:
-    needs: wait-for-release
+    needs: verify-release
     name: Build Linux ${{ matrix.asset_arch }} desktop bundle
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -255,7 +184,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             rust_arch: x86_64
             asset_arch: x86_64
             nfpm_archive_arch: x86_64
@@ -269,7 +198,7 @@ jobs:
       - name: Checkout verified release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.wait-for-release.outputs.sha }}
+          ref: ${{ needs.verify-release.outputs.sha }}
           persist-credentials: false
       - name: Install Linux desktop dependencies
         run: >-
@@ -293,7 +222,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: stable
+          toolchain: 1.88.0
       - name: Build CLI and tray
         run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
       - name: Verify and package desktop bundle
@@ -339,7 +268,7 @@ jobs:
       - name: Upload unsigned Linux bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: feanorfs-linux-${{ matrix.asset_arch }}-${{ needs.wait-for-release.outputs.sha }}
+          name: feanorfs-linux-${{ matrix.asset_arch }}-${{ needs.verify-release.outputs.sha }}
           path: |
             FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz
             FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz.sha256
@@ -353,16 +282,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  publish-linux:
+  stage-linux:
     needs:
-      - wait-for-release
+      - verify-release
       - build-linux
-    name: Attest and publish Linux ${{ matrix.asset_arch }}
+    name: Attest and stage Linux ${{ matrix.asset_arch }}
     environment: prod
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: write
+      actions: read
+      contents: read
       attestations: write
       id-token: write
     strategy:
@@ -372,25 +302,26 @@ jobs:
     steps:
       - name: Verify immutable release tag
         env:
-          EXPECTED_SHA: ${{ needs.wait-for-release.outputs.sha }}
+          EXPECTED_SHA: ${{ needs.verify-release.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
         run: |
+          set -euo pipefail
           tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
           tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
           tag_type="$(jq -r '.object.type' <<<"$tag_object")"
           if [ "$tag_type" = tag ]; then
-            tag_sha="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
+            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
+            tag_type="$(jq -r '.object.type' <<<"$annotated")"
           fi
-          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          test "$tag_sha" = "$release_sha"
-          if [ -n "$EXPECTED_SHA" ]; then test "$tag_sha" = "$EXPECTED_SHA"; fi
+          test "$tag_type" = commit
+          test "$tag_sha" = "$EXPECTED_SHA"
       - name: Download Linux bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: feanorfs-linux-${{ matrix.asset_arch }}-${{ needs.wait-for-release.outputs.sha }}
+          name: feanorfs-linux-${{ matrix.asset_arch }}-${{ needs.verify-release.outputs.sha }}
           path: release
       - name: Verify checksums
         working-directory: release
@@ -414,37 +345,27 @@ jobs:
             release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst
             release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst.sha256
             release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
-      - name: Upload Linux release assets
-        env:
-          EXPECTED_SHA: ${{ needs.wait-for-release.outputs.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          tag_sha="$(gh api "repos/$REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')"
-          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          if [ "$tag_sha" != "$EXPECTED_SHA" ] || [ "$release_sha" != "$EXPECTED_SHA" ]; then
-            echo "::error::Release source changed after validation; refusing to upload."
-            exit 1
-          fi
-          gh release upload "$RELEASE_TAG" \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz.sha256 \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.deb \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.deb.sha256 \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm.sha256 \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst.sha256 \
-            release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt \
-            --repo "$REPOSITORY" \
-            --clobber
+      - name: Stage Linux release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: artifacts-linux-${{ matrix.asset_arch }}-${{ needs.verify-release.outputs.sha }}
+          path: |
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.tar.xz.sha256
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.deb
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.deb.sha256
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.rpm.sha256
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst.sha256
+            release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
+          if-no-files-found: error
+          retention-days: 1
 
   build-windows:
-    needs: wait-for-release
+    needs: verify-release
     name: Build Windows x86_64 desktop binaries
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 45
     permissions:
       contents: read
@@ -452,18 +373,18 @@ jobs:
       - name: Checkout verified release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.wait-for-release.outputs.sha }}
+          ref: ${{ needs.verify-release.outputs.sha }}
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: stable
+          toolchain: 1.88.0
       - name: Build CLI and tray
         run: cargo build --release -p feanorfs-client -p feanorfs-tray --locked
       - name: Compile and smoke unsigned Windows installer
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
         run: |
           $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
           if (-not $iscc) {
@@ -487,54 +408,56 @@ jobs:
       - name: Upload unsigned Windows binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: feanorfs-windows-x86_64-unsigned-${{ needs.wait-for-release.outputs.sha }}
+          name: feanorfs-windows-x86_64-unsigned-${{ needs.verify-release.outputs.sha }}
           path: |
             target/release/feanorfs.exe
             target/release/feanorfs-tray.exe
           if-no-files-found: error
           retention-days: 1
 
-  sign-publish-windows:
+  sign-stage-windows:
     needs:
-      - wait-for-release
+      - verify-release
       - build-windows
     if: ${{ vars.RELEASE_SIGNING_ENABLED == 'true' }}
-    name: Sign and publish Windows x86_64 desktop bundle
+    name: Sign and stage Windows x86_64 desktop bundle
     environment: prod
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 35
     permissions:
-      contents: write
+      actions: read
+      contents: read
       attestations: write
       id-token: write
     steps:
       - name: Verify immutable release tag
         shell: bash
         env:
-          EXPECTED_SHA: ${{ needs.wait-for-release.outputs.sha }}
+          EXPECTED_SHA: ${{ needs.verify-release.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
         run: |
+          set -euo pipefail
           tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
           tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
           tag_type="$(jq -r '.object.type' <<<"$tag_object")"
           if [ "$tag_type" = tag ]; then
-            tag_sha="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
+            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
+            tag_type="$(jq -r '.object.type' <<<"$annotated")"
           fi
-          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          test "$tag_sha" = "$release_sha"
-          if [ -n "$EXPECTED_SHA" ]; then test "$tag_sha" = "$EXPECTED_SHA"; fi
+          test "$tag_type" = commit
+          test "$tag_sha" = "$EXPECTED_SHA"
       - name: Checkout verified release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.wait-for-release.outputs.sha }}
+          ref: ${{ needs.verify-release.outputs.sha }}
           persist-credentials: false
       - name: Download unsigned Windows binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: feanorfs-windows-x86_64-unsigned-${{ needs.wait-for-release.outputs.sha }}
+          name: feanorfs-windows-x86_64-unsigned-${{ needs.verify-release.outputs.sha }}
           path: native
       - name: Require Azure Artifact Signing configuration
         shell: pwsh
@@ -577,7 +500,7 @@ jobs:
       - name: Compile installer from signed binaries
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
         run: |
           $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
           if (-not $iscc) {
@@ -662,30 +585,19 @@ jobs:
             FeanorFS-windows-x86_64-setup.exe
             FeanorFS-windows-x86_64-setup.exe.sha256
             feanorfs-windows-installer.ps1
-      - name: Upload Windows release assets
-        shell: bash
-        env:
-          EXPECTED_SHA: ${{ needs.wait-for-release.outputs.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          tag_sha="$(gh api "repos/$REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')"
-          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          if [ "$tag_sha" != "$EXPECTED_SHA" ] || [ "$release_sha" != "$EXPECTED_SHA" ]; then
-            echo "::error::Release source changed after validation; refusing to upload."
-            exit 1
-          fi
-          gh release upload "$RELEASE_TAG" \
-            FeanorFS-windows-x86_64.zip \
-            FeanorFS-windows-x86_64.zip.sha256 \
-            FeanorFS-windows-x86_64.verification.txt \
-            FeanorFS-windows-x86_64-setup.exe \
-            FeanorFS-windows-x86_64-setup.exe.sha256 \
-            feanorfs-windows-installer.ps1 \
-            --repo "$REPOSITORY" \
-            --clobber
+      - name: Stage Windows release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: artifacts-windows-x86_64-${{ needs.verify-release.outputs.sha }}
+          path: |
+            FeanorFS-windows-x86_64.zip
+            FeanorFS-windows-x86_64.zip.sha256
+            FeanorFS-windows-x86_64.verification.txt
+            FeanorFS-windows-x86_64-setup.exe
+            FeanorFS-windows-x86_64-setup.exe.sha256
+            feanorfs-windows-installer.ps1
+          if-no-files-found: error
+          retention-days: 1
       - name: Remove Azure credentials
         if: always()
         shell: pwsh

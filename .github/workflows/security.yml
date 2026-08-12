@@ -72,6 +72,7 @@ jobs:
             .github/workflows/security.yml
             .github/workflows/tray-release.yml
             .github/workflows/unsigned-desktop-release.yml
+            .github/workflows/validate-release-assets.yml
           min-severity: medium
           persona: pedantic
           version: "1.26.1"

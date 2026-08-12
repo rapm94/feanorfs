@@ -16,23 +16,27 @@ require_text() {
 for workflow in \
     .github/workflows/desktop-release.yml \
     .github/workflows/tray-release.yml; do
-    require_text "$workflow" 'case "$EVENT_NAME" in'
-    require_text "$workflow" 'if [ "$INVOCATION_REF" != "refs/tags/$RELEASE_TAG" ]; then'
-    require_text "$workflow" 'if [ "$INVOCATION_REF" != refs/heads/main ]; then'
-    require_text "$workflow" 'if [ "$EVENT_NAME" = push ] && [ "$tag_sha" != "$INVOCATION_SHA" ]; then'
-    require_text "$workflow" '-f head_sha="$tag_sha"'
+    require_text "$workflow" 'workflow_call:'
+    require_text "$workflow" 'DIST_PLAN: ${{ inputs.plan }}'
+    require_text "$workflow" 'if [ "$INVOCATION_REF" != "refs/tags/$release_tag" ]; then'
+    require_text "$workflow" 'if [ "$tag_sha" != "$INVOCATION_SHA" ]; then'
+    require_text "$workflow" '-f head_sha="$expected_sha"'
     require_text "$workflow" '.head_sha == $sha and'
     require_text "$workflow" 'require_trusted_sha "$EXPECTED_SHA" "release commit"'
-    require_text "$workflow" 'git merge-base --is-ancestor "$INVOCATION_SHA" origin/main'
-    require_text "$workflow" 'git merge-base --is-ancestor "$EXPECTED_SHA" "$INVOCATION_SHA"'
-    require_text "$workflow" 'require_trusted_sha "$INVOCATION_SHA" "manual recovery commit"'
+    require_text "$workflow" 'git merge-base --is-ancestor "$EXPECTED_SHA" origin/main'
     require_text "$workflow" 'ref: ${{ steps.release.outputs.sha }}'
-    require_text "$workflow" 'ref: ${{ needs.wait-for-release.outputs.sha }}'
+    require_text "$workflow" 'ref: ${{ needs.verify-release.outputs.sha }}'
     require_text "$workflow" 'if: ${{ vars.RELEASE_SIGNING_ENABLED == '\''true'\'' }}'
+    require_text "$workflow" 'toolchain: 1.88.0'
 
-    if grep -Fx -- '          if [ "$tag_sha" != "$INVOCATION_SHA" ]; then' "$workflow" >/dev/null; then
-        fail "$workflow still equates a manual recovery SHA with the release tag SHA"
-    fi
+    ! grep -Eq '^  (push|workflow_dispatch):' "$workflow" || \
+        fail "$workflow must run only as a cargo-dist reusable workflow"
+    ! grep -F -- 'gh release' "$workflow" >/dev/null || \
+        fail "$workflow must stage artifacts instead of mutating a public release"
+    ! grep -F -- 'releases/tags' "$workflow" >/dev/null || \
+        fail "$workflow still waits for a public release"
+    ! grep -F -- 'wait-for-release' "$workflow" >/dev/null || \
+        fail "$workflow still contains the old circular release dependency"
 done
 
 test "$(grep -Fc 'if: ${{ vars.RELEASE_SIGNING_ENABLED == '\''true'\'' }}' \
@@ -41,6 +45,29 @@ test "$(grep -Fc 'if: ${{ vars.RELEASE_SIGNING_ENABLED == '\''true'\'' }}' \
 test "$(grep -Fc 'if: ${{ vars.RELEASE_SIGNING_ENABLED == '\''true'\'' }}' \
     .github/workflows/tray-release.yml)" -eq 1 || \
     fail '.github/workflows/tray-release.yml must gate exactly the privileged macOS publication job'
+
+require_text .github/workflows/tray-release.yml 'name: artifacts-macos-${{ needs.verify-release.outputs.sha }}'
+require_text .github/workflows/desktop-release.yml 'name: artifacts-linux-${{ matrix.asset_arch }}-${{ needs.verify-release.outputs.sha }}'
+require_text .github/workflows/desktop-release.yml 'name: artifacts-windows-x86_64-${{ needs.verify-release.outputs.sha }}'
+
+validator=.github/workflows/validate-release-assets.yml
+require_text "$validator" 'workflow_call:'
+require_text "$validator" 'pattern: artifacts-*'
+require_text "$validator" 'cargo-dist plan does not contain the exact 11 core assets.'
+require_text "$validator" 'expected_count=30'
+require_text "$validator" 'expected_count=45'
+require_text "$validator" 'sha256sum -c sha256.sum'
+
+require_text dist-workspace.toml 'rust-toolchain-version = "1.88.0"'
+require_text dist-workspace.toml 'local-artifacts-jobs = ["./tray-release", "./desktop-release"]'
+require_text dist-workspace.toml 'publish-jobs = ["./validate-release-assets"]'
+require_text dist-workspace.toml 'github-release = "announce"'
+require_text dist-workspace.toml 'github-attestations-phase = "announce"'
+
+require_text .github/workflows/release.yml 'custom-tray-release:'
+require_text .github/workflows/release.yml 'custom-desktop-release:'
+require_text .github/workflows/release.yml 'custom-validate-release-assets:'
+require_text .github/workflows/release.yml 'needs.custom-validate-release-assets.result'
 
 for workflow in \
     .github/workflows/desktop-release.yml \
@@ -55,4 +82,4 @@ for workflow in \
     fi
 done
 
-printf '%s\n' 'Deterministic release recovery policy passed.'
+printf '%s\n' 'Deterministic atomic release publication policy passed.'

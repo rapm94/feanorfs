@@ -1,32 +1,28 @@
-# Build one universal, signed, notarized, and stapled macOS package after
-# cargo-dist has created the application release. Keep this separate from the
-# generated release.yml so cargo-dist remains reproducible. Signed publication
-# is opt-in until the production Apple credentials are configured: set the
-# repository variable RELEASE_SIGNING_ENABLED to exactly "true" to enable it.
+# Build one universal, signed, notarized, and stapled macOS package inside the
+# cargo-dist release graph. Final products are staged as Actions artifacts;
+# cargo-dist creates the public release only after the combined manifest passes.
+# Signed publication remains opt-in until production credentials are configured.
 name: macOS package release
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      release_tag:
-        description: Existing stable release tag to recover from trusted main
+      plan:
+        description: Exact cargo-dist release plan
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: macos-package-${{ inputs.release_tag || github.ref_name }}
+  group: macos-package-${{ github.repository }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
-  wait-for-release:
-    name: Verify exact cargo-dist release source
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  verify-release:
+    name: Verify exact trusted release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       actions: read
       contents: read
@@ -35,14 +31,13 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Wait for successful cargo-dist release
+      - name: Resolve exact cargo-dist release source
         id: release
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          DIST_PLAN: ${{ inputs.plan }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INVOCATION_REF: ${{ github.ref }}
           INVOCATION_SHA: ${{ github.sha }}
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -50,30 +45,17 @@ jobs:
             echo "::error::Release packaging runs only in rapm94/feanorfs."
             exit 1
           fi
-          case "$EVENT_NAME" in
-            push)
-              if [ "$INVOCATION_REF" != "refs/tags/$RELEASE_TAG" ]; then
-                echo "::error::Tag publication must run at refs/tags/$RELEASE_TAG, not $INVOCATION_REF."
-                exit 1
-              fi
-              ;;
-            workflow_dispatch)
-              if [ "$INVOCATION_REF" != refs/heads/main ]; then
-                echo "::error::Manual macOS recovery must be dispatched from main."
-                exit 1
-              fi
-              ;;
-            *)
-              echo "::error::Release packaging requires a tag push or manual recovery from main."
-              exit 1
-              ;;
-          esac
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tag must be canonical stable SemVer (vMAJOR.MINOR.PATCH): $RELEASE_TAG"
+          release_tag="$(jq -r '.announcement_tag // empty' <<<"$DIST_PLAN")"
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::cargo-dist planned a non-canonical stable tag: $release_tag"
+            exit 1
+          fi
+          if [ "$INVOCATION_REF" != "refs/tags/$release_tag" ]; then
+            echo "::error::Release plan is for $release_tag, but invocation ref is $INVOCATION_REF."
             exit 1
           fi
 
-          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$release_tag")"
           tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
           tag_type="$(jq -r '.object.type' <<<"$tag_object")"
           if [ "$tag_type" = tag ]; then
@@ -85,52 +67,14 @@ jobs:
             echo "::error::Release tag does not resolve directly to a commit."
             exit 1
           fi
-
-          ready=false
-          release_json=''
-          for attempt in $(seq 1 60); do
-            if release_json="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null)"; then
-              release_target="$(jq -r '.target_commitish' <<<"$release_json")"
-              release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-              if [ "$tag_sha" != "$release_sha" ]; then
-                echo "::error::Release targets $release_sha, but $RELEASE_TAG resolves to $tag_sha."
-                exit 1
-              fi
-              release_runs="$(gh api --method GET \
-                "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
-                -f head_sha="$tag_sha" \
-                -f event=push \
-                -f per_page=100)"
-              if [ "$(jq '.assets | length' <<<"$release_json")" -gt 0 ] && \
-                jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" --arg sha "$tag_sha" \
-                  'any(.workflow_runs[];
-                    .conclusion == "success" and
-                    .event == "push" and
-                    .head_branch == $tag and
-                    .head_sha == $sha and
-                    .head_repository.full_name == $repository and
-                    .repository.full_name == $repository)' \
-                  <<<"$release_runs" >/dev/null; then
-                ready=true
-                break
-              fi
-            fi
-            echo "Waiting for successful cargo-dist publication of $RELEASE_TAG ($attempt/60)..."
-            sleep 30
-          done
-          if [ "$ready" != true ]; then
-            echo "::error::Timed out waiting for a successful cargo-dist release of $RELEASE_TAG."
-            exit 1
-          fi
-
-          if [ "$EVENT_NAME" = push ] && [ "$tag_sha" != "$INVOCATION_SHA" ]; then
+          if [ "$tag_sha" != "$INVOCATION_SHA" ]; then
             echo "::error::Tag resolves to $tag_sha, expected invocation SHA $INVOCATION_SHA."
             exit 1
           fi
           {
             echo "sha=$tag_sha"
-            echo "tag=$RELEASE_TAG"
-            echo "version=${RELEASE_TAG#v}"
+            echo "tag=$release_tag"
+            echo "version=${release_tag#v}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout verified release commit
@@ -142,10 +86,8 @@ jobs:
 
       - name: Require trusted main CI, Security, and matching version
         env:
-          EVENT_NAME: ${{ github.event_name }}
           EXPECTED_SHA: ${{ steps.release.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INVOCATION_REF: ${{ github.ref }}
           INVOCATION_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
@@ -225,30 +167,16 @@ jobs:
           }
 
           require_trusted_sha "$EXPECTED_SHA" "release commit"
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then
-            if [ "$INVOCATION_REF" != refs/heads/main ]; then
-              echo "::error::Manual macOS recovery must be dispatched from main."
-              exit 1
-            fi
-            if ! git merge-base --is-ancestor "$INVOCATION_SHA" origin/main; then
-              echo "::error::Manual recovery commit $INVOCATION_SHA is not reachable from origin/main."
-              exit 1
-            fi
-            if ! git merge-base --is-ancestor "$EXPECTED_SHA" "$INVOCATION_SHA"; then
-              echo "::error::Manual recovery commit $INVOCATION_SHA predates release commit $EXPECTED_SHA."
-              exit 1
-            fi
-            require_trusted_sha "$INVOCATION_SHA" "manual recovery commit"
-          elif [ "$INVOCATION_SHA" != "$EXPECTED_SHA" ]; then
+          if [ "$INVOCATION_SHA" != "$EXPECTED_SHA" ]; then
             echo "::error::Tag invocation SHA $INVOCATION_SHA does not match release commit $EXPECTED_SHA."
             exit 1
           fi
 
 
   build-native:
-    needs: wait-for-release
+    needs: verify-release
     name: Build macOS ${{ matrix.target }}
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     timeout-minutes: 45
     permissions:
       contents: read
@@ -262,13 +190,13 @@ jobs:
       - name: Checkout verified release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.wait-for-release.outputs.sha }}
+          ref: ${{ needs.verify-release.outputs.sha }}
           persist-credentials: false
           submodules: recursive
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: stable
+          toolchain: 1.88.0
           targets: ${{ matrix.target }}
       - name: Build CLI and tray
         run: >-
@@ -289,7 +217,7 @@ jobs:
       - name: Upload native binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: feanorfs-macos-${{ matrix.target }}-${{ needs.wait-for-release.outputs.sha }}
+          name: feanorfs-macos-${{ matrix.target }}-${{ needs.verify-release.outputs.sha }}
           path: |
             target/${{ matrix.target }}/release/feanorfs
             target/${{ matrix.target }}/release/feanorfs-tray
@@ -298,56 +226,58 @@ jobs:
 
   package-macos:
     needs:
-      - wait-for-release
+      - verify-release
       - build-native
     if: ${{ vars.RELEASE_SIGNING_ENABLED == 'true' }}
     name: Sign and package universal macOS app
     environment: prod
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     timeout-minutes: 45
     permissions:
-      contents: write
+      actions: read
+      contents: read
       attestations: write
       id-token: write
     steps:
       - name: Verify immutable release tag
         env:
-          EXPECTED_SHA: ${{ needs.wait-for-release.outputs.sha }}
+          EXPECTED_SHA: ${{ needs.verify-release.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
         run: |
-          TAG_OBJECT="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
-          TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"
-          TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"
-          if [ "$TAG_TYPE" = "tag" ]; then
-            TAG_SHA="$(gh api "repos/$REPOSITORY/git/tags/$TAG_SHA" --jq '.object.sha')"
+          set -euo pipefail
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
+            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
+            tag_type="$(jq -r '.object.type' <<<"$annotated")"
           fi
-          RELEASE_TARGET="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
-          RELEASE_SHA="$(gh api "repos/$REPOSITORY/commits/$RELEASE_TARGET" --jq '.sha')"
-          if [ "$TAG_SHA" != "$RELEASE_SHA" ]; then
-            echo "::error::Release $RELEASE_TAG targets $RELEASE_SHA, but its tag resolves to $TAG_SHA."
+          if [ "$tag_type" != commit ]; then
+            echo "::error::Release tag does not resolve directly to a commit."
             exit 1
           fi
-          if [ -n "$EXPECTED_SHA" ] && [ "$TAG_SHA" != "$EXPECTED_SHA" ]; then
-            echo "::error::Release tag resolves to $TAG_SHA, expected $EXPECTED_SHA."
+          if [ "$tag_sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::Release tag resolves to $tag_sha, expected $EXPECTED_SHA."
             exit 1
           fi
       - name: Checkout verified release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.wait-for-release.outputs.sha }}
+          ref: ${{ needs.verify-release.outputs.sha }}
           persist-credentials: false
           submodules: recursive
       - name: Download arm64 binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: feanorfs-macos-aarch64-apple-darwin-${{ needs.wait-for-release.outputs.sha }}
+          name: feanorfs-macos-aarch64-apple-darwin-${{ needs.verify-release.outputs.sha }}
           path: native/arm64
       - name: Download x86_64 binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: feanorfs-macos-x86_64-apple-darwin-${{ needs.wait-for-release.outputs.sha }}
+          name: feanorfs-macos-x86_64-apple-darwin-${{ needs.verify-release.outputs.sha }}
           path: native/x86_64
       - name: Assemble universal binaries
         run: |
@@ -368,7 +298,7 @@ jobs:
           APP_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
           INSTALLER_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
           INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
         run: |
           if [ -z "$APP_CERTIFICATE_BASE64" ] || [ -z "$APP_CERTIFICATE_PASSWORD" ]; then
             echo "::error::Configure the Developer ID Application certificate secrets before releasing macOS."
@@ -461,7 +391,7 @@ jobs:
           NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
           NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
         run: |
           if [ -z "$NOTARY_KEY_P8_BASE64" ] || [ -z "$NOTARY_KEY_ID" ] || [ -z "$NOTARY_ISSUER_ID" ]; then
             echo "::error::Configure the App Store Connect notarization secrets before releasing macOS."
@@ -504,7 +434,7 @@ jobs:
           xcrun stapler validate -v FeanorFS-macOS.dmg
       - name: Verify package trust and contents
         env:
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
         run: |
           evidence="FeanorFS-macOS.verification.txt"
           package_root="$RUNNER_TEMP/feanorfs-package"
@@ -561,32 +491,22 @@ jobs:
             FeanorFS-macOS.verification.txt
             FeanorFS-macOS.keychain-smoke.txt
             feanorfs-macos-installer.sh
-      - name: Upload macOS release assets
-        env:
-          EXPECTED_SHA: ${{ needs.wait-for-release.outputs.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.wait-for-release.outputs.tag }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          tag_sha="$(gh api "repos/$REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')"
-          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          if [ "$tag_sha" != "$EXPECTED_SHA" ] || [ "$release_sha" != "$EXPECTED_SHA" ]; then
-            echo "::error::Release source changed after validation; refusing to upload."
-            exit 1
-          fi
-          gh release upload "$RELEASE_TAG" \
-            FeanorFS-macOS.pkg \
-            FeanorFS-macOS.pkg.sha256 \
-            FeanorFS-macOS.dmg \
-            FeanorFS-macOS.dmg.sha256 \
-            FeanorFS-macOS.notarization.json \
-            FeanorFS-macOS.dmg.notarization.json \
-            FeanorFS-macOS.verification.txt \
-            FeanorFS-macOS.keychain-smoke.txt \
-            feanorfs-macos-installer.sh \
-            --repo "$REPOSITORY" \
-            --clobber
+      - name: Stage macOS release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: artifacts-macos-${{ needs.verify-release.outputs.sha }}
+          path: |
+            FeanorFS-macOS.pkg
+            FeanorFS-macOS.pkg.sha256
+            FeanorFS-macOS.dmg
+            FeanorFS-macOS.dmg.sha256
+            FeanorFS-macOS.notarization.json
+            FeanorFS-macOS.dmg.notarization.json
+            FeanorFS-macOS.verification.txt
+            FeanorFS-macOS.keychain-smoke.txt
+            feanorfs-macos-installer.sh
+          if-no-files-found: error
+          retention-days: 1
       - name: Remove Apple credentials
         if: always()
         run: |

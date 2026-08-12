@@ -12,8 +12,9 @@ contributor templates.
 - `workflows/release-plz.yml` — post-CI version PR and tag automation.
 - `workflows/npm-release.yml` — manual dry-run native addon matrix and deterministic six-package assembly; automatic npm publication is disabled while releases ship only the app.
 - `workflows/release.yml` — generated cargo-dist release workflow.
-- `workflows/tray-release.yml` — post-tag universal macOS app/package/DMG signing, notarization, stapling, attestation, and upload (waits for cargo-dist; privileged publication requires `RELEASE_SIGNING_ENABLED=true`).
-- `workflows/desktop-release.yml` — post-tag Linux x86-64/ARM64 `.deb`/`.rpm`/`.pkg.tar.zst`/tar desktop products and optional Azure Authenticode-signed Windows x86-64 installer EXE and bundle (waits for cargo-dist; privileged publication requires `RELEASE_SIGNING_ENABLED=true`).
+- `workflows/tray-release.yml` — cargo-dist reusable job for universal macOS app/package/DMG signing, notarization, stapling, attestation, and artifact staging (`RELEASE_SIGNING_ENABLED=true` only).
+- `workflows/desktop-release.yml` — cargo-dist reusable job for Linux x86-64/ARM64 `.deb`/`.rpm`/`.pkg.tar.zst`/tar products and optional Azure Authenticode-signed Windows x86-64 installer EXE and bundle; it stages products without mutating a release.
+- `workflows/validate-release-assets.yml` — final pre-announcement gate for the exact 30-asset unsigned-signing-state or 45-asset signing-enabled manifest and every checksum.
 - `workflows/relay-image.yml` — trusted-tag multi-architecture `ghcr.io/rapm94/feanorfs-relay` publication with SBOM and build provenance.
 - `workflows/unsigned-desktop-release.yml` — manual, prerelease-only, conspicuously named unsigned desktop preview artifacts; never a trusted installer fallback.
 - `dependabot.yml` — Cargo, npm, Docker base-image, and GitHub Actions updates.
@@ -26,7 +27,7 @@ contributor templates.
   comments; Dependabot maintains them. Generated cargo-dist action commits live
   in `dist-workspace.toml` and require regeneration rather than direct edits.
 - Default permissions are read-only or empty. Grant write scopes only at the
-  job that requires them. Repository-owned signing, release-upload, and registry
+  job that requires them. Repository-owned signing, final announcement, and registry
   publication jobs declare the `prod` environment; TODO F4 still owns required
   reviewers, deployment restrictions, and administrator-bypass controls.
 - Checkout steps set `persist-credentials: false`.
@@ -35,10 +36,10 @@ contributor templates.
   macOS/Linux/Windows tray products. The legacy server binary remains source-only because
   `feanorfs serve` is the supported hub entrypoint.
 - Trusted tags publish the same `feanorfs serve --relay` implementation as a non-root, read-only-capable Linux OCI image for amd64/arm64. It generates its bearer token in a persistent volume, binds HTTP only behind an operator-owned TLS reverse proxy, passes a blocking Trivy scan for fixed high/critical runtime vulnerabilities, and publishes SBOM/provenance attestations; never add a second relay implementation or an open-hub default.
-- The macOS signed-product job requires `RELEASE_SIGNING_ENABLED=true`, Developer ID Application and Developer ID Installer certificates, and an App Store Connect notarization key. When enabled, it signs the universal CLI and `FeanorFS.app` with hardened runtime and timestamping, signs/notarizes/staples the Installer package, wraps that exact package in a separately notarized/stapled DMG, requires Gatekeeper acceptance, and publishes verification evidence before upload. When disabled, the privileged job is skipped and no macOS installer is claimed; there is no unsigned fallback on the trusted route.
+- The macOS signed-product job requires `RELEASE_SIGNING_ENABLED=true`, Developer ID Application and Developer ID Installer certificates, and an App Store Connect notarization key. When enabled, it signs the universal CLI and `FeanorFS.app` with hardened runtime and timestamping, signs/notarizes/staples the Installer package, wraps that exact package in a separately notarized/stapled DMG, requires Gatekeeper acceptance, and stages verification evidence with the products. When disabled, the privileged job is skipped and no macOS installer is claimed; there is no unsigned fallback on the trusted route.
 - Before packaging, the Developer ID CLI must pass `scripts/smoke-macos-keychain.sh`: auto-detected Keychain storage, redacted config, live credential reload, cleanup, and a public smoke record whose SHA-256 matches the packaged CLI. CI separately requires unsigned development builds to fail this gate.
-- Native arm64/x86_64 jobs receive no Apple secrets. When signed publication is enabled, one privileged job combines them with `lipo`, builds `FeanorFS-macOS.pkg` and its exact DMG container, and uploads only the signed/notarized/stapled/checksummed/attested products plus evidence and the verifying convenience installer.
-- Linux release jobs publish exact native `.deb`/`.rpm`/`.pkg.tar.zst` packages plus a four-file tar fallback only after architecture, dependency metadata, payload, install-script, `ldd`, explicit absence of the unused distro-variant `libxdo` ABI, SHA-256, clean-container, and GitHub-attestation checks. Main CI and the trusted tag-triggered Windows release run the Task Scheduler product smoke in explicit headless-runner mode: the supervisor, hub, and workspace watcher must run, while the `InteractiveToken` tray task must be correctly registered and settle ready or running without depending on a hosted runner's desktop session. The separate manual preview workflow retains the complete interactive tray smoke. Windows native builds also compile/install/uninstall the Inno Setup product before becoming artifacts; the privileged job repeats those smokes after verifying Azure Authenticode on both executables and the installer EXE, then publishes only the exact checksummed/attested products. The trusted route has no unsigned fallback; manual preview artifacts remain explicitly named and prerelease-only.
+- Native arm64/x86_64 jobs receive no Apple secrets. When signed publication is enabled, one privileged job combines them with `lipo`, builds `FeanorFS-macOS.pkg` and its exact DMG container, and stages only the signed/notarized/stapled/checksummed/attested products plus evidence and the verifying convenience installer.
+- Linux release jobs stage exact native `.deb`/`.rpm`/`.pkg.tar.zst` packages plus a four-file tar fallback only after architecture, dependency metadata, payload, install-script, `ldd`, explicit absence of the unused distro-variant `libxdo` ABI, SHA-256, clean-container, and GitHub-attestation checks. Main CI and the trusted tag-triggered Windows release run the Task Scheduler product smoke in explicit headless-runner mode: the supervisor, hub, and workspace watcher must run, while the `InteractiveToken` tray task must be correctly registered and settle ready or running without depending on a hosted runner's desktop session. The separate manual preview workflow retains the complete interactive tray smoke. Windows native builds also compile/install/uninstall the Inno Setup product before becoming artifacts; the privileged job repeats those smokes after verifying Azure Authenticode on both executables and the installer EXE, then stages only the exact checksummed/attested products. The trusted route has no unsigned fallback; manual preview artifacts remain explicitly named and prerelease-only.
 - Pull requests require the fast Linux gates (format, Clippy, tests, dependency
   policy, and workflow lint) plus an exact-head native Windows run of the
   agent-core/client runner lifecycle suites. MSRV, complete macOS/Windows
@@ -70,25 +71,25 @@ contributor templates.
   trigger only after an explicit product decision and npm bootstrap
   authentication are in place.
 - The dormant npm publish job retains `id-token: write`, exact-integrity checks, and `NPM_TOKEN` bootstrap support so publication can be reactivated without weakening provenance controls.
-- Privileged desktop workflows resolve a canonical stable tag to one immutable
-  SHA before building, require the release target and successful cargo-dist run
-  to use that SHA, prove main reachability plus successful exact-SHA CI and
-  `Security success`, check out only the SHA, and bind intermediate artifact
-  names to it. Tag-triggered runs require the exact immutable tag ref and SHA.
-  Manual recovery runs require an exact CI/Security-green `main` invocation SHA
-  descended from the release commit, then independently resolve, validate, and
-  check out the immutable requested tag SHA; they never equate the recovery
-  workflow SHA with an older release SHA. Relay and unsigned-preview trust gates
-  require the same CI/Security proof; unsigned uploads revalidate the original
-  prerelease ID, tag, and target immediately before mutation.
+- Reusable desktop workflows consume cargo-dist's exact plan, resolve its
+  canonical stable tag to the invocation SHA before building, prove main
+  reachability plus successful exact-SHA CI and `Security success`, check out
+  only that SHA, and bind every intermediate artifact name to it. They never
+  wait for or mutate a GitHub Release. Final products alone use the
+  `artifacts-*` staging namespace; cargo-dist's publish gate verifies the exact
+  combined names and checksums before the one announcement job creates the
+  public release. Relay and unsigned-preview trust gates retain their separate
+  exact-SHA checks; unsigned uploads revalidate the original prerelease ID, tag,
+  and target immediately before mutation.
 - Apple Application/Installer identities and notarization credentials are scoped to the privileged package steps, decoded only under `$RUNNER_TEMP`, imported into a temporary keychain, and removed by an `always()` cleanup step. Never expose them to native build steps or persist them as artifacts.
 - `release.yml` is cargo-dist generated. Configure immutable action commits,
-  attestation filters, and other settings in `dist-workspace.toml`, then
+  custom graph jobs, attestation filters, and other settings in
+  `dist-workspace.toml`, then
   regenerate with its documented cargo-dist version; never patch the workflow
-  directly. Its broad generated SemVer-like tag trigger cannot join
-  repository-owned CI/Security API gates, so restricted creation and immutable
-  updates/deletions for every matching tag remain the residual control in TODO F4.
-- cargo-dist publishes attested CLI archives only; it must not generate shell/PowerShell installers that look like the tray-inclusive desktop product. Public installer routing belongs to `scripts/install.sh`, the signed macOS package/DMG, verified Linux native packages/full bundle, and the Authenticode Windows setup EXE.
+  directly. The reusable platform jobs join repository-owned CI/Security API
+  gates before announcement; restricted creation and immutable updates/deletions
+  for every matching tag remain the residual control in TODO F4.
+- cargo-dist generates attested CLI archives only and publishes them together with the exact validated custom product set; it must not generate shell/PowerShell installers that look like the tray-inclusive desktop product. Public installer routing belongs to `scripts/install.sh`, the signed macOS package/DMG, verified Linux native packages/full bundle, and the Authenticode Windows setup EXE.
 - Relay image publication builds amd64 and arm64 `feanorfs` binaries inside the pinned Bookworm Rust environment on matching native runners, assembles each through `Dockerfile.relay-binary` with the same Bookworm runtime ABI, attests each architecture, records each Buildx digest in an immutable workflow artifact, then merges those digests without resolving architecture tags. Never restore QEMU workspace compilation or copy a newer host-glibc binary into the runtime image.
 
 ## Work Guidance
@@ -104,7 +105,8 @@ contributor templates.
 - `actionlint`
 - `zizmor --persona=pedantic --min-severity=medium` over repository-owned workflows and `dependabot.yml`; exclude cargo-dist-generated `release.yml` as the security workflow does.
 - `cargo deny check`
-- `dist plan`
+- `dist generate --check` and `dist plan`
+- `scripts/test-release-workflow-policy.sh` proves reusable platform jobs cannot mutate a release and the generated graph waits for the exact asset validator before announcement.
 - The macOS `tray` CI job assembles and expands an unsigned package, compares its payload binaries byte-for-byte, verifies the postinstall/metadata/native architecture, and mounts an unsigned DMG to compare its inner package byte-for-byte.
 - `scripts/smoke-macos-product.sh` runs the expanded package through first-machine `start`, complete JSON lifecycle diagnostics, launchd argv/permission checks, tray startup, TLS rejection, MCP, pairing readiness, and reversible stop/resume while preserving the hub and encrypted workspace setup without printing secrets. Its first-run gate launches from an isolated unconfigured directory with `--first-run` and requires a process sample to reach native `CFUserNotificationDisplayAlert`; process liveness alone does not prove the start-or-join choice appeared.
 - `scripts/test-install-routing.sh` proves Unix fallback, fail-closed macOS/Linux product routing, headless opt-out, and verified Linux tray-first launch with the exact `--first-run` hint. `scripts/smoke-linux-packages.sh` installs the exact native packages into digest-pinned Debian 13 and Fedora 44 containers on both architectures and official Arch on x86-64, creates an idle format-v3 encrypted workspace, and keeps the tray alive under Xvfb/D-Bus. Official Arch has no ARM64 container, so that matrix leg requires exact Arch metadata/payload checks plus native ARM64 Debian/Fedora execution. `scripts/test-install-routing.ps1` proves Windows setup-EXE checksum/signature routing and rejection of legacy remote execution; `scripts/smoke-windows-installer.ps1` proves exact payload, PATH, uninstall, and signatures. Publication requires valid Authenticode.
