@@ -606,6 +606,11 @@ jobs:
           persist-credentials: false
       - name: Run actionlint
         uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+      - name: Require deterministic hosted Windows smokes
+        run: |
+          test "$(grep -Ec '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/ci.yml)" = 1
+          test "$(grep -Ec '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/desktop-release.yml)" = 2
+          ! grep -Eq '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/unsigned-desktop-release.yml
       - name: Test deterministic release history packaging
         run: scripts/test-release-plz-cargo.sh
 
