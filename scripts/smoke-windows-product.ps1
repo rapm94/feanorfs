@@ -5,7 +5,9 @@ param(
     [Parameter(Mandatory = $true, Position = 1)]
     [string]$FeanorFSTrayBin,
 
-    [switch]$RequireAuthenticode
+    [switch]$RequireAuthenticode,
+
+    [switch]$HeadlessRunner
 )
 
 $ErrorActionPreference = "Stop"
@@ -197,8 +199,26 @@ function Get-SupervisedChildState([string]$Key) {
 function Assert-HealthyProduct {
     Wait-For {
         $tasks = @(Get-SmokeTasks)
-        $tasks.Count -eq 2 -and @($tasks | Where-Object State -ne "Running").Count -eq 0
-    } "supervisor and tray tasks to run" 30
+        $tasks.Count -eq 2
+    } "supervisor and tray task registration" 30
+
+    Wait-For {
+        $supervisor = @(Get-SmokeTasks | Where-Object TaskName -eq "Agent")
+        $supervisor.Count -eq 1 -and $supervisor[0].State -eq "Running"
+    } "supervisor task to run" 30
+
+    if ($HeadlessRunner) {
+        Wait-For {
+            $trayTasks = @(Get-SmokeTasks | Where-Object TaskName -eq "Tray")
+            $trayTasks.Count -eq 1 -and [string]$trayTasks[0].State -in @("Ready", "Running")
+        } "tray task to be ready or running" 30
+    }
+    else {
+        Wait-For {
+            $trayTasks = @(Get-SmokeTasks | Where-Object TaskName -eq "Tray")
+            $trayTasks.Count -eq 1 -and $trayTasks[0].State -eq "Running"
+        } "interactive tray task to run" 30
+    }
 
     $tasks = @(Get-SmokeTasks)
     $supervisorTask = $tasks | Where-Object TaskName -eq "Agent"
@@ -334,7 +354,8 @@ try {
 
     Invoke-Start
     Assert-HealthyProduct
-    Write-Host "Windows product smoke passed: one-command host, Credential Manager, Task Scheduler services, interactive tray, TLS, doctor, MCP, and reversible stop/resume."
+    $trayProof = if ($HeadlessRunner) { "interactive tray registration" } else { "interactive tray runtime" }
+    Write-Host "Windows product smoke passed: one-command host, Credential Manager, Task Scheduler services, $trayProof, TLS, doctor, MCP, and reversible stop/resume."
 }
 finally {
     $cleanupFailed = $false
