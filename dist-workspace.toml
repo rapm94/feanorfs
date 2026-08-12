@@ -1,8 +1,9 @@
 [workspace]
 # Point cargo-dist at the Cargo workspace once. Package selection belongs in
 # `[dist].packages`; listing member paths separately rediscovers the workspace.
-# `.github/workflows/tray-release.yml` builds tray archives after cargo-dist
-# completes, leaving its generated `.github/workflows/release.yml` unchanged.
+# Repository-owned reusable workflows build the platform products inside the
+# generated cargo-dist graph. The release is announced only after their exact
+# combined asset manifest passes.
 members = ["cargo:."]
 
 # Config for 'dist'
@@ -20,8 +21,16 @@ source-tarball = false
 precise-builds = true
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
+# Build every release product with the same exact compiler as the relay image.
+# This is the product toolchain, distinct from the supported Rust 1.88 MSRV.
+rust-toolchain-version = "1.88.0"
 # CI backends to support
 ci = "github"
+# Build desktop products as first-class dependencies of cargo-dist, validate
+# the complete staged asset set, and create the public release exactly once.
+local-artifacts-jobs = ["./tray-release", "./desktop-release"]
+publish-jobs = ["./validate-release-assets"]
+github-custom-job-permissions = { tray-release = { actions = "read", attestations = "write", contents = "read", id-token = "write" }, desktop-release = { actions = "read", attestations = "write", contents = "read", id-token = "write" }, validate-release-assets = { actions = "read", contents = "read" } }
 # Platform desktop installers are the only public installer entrypoints. Keep
 # cargo-dist focused on attested CLI archives so its generated scripts cannot
 # be mistaken for the tray-inclusive product.
@@ -32,12 +41,15 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "~/.local/bin"
 # Where to host releases
 hosting = "github"
+# Defer the sole public-release mutation until every custom build and exact
+# asset-manifest validation job has succeeded.
+github-release = "announce"
 # Whether to install an updater program
 install-updater = false
 # Whether to enable GitHub Attestations
 github-attestations = true
 # When to generate GitHub Attestations
-github-attestations-phase = "host"
+github-attestations-phase = "announce"
 # Attest every published CLI archive plus its checksum and canonical manifest.
 # cargo-dist installers are disabled, so script filters would match no product.
 github-attestations-filters = ["*.tar.xz", "*.zip", "*.sha256", "sha256.sum", "dist-manifest.json"]

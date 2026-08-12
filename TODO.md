@@ -48,8 +48,10 @@ acceptance is blocked on F2.
 - [ ] Add rules for every tag ref (not only `v*`) that restrict creation to
   the approved release automation identity, prevent update/deletion, and apply
   to administrators as well as other actors. This is the residual gate for
-  cargo-dist's broad generated SemVer-like `release.yml` tag trigger, which must
-  not be hand-edited to add repository-owned CI/Security API checks.
+  cargo-dist's broad generated SemVer-like `release.yml` tag trigger. Reusable
+  platform jobs now enforce repository-owned exact-SHA CI/Security checks before
+  the single announcement, but tag mutation during the run must still be denied
+  by the control plane rather than workflow convention.
 - [ ] Protect the `prod` environment with required reviewers, release-only
   deployment policy, and no administrator bypass.
 - [ ] Enable required Code Owner reviews through the repository branch rules for

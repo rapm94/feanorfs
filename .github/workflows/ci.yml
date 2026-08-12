@@ -611,7 +611,7 @@ jobs:
           test "$(grep -Ec '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/ci.yml)" = 1
           test "$(grep -Ec '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/desktop-release.yml)" = 2
           ! grep -Eq '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/unsigned-desktop-release.yml
-      - name: Test deterministic release recovery policy
+      - name: Test deterministic atomic release policy
         run: scripts/test-release-workflow-policy.sh
       - name: Test deterministic release history packaging
         run: scripts/test-release-plz-cargo.sh

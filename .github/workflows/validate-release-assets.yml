@@ -1,0 +1,150 @@
+name: Validate release assets
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: Exact cargo-dist release plan
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  validate:
+    name: Validate exact release asset manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Download every staged release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: artifacts-*
+          path: release
+          merge-multiple: true
+      - name: Require the exact checksummed product manifest
+        env:
+          DIST_PLAN: ${{ inputs.plan }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INVOCATION_REF: ${{ github.ref }}
+          INVOCATION_SHA: ${{ github.sha }}
+          RELEASE_SIGNING_ENABLED: ${{ vars.RELEASE_SIGNING_ENABLED }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$REPOSITORY" != "rapm94/feanorfs" ]; then
+            echo "::error::Release validation runs only in rapm94/feanorfs."
+            exit 1
+          fi
+          release_tag="$(jq -r '.announcement_tag // empty' <<<"$DIST_PLAN")"
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::cargo-dist planned a non-canonical stable tag: $release_tag"
+            exit 1
+          fi
+          if [ "$INVOCATION_REF" != "refs/tags/$release_tag" ]; then
+            echo "::error::Release plan is for $release_tag, but invocation ref is $INVOCATION_REF."
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "$INVOCATION_SHA"
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$release_tag")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
+            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
+            tag_type="$(jq -r '.object.type' <<<"$annotated")"
+          fi
+          if [ "$tag_type" != commit ] || [ "$tag_sha" != "$INVOCATION_SHA" ]; then
+            echo "::error::Release tag no longer resolves to invocation SHA $INVOCATION_SHA."
+            exit 1
+          fi
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "$release_tag" != "v$version" ]; then
+            echo "::error::Release plan tag $release_tag does not match workspace version v$version."
+            exit 1
+          fi
+
+          # cargo-dist stages planning/build fragments for its own merge. They
+          # are not release products; the canonical dist-manifest remains.
+          rm -f release/*-dist-manifest.json
+
+          printf '%s\n' \
+            feanorfs-client-aarch64-apple-darwin.tar.xz \
+            feanorfs-client-aarch64-apple-darwin.tar.xz.sha256 \
+            feanorfs-client-aarch64-unknown-linux-gnu.tar.xz \
+            feanorfs-client-aarch64-unknown-linux-gnu.tar.xz.sha256 \
+            feanorfs-client-x86_64-apple-darwin.tar.xz \
+            feanorfs-client-x86_64-apple-darwin.tar.xz.sha256 \
+            feanorfs-client-x86_64-pc-windows-msvc.zip \
+            feanorfs-client-x86_64-pc-windows-msvc.zip.sha256 \
+            feanorfs-client-x86_64-unknown-linux-gnu.tar.xz \
+            feanorfs-client-x86_64-unknown-linux-gnu.tar.xz.sha256 \
+            sha256.sum | LC_ALL=C sort > expected-core-assets.txt
+          jq -r '.artifacts | to_entries[] | (.value.name // .key)' \
+            <<<"$DIST_PLAN" | LC_ALL=C sort > planned-core-assets.txt
+          if ! diff -u expected-core-assets.txt planned-core-assets.txt; then
+            echo "::error::cargo-dist plan does not contain the exact 11 core assets."
+            exit 1
+          fi
+
+          cp expected-core-assets.txt expected-assets.txt
+          printf '%s\n' dist-manifest.json >> expected-assets.txt
+          for arch in aarch64 x86_64; do
+            printf '%s\n' \
+              "FeanorFS-linux-$arch.tar.xz" \
+              "FeanorFS-linux-$arch.tar.xz.sha256" \
+              "FeanorFS-linux-$arch.deb" \
+              "FeanorFS-linux-$arch.deb.sha256" \
+              "FeanorFS-linux-$arch.rpm" \
+              "FeanorFS-linux-$arch.rpm.sha256" \
+              "FeanorFS-linux-$arch.pkg.tar.zst" \
+              "FeanorFS-linux-$arch.pkg.tar.zst.sha256" \
+              "FeanorFS-linux-$arch.linkage.txt" >> expected-assets.txt
+          done
+          if [ "$RELEASE_SIGNING_ENABLED" = true ]; then
+            printf '%s\n' \
+              FeanorFS-macOS.pkg \
+              FeanorFS-macOS.pkg.sha256 \
+              FeanorFS-macOS.dmg \
+              FeanorFS-macOS.dmg.sha256 \
+              FeanorFS-macOS.notarization.json \
+              FeanorFS-macOS.dmg.notarization.json \
+              FeanorFS-macOS.verification.txt \
+              FeanorFS-macOS.keychain-smoke.txt \
+              feanorfs-macos-installer.sh \
+              FeanorFS-windows-x86_64.zip \
+              FeanorFS-windows-x86_64.zip.sha256 \
+              FeanorFS-windows-x86_64.verification.txt \
+              FeanorFS-windows-x86_64-setup.exe \
+              FeanorFS-windows-x86_64-setup.exe.sha256 \
+              feanorfs-windows-installer.ps1 >> expected-assets.txt
+          fi
+          LC_ALL=C sort -u expected-assets.txt -o expected-assets.txt
+          expected_count=30
+          if [ "$RELEASE_SIGNING_ENABLED" = true ]; then
+            expected_count=45
+          fi
+          if [ "$(wc -l < expected-assets.txt | tr -d ' ')" -ne "$expected_count" ]; then
+            echo "::error::Expected manifest did not contain $expected_count unique assets."
+            exit 1
+          fi
+          find release -maxdepth 1 -type f -exec basename {} \; | \
+            LC_ALL=C sort -u > actual-assets.txt
+          if ! diff -u expected-assets.txt actual-assets.txt; then
+            echo "::error::Staged release assets do not match the exact product manifest."
+            exit 1
+          fi
+
+          while IFS= read -r checksum; do
+            (cd release && sha256sum -c "$(basename "$checksum")")
+          done < <(find release -maxdepth 1 -type f -name '*.sha256' | LC_ALL=C sort)
+          (cd release && sha256sum -c sha256.sum)
+          echo "Validated $expected_count exact release assets for $release_tag."
