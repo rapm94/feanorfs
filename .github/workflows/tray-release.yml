@@ -1,6 +1,8 @@
 # Build one universal, signed, notarized, and stapled macOS package after
 # cargo-dist has created the application release. Keep this separate from the
-# generated release.yml so cargo-dist remains reproducible.
+# generated release.yml so cargo-dist remains reproducible. Signed publication
+# is opt-in until the production Apple credentials are configured: set the
+# repository variable RELEASE_SIGNING_ENABLED to exactly "true" to enable it.
 name: macOS package release
 
 on:
@@ -298,6 +300,7 @@ jobs:
     needs:
       - wait-for-release
       - build-native
+    if: ${{ vars.RELEASE_SIGNING_ENABLED == 'true' }}
     name: Sign and package universal macOS app
     environment: prod
     runs-on: macos-latest

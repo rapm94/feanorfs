@@ -28,11 +28,19 @@ for workflow in \
     require_text "$workflow" 'require_trusted_sha "$INVOCATION_SHA" "manual recovery commit"'
     require_text "$workflow" 'ref: ${{ steps.release.outputs.sha }}'
     require_text "$workflow" 'ref: ${{ needs.wait-for-release.outputs.sha }}'
+    require_text "$workflow" 'if: ${{ vars.RELEASE_SIGNING_ENABLED == '\''true'\'' }}'
 
     if grep -Fx -- '          if [ "$tag_sha" != "$INVOCATION_SHA" ]; then' "$workflow" >/dev/null; then
         fail "$workflow still equates a manual recovery SHA with the release tag SHA"
     fi
 done
+
+test "$(grep -Fc 'if: ${{ vars.RELEASE_SIGNING_ENABLED == '\''true'\'' }}' \
+    .github/workflows/desktop-release.yml)" -eq 1 || \
+    fail '.github/workflows/desktop-release.yml must gate exactly the privileged Windows publication job'
+test "$(grep -Fc 'if: ${{ vars.RELEASE_SIGNING_ENABLED == '\''true'\'' }}' \
+    .github/workflows/tray-release.yml)" -eq 1 || \
+    fail '.github/workflows/tray-release.yml must gate exactly the privileged macOS publication job'
 
 for workflow in \
     .github/workflows/desktop-release.yml \
