@@ -448,6 +448,7 @@ jobs:
           scripts/smoke-windows-product.ps1
           target/release/feanorfs.exe
           target/release/feanorfs-tray.exe
+          -HeadlessRunner
       - name: Upload unsigned Windows binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -614,6 +615,7 @@ jobs:
           native/feanorfs.exe
           native/feanorfs-tray.exe
           -RequireAuthenticode
+          -HeadlessRunner
       - name: Attest Windows release assets
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
