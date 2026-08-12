@@ -18,7 +18,8 @@ categories = ["command-line-utilities", "filesystem"]
 feanorfs-common = { version = "0", path = "common" }
 feanorfs-server = { version = "0", path = "server" }
 feanorfs-agent-core = { version = "0", path = "agent-core" }
-feanorfs-test-support = { version = "0", path = "test-support" }
+# Path-only so Cargo omits this unpublished test helper from packaged dev-dependencies.
+feanorfs-test-support = { path = "test-support" }
 napi = { version = "3", default-features = false, features = ["napi4"] }
 napi-derive = "3"
 serde = { version = "1.0", features = ["derive"] }
