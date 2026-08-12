@@ -47,7 +47,9 @@ contributor templates.
 - Release-plz may tag only an exact SHA with both successful CI and the named
   `Security success` aggregator on trusted `main` pushes. Automatic and manual
   recovery paths prove the repository, event, branch, SHA, and aggregator job
-  through the Actions API before either release-plz command runs.
+  through the Actions API before either release-plz command runs. Release gates
+  select completed success from exact run records instead of relying on the
+  Actions API's eventually consistent `status=completed` index.
 - Release PR automation updates Cargo versions first, then runs
   `assemble-metadata` on the release branch so the npm facade, lockfile,
   generated native-loader checks, and five native package manifests use the
@@ -72,10 +74,13 @@ contributor templates.
   SHA before building, require the release target and successful cargo-dist run
   to use that SHA, prove main reachability plus successful exact-SHA CI and
   `Security success`, check out only the SHA, and bind intermediate artifact
-  names to it. Manual attesting dispatches must themselves run at that exact tag
-  ref and SHA. Relay and unsigned-preview trust gates require the same CI/Security
-  proof; unsigned uploads revalidate the original prerelease ID, tag, and target
-  immediately before mutation.
+  names to it. Tag-triggered runs require the exact immutable tag ref and SHA.
+  Manual recovery runs require an exact CI/Security-green `main` invocation SHA
+  descended from the release commit, then independently resolve, validate, and
+  check out the immutable requested tag SHA; they never equate the recovery
+  workflow SHA with an older release SHA. Relay and unsigned-preview trust gates
+  require the same CI/Security proof; unsigned uploads revalidate the original
+  prerelease ID, tag, and target immediately before mutation.
 - Apple Application/Installer identities and notarization credentials are scoped to the privileged package steps, decoded only under `$RUNNER_TEMP`, imported into a temporary keychain, and removed by an `always()` cleanup step. Never expose them to native build steps or persist them as artifacts.
 - `release.yml` is cargo-dist generated. Configure immutable action commits,
   attestation filters, and other settings in `dist-workspace.toml`, then

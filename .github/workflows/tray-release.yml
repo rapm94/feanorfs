@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing application release tag to package for macOS
+        description: Existing stable release tag to recover from trusted main
         required: true
         type: string
 
@@ -48,43 +48,26 @@ jobs:
             echo "::error::Release packaging runs only in rapm94/feanorfs."
             exit 1
           fi
-          if [ "$EVENT_NAME" != push ] && [ "$EVENT_NAME" != workflow_dispatch ]; then
-            echo "::error::Release packaging requires a tag push or manual tag dispatch."
-            exit 1
-          fi
-          if [ "$INVOCATION_REF" != "refs/tags/$RELEASE_TAG" ]; then
-            echo "::error::Invocation ref $INVOCATION_REF is not refs/tags/$RELEASE_TAG."
-            exit 1
-          fi
+          case "$EVENT_NAME" in
+            push)
+              if [ "$INVOCATION_REF" != "refs/tags/$RELEASE_TAG" ]; then
+                echo "::error::Tag publication must run at refs/tags/$RELEASE_TAG, not $INVOCATION_REF."
+                exit 1
+              fi
+              ;;
+            workflow_dispatch)
+              if [ "$INVOCATION_REF" != refs/heads/main ]; then
+                echo "::error::Manual macOS recovery must be dispatched from main."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Release packaging requires a tag push or manual recovery from main."
+              exit 1
+              ;;
+          esac
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Release tag must be canonical stable SemVer (vMAJOR.MINOR.PATCH): $RELEASE_TAG"
-            exit 1
-          fi
-
-          ready=false
-          release_json=''
-          for attempt in $(seq 1 60); do
-            if release_json="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null)"; then
-              asset_count="$(jq '.assets | length' <<<"$release_json")"
-              runs="$(gh api --method GET "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
-                -f event=push -f status=completed -f per_page=100)"
-              if [ "$asset_count" -gt 0 ] && jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" \
-                'any(.workflow_runs[];
-                  .conclusion == "success" and
-                  .event == "push" and
-                  .head_branch == $tag and
-                  .head_repository.full_name == $repository and
-                  .repository.full_name == $repository)' \
-                <<<"$runs" >/dev/null; then
-                ready=true
-                break
-              fi
-            fi
-            echo "Waiting for successful cargo-dist publication of $RELEASE_TAG ($attempt/60)..."
-            sleep 30
-          done
-          if [ "$ready" != true ]; then
-            echo "::error::Timed out waiting for a successful cargo-dist release of $RELEASE_TAG."
             exit 1
           fi
 
@@ -100,28 +83,46 @@ jobs:
             echo "::error::Release tag does not resolve directly to a commit."
             exit 1
           fi
-          release_target="$(jq -r '.target_commitish' <<<"$release_json")"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          if [ "$tag_sha" != "$release_sha" ]; then
-            echo "::error::Release targets $release_sha, but $RELEASE_TAG resolves to $tag_sha."
+
+          ready=false
+          release_json=''
+          for attempt in $(seq 1 60); do
+            if release_json="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null)"; then
+              release_target="$(jq -r '.target_commitish' <<<"$release_json")"
+              release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
+              if [ "$tag_sha" != "$release_sha" ]; then
+                echo "::error::Release targets $release_sha, but $RELEASE_TAG resolves to $tag_sha."
+                exit 1
+              fi
+              release_runs="$(gh api --method GET \
+                "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
+                -f head_sha="$tag_sha" \
+                -f event=push \
+                -f per_page=100)"
+              if [ "$(jq '.assets | length' <<<"$release_json")" -gt 0 ] && \
+                jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" --arg sha "$tag_sha" \
+                  'any(.workflow_runs[];
+                    .conclusion == "success" and
+                    .event == "push" and
+                    .head_branch == $tag and
+                    .head_sha == $sha and
+                    .head_repository.full_name == $repository and
+                    .repository.full_name == $repository)' \
+                  <<<"$release_runs" >/dev/null; then
+                ready=true
+                break
+              fi
+            fi
+            echo "Waiting for successful cargo-dist publication of $RELEASE_TAG ($attempt/60)..."
+            sleep 30
+          done
+          if [ "$ready" != true ]; then
+            echo "::error::Timed out waiting for a successful cargo-dist release of $RELEASE_TAG."
             exit 1
           fi
-          if [ "$tag_sha" != "$INVOCATION_SHA" ]; then
+
+          if [ "$EVENT_NAME" = push ] && [ "$tag_sha" != "$INVOCATION_SHA" ]; then
             echo "::error::Tag resolves to $tag_sha, expected invocation SHA $INVOCATION_SHA."
-            exit 1
-          fi
-          release_runs="$(gh api --method GET "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
-            -f head_sha="$tag_sha" -f event=push -f status=completed -f per_page=100)"
-          if ! jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" --arg sha "$tag_sha" \
-            'any(.workflow_runs[];
-              .conclusion == "success" and
-              .event == "push" and
-              .head_branch == $tag and
-              .head_sha == $sha and
-              .head_repository.full_name == $repository and
-              .repository.full_name == $repository)' \
-            <<<"$release_runs" >/dev/null; then
-            echo "::error::No successful cargo-dist release run exists for $RELEASE_TAG at $tag_sha."
             exit 1
           fi
           {
@@ -139,8 +140,11 @@ jobs:
 
       - name: Require trusted main CI, Security, and matching version
         env:
+          EVENT_NAME: ${{ github.event_name }}
           EXPECTED_SHA: ${{ steps.release.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INVOCATION_REF: ${{ github.ref }}
+          INVOCATION_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
         run: |
@@ -164,17 +168,19 @@ jobs:
           trusted_run_id() {
             local workflow_file="$1"
             local workflow_name="$2"
+            local expected_sha="$3"
             local runs
+            # GitHub's status index can lag the canonical run record. Select
+            # completed successful records by their exact identity below.
             runs="$(gh api --method GET \
               "repos/$REPOSITORY/actions/workflows/$workflow_file/runs" \
               -f branch=main \
-              -f head_sha="$EXPECTED_SHA" \
+              -f head_sha="$expected_sha" \
               -f event=push \
-              -f status=completed \
               -f per_page=100)"
             jq -r \
               --arg repository "$REPOSITORY" \
-              --arg sha "$EXPECTED_SHA" \
+              --arg sha "$expected_sha" \
               --arg workflow "$workflow_name" \
               '[.workflow_runs[] | select(
                 .name == $workflow and
@@ -187,24 +193,52 @@ jobs:
               )] | first | .id // empty' <<<"$runs"
           }
 
-          ci_run_id="$(trusted_run_id ci.yml CI)"
-          if [ -z "$ci_run_id" ]; then
-            echo "::error::No successful trusted main-push CI run exists for $EXPECTED_SHA."
-            exit 1
-          fi
-          security_run_id="$(trusted_run_id security.yml Security)"
-          if [ -z "$security_run_id" ]; then
-            echo "::error::No successful trusted Security run exists for $EXPECTED_SHA."
-            exit 1
-          fi
-          security_jobs="$(gh api --method GET \
-            "repos/$REPOSITORY/actions/runs/$security_run_id/jobs?filter=latest&per_page=100")"
-          if ! jq -e --arg sha "$EXPECTED_SHA" \
-            'any(.jobs[];
-              .name == "Security success" and
-              .conclusion == "success" and
-              .head_sha == $sha)' <<<"$security_jobs" >/dev/null; then
-            echo "::error::Security success did not pass for $EXPECTED_SHA."
+          require_trusted_sha() {
+            local expected_sha="$1"
+            local source_name="$2"
+            local ci_run_id
+            local security_jobs
+            local security_run_id
+
+            ci_run_id="$(trusted_run_id ci.yml CI "$expected_sha")"
+            if [ -z "$ci_run_id" ]; then
+              echo "::error::No successful trusted main-push CI run exists for $source_name $expected_sha."
+              exit 1
+            fi
+            security_run_id="$(trusted_run_id security.yml Security "$expected_sha")"
+            if [ -z "$security_run_id" ]; then
+              echo "::error::No successful trusted Security run exists for $source_name $expected_sha."
+              exit 1
+            fi
+            security_jobs="$(gh api --method GET \
+              "repos/$REPOSITORY/actions/runs/$security_run_id/jobs?filter=latest&per_page=100")"
+            if ! jq -e --arg sha "$expected_sha" \
+              'any(.jobs[];
+                .name == "Security success" and
+                .conclusion == "success" and
+                .head_sha == $sha)' <<<"$security_jobs" >/dev/null; then
+              echo "::error::Security success did not pass for $source_name $expected_sha."
+              exit 1
+            fi
+          }
+
+          require_trusted_sha "$EXPECTED_SHA" "release commit"
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            if [ "$INVOCATION_REF" != refs/heads/main ]; then
+              echo "::error::Manual macOS recovery must be dispatched from main."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$INVOCATION_SHA" origin/main; then
+              echo "::error::Manual recovery commit $INVOCATION_SHA is not reachable from origin/main."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$EXPECTED_SHA" "$INVOCATION_SHA"; then
+              echo "::error::Manual recovery commit $INVOCATION_SHA predates release commit $EXPECTED_SHA."
+              exit 1
+            fi
+            require_trusted_sha "$INVOCATION_SHA" "manual recovery commit"
+          elif [ "$INVOCATION_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Tag invocation SHA $INVOCATION_SHA does not match release commit $EXPECTED_SHA."
             exit 1
           fi
 

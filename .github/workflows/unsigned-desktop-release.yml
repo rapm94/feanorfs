@@ -95,7 +95,7 @@ jobs:
             exit 1
           fi
           release_runs="$(gh api --method GET "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
-            -f head_sha="$tag_sha" -f event=push -f status=completed -f per_page=100)"
+            -f head_sha="$tag_sha" -f event=push -f per_page=100)"
           if ! jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" --arg sha "$tag_sha" \
             'any(.workflow_runs[];
               .conclusion == "success" and
@@ -155,7 +155,6 @@ jobs:
               -f branch=main \
               -f head_sha="$EXPECTED_SHA" \
               -f event=push \
-              -f status=completed \
               -f per_page=100)"
             jq -r \
               --arg repository "$REPOSITORY" \
