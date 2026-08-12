@@ -671,6 +671,66 @@ impl ManualSupervisor {
         }
     }
 
+    async fn wait_until_runner_stop_reconciled(&mut self, workspace: &Path) {
+        let pid = self.child.id().expect("manual supervisor pid");
+        let canonical = workspace
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let state_root = feanorfs_agent_core::global_state_root().unwrap();
+        let registry_path = state_root.join("supervisor.json");
+        let ack_path = state_root.join("supervisor-runner-ack.json");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    panic!("manual supervisor exited before reconciliation: {status}")
+                }
+                Ok(None) => {}
+                Err(error) => panic!("inspect manual supervisor: {error}"),
+            }
+            let registry = std::fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let ack_store = std::fs::read(&ack_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            let registry_generation = registry
+                .as_ref()
+                .and_then(|value| value["mutation_generation"].as_u64());
+            let tombstone = registry
+                .as_ref()
+                .and_then(|value| value["runner_stop_tokens"].get(&canonical));
+            let ack = ack_store
+                .as_ref()
+                .and_then(|value| value["acks"].get(&canonical));
+            if let (Some(registry_generation), Some(tombstone), Some(ack)) =
+                (registry_generation, tombstone, ack)
+            {
+                let stop_token = tombstone["token"].as_str().unwrap_or_default();
+                if registry_generation > 0
+                    && tombstone["generation"]
+                        .as_u64()
+                        .is_some_and(|value| value > 0)
+                    && !stop_token.is_empty()
+                    && ack["pid"].as_u64() == Some(u64::from(pid))
+                    && ack["workspace"].as_str() == Some(canonical.as_str())
+                    && ack["registry_generation"].as_u64() == Some(registry_generation)
+                    && ack["generation"].as_u64().is_some_and(|value| value > 0)
+                    && ack["stop_token"].as_str() == Some(stop_token)
+                {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "manual supervisor did not reconcile the stopped runner"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn shutdown(mut self) {
         self.child.terminate();
         if self.child.wait_for_exit(Duration::from_secs(7)).await {
@@ -1146,6 +1206,9 @@ async fn visible_runner_stop_prevents_resurrection_across_manual_supervisor_rest
     supervisor.shutdown().await;
     let mut restarted = ManualSupervisor::spawn(&fixture, "publish_result", &record_path).await;
     restarted.wait_until_ready().await;
+    restarted
+        .wait_until_runner_stop_reconciled(fixture.root())
+        .await;
 
     let deferred_request = send_request(&fixture, AGENT, "must remain stopped").await;
     tokio::time::sleep(Duration::from_millis(1_200)).await;
