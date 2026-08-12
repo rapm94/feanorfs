@@ -105,12 +105,13 @@ jobs:
             local workflow_file="$1"
             local workflow_name="$2"
             local runs
+            # GitHub's status index can lag the canonical run record. Filter
+            # completion and trust properties from the returned records below.
             runs="$(gh api --method GET \
               "repos/$REPOSITORY/actions/workflows/$workflow_file/runs" \
               -f branch=main \
               -f head_sha="$EXPECTED_SHA" \
               -f event=push \
-              -f status=completed \
               -f per_page=100)"
             jq -r \
               --arg repository "$REPOSITORY" \
@@ -261,12 +262,13 @@ jobs:
             local workflow_file="$1"
             local workflow_name="$2"
             local runs
+            # GitHub's status index can lag the canonical run record. Filter
+            # completion and trust properties from the returned records below.
             runs="$(gh api --method GET \
               "repos/$REPOSITORY/actions/workflows/$workflow_file/runs" \
               -f branch=main \
               -f head_sha="$EXPECTED_SHA" \
               -f event=push \
-              -f status=completed \
               -f per_page=100)"
             jq -r \
               --arg repository "$REPOSITORY" \
