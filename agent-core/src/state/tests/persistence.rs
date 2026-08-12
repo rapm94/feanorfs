@@ -70,6 +70,76 @@ fn durable_state_reopen_preserves_data() {
 }
 
 #[test]
+fn durable_state_streaming_bytes_match_canonical_serialization() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let state_store = DurableState::new(dir.path()).expect("open durable state");
+    state_store
+        .with_write(|state| {
+            state
+                .local_files
+                .insert("a.txt".into(), cache_entry("a", 42));
+            Ok(())
+        })
+        .expect("write entry");
+
+    let expected = state_store
+        .with_read(LocalStateV1::to_json)
+        .expect("serialize canonical state");
+    let persisted = fs::read_to_string(state_store.state_path()).expect("read persisted state");
+
+    assert_eq!(persisted, expected);
+}
+
+#[test]
+fn durable_state_streaming_overflow_preserves_destination_and_temp_cleanup() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let state_store = DurableState::new(dir.path()).expect("open durable state");
+    let destination = state_store.state_path();
+    let original = fs::read(destination).expect("read initial state");
+    let temporary_files_before = temporary_state_files(dir.path());
+
+    let error = state_store
+        .with_write_limit_for_test(16, |state| {
+            state
+                .local_files
+                .insert("a.txt".into(), cache_entry("a", 42));
+            Ok(())
+        })
+        .expect_err("bounded streaming write should fail");
+
+    assert!(error.to_string().contains("exceeds"));
+    assert_eq!(fs::read(destination).expect("read destination"), original);
+    assert_eq!(temporary_state_files(dir.path()), temporary_files_before);
+}
+
+#[test]
+#[ignore = "manual 100k-entry streaming local-state persistence profile"]
+fn local_state_persistence_profile_100k() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let state_store = DurableState::new(dir.path()).expect("open durable state");
+
+    let started = std::time::Instant::now();
+    state_store
+        .with_write(|state| {
+            for index in 0..100_000 {
+                let path = format!("src/file_{index:06}.txt");
+                state
+                    .local_files
+                    .insert(path, cache_entry(&format!("entry-{index:06}"), index));
+            }
+            Ok(())
+        })
+        .expect("persist large local state");
+    let elapsed = started.elapsed();
+    let bytes = fs::metadata(state_store.state_path())
+        .expect("inspect persisted state")
+        .len();
+
+    assert!(bytes > 10_000_000);
+    eprintln!("local_state_persistence_profile_100k: elapsed={elapsed:.2?} bytes={bytes}");
+}
+
+#[test]
 fn durable_state_read_sees_latest_commit() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let state_store = DurableState::new(dir.path()).expect("open durable state");
@@ -187,4 +257,15 @@ fn durable_state_read_fails_on_missing_state_file() {
         .expect_err("missing state should fail");
 
     assert!(error.to_string().contains("local_state.json is missing"));
+}
+
+fn temporary_state_files(directory: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let mut files = fs::read_dir(directory)
+        .expect("read state directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".local_state.json."))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }

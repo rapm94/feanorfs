@@ -4,10 +4,11 @@ use anyhow::{Context, Result};
 use feanorfs_common::tray_contract::{RecentWorkspaceEntry, RecentWorkspacesResult};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 const MAX_RECENT: usize = 12;
+const MAX_RECENT_STATE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RecentStore {
@@ -35,6 +36,14 @@ fn create_store_dir(path: &Path) -> Result<()> {
 }
 
 fn open_store_lock(path: &Path) -> Result<File> {
+    open_store_lock_with(path, false)
+}
+
+fn open_store_lock_shared(path: &Path) -> Result<File> {
+    open_store_lock_with(path, true)
+}
+
+fn try_open_store_lock_shared(path: &Path) -> Result<Option<File>> {
     let lock_path = path.with_extension("lock");
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
@@ -46,8 +55,36 @@ fn open_store_lock(path: &Path) -> Result<File> {
     let lock = options
         .open(&lock_path)
         .with_context(|| format!("open recent-workspace lock {}", lock_path.display()))?;
-    fs2::FileExt::lock_exclusive(&lock)
-        .with_context(|| format!("lock recent workspaces {}", lock_path.display()))?;
+    match fs2::FileExt::try_lock_shared(&lock) {
+        Ok(()) => Ok(Some(lock)),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(None)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("lock recent workspaces {}", lock_path.display()))
+        }
+    }
+}
+
+fn open_store_lock_with(path: &Path, shared: bool) -> Result<File> {
+    let lock_path = path.with_extension("lock");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(&lock_path)
+        .with_context(|| format!("open recent-workspace lock {}", lock_path.display()))?;
+    if shared {
+        fs2::FileExt::lock_shared(&lock)
+            .with_context(|| format!("lock recent workspaces {}", lock_path.display()))?;
+    } else {
+        fs2::FileExt::lock_exclusive(&lock)
+            .with_context(|| format!("lock recent workspaces {}", lock_path.display()))?;
+    }
     Ok(lock)
 }
 
@@ -55,9 +92,16 @@ fn load_store(path: &Path) -> Result<RecentStore> {
     if !path.is_file() {
         return Ok(RecentStore::default());
     }
-    let content = fs::read_to_string(path)
+    let file =
+        File::open(path).with_context(|| format!("open recent workspaces {}", path.display()))?;
+    let mut content = Vec::new();
+    file.take(MAX_RECENT_STATE_BYTES.saturating_add(1))
+        .read_to_end(&mut content)
         .with_context(|| format!("read recent workspaces {}", path.display()))?;
-    serde_json::from_str(&content)
+    if content.len() as u64 > MAX_RECENT_STATE_BYTES {
+        anyhow::bail!("recent workspace state exceeds {MAX_RECENT_STATE_BYTES} byte limit");
+    }
+    serde_json::from_slice(&content)
         .with_context(|| format!("parse recent workspaces {}", path.display()))
 }
 
@@ -163,9 +207,59 @@ fn forget_unavailable_from_store_with(
 }
 
 fn result_from_store(store: &RecentStore) -> RecentWorkspacesResult {
-    RecentWorkspacesResult {
-        active: store.active.clone(),
-        workspaces: store.workspaces.clone(),
+    let workspaces = store
+        .workspaces
+        .iter()
+        .take(MAX_RECENT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let active = store.active.as_ref().and_then(|active| {
+        workspaces
+            .iter()
+            .any(|workspace| &workspace.path == active)
+            .then(|| active.clone())
+    });
+    RecentWorkspacesResult { active, workspaces }
+}
+
+fn list_recent_workspaces_at(path: &Path) -> Result<RecentWorkspacesResult> {
+    let Some(parent) = path.parent() else {
+        return Ok(result_from_store(&RecentStore::default()));
+    };
+
+    // A first read must not create the global state root, its permissions, or
+    // a lock/store file. Once the root exists, the shared lock provides the
+    // same linearization point as writers while preserving atomic replacement.
+    match fs::symlink_metadata(parent) {
+        Ok(_) => {
+            let _lock = open_store_lock_shared(path)?;
+            Ok(result_from_store(&load_store(path)?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(result_from_store(&RecentStore::default()))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect recent workspace state root {}", parent.display())),
+    }
+}
+
+fn try_list_recent_workspaces_at(path: &Path) -> Result<Option<RecentWorkspacesResult>> {
+    let Some(parent) = path.parent() else {
+        return Ok(Some(result_from_store(&RecentStore::default())));
+    };
+
+    match fs::symlink_metadata(parent) {
+        Ok(_) => {
+            let Some(_lock) = try_open_store_lock_shared(path)? else {
+                return Ok(None);
+            };
+            Ok(Some(result_from_store(&load_store(path)?)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Some(result_from_store(&RecentStore::default())))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect recent workspace state root {}", parent.display())),
     }
 }
 
@@ -208,9 +302,16 @@ pub fn unregister_workspace(workspace_path: &Path) -> Result<RecentWorkspacesRes
 
 pub fn list_recent_workspaces() -> Result<RecentWorkspacesResult> {
     let path = recent_path()?;
-    create_store_dir(&path)?;
-    let _lock = open_store_lock(&path)?;
-    Ok(result_from_store(&load_store(&path)?))
+    list_recent_workspaces_at(&path)
+}
+
+/// Best-effort bounded projection for recurring desktop refreshes.
+///
+/// A contended writer returns `Ok(None)` immediately so the tray can retain
+/// its last good folder list instead of leaving the status process pending.
+pub fn try_list_recent_workspaces() -> Result<Option<RecentWorkspacesResult>> {
+    let path = recent_path()?;
+    try_list_recent_workspaces_at(&path)
 }
 
 /// Explicitly remove tray entries whose folder is missing or whose workspace
@@ -285,10 +386,111 @@ mod tests {
         let path = directory.path().join("recent.json");
         fs::write(&path, b"{not-json").unwrap();
 
-        let error = load_store(&path).unwrap_err();
+        let error = list_recent_workspaces_at(&path).unwrap_err();
 
         assert!(error.to_string().contains("parse recent workspaces"));
         assert_eq!(fs::read(&path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn missing_state_root_read_is_empty_without_creating_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let path = root.join("recent.json");
+
+        let result = list_recent_workspaces_at(&path).unwrap();
+
+        assert!(result.active.is_none());
+        assert!(result.workspaces.is_empty());
+        assert!(!root.exists());
+        assert!(!path.exists());
+        assert!(!path.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn listing_preserves_store_projection_and_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recent.json");
+        let store = RecentStore {
+            active: Some("/second".into()),
+            workspaces: vec![entry("/second"), entry("/first")],
+        };
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let listed = list_recent_workspaces_at(&path).unwrap();
+
+        assert_eq!(listed.active.as_deref(), store.active.as_deref());
+        assert_eq!(listed.workspaces.len(), store.workspaces.len());
+        for (listed, stored) in listed.workspaces.iter().zip(store.workspaces.iter()) {
+            assert_eq!(listed.path, stored.path);
+            assert_eq!(listed.workspace_id, stored.workspace_id);
+            assert_eq!(listed.label, stored.label);
+        }
+    }
+
+    #[test]
+    fn listing_caps_legacy_entries_and_drops_an_out_of_projection_active_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recent.json");
+        let workspaces = (0..MAX_RECENT + 3)
+            .map(|index| entry(&format!("/{index}")))
+            .collect::<Vec<_>>();
+        let store = RecentStore {
+            active: Some(format!("/{}", MAX_RECENT + 1)),
+            workspaces,
+        };
+        fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        let listed = list_recent_workspaces_at(&path).unwrap();
+
+        assert_eq!(listed.workspaces.len(), MAX_RECENT);
+        assert!(listed.active.is_none());
+    }
+
+    #[test]
+    fn listing_rejects_oversized_recent_state_before_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recent.json");
+        fs::write(&path, vec![b' '; MAX_RECENT_STATE_BYTES as usize + 1]).unwrap();
+
+        let error = list_recent_workspaces_at(&path).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn best_effort_listing_skips_a_contended_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recent.json");
+        let _writer = open_store_lock(&path).unwrap();
+
+        assert!(try_list_recent_workspaces_at(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn shared_readers_coexist_while_exclusive_writer_is_blocked() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recent.json");
+        let first_reader = open_store_lock_shared(&path).unwrap();
+        let lock_path = path.with_extension("lock");
+        let second_reader = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+
+        assert!(fs2::FileExt::try_lock_shared(&second_reader).is_ok());
+
+        let writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&writer).is_err());
+
+        drop(first_reader);
+        drop(second_reader);
+        assert!(fs2::FileExt::try_lock_exclusive(&writer).is_ok());
     }
 
     #[test]

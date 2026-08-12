@@ -104,11 +104,46 @@ pub fn validate_e2ee_key(key: &str, format_version: u32) -> Result<()> {
     Ok(())
 }
 
+fn read_workspace_config_at_state(state: &Path) -> Result<String> {
+    std::fs::read_to_string(state.join("config.json"))
+        .context("Could not read config file. Make sure you have initialized the client.")
+}
+
+fn read_workspace_config(base_path: &Path) -> Result<String> {
+    let state = crate::workspace_layout::ensure_workspace_state(base_path)?;
+    read_workspace_config_at_state(&state)
+}
+
+/// Load the public workspace identifier from an already-resolved private
+/// workspace state directory.
+///
+/// The argument is deliberately a state directory, not a project path. This
+/// helper performs no workspace migration or maintenance; callers that start
+/// from a project path must resolve it with
+/// [`ensure_workspace_state`](crate::workspace_layout::ensure_workspace_state) first.
+pub fn load_workspace_id_from_state(state: &Path) -> Result<String> {
+    #[derive(Deserialize)]
+    struct WorkspaceIdOnly {
+        workspace_id: String,
+    }
+
+    let content = read_workspace_config_at_state(state)?;
+    serde_json::from_str::<WorkspaceIdOnly>(&content)
+        .map(|config| config.workspace_id)
+        .context("parse workspace identifier")
+}
+
+/// Load the public workspace identifier without resolving protected secrets.
+///
+/// Read-only status surfaces use this projection so routine polling never
+/// opens the OS credential store merely to label a workspace.
+pub fn load_workspace_id(base_path: &Path) -> Result<String> {
+    let state = crate::workspace_layout::ensure_workspace_state(base_path)?;
+    load_workspace_id_from_state(&state)
+}
+
 pub fn load_config(base_path: &Path) -> Result<Config> {
-    let config_path =
-        crate::workspace_layout::ensure_workspace_state(base_path)?.join("config.json");
-    let content = std::fs::read_to_string(&config_path)
-        .context("Could not read config file. Make sure you have initialized the client.")?;
+    let content = read_workspace_config(base_path)?;
     let mut config: Config = serde_json::from_str(&content).context("parse workspace config")?;
     if let Some(secrets) = credentials::load(&content)? {
         config.encryption_password = secrets.encryption_password;

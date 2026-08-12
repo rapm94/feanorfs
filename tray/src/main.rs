@@ -13,10 +13,12 @@ use feanorfs::{
     conflicts_keep_all, copy_pairing_clipboard, export_recovery_kit, forget_unavailable_workspaces,
     graceful_stop_child, import_recovery_kit, invalidate_config_cache, join_workspace,
     run_pairing_session, start_workspace, stop_workspace, sync_once, system_health, tray_activate,
-    tray_pause, tray_recent, tray_status, workspace_has_config, HealthReport, HealthStatus,
-    PairSessionEvent, UpdateCheckResult, UpdateStatus,
+    tray_overview, tray_pause, tray_recent, tray_status, workspace_has_config, HealthReport,
+    HealthStatus, PairSessionEvent, UpdateCheckResult, UpdateStatus,
 };
-use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
+use feanorfs_common::tray_contract::{
+    RecentWorkspacesResult, TrayOverviewResult, TrayStatusResult,
+};
 use icons::{icon_for, visual_from_state, TrayVisual};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use std::cell::Cell;
@@ -38,7 +40,6 @@ const REFRESH_SECS: u64 = 10;
 /// Daily cadence for the throttled periodic update offer (the CLI enforces
 /// its own per-machine throttle window as well).
 const PERIODIC_UPDATE_SECS: u64 = 24 * 60 * 60;
-const RECENT_CACHE_SECS: u64 = 30;
 const MAX_WATCH_FAILURES: u32 = 3;
 const FAST_EXIT_SECS: u64 = 10;
 
@@ -105,7 +106,11 @@ enum Action {
     StatusReady {
         generation: u64,
         workspace: PathBuf,
-        status: Result<TrayStatusResult, String>,
+        overview: Result<TrayOverviewResult, String>,
+    },
+    RecentReady {
+        generation: u64,
+        recent: Option<RecentWorkspacesResult>,
     },
     HealthReady {
         workspace: PathBuf,
@@ -177,7 +182,7 @@ struct AppState {
     status_failed: bool,
     error_message: Option<String>,
     recent: Option<RecentWorkspacesResult>,
-    recent_fetched_at: Option<Instant>,
+    recent_inflight: bool,
     managed_service: Option<bool>,
     setup_inflight: bool,
     setup_kind: Option<SetupKind>,
@@ -208,7 +213,7 @@ impl AppState {
             status_failed: false,
             error_message: None,
             recent: None,
-            recent_fetched_at: None,
+            recent_inflight: false,
             managed_service: None,
             setup_inflight: false,
             setup_kind: None,
@@ -346,20 +351,8 @@ impl AppState {
         }
     }
 
-    fn cached_recent(&mut self) {
-        let stale = self
-            .recent_fetched_at
-            .map(|t| t.elapsed().as_secs() >= RECENT_CACHE_SECS)
-            .unwrap_or(true);
-        if stale {
-            self.recent = tray_recent();
-            self.recent_fetched_at = Some(Instant::now());
-        }
-    }
-
     fn invalidate_recent(&mut self) {
         self.recent = None;
-        self.recent_fetched_at = None;
     }
 
     fn reset_watch_policy(&mut self) {
@@ -379,7 +372,6 @@ impl AppState {
         {
             return false;
         }
-        self.cached_recent();
         let Some(recent) = self.recent.as_ref() else {
             return false;
         };
@@ -590,18 +582,21 @@ fn is_paused_on_disk(workspace: &Path) -> bool {
     tray_status(workspace).is_ok_and(|status| status.paused)
 }
 
-fn resolve_initial_workspace() -> Option<PathBuf> {
+fn resolve_initial_workspace() -> (Option<PathBuf>, Option<RecentWorkspacesResult>) {
     if let Ok(p) = std::env::var("FEANORFS_WORKSPACE") {
         let path = expand_tilde(&p);
-        return workspace_has_config(&path).then_some(path);
+        return (workspace_has_config(&path).then_some(path), None);
     }
-    let recent = tray_recent()?;
-    recent
-        .active
-        .into_iter()
-        .chain(recent.workspaces.into_iter().map(|w| w.path))
-        .map(PathBuf::from)
-        .find(|p| workspace_has_config(p))
+    let recent = tray_recent();
+    let workspace = recent.as_ref().and_then(|recent| {
+        recent
+            .active
+            .iter()
+            .chain(recent.workspaces.iter().map(|workspace| &workspace.path))
+            .map(PathBuf::from)
+            .find(|path| workspace_has_config(path))
+    });
+    (workspace, recent)
 }
 
 fn first_run_requested(args: &[OsString]) -> bool {
@@ -1474,9 +1469,14 @@ fn action_allowed_while_background_check_runs(action: &MenuAction) -> bool {
 }
 
 fn menu_revision(state: &AppState) -> u64 {
+    // Hash the in-memory projections directly. `serde_json::to_vec` here used
+    // to allocate for every status/recent refresh even when the menu was
+    // unchanged; these types derive `Hash` without changing their JSON wire
+    // representation.
     let mut hasher = DefaultHasher::new();
     state.workspace.hash(&mut hasher);
     state.owns_watch.hash(&mut hasher);
+    state.managed_service.hash(&mut hasher);
     state.error_message.hash(&mut hasher);
     state.setup_inflight.hash(&mut hasher);
     state.setup_kind.hash(&mut hasher);
@@ -1486,16 +1486,8 @@ fn menu_revision(state: &AppState) -> u64 {
     state.recovery_inflight.hash(&mut hasher);
     state.health_inflight.hash(&mut hasher);
     state.update_inflight.hash(&mut hasher);
-    if let Some(status) = state.last_status.as_ref() {
-        if let Ok(encoded) = serde_json::to_vec(status) {
-            encoded.hash(&mut hasher);
-        }
-    }
-    if let Some(recent) = state.recent.as_ref() {
-        if let Ok(encoded) = serde_json::to_vec(recent) {
-            encoded.hash(&mut hasher);
-        }
-    }
+    state.last_status.hash(&mut hasher);
+    state.recent.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1551,11 +1543,11 @@ fn request_status_fetch_with_policy(
     };
     let proxy = proxy.clone();
     std::thread::spawn(move || {
-        let status = tray_status(&workspace);
+        let overview = tray_overview(&workspace);
         let _ = proxy.send_event(Action::StatusReady {
             generation,
             workspace,
-            status,
+            overview,
         });
     });
 }
@@ -1569,6 +1561,36 @@ fn request_periodic_status_fetch(
     proxy: &tao::event_loop::EventLoopProxy<Action>,
 ) {
     request_status_fetch_with_policy(state, proxy, false);
+}
+
+fn request_recent_fetch(state: &mut AppState, proxy: &tao::event_loop::EventLoopProxy<Action>) {
+    if state.recent_inflight {
+        return;
+    }
+    state.recent_inflight = true;
+    let generation = state.task_generation;
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let _ = proxy.send_event(Action::RecentReady {
+            generation,
+            recent: tray_recent(),
+        });
+    });
+}
+
+fn apply_recent_fetch(
+    state: &mut AppState,
+    generation: u64,
+    recent: Option<RecentWorkspacesResult>,
+) -> bool {
+    state.recent_inflight = false;
+    if generation != state.task_generation {
+        return false;
+    }
+    if let Some(recent) = recent {
+        state.recent = Some(recent);
+    }
+    true
 }
 
 fn run_exclusive_service_action(
@@ -2188,7 +2210,7 @@ fn main() {
             return;
         }
     };
-    let workspace = resolve_initial_workspace();
+    let (workspace, recent) = resolve_initial_workspace();
     let prompt_first_run =
         should_prompt_first_run(first_run_requested(&arguments), workspace.as_deref());
 
@@ -2210,7 +2232,7 @@ fn main() {
     }));
 
     let mut state = AppState::new(workspace);
-    state.cached_recent();
+    state.recent = recent;
 
     let initial_visual = TrayVisual::Idle;
     let tray = TrayIconBuilder::new()
@@ -2283,6 +2305,7 @@ fn main() {
                 Err(poisoned) => poisoned.into_inner(),
             };
             st.status_inflight = false;
+            st.recent_inflight = false;
             st.setup_inflight = false;
             st.stop_inflight = false;
             st.switch_inflight = false;
@@ -2318,21 +2341,19 @@ fn main() {
                 apply_ui(st, tray, visual);
             }
             Action::Refresh => {
-                // Other CLI processes can add or stop folders while the tray is
-                // open. Refresh the shared registry on every UI refresh so a
-                // new mirrored folder appears within one polling interval.
-                st.invalidate_recent();
-                st.cached_recent();
-                if st.adopt_recent_if_unconfigured() {
-                    st.last_status = None;
+                if st.workspace.is_none() {
+                    // Keep the unconfigured tray responsive while detecting a
+                    // folder added by another CLI process.
+                    request_recent_fetch(st, proxy);
+                } else {
+                    request_periodic_status_fetch(st, proxy);
                 }
-                request_periodic_status_fetch(st, proxy);
                 apply_ui(st, tray, visual);
             }
             Action::StatusReady {
                 generation,
                 workspace,
-                status,
+                overview,
             } => {
                 let stale =
                     generation != st.task_generation || st.workspace.as_ref() != Some(&workspace);
@@ -2347,9 +2368,12 @@ fn main() {
                     return;
                 }
                 st.status_inflight = false;
-                match status {
-                    Ok(s) => {
-                        st.last_status = Some(s);
+                match overview {
+                    Ok(overview) => {
+                        st.last_status = Some(overview.status);
+                        if let Some(recent) = overview.recent {
+                            st.recent = Some(recent);
+                        }
                         st.status_failed = false;
                         st.error_message = None;
                     }
@@ -2360,12 +2384,24 @@ fn main() {
                     }
                 }
                 st.check_watch_alive();
-                st.cached_recent();
                 apply_ui(st, tray, visual);
                 if st.status_pending {
                     st.status_pending = false;
                     request_status_fetch(st, proxy);
                 }
+            }
+            Action::RecentReady { generation, recent } => {
+                if !apply_recent_fetch(st, generation, recent) {
+                    if st.workspace.is_none() {
+                        request_recent_fetch(st, proxy);
+                    }
+                    return;
+                }
+                if st.adopt_recent_if_unconfigured() {
+                    st.last_status = None;
+                    request_status_fetch(st, proxy);
+                }
+                apply_ui(st, tray, visual);
             }
             Action::HealthReady { workspace, report } => {
                 st.health_inflight = false;
@@ -2556,7 +2592,6 @@ fn main() {
                     st.workspace = Some(path);
                     invalidate_config_cache();
                     st.invalidate_recent();
-                    st.cached_recent();
                     st.reset_watch_policy();
                     st.last_status = None;
                 }
@@ -2577,7 +2612,6 @@ fn main() {
                         let removed =
                             before.min(before.saturating_sub(unavailable_workspace_count(&recent)));
                         st.recent = Some(recent);
-                        st.recent_fetched_at = Some(Instant::now());
                         st.error_message = None;
                         if st.workspace.is_none() {
                             let _ = st.adopt_recent_if_unconfigured();
@@ -2629,7 +2663,6 @@ fn main() {
                     st.workspace = Some(path.clone());
                     invalidate_config_cache();
                     st.invalidate_recent();
-                    st.cached_recent();
                     st.reset_watch_policy();
                     st.last_status = None;
                     let (title, description) = setup_success_copy(kind, &path);
@@ -2668,8 +2701,7 @@ fn main() {
                     invalidate_config_cache();
                     st.invalidate_recent();
                     st.reset_watch_policy();
-                    st.cached_recent();
-                    let _ = st.adopt_recent_if_unconfigured();
+                    request_recent_fetch(st, proxy);
                 }
                 request_status_fetch(st, proxy);
                 apply_ui(st, tray, visual);
@@ -2745,7 +2777,6 @@ fn main() {
                         st.workspace = Some(path);
                         invalidate_config_cache();
                         st.invalidate_recent();
-                        st.cached_recent();
                         st.reset_watch_policy();
                         st.last_status = None;
                         let _ = rfd::MessageDialog::new()
@@ -2802,7 +2833,8 @@ mod tests {
     }
 
     use feanorfs_common::tray_contract::{
-        RecentWorkspaceEntry, TrayAgentsSummary, TrayStatusResult,
+        RecentWorkspaceEntry, TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry,
+        TrayStatusResult,
     };
     use icons::visual_from_state;
 
@@ -2824,6 +2856,119 @@ mod tests {
         }
     }
 
+    fn menu_revision_fixture() -> AppState {
+        let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
+        state.owns_watch = false;
+        state.managed_service = Some(false);
+        state.error_message = Some("an actionable error".into());
+        state.setup_inflight = true;
+        state.setup_kind = Some(SetupKind::AddFolder);
+        state.stop_inflight = true;
+        state.switch_inflight = true;
+        state.pair_inflight = true;
+        state.recovery_inflight = true;
+        state.health_inflight = true;
+        state.update_inflight = true;
+        state.last_status = Some(TrayStatusResult {
+            mirror_state: "conflict".into(),
+            paused: true,
+            watching: true,
+            workspace_path: "/tmp/test".into(),
+            workspace_id: "test-workspace".into(),
+            workspace_label: "test".into(),
+            pending_conflict_count: 2,
+            pending_conflicts: vec![TrayConflictEntry {
+                path: "notes.txt".into(),
+                kind: "edit_edit".into(),
+                label: "Both sides changed notes.txt".into(),
+                choices: vec!["local".into(), "cloud".into(), "both".into()],
+            }],
+            agents: TrayAgentsSummary {
+                working: 1,
+                need_attention: 1,
+                entries: vec![TrayAgentEntry {
+                    name: "agent".into(),
+                    state: "changes".into(),
+                    change_count: 2,
+                    conflict_count: 1,
+                }],
+            },
+        });
+        state.recent = Some(RecentWorkspacesResult {
+            active: Some("/tmp/test".into()),
+            workspaces: vec![RecentWorkspaceEntry {
+                path: "/tmp/test".into(),
+                workspace_id: "test-workspace".into(),
+                label: "test".into(),
+            }],
+        });
+        state
+    }
+
+    #[test]
+    fn stale_recent_fetch_cannot_replace_newer_registry_state() {
+        let mut state = menu_revision_fixture();
+        state.task_generation = 2;
+        state.recent_inflight = true;
+        let expected = state.recent.clone().unwrap();
+        let stale = RecentWorkspacesResult {
+            active: Some("/tmp/stale".into()),
+            workspaces: vec![RecentWorkspaceEntry {
+                path: "/tmp/stale".into(),
+                workspace_id: "stale-workspace".into(),
+                label: "stale".into(),
+            }],
+        };
+
+        assert!(!apply_recent_fetch(&mut state, 1, Some(stale)));
+        assert!(!state.recent_inflight);
+        assert_eq!(
+            state.recent.as_ref().unwrap().active,
+            expected.active,
+            "an earlier fetch must not overwrite a later task generation"
+        );
+    }
+
+    fn assert_menu_revision_changes(mut state: AppState, mutate: impl FnOnce(&mut AppState)) {
+        let before = menu_revision(&state);
+        mutate(&mut state);
+        assert_ne!(
+            menu_revision(&state),
+            before,
+            "menu revision must change when visible state changes"
+        );
+    }
+
+    /// The pre-optimization implementation serialized each projection before
+    /// hashing it. Keep this test-only copy as the baseline for the ignored
+    /// profile below; production uses `Hash` directly and allocates nothing.
+    fn menu_revision_serializing(state: &AppState) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        state.workspace.hash(&mut hasher);
+        state.owns_watch.hash(&mut hasher);
+        state.managed_service.hash(&mut hasher);
+        state.error_message.hash(&mut hasher);
+        state.setup_inflight.hash(&mut hasher);
+        state.setup_kind.hash(&mut hasher);
+        state.stop_inflight.hash(&mut hasher);
+        state.switch_inflight.hash(&mut hasher);
+        state.pair_inflight.hash(&mut hasher);
+        state.recovery_inflight.hash(&mut hasher);
+        state.health_inflight.hash(&mut hasher);
+        state.update_inflight.hash(&mut hasher);
+        if let Some(status) = state.last_status.as_ref() {
+            if let Ok(encoded) = serde_json::to_vec(status) {
+                encoded.hash(&mut hasher);
+            }
+        }
+        if let Some(recent) = state.recent.as_ref() {
+            if let Ok(encoded) = serde_json::to_vec(recent) {
+                encoded.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     #[test]
     fn empty_state_is_safe_before_setup() {
         let mut state = AppState::new(None);
@@ -2837,6 +2982,7 @@ mod tests {
         assert!(!state.recovery_inflight);
         assert!(!state.health_inflight);
         assert!(!state.update_inflight);
+        assert!(!state.recent_inflight);
         assert!(state.pair_cancel.is_none());
         assert_eq!(state.last_menu_revision.get(), None);
         assert!(!state.has_managed_service());
@@ -2944,13 +3090,150 @@ mod tests {
         state.last_status = Some(make_status("idle", false));
         let initial = menu_revision(&state);
 
-        // Cache bookkeeping changes every refresh but has no visible menu
+        // Background-refresh bookkeeping has no visible menu
         // effect, so it must not close an open macOS status menu.
-        state.recent_fetched_at = Some(Instant::now());
+        state.recent_inflight = true;
         assert_eq!(menu_revision(&state), initial);
 
         state.last_status.as_mut().unwrap().paused = true;
         assert_ne!(menu_revision(&state), initial);
+    }
+
+    #[test]
+    fn menu_revision_tracks_representative_top_level_visible_state_changes() {
+        let changes: [fn(&mut AppState); 6] = [
+            |state| state.workspace = None,
+            |state| state.owns_watch = true,
+            |state| state.error_message = Some("a different error".into()),
+            |state| state.setup_inflight = false,
+            |state| state.setup_kind = Some(SetupKind::JoinFolder),
+            |state| state.health_inflight = false,
+        ];
+        for change in changes {
+            assert_menu_revision_changes(menu_revision_fixture(), change);
+        }
+    }
+
+    #[test]
+    fn menu_revision_tracks_managed_service_watcher_label_changes() {
+        let mut state = menu_revision_fixture();
+        assert!(unmanaged_terminal_watcher_active(
+            &state,
+            state.last_status.as_ref().expect("fixture status")
+        ));
+        let before = menu_revision(&state);
+        state.managed_service = Some(true);
+        assert!(!unmanaged_terminal_watcher_active(
+            &state,
+            state.last_status.as_ref().expect("fixture status")
+        ));
+        assert_ne!(menu_revision(&state), before);
+    }
+
+    #[test]
+    fn menu_revision_tracks_representative_status_conflict_and_agent_changes() {
+        let baseline = menu_revision(&menu_revision_fixture());
+        let changes: [fn(&mut TrayStatusResult); 6] = [
+            |status| status.mirror_state = "idle".into(),
+            |status| status.paused = false,
+            |status| status.pending_conflict_count = 3,
+            |status| status.pending_conflicts[0].path = "other.txt".into(),
+            |status| status.agents.entries[0].state = "conflicts".into(),
+            |status| {
+                status.agents.entries.push(TrayAgentEntry {
+                    name: "third-agent".into(),
+                    state: "offline".into(),
+                    change_count: 0,
+                    conflict_count: 0,
+                })
+            },
+        ];
+        for change in changes {
+            let mut state = menu_revision_fixture();
+            change(state.last_status.as_mut().expect("fixture status"));
+            assert_ne!(
+                menu_revision(&state),
+                baseline,
+                "menu revision must include representative rendered status/conflict/agent changes"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_revision_tracks_representative_recent_workspace_changes() {
+        let baseline = menu_revision(&menu_revision_fixture());
+        let changes: [fn(&mut RecentWorkspacesResult); 3] = [
+            |recent| recent.active = Some("/tmp/other".into()),
+            |recent| recent.workspaces[0].path = "/tmp/other".into(),
+            |recent| {
+                recent.workspaces.push(RecentWorkspaceEntry {
+                    path: "/tmp/third".into(),
+                    workspace_id: "third-workspace".into(),
+                    label: "third".into(),
+                })
+            },
+        ];
+        for change in changes {
+            let mut state = menu_revision_fixture();
+            change(state.recent.as_mut().expect("fixture recent workspaces"));
+            assert_ne!(
+                menu_revision(&state),
+                baseline,
+                "menu revision must include representative rendered recent-workspace changes"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_revision_ignores_refresh_bookkeeping_without_menu_effect() {
+        let mut state = menu_revision_fixture();
+        let baseline = menu_revision(&state);
+        state.status_inflight = true;
+        state.status_pending = true;
+        state.recent_inflight = true;
+        state.watch_failures = 2;
+        state.respawn_disabled = true;
+        assert_eq!(menu_revision(&state), baseline);
+    }
+
+    #[test]
+    #[ignore = "manual profile; run with --ignored --nocapture"]
+    fn profile_menu_revision_allocation_baseline_vs_structural_hash() {
+        const ITERATIONS: usize = 20_000;
+        let state = menu_revision_fixture();
+
+        let started = Instant::now();
+        let mut serialized_sum = 0_u64;
+        for _ in 0..ITERATIONS {
+            serialized_sum = serialized_sum.wrapping_add(std::hint::black_box(
+                menu_revision_serializing(std::hint::black_box(&state)),
+            ));
+        }
+        let serialized_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        let mut structural_sum = 0_u64;
+        for _ in 0..ITERATIONS {
+            structural_sum = structural_sum.wrapping_add(std::hint::black_box(menu_revision(
+                std::hint::black_box(&state),
+            )));
+        }
+        let structural_elapsed = started.elapsed();
+
+        assert_eq!(
+            serialized_sum,
+            menu_revision_serializing(&state).wrapping_mul(ITERATIONS as u64),
+            "serialized baseline must remain deterministic"
+        );
+        assert_eq!(
+            structural_sum,
+            menu_revision(&state).wrapping_mul(ITERATIONS as u64),
+            "structural revision must remain deterministic"
+        );
+
+        eprintln!(
+            "menu_revision profile ({ITERATIONS} iterations): serialized={serialized_elapsed:?} structural={structural_elapsed:?} checksums={serialized_sum}/{structural_sum}"
+        );
     }
 
     #[test]

@@ -63,9 +63,9 @@ pub use integrator::{
     PersistedIntegratorAssignment,
 };
 pub use local::{
-    load_config, load_global_config, save_config, save_config_secure, save_global_config,
-    save_global_config_secure, validate_e2ee_key, ClientDb, Config, CredentialProtection,
-    GlobalConfig, LOCAL_HUB_URL,
+    load_config, load_global_config, load_workspace_id, load_workspace_id_from_state, save_config,
+    save_config_secure, save_global_config, save_global_config_secure, validate_e2ee_key, ClientDb,
+    Config, CredentialProtection, GlobalConfig, LOCAL_HUB_URL,
 };
 pub use messages::{inbox, send_message, signals_since};
 pub use objects::ObjectStore;

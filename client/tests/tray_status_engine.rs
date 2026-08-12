@@ -11,7 +11,7 @@ mod support;
 
 use feanorfs_client::{
     do_push_only, do_tray_status, do_tray_status_with, invalidate_worker_status, load_config,
-    publish_worker_status, save_config, MirrorState,
+    publish_worker_status, register_workspace, save_config, MirrorState, TrayOverviewResult,
 };
 use std::time::Duration;
 use support::{
@@ -183,6 +183,40 @@ async fn worker_snapshot_poll_does_not_open_the_workspace_cache() {
 }
 
 #[tokio::test]
+async fn worker_snapshot_poll_does_not_resolve_workspace_credentials() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = make_v3(&client);
+    let root = client.workspace.path();
+    publish_worker_status(root, &MirrorState::Idle, &client.db)
+        .await
+        .unwrap();
+
+    let mut redacted = serde_json::to_value(&config).unwrap();
+    let object = redacted.as_object_mut().unwrap();
+    object.remove("encryption_password");
+    object.remove("server_password");
+    object.insert("credential_store".into(), "os".into());
+    object.insert("credential_id".into(), "fsc1-unavailable-in-test".into());
+    let state = feanorfs_agent_core::ensure_workspace_state(root).unwrap();
+    std::fs::write(
+        state.join("config.json"),
+        serde_json::to_vec(&redacted).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        load_config(root).is_err(),
+        "the fixture must prove full loading would touch protected credentials"
+    );
+    let status = do_tray_status(root)
+        .await
+        .expect("routine polling needs only public config metadata");
+    assert_eq!(status.workspace_id, config.workspace_id);
+    assert_eq!(status.mirror_state, "idle");
+}
+
+#[tokio::test]
 async fn snapshot_poll_does_not_require_a_reachable_hub() {
     let server = spawn_test_server().await;
     let client = spawn_test_client_with_server(&server).await;
@@ -206,4 +240,42 @@ async fn snapshot_poll_does_not_require_a_reachable_hub() {
     // No hub: a scanning poll would fail; the snapshot poll still answers.
     let status = do_tray_status(root).await.unwrap();
     assert_eq!(status.mirror_state, "offline");
+}
+
+#[tokio::test]
+async fn tray_overview_cli_emits_one_combined_document() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = make_v3(&client);
+    let root = client.workspace.path();
+    publish_worker_status(root, &MirrorState::Idle, &client.db)
+        .await
+        .unwrap();
+    register_workspace(root).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_feanorfs"))
+        .args(["--json", "tray", "overview"])
+        .current_dir(root)
+        .env(
+            "FEANORFS_HOME",
+            std::env::var_os("FEANORFS_HOME").expect("isolated test profile"),
+        )
+        .output()
+        .expect("run tray overview");
+    assert!(
+        output.status.success(),
+        "tray overview failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let overview: TrayOverviewResult =
+        serde_json::from_slice(&output.stdout).expect("parse one overview document");
+    assert_eq!(overview.status.workspace_id, config.workspace_id);
+    assert_eq!(overview.status.mirror_state, "idle");
+    assert!(overview.recent.is_some_and(|recent| {
+        recent
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.workspace_id == config.workspace_id)
+    }));
 }

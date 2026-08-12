@@ -97,10 +97,14 @@ FEANORFS_WORKSPACE=~/projects/my-app feanorfs-tray
 - **Needs attention** — per-conflict submenu with plain-language labels and Keep local / cloud / both actions
 - **Agents** — `N working · M need attention` with Land shortcuts
 
-Status refreshes every 10 seconds; menu actions run on worker threads so the
-menu never blocks, and unchanged refreshes do not replace or close an open
-native menu. Normally the OS-managed per-workspace service owns sync and is
-not described as a terminal process.
+Status refreshes every 10 seconds through one background CLI process that
+combines the worker-published status snapshot with the recent-folder list;
+unconfigured-folder discovery and menu actions also run on worker threads, so
+the menu never blocks. Routine polling does not scan the folder, contact the
+hub, or open protected credentials, and unchanged refreshes do not replace or
+close an open native menu; revision checks hash the in-memory projections
+without serializing JSON. Normally the OS-managed per-workspace service owns
+sync and is not described as a terminal process.
 The tray stops and restarts that service around exclusive actions. For legacy
 workspaces without a service it can still supervise one `feanorfs sync` child;
 unmanaged terminal watchers are left untouched.
@@ -109,6 +113,7 @@ unmanaged terminal watchers are left untouched.
 
 ```bash
 feanorfs --json tray status    # TrayStatusResult
+feanorfs --json tray overview  # TrayOverviewResult (bundled recurring refresh)
 feanorfs tray pause|resume     # TrayPauseResult with --json
 feanorfs --json tray recent
 feanorfs tray activate -- <path>

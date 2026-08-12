@@ -23,8 +23,8 @@ pub use invite::{
 };
 pub use tray_contract::{
     ConflictKeepResult, ConflictShowResult, RecentWorkspaceEntry, RecentWorkspacesResult,
-    TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayPauseResult, TrayStatusResult,
-    WorkerStatusSnapshot,
+    TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayOverviewResult, TrayPauseResult,
+    TrayStatusResult, WorkerStatusSnapshot,
 };
 
 pub use integrator_contract::{

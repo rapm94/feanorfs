@@ -6,6 +6,7 @@ mod tests;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 
 pub(crate) use durable::read_local_state_text;
 pub use durable::{check_no_legacy_db, DurableState};
@@ -46,28 +47,54 @@ impl Default for LocalStateV1 {
 }
 
 impl LocalStateV1 {
-    fn sort_for_serialize(&mut self) {
-        self.file_access_log.sort_by(|left, right| {
+    pub fn to_json(&self) -> Result<String> {
+        let mut bytes = Vec::new();
+        self.write_json(&mut bytes)?;
+        String::from_utf8(bytes).context("serialize local state")
+    }
+
+    /// Serialize the canonical state directly to a writer while enforcing the
+    /// on-disk size limit. The maps stay borrowed and only the two vectors that
+    /// require deterministic sorting allocate temporary references.
+    pub(crate) fn write_json<W: Write>(&self, writer: W) -> Result<usize> {
+        self.write_json_with_limit(writer, MAX_LOCAL_STATE_BYTES)
+    }
+
+    fn write_json_with_limit<W: Write>(&self, writer: W, max_bytes: usize) -> Result<usize> {
+        let canonical = self.canonical_for_serialize()?;
+        let mut writer = BoundedWriter::new(writer, max_bytes);
+        let serialization = serde_json::to_writer_pretty(&mut writer, &canonical);
+        if writer.exceeded() {
+            bail!("local_state.json exceeds {max_bytes} byte limit");
+        }
+        serialization.context("serialize local state")?;
+        writer.flush().context("flush local state")?;
+        Ok(writer.written())
+    }
+
+    fn canonical_for_serialize(&self) -> Result<CanonicalLocalState<'_>> {
+        self.validate_bounds()?;
+        let mut file_access_log = self.file_access_log.iter().collect::<Vec<_>>();
+        file_access_log.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then_with(|| left.sibling_path.cmp(&right.sibling_path))
         });
-        self.conflict_resolutions.sort_by(|left, right| {
+        let mut conflict_resolutions = self.conflict_resolutions.iter().collect::<Vec<_>>();
+        conflict_resolutions.sort_by(|left, right| {
             left.resolved_at
                 .cmp(&right.resolved_at)
                 .then_with(|| left.path.cmp(&right.path))
         });
-    }
-
-    pub fn to_json(&self) -> Result<String> {
-        self.validate_bounds()?;
-        let mut sorted = self.clone();
-        sorted.sort_for_serialize();
-        let json = serde_json::to_string_pretty(&sorted).context("serialize local state")?;
-        if json.len() > MAX_LOCAL_STATE_BYTES {
-            bail!("local_state.json exceeds {MAX_LOCAL_STATE_BYTES} byte limit");
-        }
-        Ok(json)
+        let canonical = CanonicalLocalState {
+            schema_version: self.schema_version,
+            local_files: &self.local_files,
+            file_access_log,
+            last_session: &self.last_session,
+            conflict_registry: &self.conflict_registry,
+            conflict_resolutions,
+        };
+        Ok(canonical)
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
@@ -144,6 +171,65 @@ impl LocalStateV1 {
         });
         let drop_count = self.file_access_log.len() - ACCESS_LOG_MAX_ENTRIES;
         self.file_access_log.drain(..drop_count);
+    }
+}
+
+/// Borrowed serialization view that keeps deterministic vector ordering
+/// without cloning the potentially large file/session/conflict maps.
+#[derive(Serialize)]
+struct CanonicalLocalState<'a> {
+    schema_version: u32,
+    local_files: &'a BTreeMap<String, CacheEntryV1>,
+    file_access_log: Vec<&'a AccessEntryV1>,
+    last_session: &'a BTreeMap<String, String>,
+    conflict_registry: &'a BTreeMap<String, ConflictRecordV1>,
+    conflict_resolutions: Vec<&'a ConflictResolutionV1>,
+}
+
+struct BoundedWriter<W> {
+    inner: W,
+    written: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl<W> BoundedWriter<W> {
+    fn new(inner: W, limit: usize) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+
+    const fn written(&self) -> usize {
+        self.written
+    }
+
+    const fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+impl<W: Write> Write for BoundedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.written);
+        if bytes.len() > remaining {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local state size limit exceeded",
+            ));
+        }
+
+        let written = self.inner.write(bytes)?;
+        self.written = self.written.saturating_add(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 

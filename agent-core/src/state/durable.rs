@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::{LocalStateV1, MAX_LOCAL_STATE_BYTES};
 use crate::durable::{
-    atomic_overwrite, create_lock_acquire_exclusive, open_lock_exclusive, open_lock_shared,
+    atomic_overwrite_with, create_lock_acquire_exclusive, open_lock_exclusive, open_lock_shared,
 };
 
 /// Cross-process locked, crash-safe JSON state persistence.
@@ -29,8 +29,8 @@ impl DurableState {
             let content = read_local_state_text(&state_path)?;
             LocalStateV1::from_json(&content)?;
         } else {
-            let json = LocalStateV1::default().to_json()?;
-            atomic_overwrite(&state_path, json.as_bytes())?;
+            let state = LocalStateV1::default();
+            atomic_overwrite_with(&state_path, |file| state.write_json(file).map(|_| ()))?;
         }
 
         drop(lock_file);
@@ -57,12 +57,32 @@ impl DurableState {
     where
         F: FnOnce(&mut LocalStateV1) -> Result<T>,
     {
+        self.with_write_inner(MAX_LOCAL_STATE_BYTES, operation)
+    }
+
+    fn with_write_inner<F, T>(&self, max_bytes: usize, operation: F) -> Result<T>
+    where
+        F: FnOnce(&mut LocalStateV1) -> Result<T>,
+    {
         let _lock = open_lock_exclusive(&self.lock_path)?;
         let mut state = read_state_file(&self.state_path)?;
         let result = operation(&mut state)?;
-        let json = state.to_json()?;
-        atomic_overwrite(&self.state_path, json.as_bytes())?;
+        atomic_overwrite_with(&self.state_path, |file| {
+            state.write_json_with_limit(file, max_bytes).map(|_| ())
+        })?;
         Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_write_limit_for_test<F, T>(
+        &self,
+        max_bytes: usize,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&mut LocalStateV1) -> Result<T>,
+    {
+        self.with_write_inner(max_bytes, operation)
     }
 
     #[cfg(test)]

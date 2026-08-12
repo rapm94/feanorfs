@@ -29,6 +29,7 @@ macro_rules! contract_snapshot {
 }
 
 contract_snapshot!(tray_status_json, fixtures::tray_status_json());
+contract_snapshot!(tray_overview_json, fixtures::tray_overview_json());
 contract_snapshot!(recent_workspaces_json, fixtures::recent_workspaces_json());
 contract_snapshot!(tray_pause_json, fixtures::tray_pause_json());
 contract_snapshot!(conflict_keep_json, fixtures::conflict_keep_json());
