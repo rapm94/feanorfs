@@ -1,6 +1,7 @@
 # Build platform-native desktop bundles after cargo-dist publishes the core CLI.
-# Linux bundles are checksummed and attested. Windows binaries additionally
-# require Azure Artifact Signing and fail closed when signing is unavailable.
+# Linux bundles are checksummed and attested. Signed Windows publication is
+# opt-in until the production Azure credentials are configured: set the
+# repository variable RELEASE_SIGNING_ENABLED to exactly "true" to enable it.
 name: Linux and Windows desktop release
 
 on:
@@ -497,6 +498,7 @@ jobs:
     needs:
       - wait-for-release
       - build-windows
+    if: ${{ vars.RELEASE_SIGNING_ENABLED == 'true' }}
     name: Sign and publish Windows x86_64 desktop bundle
     environment: prod
     runs-on: windows-latest
