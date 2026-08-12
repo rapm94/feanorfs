@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3](https://github.com/rapm94/feanorfs/compare/v0.9.2...v0.9.3) - 2026-08-12
+
+### Fixed
+
+- *(release)* carry product changes
+- *(release)* make Windows desktop smoke headless
+
 ## [0.9.2](https://github.com/rapm94/feanorfs/compare/v0.9.1...v0.9.2) - 2026-08-12
 
 ### Fixed
