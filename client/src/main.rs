@@ -5,7 +5,8 @@ mod cli;
 
 use clap::{Parser, Subcommand};
 use cli::{
-    setup_logging, AgentAction, ConflictsAction, HydrateAction, SyncAction, WorkspaceAction,
+    setup_logging, AgentAction, ConflictsAction, HydrateAction, LoggingMode, SyncAction,
+    WorkspaceAction,
 };
 
 #[derive(Parser)]
@@ -55,12 +56,29 @@ enum Commands {
     },
 }
 
+fn logging_mode(command: &Commands) -> LoggingMode {
+    let Commands::Workspace(WorkspaceAction::Tray { action }) = command else {
+        return LoggingMode::Standard;
+    };
+    match action {
+        cli::tray::TrayAction::Recent
+        | cli::tray::TrayAction::ForgetUnavailable
+        | cli::tray::TrayAction::Activate { .. }
+        | cli::tray::TrayAction::Join { .. } => LoggingMode::TrayGlobal,
+        cli::tray::TrayAction::Status { .. }
+        | cli::tray::TrayAction::Overview
+        | cli::tray::TrayAction::Pause
+        | cli::tray::TrayAction::Resume
+        | cli::tray::TrayAction::Register => LoggingMode::TrayWorkspace,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let current_dir = std::env::current_dir()?;
 
-    if let Err(e) = setup_logging(&current_dir) {
+    if let Err(e) = setup_logging(&current_dir, logging_mode(&cli.command)) {
         eprintln!("Warning: failed to initialize log file: {e:?}");
     }
 
@@ -91,6 +109,38 @@ use feanorfs_client::{open_api_client, open_client_db};
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    fn parsed_logging_mode(args: &[&str]) -> LoggingMode {
+        let cli = Cli::try_parse_from(args).unwrap();
+        logging_mode(&cli.command)
+    }
+
+    #[test]
+    fn tray_commands_select_latency_safe_logging_modes() {
+        for args in [
+            &["feanorfs", "tray", "recent"][..],
+            &["feanorfs", "tray", "forget-unavailable"][..],
+            &["feanorfs", "tray", "activate", "/configured/workspace"][..],
+            &["feanorfs", "tray", "join", "/new/workspace"][..],
+        ] {
+            assert_eq!(parsed_logging_mode(args), LoggingMode::TrayGlobal);
+        }
+
+        for args in [
+            &["feanorfs", "tray", "status"][..],
+            &["feanorfs", "tray", "overview"][..],
+            &["feanorfs", "tray", "pause"][..],
+            &["feanorfs", "tray", "resume"][..],
+            &["feanorfs", "tray", "register"][..],
+        ] {
+            assert_eq!(parsed_logging_mode(args), LoggingMode::TrayWorkspace);
+        }
+
+        assert_eq!(
+            parsed_logging_mode(&["feanorfs", "update", "--periodic"]),
+            LoggingMode::Standard
+        );
+    }
 
     #[test]
     fn cli_debug_asserts_pass() {

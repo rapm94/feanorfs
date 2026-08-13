@@ -21,7 +21,7 @@ pub mod update;
 pub mod util;
 pub mod workspace;
 
-pub use util::setup_logging;
+pub use util::{setup_logging, LoggingMode};
 
 pub use agent::AgentAction;
 pub use conflicts::ConflictsAction;
