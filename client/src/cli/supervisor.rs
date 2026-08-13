@@ -3764,11 +3764,21 @@ fn retry_one_pending_orphan_cleanup(cleanup: &mut PendingOrphanCleanup) {
     if cleanup.ticket.is_complete() {
         return;
     }
-    // A previous Windows supervisor's Job handle is not serializable and
-    // cannot be reopened by this process.  Even a null/dead root PID gives no
-    // proof that descendants are gone; retain the ownership record forever
-    // (and therefore withhold the runner ACK) until the original kernel Job
-    // boundary has removed it.
+    // A previous Windows supervisor's Job handle is not serializable and must
+    // never be replaced with speculative PID signalling. Reaching this path
+    // means the replacement supervisor already owns the singleton instance
+    // lock, so the previous process has exited and closed its non-inheritable
+    // KILL_ON_JOB_CLOSE handle. The kernel boundary, rather than a PID scan,
+    // is therefore the proof that every process in that Job was terminated.
+    #[cfg(target_os = "windows")]
+    if cleanup.job_owned {
+        cleanup.ticket.complete();
+        return;
+    }
+    // A `job_owned` record is a Windows-only ownership proof. If such a status
+    // is moved to another platform, keep it unresolved instead of assigning
+    // Windows Job semantics where they cannot be verified.
+    #[cfg(not(target_os = "windows"))]
     if cleanup.job_owned {
         return;
     }
@@ -5052,7 +5062,16 @@ mod tests {
             STOP_GRACE,
         );
         retry_one_pending_orphan_cleanup(&mut job_owned);
-        assert!(!job_owned.ticket.is_complete());
+        #[cfg(target_os = "windows")]
+        assert!(
+            job_owned.ticket.is_complete(),
+            "the replacement supervisor's instance lock proves the old kill-on-close Job handle closed"
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            !job_owned.ticket.is_complete(),
+            "Windows Job ownership cannot be inferred on another platform"
+        );
     }
 
     #[test]
