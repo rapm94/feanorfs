@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4](https://github.com/rapm94/feanorfs/compare/v0.9.3...v0.9.4) - 2026-08-13
+
+### Fixed
+
+- *(release)* carry product changes
+
 ### Fixed
 
 - Folder switching in the desktop tray no longer resolves `$HOME` against every
