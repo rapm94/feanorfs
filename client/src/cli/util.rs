@@ -13,12 +13,34 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const LOG_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoggingMode {
+    /// Resolve the current workspace and preserve the ordinary CLI/worker
+    /// bounded wait for durable logs.
+    Standard,
+    /// Write to the global log without resolving the process working directory.
+    /// Tray processes must never wait for a log lock before updating the UI.
+    TrayGlobal,
+    /// Resolve the current workspace, but never wait for a log lock before
+    /// returning a tray result.
+    TrayWorkspace,
+}
+
+#[derive(Clone, Copy)]
+enum LogLockMode {
+    BoundedWait,
+    NonBlocking,
+}
+
 fn lock_is_contended(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
         || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
-fn lock_log_file(file: &File) -> std::io::Result<()> {
+fn lock_log_file(file: &File, mode: LogLockMode) -> std::io::Result<()> {
+    if matches!(mode, LogLockMode::NonBlocking) {
+        return fs2::FileExt::try_lock_exclusive(file);
+    }
     let deadline = std::time::Instant::now() + LOG_LOCK_TIMEOUT;
     loop {
         match fs2::FileExt::try_lock_exclusive(file) {
@@ -38,7 +60,16 @@ struct BoundedLogWriter {
 }
 
 impl BoundedLogWriter {
+    #[cfg(test)]
     fn open(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
+        Self::open_with_lock_mode(path, max_bytes, LogLockMode::BoundedWait)
+    }
+
+    fn open_with_lock_mode(
+        path: &Path,
+        max_bytes: u64,
+        lock_mode: LogLockMode,
+    ) -> std::io::Result<Self> {
         let lock_path = path.with_extension("log.lock");
         let mut lock_options = OpenOptions::new();
         lock_options.read(true).write(true).create(true);
@@ -53,7 +84,7 @@ impl BoundedLogWriter {
             use std::os::unix::fs::PermissionsExt as _;
             lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        lock_log_file(&lock)?;
+        lock_log_file(&lock, lock_mode)?;
 
         let rotated = path.with_extension("log.old");
         if std::fs::metadata(&rotated).is_ok_and(|metadata| metadata.len() > max_bytes) {
@@ -140,19 +171,31 @@ impl std::io::Write for BoundedLogWriter {
     }
 }
 
-fn bounded_log_writer(path: PathBuf) -> impl Fn() -> Box<dyn std::io::Write + Send> {
-    move || match BoundedLogWriter::open(&path, MAX_LOG_BYTES) {
+fn bounded_log_writer(
+    path: PathBuf,
+    lock_mode: LogLockMode,
+) -> impl Fn() -> Box<dyn std::io::Write + Send> {
+    move || match BoundedLogWriter::open_with_lock_mode(&path, MAX_LOG_BYTES, lock_mode) {
         Ok(writer) => Box::new(writer),
         Err(_) => Box::new(std::io::sink()),
     }
 }
 
-pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
+pub fn setup_logging(current_dir: &Path, mode: LoggingMode) -> anyhow::Result<()> {
     let global_root = feanorfs_agent_core::global_state_root()?;
-    let log_dir = if feanorfs_agent_core::workspace_is_configured(current_dir) {
-        feanorfs_agent_core::ensure_workspace_state(current_dir)?
-    } else {
-        global_root.join("logs")
+    let log_dir = match mode {
+        LoggingMode::TrayGlobal => global_root.join("logs"),
+        LoggingMode::Standard | LoggingMode::TrayWorkspace => {
+            if feanorfs_agent_core::workspace_is_configured(current_dir) {
+                feanorfs_agent_core::ensure_workspace_state(current_dir)?
+            } else {
+                global_root.join("logs")
+            }
+        }
+    };
+    let lock_mode = match mode {
+        LoggingMode::Standard => LogLockMode::BoundedWait,
+        LoggingMode::TrayGlobal | LoggingMode::TrayWorkspace => LogLockMode::NonBlocking,
     };
     let _ = std::fs::create_dir_all(&log_dir)
         .map_err(|e| eprintln!("Warning: could not create log directory: {e:?}"));
@@ -167,13 +210,13 @@ pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
             metadata.file_type().is_file() && !metadata.file_type().is_symlink()
         })
     {
-        let _ = BoundedLogWriter::open(&legacy_log, MAX_LOG_BYTES);
+        let _ = BoundedLogWriter::open_with_lock_mode(&legacy_log, MAX_LOG_BYTES, lock_mode);
     }
     // Rotate before installing the subscriber even if this invocation emits no
     // records. Every subsequent record reopens the current path under the same
     // cross-process lock, so long-lived workers cannot keep appending through a
     // rotation to an old inode.
-    let _ = BoundedLogWriter::open(&log_path, MAX_LOG_BYTES);
+    let _ = BoundedLogWriter::open_with_lock_mode(&log_path, MAX_LOG_BYTES, lock_mode);
 
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
@@ -182,7 +225,7 @@ pub fn setup_logging(current_dir: &Path) -> anyhow::Result<()> {
         .with_filter(EnvFilter::new("warn"));
 
     let file_layer = fmt::layer()
-        .with_writer(bounded_log_writer(log_path))
+        .with_writer(bounded_log_writer(log_path, lock_mode))
         .with_target(true)
         .with_ansi(false)
         .with_filter(EnvFilter::new("info"));
@@ -917,8 +960,9 @@ fn confirm_join_preflight() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        output_json_to, record_service_identity, resolve_connection_token,
+        bounded_log_writer, output_json_to, record_service_identity, resolve_connection_token,
         service_identity_matches, terminal_line, truncate_password_for_display, BoundedLogWriter,
+        LogLockMode,
     };
     use std::io::Write as _;
 
@@ -985,6 +1029,33 @@ mod tests {
         drop(repaired);
         assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
         assert!(!log.with_extension("log.old").exists());
+    }
+
+    #[test]
+    fn tray_log_writer_drops_records_instead_of_waiting_for_a_contended_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("feanorfs.log");
+        let lock_path = log.with_extension("log.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+
+        let make_writer = bounded_log_writer(log.clone(), LogLockMode::NonBlocking);
+        let mut dropped = make_writer();
+        dropped.write_all(b"must not wait\n").unwrap();
+        drop(dropped);
+        assert!(!log.exists());
+
+        drop(lock);
+        let mut persisted = make_writer();
+        persisted.write_all(b"lock available\n").unwrap();
+        drop(persisted);
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "lock available\n");
     }
 
     #[test]

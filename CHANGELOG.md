@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Folder switching in the desktop tray no longer resolves `$HOME` against every
+  workspace-state slot merely to select a log file, and tray-facing commands
+  now drop a contended log record instead of delaying the UI for up to two
+  seconds per attempt.
+
 ## [0.9.3](https://github.com/rapm94/feanorfs/compare/v0.9.2...v0.9.3) - 2026-08-12
 
 ### Fixed
