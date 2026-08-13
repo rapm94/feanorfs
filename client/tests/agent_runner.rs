@@ -716,7 +716,12 @@ impl ManualSupervisor {
                     && !stop_token.is_empty()
                     && ack["pid"].as_u64() == Some(u64::from(pid))
                     && ack["workspace"].as_str() == Some(canonical.as_str())
-                    && ack["registry_generation"].as_u64() == Some(registry_generation)
+                    // Acknowledgements are runner-scoped. An unrelated registry
+                    // mutation may advance the current generation after this
+                    // runner was reconciled, so equality would create a race.
+                    && ack["registry_generation"]
+                        .as_u64()
+                        .is_some_and(|value| value > 0)
                     && ack["generation"].as_u64().is_some_and(|value| value > 0)
                     && ack["stop_token"].as_str() == Some(stop_token)
                 {
