@@ -30,8 +30,10 @@ pub use util::{setup_logging, LoggingMode};
 /// state, so temp directories alone do not isolate their teardown. Keep their
 /// lifecycle operations serialized while preserving production lock behavior.
 pub(crate) struct RunnerTestWorkspace {
+    // `Option` lets `Drop` remove the directory explicitly before releasing
+    // the process-wide fixture guard.
+    directory: Option<tempfile::TempDir>,
     _serial_guard: std::sync::MutexGuard<'static, ()>,
-    directory: tempfile::TempDir,
 }
 
 #[cfg(test)]
@@ -42,13 +44,27 @@ impl RunnerTestWorkspace {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self {
+            directory: Some(tempfile::tempdir().expect("create isolated runner test workspace")),
             _serial_guard: serial_guard,
-            directory: tempfile::tempdir().expect("create isolated runner test workspace"),
         }
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
-        self.directory.path()
+        self.directory
+            .as_ref()
+            .expect("runner test workspace is available until drop")
+            .path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for RunnerTestWorkspace {
+    fn drop(&mut self) {
+        if let Some(directory) = self.directory.take() {
+            // Match TempDir's best-effort cleanup while retaining the fixture
+            // guard until the directory teardown has completed.
+            let _ = directory.close();
+        }
     }
 }
 
