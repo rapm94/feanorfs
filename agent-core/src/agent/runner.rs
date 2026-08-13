@@ -2731,8 +2731,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             release_sender.send(()).is_ok()
         });
+        // The holder's one-second watchdog proves executor responsiveness.
+        // This outer timeout only bounds cleanup after the lock is released,
+        // so use the standard hook allowance for loaded CI filesystems.
         let cleaned = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
+            TEST_HOOK_TIMEOUT,
             crate::agent::clean_agent(base.path(), &db, "worker"),
         )
         .await;

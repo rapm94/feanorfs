@@ -824,8 +824,8 @@ mod tests {
         std::iter::repeat_n(ch, 64).collect()
     }
 
-    fn configured_runner_fixture() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+    fn configured_runner_fixture() -> (crate::cli::RunnerTestWorkspace, PathBuf) {
+        let dir = crate::cli::RunnerTestWorkspace::new();
         let workspace = dir.path().canonicalize().unwrap();
         feanorfs_client::save_config(
             &workspace,
