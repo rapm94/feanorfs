@@ -23,6 +23,35 @@ pub mod workspace;
 
 pub use util::{setup_logging, LoggingMode};
 
+#[cfg(test)]
+/// Owns the shared runner fixture slot for the lifetime of a test workspace.
+///
+/// Runner fixtures also exercise process-wide lifecycle and supervisor test
+/// state, so temp directories alone do not isolate their teardown. Keep their
+/// lifecycle operations serialized while preserving production lock behavior.
+pub(crate) struct RunnerTestWorkspace {
+    _serial_guard: std::sync::MutexGuard<'static, ()>,
+    directory: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl RunnerTestWorkspace {
+    pub(crate) fn new() -> Self {
+        static RUNNER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let serial_guard = RUNNER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            _serial_guard: serial_guard,
+            directory: tempfile::tempdir().expect("create isolated runner test workspace"),
+        }
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.directory.path()
+    }
+}
+
 pub use agent::AgentAction;
 pub use conflicts::ConflictsAction;
 pub use hydrate::HydrateAction;

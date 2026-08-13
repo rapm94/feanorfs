@@ -4591,7 +4591,6 @@ mod tests {
     use super::*;
 
     static ACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static RUNNER_FIXTURE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static RUNNER_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(unix)]
@@ -4617,9 +4616,12 @@ mod tests {
         std::iter::repeat_n(ch, 64).collect()
     }
 
-    fn configured_runner_fixture() -> (tempfile::TempDir, PathBuf, feanorfs_agent_core::RunnerStore)
-    {
-        let dir = tempfile::tempdir().unwrap();
+    fn configured_runner_fixture() -> (
+        crate::cli::RunnerTestWorkspace,
+        PathBuf,
+        feanorfs_agent_core::RunnerStore,
+    ) {
+        let dir = crate::cli::RunnerTestWorkspace::new();
         let workspace = dir.path().canonicalize().unwrap();
         let fixture_sequence = RUNNER_FIXTURE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
         feanorfs_client::save_config(
@@ -5563,7 +5565,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn deferred_runner_stop_withholds_reconcile_until_reaper_completion() {
-        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let _guard = REAPER_TEST_LOCK.lock().await;
         let _reset = ReaperTestReset;
         TEST_TERMINATION_GRACE_MILLIS.store(1, AtomicOrdering::Release);
@@ -5715,7 +5716,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unresolved_startup_runner_authority_retries_and_then_clears() {
-        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, _store) = configured_runner_fixture();
         let canonical = workspace.to_string_lossy().into_owned();
         let program = std::env::current_exe().unwrap();
@@ -5962,7 +5962,6 @@ mod tests {
 
     #[tokio::test]
     async fn runner_exit_cleanup_waits_for_the_exact_session_then_checkpoints() {
-        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, store) = configured_runner_fixture();
         let session = store
             .execution_session(
@@ -6126,7 +6125,6 @@ mod tests {
 
     #[tokio::test]
     async fn clean_runner_exit_enters_bounded_restart_backoff() {
-        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, store) = configured_runner_fixture();
         store.set_enabled(true).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
@@ -6177,7 +6175,6 @@ mod tests {
 
     #[tokio::test]
     async fn stale_desired_runner_is_not_spawned_after_disable() {
-        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, store) = configured_runner_fixture();
         store.set_enabled(true).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
@@ -6410,7 +6407,6 @@ mod tests {
 
     #[tokio::test]
     async fn desired_runner_spec_is_exact_redacted_and_state_gated() {
-        let _runner_fixture_guard = RUNNER_FIXTURE_TEST_LOCK.lock().await;
         let (_dir, workspace, store) = configured_runner_fixture();
         store.set_enabled(true).unwrap();
         let canonical = workspace.to_string_lossy().into_owned();

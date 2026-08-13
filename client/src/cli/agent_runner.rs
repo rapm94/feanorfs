@@ -1558,8 +1558,8 @@ mod tests {
         .expect("child reaper became idle");
     }
 
-    fn setup_active_runner() -> (tempfile::TempDir, RunnerStore) {
-        let base = tempfile::tempdir().unwrap();
+    fn setup_active_runner() -> (crate::cli::RunnerTestWorkspace, RunnerStore) {
+        let base = crate::cli::RunnerTestWorkspace::new();
         feanorfs_client::save_config(
             base.path(),
             &feanorfs_client::Config {
