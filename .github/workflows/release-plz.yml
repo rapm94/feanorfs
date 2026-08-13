@@ -186,6 +186,7 @@ jobs:
         run: scripts/check-release-readiness.sh
 
       - name: Run release-plz (release)
+        id: release
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release
@@ -193,6 +194,40 @@ jobs:
           version: "0.3.160"
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Recover exact version tag after a release-plz no-op
+        if: >-
+          steps.candidate.outputs.ready == 'true' &&
+          steps.release.outputs.releases_created != 'true'
+        env:
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          tag="v$version"
+
+          gh auth setup-git
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag" 2>/dev/null || true
+          tagged_sha="$(git rev-list -n 1 "$tag" 2>/dev/null || true)"
+          if [ -n "$tagged_sha" ]; then
+            if [ "$tagged_sha" != "$EXPECTED_SHA" ]; then
+              echo "::error::$tag already resolves to $tagged_sha, expected $EXPECTED_SHA."
+              exit 1
+            fi
+            echo "$tag already resolves to the exact trusted commit."
+            exit 0
+          fi
+
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]; then
+            echo "::error::Refusing to tag a checkout other than $EXPECTED_SHA."
+            exit 1
+          fi
+          git config user.name "release-plz[bot]"
+          git config user.email "release-plz[bot]@users.noreply.github.com"
+          git tag --annotate "$tag" "$EXPECTED_SHA" \
+            --message "chore: Release package feanorfs-common version $version"
+          git push origin "refs/tags/$tag:refs/tags/$tag"
 
   release-plz-pr:
     name: Release PR

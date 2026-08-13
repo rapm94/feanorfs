@@ -69,6 +69,13 @@ require_text .github/workflows/release.yml 'custom-desktop-release:'
 require_text .github/workflows/release.yml 'custom-validate-release-assets:'
 require_text .github/workflows/release.yml 'needs.custom-validate-release-assets.result'
 
+release_plz=.github/workflows/release-plz.yml
+require_text "$release_plz" 'id: release'
+require_text "$release_plz" "steps.release.outputs.releases_created != 'true'"
+require_text "$release_plz" 'git fetch --force origin "refs/tags/$tag:refs/tags/$tag"'
+require_text "$release_plz" 'if [ "$tagged_sha" != "$EXPECTED_SHA" ]; then'
+require_text "$release_plz" 'git push origin "refs/tags/$tag:refs/tags/$tag"'
+
 for workflow in \
     .github/workflows/desktop-release.yml \
     .github/workflows/npm-release.yml \

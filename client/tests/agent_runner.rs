@@ -1202,6 +1202,33 @@ async fn visible_runner_stop_prevents_resurrection_across_manual_supervisor_rest
         first_request.message_id
     );
 
+    // Preserve the live-child snapshot so the restart always models the
+    // exact crash window under test: stop reconciliation has published its
+    // durable acknowledgement, but the matching empty status snapshot has
+    // not yet reached disk. Without this explicit stale snapshot, killing the
+    // first supervisor races its next status write and only sometimes covers
+    // the Windows Job-owned orphan handoff.
+    let status_path = feanorfs_agent_core::global_state_root()
+        .unwrap()
+        .join("supervisor-status.json");
+    let stale_running_status = std::fs::read(&status_path).unwrap();
+    let stale_status: serde_json::Value = serde_json::from_slice(&stale_running_status).unwrap();
+    let canonical = fixture
+        .root()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        stale_status["runners"][&canonical]["state"].as_str(),
+        Some("running")
+    );
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        stale_status["runners"][&canonical]["job_owned"].as_bool(),
+        Some(true)
+    );
+
     assert_cli_success(
         &run_cli_with_manual_supervisor(fixture.root(), &["--json", "agent", "runner", "stop"])
             .await,
@@ -1209,6 +1236,7 @@ async fn visible_runner_stop_prevents_resurrection_across_manual_supervisor_rest
     assert!(!fixture.store().status().unwrap().enabled);
 
     supervisor.shutdown().await;
+    std::fs::write(&status_path, stale_running_status).unwrap();
     let mut restarted = ManualSupervisor::spawn(&fixture, "publish_result", &record_path).await;
     restarted.wait_until_ready().await;
     restarted
