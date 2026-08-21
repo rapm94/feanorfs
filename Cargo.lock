@@ -1458,6 +1458,8 @@ dependencies = [
 name = "feanorfs-agent-node"
 version = "0.9.4"
 dependencies = [
+ "anyhow",
+ "base64",
  "feanorfs-agent-core",
  "feanorfs-common",
  "napi",
@@ -1523,6 +1525,8 @@ name = "feanorfs-common"
 version = "0.9.4"
 dependencies = [
  "anyhow",
+ "argon2",
+ "base64",
  "blake3",
  "chacha20poly1305",
  "chrono",
@@ -1530,6 +1534,7 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-normalization",
+ "zeroize",
 ]
 
 [[package]]
@@ -1537,6 +1542,7 @@ name = "feanorfs-ffi"
 version = "0.9.4"
 dependencies = [
  "anyhow",
+ "base64",
  "cbindgen",
  "feanorfs-agent-core",
  "feanorfs-common",
@@ -1611,6 +1617,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tao",
+ "tempfile",
  "tray-icon",
  "zeroize",
 ]
