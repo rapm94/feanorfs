@@ -190,14 +190,11 @@ for private_file in \
   [[ "$(/usr/bin/stat -f '%Lp' "$private_file")" == "600" ]]
 done
 
-jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
-  "$HOME/.feanorfs/hub-data/service-program" >/dev/null
-
-# Supervisor-owned workers carry no per-workspace identity marker on fresh
-# installs; that file is legacy per-component state.
-
-# The supervisor owns the tray on macOS; no per-component tray job or
-# identity marker exists on fresh installs (that file is Windows-only).
+# Fresh installs carry only the supervisor identity marker
+# (supervisor-service-program); per-component service-program files are
+# legacy state that only pre-supervisor machines still have.
+[[ ! -e "$HOME/.feanorfs/hub-data/service-program" ]]
+[[ ! -e "$WORKSPACE_STATE/service-program" ]]
 [[ ! -e "$HOME/.feanorfs/tray-service-program" ]]
 
 CA="$HOME/.feanorfs/hub-data/tls/ca-cert.pem"

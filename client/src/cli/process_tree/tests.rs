@@ -249,6 +249,8 @@ fn windows_owner_crash_helper() {
     ensure_owner_job().expect("establish owner Job before crash test");
     let executable = std::env::current_exe().expect("owner crash executable");
     let mut child = std::process::Command::new(executable);
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt as _;
     child
         .args([
             "--ignored",

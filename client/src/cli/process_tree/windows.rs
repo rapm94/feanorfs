@@ -410,7 +410,7 @@ pub(super) fn windows_process_start_matches(pid: u32, process_start_id: &str) ->
 /// callers must compare it through [`super::executable_matches`] so
 /// extended-prefix, separator, and case normalization are identical on both
 /// sides.
-pub(super) fn executable_path(pid: u32) -> Option<PathBuf> {
+pub(crate) fn executable_path(pid: u32) -> Option<PathBuf> {
     // SAFETY: OpenProcess returns an owned kernel handle or null.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
