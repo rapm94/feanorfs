@@ -1614,6 +1614,9 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // All current callers are unix-gated child-process tests; Windows keeps
+    // the helper compiled for future cross-platform coverage.
+    #[cfg_attr(windows, allow(dead_code))]
     fn fake_cli_dir(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "feanorfs-tray-{name}-{}-{}",

@@ -211,16 +211,20 @@ fi
   and ([.checks[].name] | sort == [
     "automatic_sync",
     "e2ee",
+    "executable_version",
     "global_config",
     "local_state",
     "private_hub",
     "remote_workspace",
     "server",
     "tray_registration",
+    "update_available",
     "workspace_config",
     "workspace_format"
   ])
-  and all(.checks[]; .status == "ok")
+  and all(.checks[] | select(.name != "update_available"); .status == "ok")
+  and (.checks[] | select(.name == "update_available") |
+       .status as $status | ["ok", "info", "warning"] | index($status))
 ' >/dev/null
 TRAY_STATUS="$ROOT/tray-status.json"
 tray_ready=false
