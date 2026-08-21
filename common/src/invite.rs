@@ -182,7 +182,9 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
         bail!("hex length must be even");
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = nibble(pair[0]).context("invalid hex in invite")?;
             let low = nibble(pair[1]).context("invalid hex in invite")?;
