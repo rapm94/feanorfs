@@ -8,7 +8,10 @@ use std::path::Path;
 use tokio::fs;
 
 use super::super::download::MAX_MATERIALIZATION_DIRECTORY_PROOFS;
-use super::model::{JournalDownload, MaterializationDirectoryIdentity, PublishedDownload};
+use super::model::{
+    JournalDownload, MaterializationDirectoryIdentity, MaterializationDirectoryProof,
+    PublishedDownload,
+};
 use super::{materialization_mode_matches, portable_mode, same_open_file_identity};
 
 #[cfg(windows)]
