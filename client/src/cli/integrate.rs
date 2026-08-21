@@ -247,6 +247,7 @@ impl HostPaths {
                     .join("claude_desktop_config.json");
 
                 let skill_dir = home.join(".claude").join("skills");
+                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                 let mut markers = vec![
                     home.join(".claude"),
                     mcp_config.parent().unwrap_or(home).to_path_buf(),
