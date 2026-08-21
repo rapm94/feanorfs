@@ -3,6 +3,17 @@
 Desktop system-tray companion for FeanorFS on macOS, Linux, and Windows.
 **Shells `feanorfs --json` only** — no duplicate sync logic.
 
+## Single instance
+
+One tray per user session: startup takes an exclusive `flock` on
+`~/.feanorfs/tray-instance.lock` and a second instance (any install path —
+packaged `.app`, `/usr/local/bin`, source build, or isolated
+`FEANORFS_HOME` data profile) exits immediately. When
+launched under the Rust test harness (`FEANORFS_RUNNER_TEST_PROFILE` or
+`FEANORFS_RUNNER_TEST_MODE` set) in a debug build, the tray exits immediately with a clean
+quit instead of drawing a menu-bar icon in the developer's session, so
+supervisor-spawned test trays never leak as orphans.
+
 ## Requirements
 
 - Built `feanorfs` on `PATH`, or set `FEANORFS_BIN`

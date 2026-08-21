@@ -1,15 +1,4 @@
-const MAX_MENU_LABEL_CHARS: usize = 52;
 const MAX_DIALOG_LINE_CHARS: usize = 68;
-
-pub(crate) fn menu_label(value: impl AsRef<str>) -> String {
-    truncate_middle(value.as_ref(), MAX_MENU_LABEL_CHARS)
-}
-
-pub(crate) fn menu_label_with_suffix(value: &str, suffix: &str) -> String {
-    let suffix_chars = suffix.chars().count();
-    let body_chars = MAX_MENU_LABEL_CHARS.saturating_sub(suffix_chars);
-    format!("{}{}", truncate_middle(value, body_chars), suffix)
-}
 
 pub(crate) fn dialog_text(value: impl AsRef<str>) -> String {
     value
@@ -18,27 +7,6 @@ pub(crate) fn dialog_text(value: impl AsRef<str>) -> String {
         .map(|line| wrap_line(line, MAX_DIALOG_LINE_CHARS))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn truncate_middle(value: &str, max_chars: usize) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    if chars.len() <= max_chars {
-        return value.to_string();
-    }
-    if max_chars == 0 {
-        return String::new();
-    }
-    if max_chars == 1 {
-        return "…".into();
-    }
-    let visible = max_chars - 1;
-    let left = visible / 2;
-    let right = visible - left;
-    chars[..left]
-        .iter()
-        .chain(std::iter::once(&'…'))
-        .chain(chars[chars.len() - right..].iter())
-        .collect()
 }
 
 fn wrap_line(line: &str, max_chars: usize) -> String {
@@ -86,23 +54,6 @@ fn wrap_line(line: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn menu_labels_keep_both_ends_with_a_hard_bound() {
-        let input = "project — ~/a/very/long/path/that/keeps/growing/project";
-        let output = menu_label(input);
-        assert!(output.starts_with("project"));
-        assert!(output.ends_with("project"));
-        assert!(output.contains('…'));
-        assert!(output.chars().count() <= MAX_MENU_LABEL_CHARS);
-    }
-
-    #[test]
-    fn suffix_stays_visible_inside_the_menu_bound() {
-        let output = menu_label_with_suffix(&"x".repeat(100), " — unavailable");
-        assert!(output.ends_with(" — unavailable"));
-        assert!(output.chars().count() <= MAX_MENU_LABEL_CHARS);
-    }
 
     #[test]
     fn dialogs_wrap_prose_and_unbroken_paths() {

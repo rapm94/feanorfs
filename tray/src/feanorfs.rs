@@ -1,10 +1,10 @@
 //! Spawn `feanorfs` subprocesses — the tray never duplicates sync logic.
 
 use crate::ui::dialog_text;
-use feanorfs_common::tray_contract::{
-    RecentWorkspacesResult, TrayOverviewResult, TrayStatusResult,
-};
+use feanorfs_common::tray_contract::{RecentWorkspacesResult, SetupResult, TrayStatusResult};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,358 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 const PAIR_EXPIRES_SECONDS: &str = "300";
+
+/// Default bound for captured stdout of ordinary JSON commands.
+const DEFAULT_STDOUT_LIMIT: usize = 256 * 1024;
+/// Bound for captured stderr of every subprocess.
+const DEFAULT_STDERR_LIMIT: usize = 64 * 1024;
+/// Bound for the typed setup-result line (`start`, `tray join`).
+const SETUP_RESULT_STDOUT_LIMIT: usize = 64 * 1024;
+/// The recent-workspace registry can legitimately list many folders.
+const RECENT_STDOUT_LIMIT: usize = 1024 * 1024;
+/// Bound for the one-line update-check JSON result.
+const UPDATE_STDOUT_LIMIT: usize = 16 * 1024;
+/// Bound for the interactive join preview line.
+const JOIN_PREVIEW_LIMIT: usize = 65_536;
+/// Bound for the pairing ready event line.
+const PAIR_LINE_LIMIT: usize = 1024;
+
+/// Bounded child stdout/stderr capture: `bytes` holds the first `limit` bytes
+/// written and `truncated` reports that the child wrote more.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoundedBytes {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+impl BoundedBytes {
+    fn read(mut reader: impl std::io::Read, limit: usize) -> Self {
+        let mut bytes = Vec::with_capacity(limit.min(65_536));
+        let mut truncated = false;
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                // Keep draining after the bound so a chatty child never blocks
+                // on a full pipe; only the bounded head is retained.
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let remaining = limit.saturating_sub(bytes.len());
+                    if read > remaining {
+                        truncated = true;
+                    }
+                    bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+            }
+        }
+        Self { bytes, truncated }
+    }
+
+    /// Lossy UTF-8 view; callers only use this for human presentation.
+    pub fn as_str_lossy(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes)
+    }
+}
+
+/// Captured outcome of one bounded subprocess run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: BoundedBytes,
+    pub stderr: BoundedBytes,
+}
+
+impl CapturedOutput {
+    /// Decode the bounded stdout as a typed JSON document.
+    ///
+    /// Fails with a typed error when the output exceeded the bound, was empty
+    /// (early exit), or was not valid JSON for the requested type.
+    pub fn decode_json<T: DeserializeOwned>(&self) -> Result<T, CapturedError> {
+        if self.stdout.truncated {
+            return Err(CapturedError::OutputOverLimit { stream: "stdout" });
+        }
+        if self.stdout.bytes.is_empty() {
+            return Err(CapturedError::NoOutput);
+        }
+        serde_json::from_slice(&self.stdout.bytes)
+            .map_err(|error| CapturedError::MalformedJson(format!("{error}")))
+    }
+}
+
+/// Typed failure of a bounded subprocess run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapturedError {
+    /// The program could not be spawned.
+    Spawn(String),
+    /// Secret stdin was invalid (line breaks/NUL) or could not be written.
+    InvalidSecret,
+    Stdin(String),
+    /// The child was stopped because the cancel channel fired.
+    Canceled,
+    /// The child exceeded the timeout; its process tree was stopped.
+    Timeout {
+        stdout: BoundedBytes,
+        stderr: BoundedBytes,
+    },
+    /// The child could not be waited on.
+    Wait(String),
+    /// The child exited without producing decodable output.
+    NoOutput,
+    /// stdout exceeded the capture bound.
+    OutputOverLimit {
+        stream: &'static str,
+    },
+    /// stdout was not valid JSON for the requested type.
+    MalformedJson(String),
+}
+
+impl std::fmt::Display for CapturedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CapturedError::Spawn(error) => write!(f, "could not start the command: {error}"),
+            CapturedError::InvalidSecret => {
+                write!(f, "the secret input contains line breaks or NUL characters")
+            }
+            CapturedError::Stdin(error) => write!(f, "could not write command input: {error}"),
+            CapturedError::Canceled => write!(f, "the command was canceled"),
+            CapturedError::Timeout { .. } => {
+                write!(f, "the command did not finish in time and was stopped")
+            }
+            CapturedError::Wait(error) => write!(f, "could not wait for the command: {error}"),
+            CapturedError::NoOutput => write!(f, "the command exited without producing output"),
+            CapturedError::OutputOverLimit { stream } => {
+                write!(f, "{stream} output exceeded the capture limit")
+            }
+            CapturedError::MalformedJson(error) => {
+                write!(f, "the command returned unreadable data: {error}")
+            }
+        }
+    }
+}
+
+/// Bounded, typed CLI subprocess adapter used by every non-interactive tray
+/// command: exact `OsString` args, working directory, bounded stdout/stderr
+/// with typed over-limit reporting, timeout, cancellation, typed JSON decode,
+/// and optional one-line secret stdin that never enters argv, env, or logs.
+#[derive(Clone)]
+pub struct CapturedCommand {
+    program: OsString,
+    args: Vec<OsString>,
+    current_dir: Option<PathBuf>,
+    stdin: Option<Zeroizing<String>>,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for CapturedCommand {
+    /// `Debug` is a potential log surface, so the secret stdin is redacted.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedCommand")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("current_dir", &self.current_dir)
+            .field("stdin", &self.stdin.as_ref().map(|_| "[secret redacted]"))
+            .field("stdout_limit", &self.stdout_limit)
+            .field("stderr_limit", &self.stderr_limit)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl CapturedCommand {
+    pub fn new(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            current_dir: None,
+            stdin: None,
+            stdout_limit: DEFAULT_STDOUT_LIMIT,
+            stderr_limit: DEFAULT_STDERR_LIMIT,
+            timeout: None,
+        }
+    }
+
+    pub fn args<I, A>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = A>,
+        A: Into<OsString>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(dir.into());
+        self
+    }
+
+    pub fn stdout_limit(mut self, limit: usize) -> Self {
+        self.stdout_limit = limit;
+        self
+    }
+
+    pub fn stderr_limit(mut self, limit: usize) -> Self {
+        self.stderr_limit = limit;
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Feed exactly one line (`secret` + `\n`) to the child's stdin and close
+    /// it. The secret never appears in argv, environment, or any log surface
+    /// (`Debug` redacts it).
+    pub fn secret_stdin(mut self, secret: Zeroizing<String>) -> Self {
+        self.stdin = Some(secret);
+        self
+    }
+
+    pub fn capture(self) -> Result<CapturedOutput, CapturedError> {
+        self.capture_with_cancel(None)
+    }
+
+    /// Capture with an explicit cancellation channel. A fired receiver stops
+    /// the child's process tree and returns [`CapturedError::Canceled`].
+    pub fn capture_with_cancel(
+        &self,
+        cancel: Option<&Receiver<()>>,
+    ) -> Result<CapturedOutput, CapturedError> {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        if let Some(dir) = &self.current_dir {
+            command.current_dir(dir);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if self.stdin.is_some() {
+            command.stdin(Stdio::piped());
+        } else {
+            command.stdin(Stdio::null());
+        }
+        let mut child =
+            spawn_child(&mut command).map_err(|error| CapturedError::Spawn(format!("{error}")))?;
+
+        if let Some(secret) = &self.stdin {
+            if secret.contains(['\r', '\n', '\0']) {
+                stop_child(&mut child);
+                return Err(CapturedError::InvalidSecret);
+            }
+            let write = child
+                .stdin
+                .take()
+                .ok_or_else(|| CapturedError::Stdin("child stdin was not piped".into()))
+                .and_then(|mut stdin| {
+                    stdin
+                        .write_all(secret.as_bytes())
+                        .and_then(|()| stdin.write_all(b"\n"))
+                        .and_then(|()| stdin.flush())
+                        .map_err(|error| CapturedError::Stdin(format!("{error}")))
+                });
+            if let Err(error) = write {
+                stop_child(&mut child);
+                return Err(error);
+            }
+        }
+        // The piped stdin handle was taken out of `child` above and dropped at
+        // the end of the write closure, so the child sees EOF on its input.
+        // `self.stdin` (the zeroized secret) drops when this builder ends.
+
+        let stdout = child.stdout.take().expect("captured stdout is piped");
+        let stderr = child.stderr.take().expect("captured stderr is piped");
+        let stdout_limit = self.stdout_limit;
+        let stderr_limit = self.stderr_limit;
+        let stdout_thread = std::thread::spawn(move || BoundedBytes::read(stdout, stdout_limit));
+        let stderr_thread = std::thread::spawn(move || BoundedBytes::read(stderr, stderr_limit));
+
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = stdout_thread.join().unwrap_or_default();
+                    let stderr = stderr_thread.join().unwrap_or_default();
+                    return Ok(CapturedOutput {
+                        status,
+                        stdout,
+                        stderr,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    stop_child(&mut child);
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(CapturedError::Wait(format!("{error}")));
+                }
+            }
+            if let Some(cancel) = cancel {
+                if cancel.try_recv().is_ok() {
+                    stop_child(&mut child);
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(CapturedError::Canceled);
+                }
+            }
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    stop_child(&mut child);
+                    let stdout = stdout_thread.join().unwrap_or_default();
+                    let stderr = stderr_thread.join().unwrap_or_default();
+                    return Err(CapturedError::Timeout { stdout, stderr });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Spawn a child as a new process-group leader on Unix so cancellation and
+/// timeout can stop its whole process tree, never just the direct child.
+fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    command.spawn()
+}
+
+/// Stop a child and its process tree: SIGTERM to the group, a short grace
+/// period, then SIGKILL to the group — even when the direct child already
+/// exited — so grandchildren that ignored TERM cannot survive holding pipes.
+/// On non-Unix, falls back to `kill()`.
+pub fn stop_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct HealthReport {
@@ -96,42 +448,8 @@ fn packaged_cli_candidates() -> Vec<PathBuf> {
     }
 }
 
-/// TTL for cached config-presence results. Config presence changes only
-/// through tray/CLI start-stop actions, so the cache removes a full CLI
-/// process spawn per folder from every menu rebuild; tray-driven changes
-/// invalidate it explicitly, and external changes self-heal within the TTL.
-const CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
-
-fn config_presence_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (Instant, bool)>> {
-    static CACHE: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, (Instant, bool)>>,
-    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    &CACHE
-}
-
 pub fn workspace_has_config(path: &Path) -> bool {
-    let mut cache = config_presence_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((checked_at, configured)) = cache.get(path) {
-        if checked_at.elapsed() < CONFIG_CACHE_TTL {
-            return *configured;
-        }
-    }
-    let configured =
-        run_in(path, &["--json", "config"]).is_ok_and(|output| output.status.success());
-    cache.insert(path.to_path_buf(), (Instant::now(), configured));
-    configured
-}
-
-/// Clears cached config-presence results after a tray-driven start/stop so
-/// the next menu rebuild re-checks the affected folders.
-pub fn invalidate_config_cache() {
-    config_presence_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
+    quick_capture(path, &["--json", "config"]).is_ok_and(|output| output.status.success())
 }
 
 fn home_dir() -> PathBuf {
@@ -141,23 +459,35 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/"))
 }
 
-fn run_in(workspace: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new(feanorfs_bin())
+/// Run a quick local command with the default bounds and a 30s timeout.
+fn quick_capture(workspace: &Path, args: &[&str]) -> Result<CapturedOutput, CapturedError> {
+    CapturedCommand::new(feanorfs_bin())
         .args(args)
-        .current_dir(workspace)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .cwd(workspace)
+        .stdout_limit(DEFAULT_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT)
+        .timeout(Duration::from_secs(30))
+        .capture()
 }
 
-fn run_checked(workspace: &Path, args: &[&str]) -> Result<(), String> {
-    let out = run_in(workspace, args).map_err(|error| {
-        truncate_error(&format!(
-            "FeanorFS could not start its sync command. No files were changed. Reinstall FeanorFS and try again. Details: {error}"
-        ))
-    })?;
+fn run_checked(workspace: &Path, args: &[&str], timeout: Option<Duration>) -> Result<(), String> {
+    let mut command = CapturedCommand::new(feanorfs_bin())
+        .args(args)
+        .cwd(workspace)
+        .stdout_limit(DEFAULT_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT);
+    if let Some(timeout) = timeout {
+        command = command.timeout(timeout);
+    }
+    let out = command
+        .capture()
+        .map_err(|error| {
+            truncate_error(&format!(
+                "FeanorFS could not start its sync command. No files were changed. Reinstall FeanorFS and try again. Details: {error}"
+            ))
+        })?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stderr = out.stderr.as_str_lossy().trim().to_string();
         let msg = if stderr.is_empty() {
             format!("feanorfs exited with {}", out.status)
         } else {
@@ -166,6 +496,23 @@ fn run_checked(workspace: &Path, args: &[&str]) -> Result<(), String> {
         return Err(truncate_error(&msg));
     }
     Ok(())
+}
+
+/// Trimmed stderr text with a leading `Error:` prefix removed, when any.
+fn stderr_detail(stderr: &BoundedBytes) -> Option<String> {
+    let text = stderr.as_str_lossy();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        trimmed
+            .strip_prefix("Error:")
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty())
+            .unwrap_or(trimmed)
+            .to_string(),
+    )
 }
 
 fn truncate_error(msg: &str) -> String {
@@ -183,63 +530,21 @@ fn truncate_error(msg: &str) -> String {
 }
 
 pub fn tray_status(workspace: &Path) -> Result<TrayStatusResult, String> {
-    let out = run_in(workspace, &["--json", "tray", "status"]).map_err(|error| {
+    let out = quick_capture(workspace, &["--json", "tray", "status"]).map_err(|error| {
         truncate_error(&format!(
             "Sync status is unavailable because the FeanorFS command could not start. Your files were not changed. Reinstall FeanorFS and try again. Details: {error}"
         ))
     })?;
     if !out.status.success() {
-        return Err(status_command_failure(&out.stderr));
+        return Err(status_failure_message(
+            stderr_detail(&out.stderr).as_deref(),
+        ));
     }
-    serde_json::from_slice(&out.stdout).map_err(|_| {
+    out.decode_json::<TrayStatusResult>().map_err(|_| {
         status_failure_message(Some(
             "the installed CLI returned unreadable status data; reinstall FeanorFS",
         ))
     })
-}
-
-/// Fetches the complete recurring desktop projection in one CLI process.
-pub fn tray_overview(workspace: &Path) -> Result<TrayOverviewResult, String> {
-    let out = run_in(workspace, &["--json", "tray", "overview"]).map_err(|error| {
-        truncate_error(&format!(
-            "Sync status is unavailable because the FeanorFS command could not start. Your files were not changed. Reinstall FeanorFS and try again. Details: {error}"
-        ))
-    })?;
-    overview_or_fallback(out.status.success(), &out.stdout, || {
-        // Desktop and CLI installers can be replaced independently. Preserve
-        // the stable status contract when a newer tray temporarily runs beside
-        // a CLI that predates the additive `overview` subcommand.
-        tray_status(workspace).map(|status| TrayOverviewResult {
-            status,
-            // Keep the last good folder list. Calling the legacy `recent`
-            // command here could block behind its registry writer and defeat
-            // the bounded status fallback.
-            recent: None,
-        })
-    })
-}
-
-fn overview_or_fallback(
-    command_succeeded: bool,
-    stdout: &[u8],
-    fallback: impl FnOnce() -> Result<TrayOverviewResult, String>,
-) -> Result<TrayOverviewResult, String> {
-    if command_succeeded {
-        if let Ok(overview) = serde_json::from_slice(stdout) {
-            return Ok(overview);
-        }
-    }
-    fallback()
-}
-
-fn status_command_failure(stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr);
-    let detail = stderr
-        .trim()
-        .strip_prefix("Error:")
-        .map(str::trim)
-        .filter(|detail| !detail.is_empty());
-    status_failure_message(detail)
 }
 
 fn status_failure_message(detail: Option<&str>) -> String {
@@ -251,17 +556,24 @@ fn status_failure_message(detail: Option<&str>) -> String {
 }
 
 pub fn system_health(workspace: &Path) -> Result<HealthReport, String> {
-    let out = run_in(workspace, &health_args()).map_err(|_| {
-        "System health could not be checked because the FeanorFS command is unavailable. Your files were not changed. Reinstall FeanorFS and try again."
-            .to_string()
-    })?;
+    let out = CapturedCommand::new(feanorfs_bin())
+        .args(health_args())
+        .cwd(workspace)
+        .stdout_limit(DEFAULT_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT)
+        .timeout(Duration::from_secs(90))
+        .capture()
+        .map_err(|_| {
+            "System health could not be checked because the FeanorFS command is unavailable. Your files were not changed. Reinstall FeanorFS and try again."
+                .to_string()
+        })?;
     if !out.status.success() {
         return Err(
             "System health could not be checked. Your files were not changed. Reopen FeanorFS and try again."
                 .into(),
         );
     }
-    serde_json::from_slice(&out.stdout).map_err(|_| {
+    out.decode_json::<HealthReport>().map_err(|_| {
         "System health could not be read from the installed FeanorFS command. Your files were not changed. Reinstall FeanorFS and try again."
             .into()
     })
@@ -272,27 +584,24 @@ fn health_args() -> [&'static str; 2] {
 }
 
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
-    run_update_check(&update_args(false))
-}
-
-/// Throttled periodic check: the CLI reuses its per-machine cached result
-/// until the interval elapses, so the tray never hammers the release API.
-pub fn check_for_updates_periodic() -> Result<UpdateCheckResult, String> {
-    run_update_check(&update_args(true))
-}
-
-fn run_update_check(args: &[&str]) -> Result<UpdateCheckResult, String> {
-    let out = run_in(&home_dir(), args).map_err(|_| {
-        "Updates could not be checked because the FeanorFS command is unavailable. The installed app was not changed. Reinstall FeanorFS and try again."
-            .to_string()
-    })?;
+    let out = CapturedCommand::new(feanorfs_bin())
+        .args(update_args())
+        .cwd(home_dir())
+        .stdout_limit(UPDATE_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT)
+        .timeout(Duration::from_secs(90))
+        .capture()
+        .map_err(|_| {
+            "Updates could not be checked because the FeanorFS command is unavailable. The installed app was not changed. Reinstall FeanorFS and try again."
+                .to_string()
+        })?;
     if !out.status.success() {
         return Err(
             "Updates could not be checked. The installed app was not changed. Check your internet connection and try again."
                 .into(),
         );
     }
-    let result: UpdateCheckResult = serde_json::from_slice(&out.stdout).map_err(|_| {
+    let result: UpdateCheckResult = out.decode_json().map_err(|_| {
         "The installed FeanorFS command returned an unreadable update result. The installed app was not changed. Reinstall FeanorFS and try again."
             .to_string()
     })?;
@@ -305,12 +614,8 @@ fn run_update_check(args: &[&str]) -> Result<UpdateCheckResult, String> {
     Ok(result)
 }
 
-fn update_args(periodic: bool) -> Vec<&'static str> {
-    if periodic {
-        vec!["--json", "update", "--periodic"]
-    } else {
-        vec!["--json", "update"]
-    }
+fn update_args() -> [&'static str; 2] {
+    ["--json", "update"]
 }
 
 fn official_release_result(result: &UpdateCheckResult) -> bool {
@@ -337,34 +642,48 @@ fn official_release_result(result: &UpdateCheckResult) -> bool {
 
 pub fn tray_pause(workspace: &Path, pause: bool) -> Result<(), String> {
     let sub = if pause { "pause" } else { "resume" };
-    run_checked(workspace, &["--json", "tray", sub])
+    run_checked(
+        workspace,
+        &["--json", "tray", sub],
+        Some(Duration::from_secs(30)),
+    )
 }
 
 pub fn tray_recent() -> Option<RecentWorkspacesResult> {
-    let out = run_in(&home_dir(), &["--json", "tray", "recent"]).ok()?;
+    let out = CapturedCommand::new(feanorfs_bin())
+        .args(["--json", "tray", "recent"])
+        .cwd(home_dir())
+        .stdout_limit(RECENT_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT)
+        .timeout(Duration::from_secs(30))
+        .capture()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
-    serde_json::from_slice(&out.stdout).ok()
+    out.decode_json::<RecentWorkspacesResult>().ok()
 }
 
 pub fn forget_unavailable_workspaces() -> Result<RecentWorkspacesResult, String> {
-    let out = run_in(
-        &home_dir(),
-        &["--json", "tray", "forget-unavailable"],
-    )
-    .map_err(|error| {
-        truncate_error(&format!(
-            "The unavailable workspace entries could not be removed. No files or workspace data were changed. Reopen FeanorFS and try again. Details: {error}"
-        ))
-    })?;
+    let out = CapturedCommand::new(feanorfs_bin())
+        .args(["--json", "tray", "forget-unavailable"])
+        .cwd(home_dir())
+        .stdout_limit(RECENT_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT)
+        .timeout(Duration::from_secs(60))
+        .capture()
+        .map_err(|error| {
+            truncate_error(&format!(
+                "The unavailable workspace entries could not be removed. No files or workspace data were changed. Reopen FeanorFS and try again. Details: {error}"
+            ))
+        })?;
     if !out.status.success() {
-        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let detail = out.stderr.as_str_lossy().trim().to_string();
         return Err(truncate_error(&format!(
             "The unavailable workspace entries could not be removed. No files or workspace data were changed. Reopen FeanorFS and try again. Details: {detail}"
         )));
     }
-    serde_json::from_slice(&out.stdout).map_err(|_| {
+    out.decode_json::<RecentWorkspacesResult>().map_err(|_| {
         "The workspace list could not be refreshed. No files or workspace data were changed. Reinstall FeanorFS and try again."
             .into()
     })
@@ -374,31 +693,66 @@ pub fn tray_activate(path: &Path) -> Result<(), String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| "workspace path is not valid UTF-8".to_string())?;
-    run_checked(&home_dir(), &["tray", "activate", "--", path_str])
+    run_checked(
+        &home_dir(),
+        &["tray", "activate", "--", path_str],
+        Some(Duration::from_secs(30)),
+    )
 }
 
-pub fn start_workspace(path: &Path) -> Result<(), String> {
-    let path = path
-        .to_str()
-        .ok_or_else(|| "workspace path is not valid UTF-8".to_string())?;
-    run_checked(&home_dir(), &start_args(path))
-}
-
-fn start_args(path: &str) -> [&str; 3] {
-    ["start", "--", path]
-}
-
-pub fn join_workspace(path: &Path, pairing_code: Zeroizing<String>) -> Result<(), String> {
-    join_workspace_interactive(path, pairing_code).and_then(|outcome| match outcome {
-        JoinOutcome::Joined => Ok(()),
-        JoinOutcome::Canceled => Err("__FEANORFS_JOIN_CANCELED__".into()),
+/// Run `feanorfs --json start` and return its typed setup outcome. The CLI
+/// prints human progress first and the `SetupResult` as its final stdout
+/// line, so the tray extracts that line and never classifies from CLI wording.
+pub fn tray_setup(path: &Path) -> SetupResult {
+    let out = match CapturedCommand::new(feanorfs_bin())
+        .args(setup_json_args(path))
+        .cwd(home_dir())
+        .stdout_limit(SETUP_RESULT_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT)
+        .capture()
+    {
+        Ok(out) => out,
+        Err(error) => {
+            return SetupResult::generic(&format!(
+                "FeanorFS could not start its setup command. No files were changed. Reinstall FeanorFS and try again. Details: {error}"
+            ));
+        }
+    };
+    last_setup_result_line(&out.stdout).unwrap_or_else(|| {
+        SetupResult::generic(&stderr_detail(&out.stderr).unwrap_or_else(|| {
+            "the installed CLI returned an unreadable setup result; reinstall FeanorFS".to_string()
+        }))
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinOutcome {
-    Joined,
-    Canceled,
+fn setup_json_args(path: &Path) -> Vec<OsString> {
+    vec![
+        "--json".into(),
+        "start".into(),
+        "--".into(),
+        path.as_os_str().to_owned(),
+    ]
+}
+
+/// The final stdout line of a setup run is the typed result; human progress
+/// lines before it never parse as `SetupResult`.
+fn last_setup_result_line(stdout: &BoundedBytes) -> Option<SetupResult> {
+    stdout
+        .as_str_lossy()
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<SetupResult>(line.trim()).ok())
+}
+
+/// Outcome of one tray join: whether the user canceled, plus the typed setup
+/// result (generic when the CLI never produced a typed tail).
+pub struct JoinOutcome {
+    pub canceled: bool,
+    pub result: SetupResult,
+}
+
+pub fn join_workspace(path: &Path, pairing_code: Zeroizing<String>) -> JoinOutcome {
+    join_workspace_interactive(path, pairing_code)
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,48 +778,80 @@ struct JoinPathGroup {
     examples: Vec<String>,
 }
 
-fn join_workspace_interactive(
-    path: &Path,
-    pairing_code: Zeroizing<String>,
-) -> Result<JoinOutcome, String> {
+fn join_workspace_interactive(path: &Path, pairing_code: Zeroizing<String>) -> JoinOutcome {
+    let canceled_failure = |canceled: bool, detail: &str| JoinOutcome {
+        canceled,
+        result: SetupResult::generic(detail),
+    };
     if pairing_code.contains(['\r', '\n', '\0']) {
-        return Err("The pairing capability cannot contain line breaks or NUL characters.".into());
+        return canceled_failure(
+            false,
+            "The pairing capability cannot contain line breaks or NUL characters.",
+        );
     }
-    let mut child = Command::new(feanorfs_bin())
+    let mut command = Command::new(feanorfs_bin());
+    command
         .args(tray_join_args(path))
         .current_dir(home_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to start secure workspace join: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "failed to open secure pairing input".to_string())?;
-    stdin
+        .stderr(Stdio::piped());
+    let mut child = match spawn_child(&mut command) {
+        Ok(child) => child,
+        Err(error) => {
+            return canceled_failure(
+                false,
+                &format!("failed to start secure workspace join: {error}"),
+            );
+        }
+    };
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            stop_child(&mut child);
+            return canceled_failure(false, "failed to open secure pairing input");
+        }
+    };
+    if let Err(error) = stdin
         .write_all(pairing_code.as_bytes())
         .and_then(|()| stdin.write_all(b"\n"))
         .and_then(|()| stdin.flush())
-        .map_err(|error| format!("send pairing capability: {error}"))?;
+    {
+        stop_child(&mut child);
+        return canceled_failure(false, &format!("send pairing capability: {error}"));
+    }
     drop(pairing_code);
 
     let stdout = child.stdout.take().expect("join stdout is piped");
     let mut stdout = BufReader::new(stdout);
     let mut event_line = String::new();
-    let bytes = std::io::Read::by_ref(&mut stdout)
-        .take(65_537)
+    let bytes = match std::io::Read::by_ref(&mut stdout)
+        .take(JOIN_PREVIEW_LIMIT as u64 + 1)
         .read_line(&mut event_line)
-        .map_err(|error| format!("read secure join preview: {error}"))?;
-    if bytes == 0 || bytes > 65_536 || !event_line.ends_with('\n') {
-        graceful_stop_child(&mut child);
-        return Err("FeanorFS ended before the safe join preview was ready.".into());
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            stop_child(&mut child);
+            return canceled_failure(false, &format!("read secure join preview: {error}"));
+        }
+    };
+    if bytes == 0 || bytes as usize > JOIN_PREVIEW_LIMIT || !event_line.ends_with('\n') {
+        stop_child(&mut child);
+        return canceled_failure(
+            false,
+            "FeanorFS ended before the safe join preview was ready.",
+        );
     }
-    let event: JoinPreviewEvent = serde_json::from_str(event_line.trim_end())
-        .map_err(|_| "FeanorFS returned an invalid safe join preview.".to_string())?;
+    let event: JoinPreviewEvent = match serde_json::from_str(event_line.trim_end()) {
+        Ok(event) => event,
+        Err(_) => {
+            stop_child(&mut child);
+            return canceled_failure(false, "FeanorFS returned an invalid safe join preview.");
+        }
+    };
     if event.event != "join_preview" {
-        graceful_stop_child(&mut child);
-        return Err("FeanorFS returned an unexpected secure join stage.".into());
+        stop_child(&mut child);
+        return canceled_failure(false, "FeanorFS returned an unexpected secure join stage.");
     }
 
     let needs_confirmation = event.preview.local_only.count > 0
@@ -481,49 +867,53 @@ fn join_workspace_interactive(
         if !matches!(confirmed, rfd::MessageDialogResult::Ok) {
             let _ = stdin.write_all(b"CANCEL\n");
             drop(stdin);
-            graceful_stop_child(&mut child);
-            return Ok(JoinOutcome::Canceled);
+            stop_child(&mut child);
+            return canceled_failure(
+                true,
+                "Join canceled. No FeanorFS setup or workspace files were changed.",
+            );
         }
     }
-    stdin
-        .write_all(b"CONFIRM\n")
-        .and_then(|()| stdin.flush())
-        .map_err(|error| format!("confirm secure workspace join: {error}"))?;
+    if let Err(error) = stdin.write_all(b"CONFIRM\n").and_then(|()| stdin.flush()) {
+        stop_child(&mut child);
+        return canceled_failure(false, &format!("confirm secure workspace join: {error}"));
+    }
     drop(stdin);
 
-    let stdout_thread = std::thread::spawn(move || drain_bounded(stdout, 8192));
+    // Drain stderr concurrently so the child never blocks on a full pipe.
     let stderr = child.stderr.take().expect("join stderr is piped");
-    let stderr_thread = std::thread::spawn(move || drain_bounded(stderr, 8192));
-    let status = child
-        .wait()
-        .map_err(|error| format!("wait for secure workspace join: {error}"))?;
-    let _ = stdout_thread.join();
-    let stderr = stderr_thread.join().unwrap_or_default();
-    if status.success() {
-        Ok(JoinOutcome::Joined)
-    } else {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-        Err(truncate_error(if stderr.is_empty() {
-            "secure workspace join failed"
-        } else {
-            &stderr
-        }))
-    }
-}
+    let stderr_thread =
+        std::thread::spawn(move || BoundedBytes::read(stderr, DEFAULT_STDERR_LIMIT));
 
-fn drain_bounded(mut reader: impl std::io::Read, limit: usize) -> Vec<u8> {
-    let mut captured = Vec::with_capacity(limit);
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
-                let remaining = limit.saturating_sub(captured.len());
-                captured.extend_from_slice(&buffer[..read.min(remaining)]);
-            }
+    // The typed setup result is the final stdout line of the join protocol;
+    // the preview line and any human progress precede it. Read to EOF so the
+    // child can never block, then classify from the typed tail.
+    let tail = BoundedBytes::read(
+        std::io::Read::by_ref(&mut stdout),
+        SETUP_RESULT_STDOUT_LIMIT,
+    );
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = stderr_thread.join();
+            return canceled_failure(false, &format!("wait for secure workspace join: {error}"));
         }
+    };
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if let Some(result) = last_setup_result_line(&tail) {
+        return JoinOutcome {
+            canceled: false,
+            result,
+        };
     }
-    captured
+    let detail = stderr_detail(&stderr).unwrap_or_else(|| {
+        if status.success() {
+            "secure workspace join returned no typed setup result".to_string()
+        } else {
+            "secure workspace join failed".to_string()
+        }
+    });
+    canceled_failure(false, &truncate_error(&detail))
 }
 
 fn join_confirmation_copy(preview: &JoinPreview) -> String {
@@ -570,7 +960,7 @@ pub fn stop_workspace(path: &Path) -> Result<(), String> {
     let path = path
         .to_str()
         .ok_or_else(|| "workspace path is not valid UTF-8".to_string())?;
-    run_checked(&home_dir(), &stop_args(path))
+    run_checked(&home_dir(), &stop_args(path), Some(Duration::from_secs(60)))
 }
 
 pub fn export_recovery_kit(
@@ -644,36 +1034,31 @@ fn run_with_stdin_secret(
             "The {input_name} cannot contain line breaks or NUL characters."
         ));
     }
-    let mut child = Command::new(feanorfs_bin())
-        .args(&args)
-        .current_dir(current_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to start {operation}: {error}"))?;
-    let write_result = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("failed to open secure {input_name} input"))
-        .and_then(|mut stdin| {
-            stdin
-                .write_all(secret.as_bytes())
-                .and_then(|()| stdin.write_all(b"\n"))
-                .map_err(|error| format!("send {input_name}: {error}"))
-        });
-    drop(secret);
-    if let Err(error) = write_result {
-        graceful_stop_child(&mut child);
-        return Err(error);
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|error| format!("wait for {operation}: {error}"))?;
+    let out = match CapturedCommand::new(feanorfs_bin())
+        .args(args)
+        .cwd(current_dir)
+        .stdout_limit(DEFAULT_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT)
+        .secret_stdin(secret)
+        .capture()
+    {
+        Ok(out) => out,
+        Err(CapturedError::InvalidSecret) => {
+            return Err(format!(
+                "The {input_name} cannot contain line breaks or NUL characters."
+            ));
+        }
+        Err(CapturedError::Stdin(error)) => {
+            return Err(format!("send {input_name}: {error}"));
+        }
+        Err(error) => {
+            return Err(format!("failed to start {operation}: {error}"));
+        }
+    };
     if out.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let stderr = out.stderr.as_str_lossy().trim().to_string();
     let fallback = format!("{operation} failed");
     Err(truncate_error(if stderr.is_empty() {
         &fallback
@@ -734,14 +1119,14 @@ fn run_pairing_session_with_bin(
     cancel: Receiver<()>,
     mut emit: impl FnMut(PairSessionEvent),
 ) {
-    let mut child = match Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(pair_args())
         .current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut child = match spawn_child(&mut command) {
         Ok(child) => child,
         Err(error) => {
             emit(PairSessionEvent::Done {
@@ -759,14 +1144,14 @@ fn run_pairing_session_with_bin(
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         let ready = std::io::Read::by_ref(&mut reader)
-            .take(1025)
+            .take(PAIR_LINE_LIMIT as u64 + 1)
             .read_line(&mut line)
             .map_err(|error| format!("read pairing code: {error}"))
             .and_then(|read| {
                 if read == 0 {
                     Err("pairing ended before a code was ready".to_string())
-                } else if read > 1024 || !line.ends_with('\n') {
-                    Err("secure pairing event exceeded 1024 bytes".to_string())
+                } else if read > PAIR_LINE_LIMIT || !line.ends_with('\n') {
+                    Err("secure pairing event exceeded the 1024-byte limit".to_string())
                 } else {
                     parse_pair_ready(line.trim_end())
                 }
@@ -883,10 +1268,12 @@ fn parse_pair_ready(line: &str) -> Result<PairReady, String> {
 }
 
 fn pairing_stderr(child: &mut Child) -> String {
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let captured = child
+        .stderr
+        .take()
+        .map(|pipe| BoundedBytes::read(pipe, DEFAULT_STDERR_LIMIT))
+        .unwrap_or_default();
+    let stderr = captured.as_str_lossy();
     let message = stderr
         .lines()
         .rev()
@@ -895,25 +1282,9 @@ fn pairing_stderr(child: &mut Child) -> String {
     truncate_error(message)
 }
 
+/// Gracefully stop a child and its whole process tree (see [`stop_child`]).
 pub fn graceful_stop_child(child: &mut Child) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGTERM);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_child(child);
 }
 
 pub fn conflicts_keep(workspace: &Path, path: &str, choice: &str) -> Result<(), String> {
@@ -926,6 +1297,7 @@ pub fn conflicts_keep(workspace: &Path, path: &str, choice: &str) -> Result<(), 
     run_checked(
         workspace,
         &["--json", "conflicts", "keep", flag, "--", path],
+        Some(Duration::from_secs(60)),
     )
 }
 
@@ -935,15 +1307,24 @@ pub fn conflicts_keep_all(workspace: &Path, choice: &str) -> Result<(), String> 
         "cloud" => "--cloud",
         _ => return Err(format!("unknown bulk keep choice: {choice}")),
     };
-    run_checked(workspace, &["--json", "conflicts", "keep", "--all", flag])
+    run_checked(
+        workspace,
+        &["--json", "conflicts", "keep", "--all", flag],
+        Some(Duration::from_secs(60)),
+    )
 }
 
 pub fn agent_land(workspace: &Path, name: &str) -> Result<(), String> {
-    run_checked(workspace, &["--json", "agent", "land", "--", name])
+    run_checked(
+        workspace,
+        &["--json", "agent", "land", "--", name],
+        Some(Duration::from_secs(60)),
+    )
 }
 
 pub fn sync_once(workspace: &Path) -> Result<(), String> {
-    run_checked(workspace, &["--json", "sync", "--no-watch"])
+    // A user-triggered sync pass can legitimately take a long time.
+    run_checked(workspace, &["--json", "sync", "--no-watch"], None)
 }
 
 #[derive(Deserialize)]
@@ -952,27 +1333,36 @@ struct BackgroundServiceResult {
 }
 
 pub fn background_service_managed(workspace: &Path) -> bool {
-    let Ok(out) = run_in(workspace, &["--json", "service", "status"]) else {
+    let Ok(out) = quick_capture(workspace, &["--json", "service", "status"]) else {
         return false;
     };
     if !out.status.success() {
         return false;
     }
-    serde_json::from_slice::<BackgroundServiceResult>(&out.stdout)
+    out.decode_json::<BackgroundServiceResult>()
         .is_ok_and(|result| result.status != "not_installed")
 }
 
 pub fn background_service_stop(workspace: &Path) -> Result<(), String> {
-    run_checked(workspace, &["--json", "service", "stop"])
+    run_checked(
+        workspace,
+        &["--json", "service", "stop"],
+        Some(Duration::from_secs(60)),
+    )
 }
 
 pub fn background_service_start(workspace: &Path) -> Result<(), String> {
-    run_checked(workspace, &["--json", "service", "start"])
+    run_checked(
+        workspace,
+        &["--json", "service", "start"],
+        Some(Duration::from_secs(60)),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use feanorfs_common::tray_contract::{SetupRecovery, SetupStage};
 
     #[test]
     fn cli_discovery_prefers_override_then_colocated_then_packaged_binary() {
@@ -1042,34 +1432,6 @@ mod tests {
     }
 
     #[test]
-    fn overview_uses_the_additive_contract_when_available() {
-        let expected = feanorfs_common::tray_contract::fixtures::tray_overview_result();
-        let json = serde_json::to_vec(&expected).unwrap();
-
-        let actual = overview_or_fallback(true, &json, || {
-            panic!("valid overview must not invoke the compatibility fallback")
-        })
-        .unwrap();
-
-        assert_eq!(actual.status.workspace_id, expected.status.workspace_id);
-        assert_eq!(
-            actual.recent.unwrap().workspaces.len(),
-            expected.recent.unwrap().workspaces.len()
-        );
-    }
-
-    #[test]
-    fn overview_falls_back_to_stable_status_for_an_older_cli() {
-        let mut expected = feanorfs_common::tray_contract::fixtures::tray_overview_result();
-        expected.recent = None;
-
-        let actual = overview_or_fallback(false, b"", || Ok(expected.clone())).unwrap();
-
-        assert_eq!(actual.status.workspace_id, expected.status.workspace_id);
-        assert!(actual.recent.is_none());
-    }
-
-    #[test]
     fn health_report_reads_only_named_statuses_from_doctor_json() {
         let report: HealthReport = serde_json::from_str(
             r#"{
@@ -1117,11 +1479,15 @@ mod tests {
     fn health_and_repair_subprocess_arguments_are_public_and_flag_safe() {
         assert_eq!(health_args(), ["--json", "doctor"]);
         assert_eq!(
-            start_args("--folder-that-looks-like-a-flag"),
-            ["start", "--", "--folder-that-looks-like-a-flag"]
+            setup_json_args(Path::new("--folder-that-looks-like-a-flag")),
+            vec![
+                OsString::from("--json"),
+                OsString::from("start"),
+                OsString::from("--"),
+                OsString::from("--folder-that-looks-like-a-flag"),
+            ]
         );
-        assert_eq!(update_args(false), ["--json", "update"]);
-        assert_eq!(update_args(true), ["--json", "update", "--periodic"]);
+        assert_eq!(update_args(), ["--json", "update"]);
     }
 
     #[test]
@@ -1247,11 +1613,10 @@ mod tests {
         assert_eq!(done, Some((false, true, None)));
         std::fs::remove_dir_all(root).unwrap();
     }
-    #[test]
-    #[cfg(unix)]
-    fn config_presence_is_cached_and_invalidated() {
+
+    fn fake_cli_dir(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "feanorfs-tray-config-cache-{}-{}",
+            "feanorfs-tray-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1259,98 +1624,259 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let counter = root.join("calls");
-        let fake = root.join("fake-feanorfs");
-        std::fs::write(
-            &fake,
-            format!("#!/bin/sh\nprintf x >> '{}'\nexit 0\n", counter.display()),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let workspace = root.join("ws");
-        std::fs::create_dir_all(&workspace).unwrap();
+        root
+    }
 
-        std::env::set_var("FEANORFS_BIN", &fake);
-        invalidate_config_cache();
-        assert!(workspace_has_config(&workspace));
-        // The second check must reuse the cached result: one CLI spawn total.
-        assert!(workspace_has_config(&workspace));
-        let calls = std::fs::read_to_string(&counter).unwrap_or_default();
-        assert_eq!(
-            calls.len(),
-            1,
-            "config check must be cached after the first call"
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        // `kill(pid, 0)` returns 0 while the process exists (same user).
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_child_output_is_bounded_and_decode_fails_typed() {
+        let root = fake_cli_dir("overflow");
+        let script = root.join("fake-feanorfs");
+        write_executable_script(
+            &script,
+            "#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\n",
+        );
+        let output = CapturedCommand::new(script.as_os_str().to_owned())
+            .stdout_limit(1024)
+            .stderr_limit(1024)
+            .capture()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.truncated);
+        assert!(output.stdout.bytes.len() <= 1024);
+        assert!(output.stderr.bytes.is_empty());
+        let decoded: Result<TrayStatusResult, _> = output.decode_json();
+        assert!(matches!(
+            decoded,
+            Err(CapturedError::OutputOverLimit { stream: "stdout" })
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_child_times_out_and_its_process_tree_is_cleaned_up() {
+        let root = fake_cli_dir("hung");
+        let marker = root.join("orphan.pid");
+        let script = root.join("fake-feanorfs");
+        // The grandchild ignores TERM, so only the group SIGKILL can reach it.
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nsh -c 'echo $$ > \"{marker}\"; trap \"\" TERM; while :; do sleep 1; done' &\nwhile :; do sleep 1; done\n",
+                marker = marker.display()
+            ),
+        );
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = CapturedCommand::new(script.as_os_str().to_owned())
+                .stdout_limit(1024)
+                .stderr_limit(1024)
+                .timeout(Duration::from_millis(1500))
+                .capture();
+            let _ = result_tx.send(result);
+        });
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("capture must return");
+        assert!(matches!(result, Err(CapturedError::Timeout { .. })));
+
+        // The grandchild may spawn a moment before the timeout fires; if it
+        // did, it must be dead after the process-tree cleanup.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if marker.is_file() {
+            let pid: i32 = std::fs::read_to_string(&marker)
+                .expect("orphan marker")
+                .trim()
+                .parse()
+                .expect("orphan pid");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while process_alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!process_alive(pid), "orphaned grandchild must be reaped");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn early_exit_without_output_is_a_typed_no_output_error() {
+        let root = fake_cli_dir("early");
+        let script = root.join("fake-feanorfs");
+        write_executable_script(&script, "#!/bin/sh\nexit 0\n");
+        let output = CapturedCommand::new(script.as_os_str().to_owned())
+            .stdout_limit(1024)
+            .stderr_limit(1024)
+            .capture()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(matches!(
+            output.decode_json::<TrayStatusResult>(),
+            Err(CapturedError::NoOutput)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_json_is_a_typed_decode_error() {
+        let root = fake_cli_dir("bad-json");
+        let script = root.join("fake-feanorfs");
+        write_executable_script(&script, "#!/bin/sh\nprintf 'this is not json'\n");
+        let output = CapturedCommand::new(script.as_os_str().to_owned())
+            .stdout_limit(1024)
+            .stderr_limit(1024)
+            .capture()
+            .unwrap();
+        assert!(matches!(
+            output.decode_json::<TrayStatusResult>(),
+            Err(CapturedError::MalformedJson(_))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_stdin_is_one_line_and_never_exposed_to_argv_env_or_errors() {
+        let root = fake_cli_dir("secret");
+        let argv_file = root.join("argv.txt");
+        let env_file = root.join("env.txt");
+        let stdin_file = root.join("stdin.txt");
+        let script = root.join("fake-feanorfs");
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{argv_file}\"\nenv > \"{env_file}\"\ncat > \"{stdin_file}\"\n",
+                argv_file = argv_file.display(),
+                env_file = env_file.display(),
+                stdin_file = stdin_file.display(),
+            ),
         );
 
-        invalidate_config_cache();
-        assert!(workspace_has_config(&workspace));
-        let calls = std::fs::read_to_string(&counter).unwrap_or_default();
-        assert_eq!(calls.len(), 2, "invalidation must force a fresh check");
-        std::env::remove_var("FEANORFS_BIN");
+        let secret = Zeroizing::new("hunter2-secret".to_string());
+        let command = CapturedCommand::new(script.as_os_str().to_owned())
+            .args([OsString::from("--flag"), OsString::from("--value")])
+            .stdout_limit(1024)
+            .stderr_limit(1024)
+            .secret_stdin(secret.clone());
+        // Debug is a log surface: it must never expose the secret.
+        let debug_render = format!("{command:?}");
+        assert!(!debug_render.contains("hunter2-secret"));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let output = command.capture().unwrap();
+        assert!(output.status.success());
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        let env = std::fs::read_to_string(&env_file).unwrap();
+        let stdin = std::fs::read_to_string(&stdin_file).unwrap();
+        assert!(!argv.contains("hunter2-secret"));
+        assert!(!env.contains("hunter2-secret"));
+        assert_eq!(stdin, "hunter2-secret\n");
+
+        // Errors never echo the secret either.
+        let error = CapturedCommand::new(root.join("does-not-exist").as_os_str().to_owned())
+            .secret_stdin(secret)
+            .capture()
+            .expect_err("spawn must fail");
+        assert!(!format!("{error:?}").contains("hunter2-secret"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_stdin_rejects_line_breaks_without_spawning() {
+        let root = fake_cli_dir("bad-secret");
+        let script = root.join("fake-feanorfs");
+        write_executable_script(&script, "#!/bin/sh\ncat\n");
+        let error = CapturedCommand::new(script.as_os_str().to_owned())
+            .secret_stdin(Zeroizing::new("line\nbreak".to_string()))
+            .capture()
+            .expect_err("invalid secret must fail");
+        assert_eq!(error, CapturedError::InvalidSecret);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canceling_a_capture_stops_the_child_process_tree() {
+        let root = fake_cli_dir("cancel");
+        let marker = root.join("started.pid");
+        let script = root.join("fake-feanorfs");
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\necho $$ > \"{marker}\"\nwhile :; do sleep 1; done\n",
+                marker = marker.display(),
+            ),
+        );
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = CapturedCommand::new(script.as_os_str().to_owned())
+                .stdout_limit(1024)
+                .stderr_limit(1024)
+                .capture_with_cancel(Some(&cancel_rx));
+            let _ = result_tx.send(result);
+        });
+        // Wait for the child to be running, then cancel it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(marker.is_file(), "child must start before cancellation");
+        cancel_tx.send(()).unwrap();
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("capture must return");
+        assert!(matches!(result, Err(CapturedError::Canceled)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    #[cfg(unix)]
-    #[ignore = "manual profile; run with --ignored --nocapture"]
-    fn profile_cli_discovery_and_subprocess_spawn() {
-        let root = std::env::temp_dir().join(format!(
-            "feanorfs-tray-cli-profile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let sibling = root.join(format!("fake-feanorfs{}", std::env::consts::EXE_SUFFIX));
-        let workspace = root.join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(&sibling, b"#!/bin/sh\nexit 0\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+    fn setup_result_line_extraction_skips_human_progress_and_preview() {
+        let mut stdout = BoundedBytes {
+            bytes: br#"Running sync...
+Initial sync completed.
+{"event":"join_preview","preview":{}}
+Some human wording that changed completely
+{"stage":"initial_sync","committed":{"workspace_configured":true,"initial_sync_completed":true,"background_service_installed":false,"tray_registered":false},"retryable":true,"recovery":"retry_start","detail":"reworded CLI message"}
+"#
+            .to_vec(),
+            truncated: false,
+        };
+        let result = last_setup_result_line(&stdout).expect("typed line must be found");
+        assert_eq!(result.stage, SetupStage::InitialSync);
+        assert_eq!(result.detail.as_deref(), Some("reworded CLI message"));
 
-        const DISCOVERY_ITERATIONS: usize = 50_000;
-        let previous_bin = std::env::var_os("FEANORFS_BIN");
-        std::env::remove_var("FEANORFS_BIN");
-        let started = Instant::now();
-        let mut discovered = 0_usize;
-        for _ in 0..DISCOVERY_ITERATIONS {
-            if std::hint::black_box(feanorfs_bin()).is_empty() {
-                // A real discovery result is always non-empty; retain the
-                // branch so the benchmark consumes each returned value.
-            } else {
-                discovered = discovered.saturating_add(1);
-            }
-        }
-        let discovery_elapsed = started.elapsed();
+        // No typed line at all (crashed/very old CLI) → None, so the caller
+        // falls back to a generic outcome.
+        stdout.bytes = b"just human text\n".to_vec();
+        assert!(last_setup_result_line(&stdout).is_none());
+    }
 
-        std::env::set_var("FEANORFS_BIN", &sibling);
-        const SPAWN_ITERATIONS: usize = 100;
-        let started = Instant::now();
-        let mut successful = 0_usize;
-        for _ in 0..SPAWN_ITERATIONS {
-            if run_in(&workspace, &["--json", "config"]).is_ok() {
-                successful = successful.saturating_add(1);
-            }
-        }
-        let spawn_elapsed = started.elapsed();
-        if let Some(previous_bin) = previous_bin {
-            std::env::set_var("FEANORFS_BIN", previous_bin);
-        } else {
-            std::env::remove_var("FEANORFS_BIN");
-        }
-
-        eprintln!(
-            "CLI profile: discovery={discovery_elapsed:?} ({discovered}/{DISCOVERY_ITERATIONS}), run_in={spawn_elapsed:?} ({successful}/{SPAWN_ITERATIONS})"
-        );
-        std::fs::remove_dir_all(root).unwrap();
+    #[test]
+    fn setup_result_json_fixture_decodes_stable_stage_names() {
+        let fixture = r#"{"stage":"service_installed","committed":{"workspace_configured":true,"initial_sync_completed":true,"background_service_installed":true,"tray_registered":false},"retryable":true,"recovery":"retry_tray","detail":"whatever the CLI says"}"#;
+        let result: SetupResult = serde_json::from_str(fixture).unwrap();
+        assert_eq!(result.stage, SetupStage::ServiceInstalled);
+        assert_eq!(result.recovery, Some(SetupRecovery::RetryTray));
+        assert!(result.committed.background_service_installed);
     }
 }

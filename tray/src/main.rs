@@ -1,123 +1,84 @@
 #[cfg(test)]
 feanorfs_test_support::isolate_test_process!();
 
+mod actions;
+mod dialogs;
 mod feanorfs;
 mod icons;
+mod instance;
+mod menu;
+mod model;
 mod password_dialog;
 mod ui;
 
-use feanorfs::feanorfs_bin;
-use feanorfs::{
-    agent_land, background_service_managed, background_service_start, background_service_stop,
-    check_for_updates, check_for_updates_periodic, clear_pairing_clipboard, conflicts_keep,
-    conflicts_keep_all, copy_pairing_clipboard, export_recovery_kit, forget_unavailable_workspaces,
-    graceful_stop_child, import_recovery_kit, invalidate_config_cache, join_workspace,
-    run_pairing_session, start_workspace, stop_workspace, sync_once, system_health, tray_activate,
-    tray_overview, tray_pause, tray_recent, tray_status, workspace_has_config, HealthReport,
-    HealthStatus, PairSessionEvent, UpdateCheckResult, UpdateStatus,
+use actions::{begin_workspace_repair, handle_menu_action, quit_tray, request_status_fetch};
+use dialogs::{
+    health_report_needs_repair, setup_failure_copy, setup_success_copy, show_first_run_choice,
+    show_forget_unavailable_result, show_health_dialog, show_health_unavailable,
+    show_pairing_dialog, show_recovery_kit_saved_dialog, show_setup_result_dialog,
+    show_update_dialog, show_update_error, show_workspace_restored_dialog, FirstRunChoice,
 };
+use feanorfs::{workspace_has_config, HealthReport, UpdateCheckResult};
 use feanorfs_common::tray_contract::{
-    RecentWorkspacesResult, TrayOverviewResult, TrayStatusResult,
+    RecentWorkspacesResult, SetupResult, SetupStage, TrayStatusResult, MANAGED_TRAY_ARG,
 };
 use icons::{icon_for, visual_from_state, TrayVisual};
-use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use std::cell::Cell;
-use std::collections::hash_map::DefaultHasher;
-use std::ffi::{OsStr, OsString};
-use std::fs::{File, OpenOptions};
-use std::hash::{Hash, Hasher};
-use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use menu::{build_menu, parse_menu_action, MenuAction};
+use model::{
+    first_run_requested, is_paused_on_disk, menu_revision, resolve_initial_workspace,
+    should_prompt_first_run, unavailable_workspace_count, AppState, SetupKind, REFRESH_SECS,
+};
+use muda::MenuEvent;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::{TrayIcon, TrayIconBuilder};
-use ui::{dialog_text, menu_label, menu_label_with_suffix};
 
-const REFRESH_SECS: u64 = 10;
-/// Daily cadence for the throttled periodic update offer (the CLI enforces
-/// its own per-machine throttle window as well).
-const PERIODIC_UPDATE_SECS: u64 = 24 * 60 * 60;
-const MAX_WATCH_FAILURES: u32 = 3;
-const FAST_EXIT_SECS: u64 = 10;
+const SUPERVISED_TRAY_CONTENTION_EXIT_CODE: i32 = 75;
 
-struct TrayInstanceGuard {
-    file: File,
-}
-
-impl Drop for TrayInstanceGuard {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+fn print_version_and_exit(arguments: &[std::ffi::OsString]) -> bool {
+    let version_requested = arguments.len() == 1
+        && arguments[0]
+            .to_str()
+            .is_some_and(|argument| matches!(argument, "--version" | "-V"));
+    if version_requested {
+        println!("feanorfs-tray {}", env!("CARGO_PKG_VERSION"));
     }
+    version_requested
 }
 
-fn tray_instance_lock_path() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .map(|home| home.join(".feanorfs").join("tray-instance.lock"))
-        .ok_or_else(|| "FeanorFS could not find this user's home folder.".into())
+fn managed_tray_launch(arguments: &[std::ffi::OsString]) -> bool {
+    arguments
+        .iter()
+        .any(|argument| argument == std::ffi::OsStr::new(MANAGED_TRAY_ARG))
 }
 
-fn acquire_tray_instance_lock() -> Result<Option<TrayInstanceGuard>, String> {
-    let path = tray_instance_lock_path()?;
-    acquire_tray_instance_lock_at(&path).map_err(|error| {
-        format!(
-            "FeanorFS could not create its single-tray lock at {}: {error}",
-            path.display()
-        )
-    })
+#[cfg(debug_assertions)]
+fn runner_test_launch(profile: Option<&std::ffi::OsStr>, mode: Option<&std::ffi::OsStr>) -> bool {
+    profile.is_some() || mode.is_some()
 }
 
-fn acquire_tray_instance_lock_at(path: &Path) -> io::Result<Option<TrayInstanceGuard>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(path)?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some(TrayInstanceGuard { file })),
-        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum SetupKind {
-    AddFolder,
-    JoinFolder,
-    Repair,
+#[cfg(not(debug_assertions))]
+fn runner_test_launch(_: Option<&std::ffi::OsStr>, _: Option<&std::ffi::OsStr>) -> bool {
+    false
 }
 
 #[derive(Clone)]
-enum Action {
+pub(crate) enum Action {
     Refresh,
     FirstRun,
     StatusReady {
         generation: u64,
         workspace: PathBuf,
-        overview: Result<TrayOverviewResult, String>,
-    },
-    RecentReady {
-        generation: u64,
-        recent: Option<RecentWorkspacesResult>,
+        status: Result<TrayStatusResult, String>,
     },
     HealthReady {
         workspace: PathBuf,
         report: Result<HealthReport, String>,
     },
     UpdateReady(Result<UpdateCheckResult, String>),
-    PeriodicUpdateCheck,
     MenuClick(String),
     TaskDone {
         error: Option<String>,
@@ -140,7 +101,7 @@ enum Action {
         generation: u64,
         path: PathBuf,
         kind: SetupKind,
-        error: Option<String>,
+        result: SetupResult,
     },
     SetupCanceled {
         generation: u64,
@@ -166,1329 +127,6 @@ enum Action {
         restored_folder: Option<PathBuf>,
         error: Option<String>,
     },
-}
-
-struct AppState {
-    workspace: Option<PathBuf>,
-    watch_child: Option<Child>,
-    owns_watch: bool,
-    watch_failures: u32,
-    last_spawn_at: Option<Instant>,
-    respawn_disabled: bool,
-    status_inflight: bool,
-    status_pending: bool,
-    task_generation: u64,
-    last_status: Option<TrayStatusResult>,
-    status_failed: bool,
-    error_message: Option<String>,
-    recent: Option<RecentWorkspacesResult>,
-    recent_inflight: bool,
-    managed_service: Option<bool>,
-    setup_inflight: bool,
-    setup_kind: Option<SetupKind>,
-    stop_inflight: bool,
-    switch_inflight: bool,
-    pair_inflight: bool,
-    recovery_inflight: bool,
-    health_inflight: bool,
-    update_inflight: bool,
-    pair_cancel: Option<std::sync::mpsc::Sender<()>>,
-    quit_pending: bool,
-    last_menu_revision: Cell<Option<u64>>,
-}
-
-impl AppState {
-    fn new(workspace: Option<PathBuf>) -> Self {
-        Self {
-            workspace,
-            watch_child: None,
-            owns_watch: false,
-            watch_failures: 0,
-            last_spawn_at: None,
-            respawn_disabled: false,
-            status_inflight: false,
-            status_pending: false,
-            task_generation: 0,
-            last_status: None,
-            status_failed: false,
-            error_message: None,
-            recent: None,
-            recent_inflight: false,
-            managed_service: None,
-            setup_inflight: false,
-            setup_kind: None,
-            stop_inflight: false,
-            switch_inflight: false,
-            pair_inflight: false,
-            recovery_inflight: false,
-            health_inflight: false,
-            update_inflight: false,
-            pair_cancel: None,
-            quit_pending: false,
-            last_menu_revision: Cell::new(None),
-        }
-    }
-
-    fn is_paused(&self) -> bool {
-        self.last_status.as_ref().is_some_and(|s| s.paused)
-    }
-
-    fn external_watcher_active(&self) -> bool {
-        self.watch_child.is_none() && self.last_status.as_ref().is_some_and(|s| s.watching)
-    }
-
-    fn has_managed_service(&mut self) -> bool {
-        if let Some(managed) = self.managed_service {
-            return managed;
-        }
-        let managed = self
-            .workspace
-            .as_deref()
-            .is_some_and(background_service_managed);
-        self.managed_service = Some(managed);
-        managed
-    }
-
-    fn start_watch(&mut self) {
-        if self.is_paused() || self.respawn_disabled || self.has_managed_service() {
-            return;
-        }
-        if self.watch_child.is_some() {
-            return;
-        }
-        if self.external_watcher_active() {
-            return;
-        }
-        let Some(workspace) = self.workspace.clone() else {
-            return;
-        };
-
-        match Command::new(feanorfs_bin())
-            .args(["sync"])
-            .current_dir(workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => {
-                self.watch_child = Some(child);
-                self.owns_watch = true;
-                self.last_spawn_at = Some(Instant::now());
-            }
-            Err(e) => {
-                self.respawn_disabled = true;
-                self.error_message = Some(format!(
-                    "Automatic syncing could not start because the FeanorFS command is unavailable. Your files were not changed. Reinstall FeanorFS and try again. Details: {e}"
-                ));
-            }
-        }
-    }
-
-    fn check_watch_alive(&mut self) {
-        if self.respawn_disabled || self.is_paused() {
-            return;
-        }
-
-        if let Some(ref mut child) = self.watch_child {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    self.watch_child = None;
-                    self.owns_watch = false;
-                    let fast_exit = self
-                        .last_spawn_at
-                        .is_some_and(|t| t.elapsed() < Duration::from_secs(FAST_EXIT_SECS));
-                    if fast_exit {
-                        self.watch_failures = self.watch_failures.saturating_add(1);
-                    } else {
-                        self.watch_failures = 0;
-                    }
-                    if self.watch_failures >= MAX_WATCH_FAILURES {
-                        self.respawn_disabled = true;
-                        self.error_message = Some(
-                            "Automatic syncing stopped after repeated failures. Your files were not changed. Quit and reopen FeanorFS; if this happens again, choose Check System Health… from the tray.".into(),
-                        );
-                        return;
-                    }
-                    self.start_watch();
-                }
-                Ok(None) => {
-                    if self
-                        .last_spawn_at
-                        .is_some_and(|t| t.elapsed() >= Duration::from_secs(FAST_EXIT_SECS))
-                    {
-                        self.watch_failures = 0;
-                    }
-                }
-                Err(_) => {
-                    self.watch_child = None;
-                    self.owns_watch = false;
-                    self.watch_failures = self.watch_failures.saturating_add(1);
-                    if self.watch_failures >= MAX_WATCH_FAILURES {
-                        self.respawn_disabled = true;
-                        self.error_message = Some(
-                            "Automatic syncing stopped after repeated failures. Your files were not changed. Quit and reopen FeanorFS; if this happens again, choose Check System Health… from the tray.".into(),
-                        );
-                        return;
-                    }
-                    self.start_watch();
-                }
-            }
-        } else if self.external_watcher_active() {
-            // Distinguish the normal OS-managed watcher from a sync command
-            // the user really started in a terminal. The menu should never
-            // describe automatic background syncing as a terminal process.
-            let _ = self.has_managed_service();
-        } else {
-            self.start_watch();
-        }
-    }
-
-    fn stop_watch(&mut self) {
-        if let Some(mut child) = self.watch_child.take() {
-            graceful_stop_child(&mut child);
-            self.owns_watch = false;
-        }
-    }
-
-    fn invalidate_recent(&mut self) {
-        self.recent = None;
-    }
-
-    fn reset_watch_policy(&mut self) {
-        self.watch_failures = 0;
-        self.respawn_disabled = false;
-        self.status_failed = false;
-        self.error_message = None;
-        self.managed_service = None;
-    }
-
-    fn adopt_recent_if_unconfigured(&mut self) -> bool {
-        if self.workspace.is_some()
-            || self.setup_inflight
-            || self.stop_inflight
-            || self.switch_inflight
-            || self.pair_inflight
-        {
-            return false;
-        }
-        let Some(recent) = self.recent.as_ref() else {
-            return false;
-        };
-        let candidate = configured_recent_workspace(recent);
-        let Some(candidate) = candidate else {
-            return false;
-        };
-        self.workspace = Some(candidate);
-        self.reset_watch_policy();
-        true
-    }
-
-    fn cancel_pairing(&mut self) {
-        if let Some(cancel) = self.pair_cancel.take() {
-            let _ = cancel.send(());
-        }
-    }
-}
-
-fn configured_recent_workspace(recent: &RecentWorkspacesResult) -> Option<PathBuf> {
-    configured_recent_workspace_with(recent, workspace_has_config)
-}
-
-fn configured_recent_workspace_with(
-    recent: &RecentWorkspacesResult,
-    has_config: impl Fn(&Path) -> bool,
-) -> Option<PathBuf> {
-    recent
-        .active
-        .iter()
-        .chain(recent.workspaces.iter().map(|workspace| &workspace.path))
-        .map(PathBuf::from)
-        .find(|path| has_config(path))
-}
-
-fn unavailable_workspace_count(recent: &RecentWorkspacesResult) -> usize {
-    unavailable_workspace_count_with(recent, workspace_has_config)
-}
-
-fn unavailable_workspace_count_with(
-    recent: &RecentWorkspacesResult,
-    has_config: impl Fn(&Path) -> bool,
-) -> usize {
-    recent
-        .workspaces
-        .iter()
-        .filter(|workspace| !has_config(Path::new(&workspace.path)))
-        .count()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MirroredFolderMenuItem {
-    id: String,
-    label: String,
-    available: bool,
-    selected: bool,
-}
-
-fn canonical_path_string(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn same_workspace_path(left: &str, right: &str) -> bool {
-    canonical_path_string(Path::new(left)) == canonical_path_string(Path::new(right))
-}
-
-fn compact_workspace_path(path: &Path) -> String {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(PathBuf::from);
-    if let Some(relative) = home
-        .as_deref()
-        .and_then(|home| path.strip_prefix(home).ok())
-    {
-        if relative.as_os_str().is_empty() {
-            return "~".into();
-        }
-        return format!("~/{}", relative.display());
-    }
-    path.display().to_string()
-}
-
-fn workspace_switch_item_with(
-    label: &str,
-    path: &str,
-    active: Option<&str>,
-    has_config: impl Fn(&Path) -> bool,
-) -> MirroredFolderMenuItem {
-    let available = has_config(Path::new(path));
-    let selected = active.is_some_and(|active| same_workspace_path(active, path));
-    let base_label = format!("{label} — {}", compact_workspace_path(Path::new(path)));
-    let menu_label = if available {
-        menu_label(base_label)
-    } else {
-        menu_label_with_suffix(&base_label, " — unavailable")
-    };
-    MirroredFolderMenuItem {
-        id: format!("switch:{path}"),
-        label: menu_label,
-        available,
-        selected,
-    }
-}
-
-fn mirrored_folder_menu_items(state: &AppState) -> Vec<MirroredFolderMenuItem> {
-    mirrored_folder_menu_items_with(state, workspace_has_config)
-}
-
-fn mirrored_folder_menu_items_with(
-    state: &AppState,
-    has_config: impl Fn(&Path) -> bool + Copy,
-) -> Vec<MirroredFolderMenuItem> {
-    let mut workspaces = state
-        .recent
-        .as_ref()
-        .map(|recent| {
-            recent
-                .workspaces
-                .iter()
-                .map(|workspace| (workspace.path.clone(), workspace.label.clone()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if let Some(workspace) = state.workspace.as_deref() {
-        let path = canonical_path_string(workspace);
-        if !workspaces
-            .iter()
-            .any(|(candidate, _)| same_workspace_path(candidate, &path))
-        {
-            let label = workspace
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("folder")
-                .to_string();
-            workspaces.insert(0, (path, label));
-        }
-    }
-
-    let active = state
-        .workspace
-        .as_deref()
-        .map(canonical_path_string)
-        .or_else(|| {
-            state
-                .recent
-                .as_ref()
-                .and_then(|recent| recent.active.clone())
-        });
-    workspaces
-        .iter()
-        .map(|(path, label)| workspace_switch_item_with(label, path, active.as_deref(), has_config))
-        .collect()
-}
-
-fn append_mirrored_folders(menu: &Menu, state: &AppState, actions_enabled: bool) {
-    let entries = mirrored_folder_menu_items(state);
-    if entries.is_empty() {
-        return;
-    }
-    let folders = Submenu::with_id(
-        muda::MenuId::new("mirrored-folders"),
-        "Mirrored Folders",
-        true,
-    );
-    for entry in entries {
-        let _ = folders.append(&CheckMenuItem::with_id(
-            muda::MenuId::new(entry.id),
-            entry.label,
-            actions_enabled && entry.available,
-            entry.selected,
-            None,
-        ));
-    }
-    if state
-        .recent
-        .as_ref()
-        .is_some_and(|recent| unavailable_workspace_count(recent) > 0)
-    {
-        let _ = folders.append(&PredefinedMenuItem::separator());
-        let _ = folders.append(&MenuItem::with_id(
-            muda::MenuId::new("forget-unavailable"),
-            "Remove Unavailable Folders…",
-            actions_enabled,
-            None,
-        ));
-    }
-    let _ = menu.append(&folders);
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    } else if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
-        }
-    }
-    PathBuf::from(path)
-}
-
-fn is_paused_on_disk(workspace: &Path) -> bool {
-    tray_status(workspace).is_ok_and(|status| status.paused)
-}
-
-fn resolve_initial_workspace() -> (Option<PathBuf>, Option<RecentWorkspacesResult>) {
-    if let Ok(p) = std::env::var("FEANORFS_WORKSPACE") {
-        let path = expand_tilde(&p);
-        return (workspace_has_config(&path).then_some(path), None);
-    }
-    let recent = tray_recent();
-    let workspace = recent.as_ref().and_then(|recent| {
-        recent
-            .active
-            .iter()
-            .chain(recent.workspaces.iter().map(|workspace| &workspace.path))
-            .map(PathBuf::from)
-            .find(|path| workspace_has_config(path))
-    });
-    (workspace, recent)
-}
-
-fn first_run_requested(args: &[OsString]) -> bool {
-    args.iter()
-        .any(|argument| argument == OsStr::new("--first-run"))
-}
-
-fn version_requested(args: &[OsString]) -> bool {
-    args.iter()
-        .any(|argument| argument == OsStr::new("--version") || argument == OsStr::new("-V"))
-}
-
-fn should_prompt_first_run(requested: bool, workspace: Option<&Path>) -> bool {
-    requested && workspace.is_none()
-}
-
-const FIRST_RUN_START: &str = "Start Mirroring a Folder…";
-const FIRST_RUN_JOIN: &str = "Join a Shared Folder…";
-const FIRST_RUN_LATER: &str = "Not Now";
-const HEALTH_REPAIR: &str = "Repair Mirroring";
-const HEALTH_CLOSE: &str = "Close";
-const UPDATE_OPEN: &str = "Open Release Page";
-const UPDATE_LATER: &str = "Later";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FirstRunChoice {
-    Start,
-    Join,
-    Later,
-}
-
-fn first_run_choice(result: rfd::MessageDialogResult) -> FirstRunChoice {
-    match result {
-        rfd::MessageDialogResult::Custom(choice) if choice == FIRST_RUN_START => {
-            FirstRunChoice::Start
-        }
-        rfd::MessageDialogResult::Custom(choice) if choice == FIRST_RUN_JOIN => {
-            FirstRunChoice::Join
-        }
-        _ => FirstRunChoice::Later,
-    }
-}
-
-fn show_first_run_choice() -> FirstRunChoice {
-    activate_for_native_dialog();
-    first_run_choice(
-        rfd::MessageDialog::new()
-            .set_title("Welcome to FeanorFS")
-            .set_description(dialog_text(
-                "Add a folder from this computer, or securely join one shared from another computer. FeanorFS keeps your shared working files — including uncommitted work-in-progress — in sync automatically.",
-            ))
-            .set_level(rfd::MessageLevel::Info)
-            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-                FIRST_RUN_START.into(),
-                FIRST_RUN_JOIN.into(),
-                FIRST_RUN_LATER.into(),
-            ))
-            .show(),
-    )
-}
-
-fn health_check_label(name: &str) -> &str {
-    match name {
-        "global_config" => "Saved connection",
-        "workspace_config" => "Workspace setup",
-        "e2ee" => "End-to-end encryption",
-        "workspace_format" => "Encrypted snapshot format",
-        "automatic_sync" => "Automatic syncing",
-        "tray_registration" => "System tray startup",
-        "private_hub" => "Private hub",
-        "relay" => "Off-LAN connection",
-        "server" => "Mirror connection",
-        "remote_workspace" => "Remote workspace",
-        "local_state" => "Local sync state",
-        _ => "FeanorFS component",
-    }
-}
-
-fn health_report_needs_repair(report: &HealthReport) -> bool {
-    !report.ok
-        || report
-            .checks
-            .iter()
-            .any(|check| check.status == HealthStatus::Failure)
-}
-
-fn health_choice_requests_repair(choice: &rfd::MessageDialogResult) -> bool {
-    matches!(
-        choice,
-        rfd::MessageDialogResult::Custom(value) if value == HEALTH_REPAIR
-    )
-}
-
-fn health_report_description(report: &HealthReport) -> String {
-    let failures = report
-        .checks
-        .iter()
-        .filter(|check| check.status == HealthStatus::Failure)
-        .map(|check| health_check_label(&check.name))
-        .collect::<Vec<_>>();
-    let warnings = report
-        .checks
-        .iter()
-        .filter(|check| check.status == HealthStatus::Warning)
-        .map(|check| health_check_label(&check.name))
-        .collect::<Vec<_>>();
-    if failures.is_empty() && warnings.is_empty() && report.ok {
-        return "FeanorFS is healthy. Encryption, the mirror connection, background syncing, and local state passed their checks."
-            .into();
-    }
-
-    let mut description = if failures.is_empty() && !report.ok {
-        "FeanorFS could not confirm all required checks. The health check did not change your files."
-            .to_string()
-    } else if failures.is_empty() {
-        "FeanorFS is working, with items worth checking.".to_string()
-    } else {
-        format!(
-            "FeanorFS found {} issue{}. The health check did not change your files.",
-            failures.len(),
-            if failures.len() == 1 { "" } else { "s" }
-        )
-    };
-    if !failures.is_empty() {
-        description.push_str("\n\nNeeds repair:");
-        for label in failures {
-            description.push_str("\n• ");
-            description.push_str(label);
-        }
-    }
-    if !warnings.is_empty() {
-        description.push_str("\n\nCheck when convenient:");
-        for label in warnings {
-            description.push_str("\n• ");
-            description.push_str(label);
-        }
-    }
-    description
-}
-
-fn update_description(result: &UpdateCheckResult) -> String {
-    match result.status {
-        UpdateStatus::UpToDate => format!(
-            "FeanorFS {} is up to date with the latest stable release.",
-            result.current_version
-        ),
-        UpdateStatus::UpdateAvailable => format!(
-            "FeanorFS {} is available. This computer has {}.\n\nFeanorFS will not download or execute anything automatically. Open the official release page to review the signed or checksummed installer for your platform.",
-            result.latest_version, result.current_version
-        ),
-        UpdateStatus::DevelopmentBuild => format!(
-            "This FeanorFS build ({}) is newer than the latest stable release ({}). No update is needed.",
-            result.current_version, result.latest_version
-        ),
-    }
-}
-
-fn update_choice_opens_release(choice: &rfd::MessageDialogResult) -> bool {
-    matches!(
-        choice,
-        rfd::MessageDialogResult::Custom(value) if value == UPDATE_OPEN
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn activate_for_native_dialog() {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSApplication;
-
-    if let Some(main_thread) = MainThreadMarker::new() {
-        let app = NSApplication::sharedApplication(main_thread);
-        // First-run onboarding is explicitly user-initiated by the installer.
-        // Cooperative activation may decline while Terminal or Finder is active.
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn activate_for_native_dialog() {}
-
-fn header_label(status: &TrayStatusResult) -> String {
-    if status.paused {
-        return format!("FeanorFS — {} (paused)", status.workspace_label);
-    }
-    let state = match status.mirror_state.as_str() {
-        "idle" => "in sync with your shared WIP",
-        "out_of_sync" => "has changes",
-        "offline" => "offline",
-        "conflict" => "needs attention",
-        "syncing" => "syncing",
-        "error" => "error",
-        other => other,
-    };
-    format!("FeanorFS — {} ({state})", status.workspace_label)
-}
-
-fn choice_label(choice: &str) -> String {
-    match choice {
-        "local" => "Keep my version".into(),
-        "cloud" => "Keep cloud version".into(),
-        "both" => "Keep both".into(),
-        other => other.into(),
-    }
-}
-
-fn format_duration(seconds: u64) -> String {
-    if seconds < 60 {
-        format!("{seconds} seconds")
-    } else {
-        let minutes = seconds / 60;
-        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
-    }
-}
-
-fn pairing_dialog_description(code: &str, expires_in_seconds: u64) -> String {
-    let expiry = format_duration(expires_in_seconds);
-    if code.starts_with("fnp2-") {
-        return format!(
-            "A secure one-time sharing code was copied to your clipboard.\n\n\
-             On the other computer, open FeanorFS, choose Join a Shared Folder…, and paste it.\n\n\
-             The code expires in {expiry} and works once. Keep this window open while the other computer connects."
-        );
-    }
-    format!(
-        "On the other computer, open FeanorFS, choose Join a Shared Folder…, and paste this one-time code:\n\n{code}\n\n\
-         The code was copied to your clipboard and expires in {expiry}. \
-         Keep this window open while the other computer connects."
-    )
-}
-
-fn prompt_recovery_passphrase() -> Option<zeroize::Zeroizing<String>> {
-    native_password_input("FeanorFS recovery", "Recovery kit passphrase")
-}
-
-fn prompt_new_recovery_passphrase() -> Option<zeroize::Zeroizing<String>> {
-    let passphrase = native_password_input(
-        "Protect FeanorFS recovery kit",
-        "New recovery passphrase (12+ characters)",
-    )?;
-    let confirmation = native_password_input(
-        "Protect FeanorFS recovery kit",
-        "Confirm recovery passphrase",
-    )?;
-    if passphrase.as_str() != confirmation.as_str() {
-        let _ = rfd::MessageDialog::new()
-            .set_title("Passphrases do not match")
-            .set_description(dialog_text(
-                "The recovery kit was not created. Try again with matching passphrases.",
-            ))
-            .set_level(rfd::MessageLevel::Error)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
-        return None;
-    }
-    Some(passphrase)
-}
-
-fn native_password_input(title: &str, message: &str) -> Option<zeroize::Zeroizing<String>> {
-    match password_dialog::prompt(title, message) {
-        Ok(passphrase) => passphrase,
-        Err(error) => {
-            let _ = rfd::MessageDialog::new()
-                .set_title("Could not open secure password dialog")
-                .set_description(dialog_text(error))
-                .set_level(rfd::MessageLevel::Error)
-                .set_buttons(rfd::MessageButtons::Ok)
-                .show();
-            None
-        }
-    }
-}
-
-fn menu_actions_enabled(state: &AppState) -> bool {
-    !state.setup_inflight
-        && !state.stop_inflight
-        && !state.switch_inflight
-        && !state.pair_inflight
-        && !state.recovery_inflight
-}
-
-fn unmanaged_terminal_watcher_active(state: &AppState, status: &TrayStatusResult) -> bool {
-    status.watching && !state.owns_watch && state.managed_service == Some(false)
-}
-
-fn append_other_computers(menu: &Menu, state: &AppState, actions_enabled: bool) {
-    let computers = Submenu::with_id(
-        muda::MenuId::new("other-computers"),
-        "Other Computers",
-        true,
-    );
-    let _ = computers.append(&MenuItem::with_id(
-        muda::MenuId::new("pair"),
-        if state.pair_inflight {
-            "Preparing Secure Share…"
-        } else {
-            "Share Selected Folder…"
-        },
-        actions_enabled && state.workspace.is_some(),
-        None,
-    ));
-    let _ = computers.append(&MenuItem::with_id(
-        muda::MenuId::new("join-computer"),
-        "Join a Shared Folder…",
-        actions_enabled,
-        None,
-    ));
-    let _ = menu.append(&computers);
-}
-
-fn append_recovery_menu(menu: &Menu, state: &AppState, actions_enabled: bool) {
-    let recovery = Submenu::with_id(
-        muda::MenuId::new("recovery"),
-        if state.recovery_inflight {
-            "Recovery in progress…"
-        } else {
-            "Recovery"
-        },
-        true,
-    );
-    let _ = recovery.append(&MenuItem::with_id(
-        muda::MenuId::new("recovery-export"),
-        "Export Encrypted Recovery Kit…",
-        actions_enabled && state.workspace.is_some(),
-        None,
-    ));
-    let _ = recovery.append(&MenuItem::with_id(
-        muda::MenuId::new("recovery-import"),
-        "Restore From Recovery Kit…",
-        actions_enabled,
-        None,
-    ));
-    let _ = menu.append(&recovery);
-}
-
-fn folder_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("the selected folder")
-        .to_string()
-}
-
-fn setup_success_copy(kind: SetupKind, path: &Path) -> (&'static str, String) {
-    let name = folder_name(path);
-    match kind {
-        SetupKind::AddFolder => (
-            "Folder ready",
-            format!(
-                "FeanorFS is now mirroring “{name}”. It will sync automatically, including after you log in again."
-            ),
-        ),
-        SetupKind::JoinFolder => (
-            "Shared folder ready",
-            format!(
-                "“{name}” is connected securely and will sync automatically, including after you log in again."
-            ),
-        ),
-        SetupKind::Repair => (
-            "Mirroring repaired",
-            format!("FeanorFS repaired automatic syncing for “{name}”."),
-        ),
-    }
-}
-
-fn setup_failure_copy(
-    kind: SetupKind,
-    path: &Path,
-    configured: bool,
-    error: &str,
-) -> (&'static str, String) {
-    let name = folder_name(path);
-    let normalized_error = error.to_ascii_lowercase();
-    let initial_sync_failed = normalized_error.contains("initial sync did not complete");
-    let service_failed =
-        normalized_error.contains("automatic background sync could not be installed");
-    let tray_failed = normalized_error.contains("system tray could not be installed");
-    if initial_sync_failed || service_failed || tray_failed {
-        let (title, completed, next_step) = if tray_failed {
-            (
-                "Folder synced — tray needs repair",
-                format!("“{name}” is securely synced and automatic background sync is running."),
-                "Choose Add Folder again to retry the tray registration. FeanorFS will keep the existing workspace identity and recheck the completed stages.",
-            )
-        } else if service_failed {
-            (
-                "Folder synced — automatic sync needs repair",
-                format!("The initial secure sync for “{name}” completed."),
-                "Choose Add Folder again to retry automatic background sync and the tray. FeanorFS will keep the completed sync and existing workspace identity.",
-            )
-        } else {
-            (
-                "Folder setup saved — sync paused",
-                format!("The encrypted FeanorFS setup for “{name}” is saved, but its initial sync did not complete."),
-                "Make sure the mirror is reachable, then choose Add Folder again. FeanorFS will resume without pairing again or changing the workspace identity.",
-            )
-        };
-        let detail = error.trim().strip_prefix("Error:").unwrap_or(error.trim());
-        return (
-            title,
-            format!("{completed}\n\n{next_step}\n\nDetails: {detail}"),
-        );
-    }
-    let (title, outcome) = match kind {
-        SetupKind::AddFolder => ("Folder wasn’t added", format!("“{name}” was not added.")),
-        SetupKind::JoinFolder => (
-            "Shared folder wasn’t joined",
-            format!("“{name}” was not connected."),
-        ),
-        SetupKind::Repair => (
-            "Mirroring wasn’t repaired",
-            format!("Automatic syncing for “{name}” was not repaired."),
-        ),
-    };
-    let cause = if configured && kind == SetupKind::AddFolder {
-        "This folder already has FeanorFS setup, but its saved mirror could not be reached."
-    } else {
-        "FeanorFS could not finish the secure connection and initial sync."
-    };
-    let next_step = if configured && kind == SetupKind::AddFolder {
-        "Make sure the computer or service that hosts its existing mirror is available, then choose Add Folder again."
-    } else {
-        "Check the connection and try again. If it keeps failing, reopen FeanorFS and retry."
-    };
-    let detail = error.trim().strip_prefix("Error:").unwrap_or(error.trim());
-    (
-        title,
-        format!(
-            "{outcome} {cause}\n\nYour files and encrypted setup were not changed. {next_step}\n\nDetails: {detail}"
-        ),
-    )
-}
-
-fn show_setup_result_dialog(title: &str, description: String, success: bool) {
-    activate_for_native_dialog();
-    let _ = rfd::MessageDialog::new()
-        .set_title(title)
-        .set_description(dialog_text(description))
-        .set_level(if success {
-            rfd::MessageLevel::Info
-        } else {
-            rfd::MessageLevel::Error
-        })
-        .set_buttons(rfd::MessageButtons::Ok)
-        .show();
-}
-
-fn activity_header(state: &AppState) -> Option<&'static str> {
-    if state.setup_inflight {
-        return Some(match state.setup_kind {
-            Some(SetupKind::AddFolder) => "FeanorFS — adding folder…",
-            Some(SetupKind::JoinFolder) => "FeanorFS — joining shared folder…",
-            Some(SetupKind::Repair) => "FeanorFS — repairing mirroring…",
-            None => "FeanorFS — setting up folder…",
-        });
-    }
-    if state.stop_inflight {
-        return Some("FeanorFS — stopping mirroring…");
-    }
-    if state.switch_inflight {
-        return Some("FeanorFS — switching folders…");
-    }
-    if state.pair_inflight {
-        return Some("FeanorFS — sharing securely…");
-    }
-    if state.recovery_inflight {
-        return Some("FeanorFS — recovery in progress…");
-    }
-    None
-}
-
-fn build_menu(state: &AppState) -> Menu {
-    let menu = Menu::new();
-    let status = state.last_status.as_ref();
-    let actions_enabled = menu_actions_enabled(state);
-
-    if state.health_inflight || state.update_inflight {
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("header"),
-            if state.health_inflight {
-                "FeanorFS — checking system health…"
-            } else {
-                "FeanorFS — checking for updates…"
-            },
-            false,
-            None,
-        ));
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        append_mirrored_folders(&menu, state, false);
-        if state.workspace.is_some() {
-            let _ = menu.append(&MenuItem::with_id(
-                muda::MenuId::new("open"),
-                "Open Selected Folder",
-                true,
-                None,
-            ));
-        }
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("quit"),
-            "Quit FeanorFS Tray",
-            true,
-            None,
-        ));
-        return menu;
-    }
-
-    if let Some(s) = status {
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("header"),
-            menu_label(
-                activity_header(state)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| header_label(s)),
-            ),
-            false,
-            None,
-        ));
-        if unmanaged_terminal_watcher_active(state, s) {
-            let _ = menu.append(&MenuItem::with_id(
-                muda::MenuId::new("external-watch"),
-                "Syncing in another terminal",
-                false,
-                None,
-            ));
-        }
-        if let Some(ref msg) = state.error_message {
-            let _ = menu.append(&MenuItem::with_id(
-                muda::MenuId::new("error"),
-                menu_label(msg),
-                false,
-                None,
-            ));
-        }
-        let _ = menu.append(&PredefinedMenuItem::separator());
-
-        append_mirrored_folders(&menu, state, actions_enabled);
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("open"),
-            "Open Selected Folder",
-            true,
-            None,
-        ));
-
-        let add_label = if state.setup_inflight {
-            "Adding Folder…"
-        } else {
-            "Add Folder…"
-        };
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("add-folder"),
-            add_label,
-            actions_enabled,
-            None,
-        ));
-        let _ = menu.append(&PredefinedMenuItem::separator());
-
-        let pause_label = if s.paused {
-            "Resume Syncing"
-        } else {
-            "Pause Syncing"
-        };
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("pause"),
-            pause_label,
-            actions_enabled,
-            None,
-        ));
-
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("sync-now"),
-            "Sync Now",
-            actions_enabled,
-            None,
-        ));
-
-        if s.pending_conflict_count > 0 {
-            let _ = menu.append(&PredefinedMenuItem::separator());
-            let visible = u32::try_from(s.pending_conflicts.len()).unwrap_or(u32::MAX);
-            let title = if s.pending_conflict_count > visible {
-                format!(
-                    "Needs attention ({}; showing {visible})",
-                    s.pending_conflict_count
-                )
-            } else {
-                format!("Needs attention ({})", s.pending_conflict_count)
-            };
-            let conflict_menu = Submenu::with_id(muda::MenuId::new("conflicts"), title, true);
-            let _ = conflict_menu.append(&MenuItem::with_id(
-                muda::MenuId::new("keep-all-local"),
-                format!("Keep all {} local versions…", s.pending_conflict_count),
-                actions_enabled,
-                None,
-            ));
-            let _ = conflict_menu.append(&MenuItem::with_id(
-                muda::MenuId::new("keep-all-cloud"),
-                format!("Keep all {} mirror versions…", s.pending_conflict_count),
-                actions_enabled,
-                None,
-            ));
-            let _ = conflict_menu.append(&PredefinedMenuItem::separator());
-            for c in &s.pending_conflicts {
-                let _ = conflict_menu.append(&MenuItem::with_id(
-                    muda::MenuId::new(format!("conflict-hdr:{}", c.path)),
-                    menu_label(format!("{} — {}", c.path, c.label)),
-                    false,
-                    None,
-                ));
-                for choice in &c.choices {
-                    let _ = conflict_menu.append(&MenuItem::with_id(
-                        muda::MenuId::new(format!("keep-{choice}:{}", c.path)),
-                        format!("  {}", choice_label(choice)),
-                        actions_enabled,
-                        None,
-                    ));
-                }
-                let _ = conflict_menu.append(&PredefinedMenuItem::separator());
-            }
-            if s.pending_conflict_count > visible {
-                let hidden = s.pending_conflict_count - visible;
-                let _ = conflict_menu.append(&MenuItem::with_id(
-                    muda::MenuId::new("conflicts-truncated"),
-                    format!("…and {hidden} more conflict(s)"),
-                    false,
-                    None,
-                ));
-            }
-            let _ = menu.append(&conflict_menu);
-        }
-
-        if !s.agents.entries.is_empty() {
-            if s.pending_conflicts.is_empty() {
-                let _ = menu.append(&PredefinedMenuItem::separator());
-            }
-            let title = if s.agents.working > 0 {
-                format!(
-                    "Agents — {} working · {} need attention",
-                    s.agents.working, s.agents.need_attention
-                )
-            } else {
-                "Agents".into()
-            };
-            let agent_menu = Submenu::with_id(muda::MenuId::new("agents"), menu_label(title), true);
-            for a in &s.agents.entries {
-                let label = match a.state.as_str() {
-                    "changes" => format!("{} — {} change(s)", a.name, a.change_count),
-                    "conflicts" => format!("{} — {} conflict(s)", a.name, a.conflict_count),
-                    "offline" => format!("{} — offline", a.name),
-                    _ => format!("{} — clean", a.name),
-                };
-                if a.state == "changes" || a.state == "conflicts" {
-                    let _ = agent_menu.append(&MenuItem::with_id(
-                        muda::MenuId::new(format!("land:{}", a.name)),
-                        menu_label(format!("Land {label}")),
-                        actions_enabled,
-                        None,
-                    ));
-                } else {
-                    let _ = agent_menu.append(&MenuItem::with_id(
-                        muda::MenuId::new(format!("agent-hdr:{}", a.name)),
-                        menu_label(&label),
-                        false,
-                        None,
-                    ));
-                }
-            }
-            let _ = menu.append(&agent_menu);
-        }
-
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        append_other_computers(&menu, state, actions_enabled);
-        append_recovery_menu(&menu, state, actions_enabled);
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("stop-mirroring"),
-            if state.stop_inflight {
-                "Stopping Mirroring…"
-            } else {
-                "Stop Mirroring This Folder…"
-            },
-            actions_enabled,
-            None,
-        ));
-    } else {
-        let header = activity_header(state).unwrap_or(if state.workspace.is_some() {
-            "FeanorFS — checking folder…"
-        } else {
-            "FeanorFS — no folders yet"
-        });
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("header"),
-            menu_label(header),
-            false,
-            None,
-        ));
-        if let Some(ref msg) = state.error_message {
-            let _ = menu.append(&MenuItem::with_id(
-                muda::MenuId::new("error"),
-                menu_label(msg),
-                false,
-                None,
-            ));
-        }
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        append_mirrored_folders(&menu, state, actions_enabled);
-        if state.workspace.is_some() {
-            let _ = menu.append(&MenuItem::with_id(
-                muda::MenuId::new("open"),
-                "Open Selected Folder",
-                true,
-                None,
-            ));
-        }
-        let add_label = if state.setup_inflight {
-            "Adding Folder…"
-        } else {
-            "Add Folder…"
-        };
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("add-folder"),
-            add_label,
-            actions_enabled,
-            None,
-        ));
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        append_other_computers(&menu, state, actions_enabled);
-        append_recovery_menu(&menu, state, actions_enabled);
-        if state.workspace.is_some() {
-            let stop_label = if state.stop_inflight {
-                "Stopping Mirroring…"
-            } else {
-                "Stop Mirroring This Folder…"
-            };
-            let _ = menu.append(&MenuItem::with_id(
-                muda::MenuId::new("stop-mirroring"),
-                stop_label,
-                actions_enabled,
-                None,
-            ));
-        }
-    }
-
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    if state.workspace.is_some() {
-        let label = if state.health_inflight {
-            "Checking System Health…"
-        } else {
-            "Check System Health…"
-        };
-        let _ = menu.append(&MenuItem::with_id(
-            muda::MenuId::new("health"),
-            label,
-            actions_enabled && !state.health_inflight,
-            None,
-        ));
-    }
-
-    let update_label = if state.update_inflight {
-        "Checking for Updates…"
-    } else {
-        "Check for Updates…"
-    };
-    let _ = menu.append(&MenuItem::with_id(
-        muda::MenuId::new("update"),
-        update_label,
-        actions_enabled && !state.update_inflight,
-        None,
-    ));
-
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(
-        muda::MenuId::new("quit"),
-        "Quit FeanorFS Tray",
-        !state.setup_inflight
-            && !state.stop_inflight
-            && !state.switch_inflight
-            && !state.recovery_inflight,
-        None,
-    ));
-    menu
-}
-
-#[derive(Debug, Clone)]
-enum MenuAction {
-    AddFolder,
-    JoinComputer,
-    StopMirroring,
-    OpenFolder,
-    Pair,
-    ExportRecovery,
-    ImportRecovery,
-    TogglePause,
-    SyncNow,
-    Keep { path: String, choice: String },
-    KeepAll { choice: String },
-    Land { agent: String },
-    SwitchWorkspace(PathBuf),
-    ForgetUnavailable,
-    CheckHealth,
-    CheckUpdates,
-    Quit,
-}
-
-fn parse_menu_action(id: &str) -> Option<MenuAction> {
-    if id == "add-folder" {
-        return Some(MenuAction::AddFolder);
-    }
-    if id == "join-computer" {
-        return Some(MenuAction::JoinComputer);
-    }
-    if id == "stop-mirroring" {
-        return Some(MenuAction::StopMirroring);
-    }
-    if id == "open" {
-        return Some(MenuAction::OpenFolder);
-    }
-    if id == "pair" {
-        return Some(MenuAction::Pair);
-    }
-    if id == "recovery-export" {
-        return Some(MenuAction::ExportRecovery);
-    }
-    if id == "recovery-import" {
-        return Some(MenuAction::ImportRecovery);
-    }
-    if id == "pause" {
-        return Some(MenuAction::TogglePause);
-    }
-    if id == "sync-now" {
-        return Some(MenuAction::SyncNow);
-    }
-    if id == "forget-unavailable" {
-        return Some(MenuAction::ForgetUnavailable);
-    }
-    if id == "health" {
-        return Some(MenuAction::CheckHealth);
-    }
-    if id == "update" {
-        return Some(MenuAction::CheckUpdates);
-    }
-    if id == "quit" {
-        return Some(MenuAction::Quit);
-    }
-    if let Some(choice) = id.strip_prefix("keep-all-") {
-        if matches!(choice, "local" | "cloud") {
-            return Some(MenuAction::KeepAll {
-                choice: choice.into(),
-            });
-        }
-    }
-    if let Some(rest) = id.strip_prefix("keep-") {
-        if let Some((choice, path)) = rest.split_once(':') {
-            return Some(MenuAction::Keep {
-                path: path.into(),
-                choice: choice.into(),
-            });
-        }
-    }
-    if let Some(agent) = id.strip_prefix("land:") {
-        return Some(MenuAction::Land {
-            agent: agent.into(),
-        });
-    }
-    if let Some(path) = id.strip_prefix("switch:") {
-        return Some(MenuAction::SwitchWorkspace(PathBuf::from(path)));
-    }
-    None
-}
-
-fn action_allowed_while_background_check_runs(action: &MenuAction) -> bool {
-    matches!(action, MenuAction::OpenFolder | MenuAction::Quit)
-}
-
-fn menu_revision(state: &AppState) -> u64 {
-    // Hash the in-memory projections directly. `serde_json::to_vec` here used
-    // to allocate for every status/recent refresh even when the menu was
-    // unchanged; these types derive `Hash` without changing their JSON wire
-    // representation.
-    let mut hasher = DefaultHasher::new();
-    state.workspace.hash(&mut hasher);
-    state.owns_watch.hash(&mut hasher);
-    state.managed_service.hash(&mut hasher);
-    state.error_message.hash(&mut hasher);
-    state.setup_inflight.hash(&mut hasher);
-    state.setup_kind.hash(&mut hasher);
-    state.stop_inflight.hash(&mut hasher);
-    state.switch_inflight.hash(&mut hasher);
-    state.pair_inflight.hash(&mut hasher);
-    state.recovery_inflight.hash(&mut hasher);
-    state.health_inflight.hash(&mut hasher);
-    state.update_inflight.hash(&mut hasher);
-    state.last_status.hash(&mut hasher);
-    state.recent.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn apply_ui(state: &AppState, tray: &TrayIcon, visual: &mut TrayVisual) {
@@ -1517,700 +155,38 @@ fn apply_ui(state: &AppState, tray: &TrayIcon, visual: &mut TrayVisual) {
     state.last_menu_revision.set(Some(revision));
 }
 
-fn prepare_status_fetch(state: &mut AppState, queue_if_busy: bool) -> Option<(u64, PathBuf)> {
-    if state.setup_inflight || state.stop_inflight || state.recovery_inflight {
-        return None;
-    }
-    if state.status_inflight {
-        if queue_if_busy {
-            state.status_pending = true;
-        }
-        return None;
-    }
-    let workspace = state.workspace.clone()?;
-    state.status_inflight = true;
-    state.status_pending = false;
-    Some((state.task_generation, workspace))
-}
-
-fn request_status_fetch_with_policy(
-    state: &mut AppState,
-    proxy: &tao::event_loop::EventLoopProxy<Action>,
-    queue_if_busy: bool,
-) {
-    let Some((generation, workspace)) = prepare_status_fetch(state, queue_if_busy) else {
-        return;
-    };
-    let proxy = proxy.clone();
-    std::thread::spawn(move || {
-        let overview = tray_overview(&workspace);
-        let _ = proxy.send_event(Action::StatusReady {
-            generation,
-            workspace,
-            overview,
-        });
-    });
-}
-
-fn request_status_fetch(state: &mut AppState, proxy: &tao::event_loop::EventLoopProxy<Action>) {
-    request_status_fetch_with_policy(state, proxy, true);
-}
-
-fn request_periodic_status_fetch(
-    state: &mut AppState,
-    proxy: &tao::event_loop::EventLoopProxy<Action>,
-) {
-    request_status_fetch_with_policy(state, proxy, false);
-}
-
-fn request_recent_fetch(state: &mut AppState, proxy: &tao::event_loop::EventLoopProxy<Action>) {
-    if state.recent_inflight {
-        return;
-    }
-    state.recent_inflight = true;
-    let generation = state.task_generation;
-    let proxy = proxy.clone();
-    std::thread::spawn(move || {
-        let _ = proxy.send_event(Action::RecentReady {
-            generation,
-            recent: tray_recent(),
-        });
-    });
-}
-
-fn apply_recent_fetch(
-    state: &mut AppState,
-    generation: u64,
-    recent: Option<RecentWorkspacesResult>,
-) -> bool {
-    state.recent_inflight = false;
-    if generation != state.task_generation {
-        return false;
-    }
-    if let Some(recent) = recent {
-        state.recent = Some(recent);
-    }
-    true
-}
-
-fn run_exclusive_service_action(
-    workspace: &Path,
-    external_watcher: bool,
-    action: impl FnOnce() -> Result<(), String>,
-) -> Option<String> {
-    let managed_service = external_watcher && background_service_managed(workspace);
-    if external_watcher && !managed_service {
-        return Some(
-            "Sync is running in a terminal. Stop it before using this tray action.".into(),
-        );
-    }
-    if managed_service {
-        if let Err(error) = background_service_stop(workspace) {
-            return Some(error);
-        }
-    }
-    let action_error = action().err();
-    let restart_error = managed_service
-        .then(|| background_service_start(workspace).err())
-        .flatten();
-    action_error.or(restart_error)
-}
-
-fn begin_workspace_repair(
-    state: &mut AppState,
-    workspace: PathBuf,
-    proxy: &tao::event_loop::EventLoopProxy<Action>,
-) {
-    state.task_generation = state.task_generation.saturating_add(1);
-    let generation = state.task_generation;
-    state.setup_inflight = true;
-    state.setup_kind = Some(SetupKind::Repair);
-    state.error_message = Some("Repairing encrypted mirroring…".into());
-    let proxy = proxy.clone();
-    std::thread::spawn(move || {
-        let error = start_workspace(&workspace).err();
-        let _ = proxy.send_event(Action::SetupDone {
-            generation,
-            path: workspace,
-            kind: SetupKind::Repair,
-            error,
-        });
-    });
-}
-
-fn handle_menu_action(
-    state: &mut AppState,
-    action: MenuAction,
-    proxy: &tao::event_loop::EventLoopProxy<Action>,
-) {
-    if (state.setup_inflight || state.switch_inflight) && !matches!(&action, MenuAction::OpenFolder)
-    {
-        return;
-    }
-    if (state.health_inflight || state.update_inflight)
-        && !action_allowed_while_background_check_runs(&action)
-    {
-        return;
-    }
-    if state.stop_inflight && !matches!(&action, MenuAction::OpenFolder) {
-        return;
-    }
-    if state.pair_inflight && !matches!(&action, MenuAction::OpenFolder | MenuAction::Quit) {
-        return;
-    }
-    if state.recovery_inflight && !matches!(&action, MenuAction::OpenFolder) {
-        return;
-    }
-    if matches!(
-        &action,
-        MenuAction::ExportRecovery | MenuAction::ImportRecovery
-    ) && (state.setup_inflight
-        || state.stop_inflight
-        || state.switch_inflight
-        || state.pair_inflight)
-    {
-        return;
-    }
-    match action {
-        MenuAction::AddFolder => {
-            if state.setup_inflight
-                || state.stop_inflight
-                || state.switch_inflight
-                || state.pair_inflight
-            {
-                return;
-            }
-            activate_for_native_dialog();
-            let mut dialog = rfd::FileDialog::new().set_title("Choose a folder to mirror");
-            if let Some(directory) = state.workspace.as_deref().and_then(Path::parent) {
-                dialog = dialog.set_directory(directory);
-            }
-            let Some(path) = dialog.pick_folder() else {
-                return;
-            };
-            state.task_generation = state.task_generation.saturating_add(1);
-            let generation = state.task_generation;
-            state.setup_inflight = true;
-            state.setup_kind = Some(SetupKind::AddFolder);
-            state.error_message = Some("Setting up encrypted mirroring…".into());
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = start_workspace(&path).err();
-                let _ = proxy.send_event(Action::SetupDone {
-                    generation,
-                    path,
-                    kind: SetupKind::AddFolder,
-                    error,
-                });
-            });
-        }
-        MenuAction::JoinComputer => {
-            if state.setup_inflight
-                || state.stop_inflight
-                || state.switch_inflight
-                || state.pair_inflight
-                || state.recovery_inflight
-            {
-                return;
-            }
-            let Some(pairing_code) = native_password_input(
-                "Join a shared folder",
-                "Paste the one-time code from the other computer",
-            ) else {
-                return;
-            };
-            let mut dialog =
-                rfd::FileDialog::new().set_title("Choose where to keep the shared folder");
-            if let Some(directory) = state.workspace.as_deref().and_then(Path::parent) {
-                dialog = dialog.set_directory(directory);
-            }
-            let Some(path) = dialog.pick_folder() else {
-                return;
-            };
-            state.task_generation = state.task_generation.saturating_add(1);
-            let generation = state.task_generation;
-            state.setup_inflight = true;
-            state.setup_kind = Some(SetupKind::JoinFolder);
-            state.error_message = Some("Connecting shared folder securely…".into());
-            let proxy = proxy.clone();
-            std::thread::spawn(move || match join_workspace(&path, pairing_code) {
-                Err(error) if error == "__FEANORFS_JOIN_CANCELED__" => {
-                    let _ = proxy.send_event(Action::SetupCanceled { generation });
-                }
-                result => {
-                    let _ = proxy.send_event(Action::SetupDone {
-                        generation,
-                        path,
-                        kind: SetupKind::JoinFolder,
-                        error: result.err(),
-                    });
-                }
-            });
-        }
-        MenuAction::StopMirroring => {
-            if state.setup_inflight
-                || state.stop_inflight
-                || state.switch_inflight
-                || state.pair_inflight
-            {
-                return;
-            }
-            let Some(workspace) = state.workspace.clone() else {
-                return;
-            };
-            let confirmed = rfd::MessageDialog::new()
-                .set_title("Stop mirroring this folder?")
-                .set_description(dialog_text(
-                    "Automatic sync will stop and this folder will be removed from the FeanorFS tray.\n\nYour files and encrypted setup will be kept, so you can start mirroring it again later.",
-                ))
-                .set_level(rfd::MessageLevel::Warning)
-                .set_buttons(rfd::MessageButtons::OkCancel)
-                .show();
-            if !matches!(confirmed, rfd::MessageDialogResult::Ok) {
-                return;
-            }
-            state.stop_watch();
-            state.task_generation = state.task_generation.saturating_add(1);
-            let generation = state.task_generation;
-            state.stop_inflight = true;
-            state.error_message = Some("Stopping automatic mirroring…".into());
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = stop_workspace(&workspace).err();
-                let _ = proxy.send_event(Action::StopDone {
-                    generation,
-                    path: workspace,
-                    error,
-                });
-            });
-        }
-        MenuAction::OpenFolder => {
-            if let Some(workspace) = state.workspace.as_ref() {
-                let _ = open::that(workspace);
-            }
-        }
-        MenuAction::Pair => {
-            if state.pair_inflight
-                || state.setup_inflight
-                || state.stop_inflight
-                || state.switch_inflight
-            {
-                return;
-            }
-            let Some(workspace) = state.workspace.clone() else {
-                state.error_message = Some("Select a folder before sharing it.".into());
-                return;
-            };
-            let generation = state.task_generation;
-            let (cancel, cancel_rx) = std::sync::mpsc::channel();
-            state.pair_inflight = true;
-            state.pair_cancel = Some(cancel);
-            state.error_message = Some("Preparing a secure one-time sharing code…".into());
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                run_pairing_session(&workspace, cancel_rx, |event| match event {
-                    PairSessionEvent::Ready(ready) => {
-                        let _ = proxy.send_event(Action::PairReady {
-                            generation,
-                            code: ready.code,
-                            expires_in_seconds: ready.expires_in_seconds,
-                        });
-                    }
-                    PairSessionEvent::Done {
-                        paired,
-                        canceled,
-                        error,
-                    } => {
-                        let _ = proxy.send_event(Action::PairDone {
-                            generation,
-                            paired,
-                            canceled,
-                            error,
-                        });
-                    }
-                });
-            });
-        }
-        MenuAction::ExportRecovery => {
-            let Some(workspace) = state.workspace.clone() else {
-                return;
-            };
-            let Some(destination) = rfd::FileDialog::new()
-                .set_title("Save encrypted FeanorFS recovery kit")
-                .set_file_name("FeanorFS-recovery.fnrk")
-                .add_filter("FeanorFS recovery kit", &["fnrk"])
-                .save_file()
-            else {
-                return;
-            };
-            let Some(passphrase) = prompt_new_recovery_passphrase() else {
-                return;
-            };
-            state.task_generation = state.task_generation.saturating_add(1);
-            let generation = state.task_generation;
-            state.recovery_inflight = true;
-            state.error_message = Some("Encrypting recovery kit…".into());
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = export_recovery_kit(&workspace, &destination, passphrase).err();
-                let _ = proxy.send_event(Action::RecoveryDone {
-                    generation,
-                    restored_folder: None,
-                    error,
-                });
-            });
-        }
-        MenuAction::ImportRecovery => {
-            let Some(source) = rfd::FileDialog::new()
-                .set_title("Choose an encrypted FeanorFS recovery kit")
-                .add_filter("FeanorFS recovery kit", &["fnrk"])
-                .pick_file()
-            else {
-                return;
-            };
-            let mut dialog =
-                rfd::FileDialog::new().set_title("Choose a folder for the restored workspace");
-            if let Some(parent) = state.workspace.as_deref().and_then(Path::parent) {
-                dialog = dialog.set_directory(parent);
-            }
-            let Some(destination) = dialog.pick_folder() else {
-                return;
-            };
-            let Some(passphrase) = prompt_recovery_passphrase() else {
-                return;
-            };
-            state.task_generation = state.task_generation.saturating_add(1);
-            let generation = state.task_generation;
-            state.recovery_inflight = true;
-            state.error_message = Some("Authenticating recovery kit…".into());
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = import_recovery_kit(&source, &destination, passphrase).err();
-                let _ = proxy.send_event(Action::RecoveryDone {
-                    generation,
-                    restored_folder: Some(destination),
-                    error,
-                });
-            });
-        }
-        MenuAction::CheckHealth => {
-            if state.health_inflight
-                || state.setup_inflight
-                || state.stop_inflight
-                || state.switch_inflight
-                || state.pair_inflight
-                || state.recovery_inflight
-            {
-                return;
-            }
-            let Some(workspace) = state.workspace.clone() else {
-                return;
-            };
-            state.health_inflight = true;
-            state.error_message = Some("Checking system health…".into());
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let report = system_health(&workspace);
-                let _ = proxy.send_event(Action::HealthReady { workspace, report });
-            });
-        }
-        MenuAction::CheckUpdates => {
-            if state.update_inflight
-                || state.setup_inflight
-                || state.stop_inflight
-                || state.switch_inflight
-                || state.pair_inflight
-                || state.recovery_inflight
-            {
-                return;
-            }
-            state.update_inflight = true;
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let _ = proxy.send_event(Action::UpdateReady(check_for_updates()));
-            });
-        }
-        MenuAction::Quit => {
-            if state.pair_inflight {
-                state.quit_pending = true;
-                state.error_message = Some("Closing secure pairing…".into());
-                state.cancel_pairing();
-                return;
-            }
-            state.stop_watch();
-            std::process::exit(0);
-        }
-        MenuAction::TogglePause => {
-            let Some(workspace) = state.workspace.clone() else {
-                return;
-            };
-            let pause = !state.is_paused();
-            if pause {
-                state.stop_watch();
-            }
-            let generation = state.task_generation;
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = tray_pause(&workspace, pause).err();
-                let _ = proxy.send_event(Action::TaskDone {
-                    error,
-                    restart_watch: !pause,
-                    set_paused: Some(pause),
-                    generation,
-                });
-            });
-        }
-        MenuAction::SyncNow => {
-            let Some(workspace) = state.workspace.clone() else {
-                return;
-            };
-            let external_watcher = state.external_watcher_active();
-            state.stop_watch();
-            let generation = state.task_generation;
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = run_exclusive_service_action(&workspace, external_watcher, || {
-                    sync_once(&workspace)
-                });
-                let _ = proxy.send_event(Action::TaskDone {
-                    error,
-                    restart_watch: !external_watcher,
-                    set_paused: None,
-                    generation,
-                });
-            });
-        }
-        MenuAction::ForgetUnavailable => {
-            if state.setup_inflight
-                || state.stop_inflight
-                || state.switch_inflight
-                || state.pair_inflight
-                || state.recovery_inflight
-            {
-                return;
-            }
-            let before = state
-                .recent
-                .as_ref()
-                .map(unavailable_workspace_count)
-                .unwrap_or(0);
-            if before == 0 {
-                return;
-            }
-            let noun = if before == 1 { "folder" } else { "folders" };
-            let confirmed = rfd::MessageDialog::new()
-                .set_title("Remove unavailable folders from this list?")
-                .set_description(dialog_text(format!(
-                    "{before} {noun} cannot be opened right now. This can happen when a folder was moved or deleted, or when an external drive is disconnected.\n\nFeanorFS will remove only these entries from the tray. It will not delete files, encrypted setup, credentials, services, hub data, or remote snapshots. Reconnect external drives and cancel if you want to keep them listed."
-                )))
-                .set_level(rfd::MessageLevel::Warning)
-                .set_buttons(rfd::MessageButtons::OkCancel)
-                .show();
-            if !matches!(confirmed, rfd::MessageDialogResult::Ok) {
-                return;
-            }
-            state.task_generation = state.task_generation.saturating_add(1);
-            let generation = state.task_generation;
-            state.switch_inflight = true;
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let result = forget_unavailable_workspaces();
-                let _ = proxy.send_event(Action::ForgetUnavailableDone {
-                    generation,
-                    before,
-                    result,
-                });
-            });
-        }
-        MenuAction::Keep { path, choice } => {
-            let Some(workspace) = state.workspace.clone() else {
-                return;
-            };
-            let external_watcher = state.external_watcher_active();
-            state.stop_watch();
-            let generation = state.task_generation;
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = run_exclusive_service_action(&workspace, external_watcher, || {
-                    conflicts_keep(&workspace, &path, &choice).and_then(|()| sync_once(&workspace))
-                });
-                let _ = proxy.send_event(Action::TaskDone {
-                    error,
-                    restart_watch: !external_watcher,
-                    set_paused: None,
-                    generation,
-                });
-            });
-        }
-        MenuAction::KeepAll { choice } => {
-            let Some(workspace) = state.workspace.clone() else {
-                return;
-            };
-            let count = state
-                .last_status
-                .as_ref()
-                .map_or(0, |status| status.pending_conflict_count);
-            if count == 0 {
-                return;
-            }
-            let (title, consequence) = if choice == "local" {
-                (
-                    format!("Keep all {count} local versions?"),
-                    "Every conflicting mirror version will be discarded. Current local files and local deletions become the shared result.",
-                )
-            } else {
-                (
-                    format!("Keep all {count} mirror versions?"),
-                    "Every conflicting local version will be replaced or deleted to match the mirror. Local conflict copies remain recoverable only in immutable FeanorFS history.",
-                )
-            };
-            let confirmed = rfd::MessageDialog::new()
-                .set_title(title)
-                .set_description(dialog_text(format!(
-                    "This applies one choice to all {count} conflicting paths, including any omitted from the bounded menu.\n\n{consequence}\n\nFeanorFS will not merge file contents. Choose OK only if this single policy is correct for every conflict."
-                )))
-                .set_level(rfd::MessageLevel::Warning)
-                .set_buttons(rfd::MessageButtons::OkCancel)
-                .show();
-            if !matches!(confirmed, rfd::MessageDialogResult::Ok) {
-                return;
-            }
-            let external_watcher = state.external_watcher_active();
-            state.stop_watch();
-            let generation = state.task_generation;
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = run_exclusive_service_action(&workspace, external_watcher, || {
-                    conflicts_keep_all(&workspace, &choice).and_then(|()| sync_once(&workspace))
-                });
-                let _ = proxy.send_event(Action::TaskDone {
-                    error,
-                    restart_watch: !external_watcher,
-                    set_paused: None,
-                    generation,
-                });
-            });
-        }
-        MenuAction::Land { agent } => {
-            let Some(workspace) = state.workspace.clone() else {
-                return;
-            };
-            let external_watcher = state.external_watcher_active();
-            state.stop_watch();
-            let generation = state.task_generation;
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = run_exclusive_service_action(&workspace, external_watcher, || {
-                    agent_land(&workspace, &agent).and_then(|()| sync_once(&workspace))
-                });
-                let _ = proxy.send_event(Action::TaskDone {
-                    error,
-                    restart_watch: !external_watcher,
-                    set_paused: None,
-                    generation,
-                });
-            });
-        }
-        MenuAction::SwitchWorkspace(path) => {
-            if state.setup_inflight
-                || state.stop_inflight
-                || state.switch_inflight
-                || state.pair_inflight
-            {
-                return;
-            }
-            if !workspace_has_config(&path) {
-                state.error_message = Some(format!(
-                    "This folder is no longer available to FeanorFS: {}",
-                    path.display()
-                ));
-                return;
-            }
-            state.task_generation = state.task_generation.saturating_add(1);
-            let generation = state.task_generation;
-            state.switch_inflight = true;
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                let error = tray_activate(&path).err();
-                let _ = proxy.send_event(Action::SwitchDone {
-                    generation,
-                    path,
-                    error,
-                });
-            });
-        }
-    }
-}
-
-/// Writes one main-thread handler panic to a private log file so a recovered
-/// tray crash stays diagnosable without affecting the UI thread.
-fn log_handler_panic(panic: Box<dyn std::any::Any + Send>) {
-    let message = panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("unknown panic payload");
-    let backtrace = std::backtrace::Backtrace::force_capture();
-    let root = std::env::var_os("FEANORFS_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|home| std::path::PathBuf::from(home).join(".feanorfs"))
-        });
-    if let Some(root) = root {
-        let _ = std::fs::create_dir_all(&root);
-        let path = root.join("tray-panic.log");
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            use std::io::Write as _;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let _ = writeln!(
-                file,
-                "t={now} tray handler panicked: {message}\n{backtrace}\n"
-            );
-        }
-    }
-}
-
-/// Runs one event-loop handler step inside `catch_unwind` so a panic in any
-/// handler (including UI-framework internals) can never abort the tray: the
-/// panic is logged, volatile in-flight flags are reset, and the loop keeps
-/// running with a fresh menu.
-fn catch_handler(step: impl FnOnce()) -> bool {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)) {
-        Ok(()) => true,
-        Err(panic) => {
-            log_handler_panic(panic);
-            eprintln!(
-                "feanorfs-tray recovered from a handler panic; see ~/.feanorfs/tray-panic.log"
-            );
-            false
-        }
-    }
-}
-
 fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if version_requested(&arguments) {
-        println!("feanorfs-tray {}", env!("CARGO_PKG_VERSION"));
+    if print_version_and_exit(&arguments) {
         return;
     }
-    let _instance_guard = match acquire_tray_instance_lock() {
-        Ok(Some(guard)) => guard,
-        Ok(None) => return,
+    if runner_test_launch(
+        std::env::var_os("FEANORFS_RUNNER_TEST_PROFILE").as_deref(),
+        std::env::var_os("FEANORFS_RUNNER_TEST_MODE").as_deref(),
+    ) {
+        return;
+    }
+    let managed = managed_tray_launch(&arguments);
+    let _instance_guard = match instance::claim() {
+        Ok(instance::Claim::Primary(guard)) => guard,
+        Ok(instance::Claim::AlreadyRunning) if managed => {
+            std::process::exit(SUPERVISED_TRAY_CONTENTION_EXIT_CODE);
+        }
+        Ok(instance::Claim::AlreadyRunning) => return,
         Err(error) => {
-            eprintln!("{error}");
-            return;
+            eprintln!("FeanorFS tray could not claim its single-instance lock: {error}");
+            std::process::exit(1);
         }
     };
-    let (workspace, recent) = resolve_initial_workspace();
+    match instance::take_user_quit() {
+        Ok(true) if managed => return,
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("FeanorFS tray could not consume its user-quit marker: {error}");
+            std::process::exit(1);
+        }
+    }
+    let workspace = resolve_initial_workspace();
     let prompt_first_run =
         should_prompt_first_run(first_run_requested(&arguments), workspace.as_deref());
 
@@ -2232,7 +208,8 @@ fn main() {
     }));
 
     let mut state = AppState::new(workspace);
-    state.recent = recent;
+    state.managed_launch = managed;
+    state.cached_recent();
 
     let initial_visual = TrayVisual::Idle;
     let tray = TrayIconBuilder::new()
@@ -2248,12 +225,6 @@ fn main() {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(REFRESH_SECS));
         let _ = refresh_proxy.send_event(Action::Refresh);
-    });
-
-    let update_proxy = proxy.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(PERIODIC_UPDATE_SECS));
-        let _ = update_proxy.send_event(Action::PeriodicUpdateCheck);
     });
 
     let shared = Rc::new(Mutex::new(state));
@@ -2286,48 +257,8 @@ fn main() {
             return;
         };
 
-        let shared_ref = Rc::clone(&shared);
-        let tray_ref = Rc::clone(&tray);
-        let proxy_ref = proxy.clone();
-        let visual_ref = &mut visual;
-        let recovered = !catch_handler(move || {
-            let mut st = match shared_ref.lock() {
-                Ok(st) => st,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            handle_user_event(&mut st, &tray_ref, visual_ref, &proxy_ref, action);
-        });
-        if recovered {
-            // A handler panicked. Reset volatile flags so the tray stays
-            // usable, then rebuild the UI from the (still valid) state.
-            let mut st = match shared.lock() {
-                Ok(st) => st,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            st.status_inflight = false;
-            st.recent_inflight = false;
-            st.setup_inflight = false;
-            st.stop_inflight = false;
-            st.switch_inflight = false;
-            st.pair_inflight = false;
-            st.recovery_inflight = false;
-            st.health_inflight = false;
-            st.update_inflight = false;
-            st.error_message = Some(
-                "FeanorFS Tray recovered from an unexpected error. The error was written to ~/.feanorfs/tray-panic.log; your files were not changed.".into(),
-            );
-            apply_ui(&st, &tray, &mut visual);
-            request_status_fetch(&mut st, &proxy);
-        }
-    });
+        let mut st = shared.lock().unwrap();
 
-    fn handle_user_event(
-        st: &mut AppState,
-        tray: &Rc<TrayIcon>,
-        visual: &mut TrayVisual,
-        proxy: &tao::event_loop::EventLoopProxy<Action>,
-        action: Action,
-    ) {
         match action {
             Action::FirstRun => {
                 let menu_action = match show_first_run_choice() {
@@ -2336,24 +267,26 @@ fn main() {
                     FirstRunChoice::Later => None,
                 };
                 if let Some(menu_action) = menu_action {
-                    handle_menu_action(st, menu_action, proxy);
+                    handle_menu_action(&mut st, menu_action, &proxy);
                 }
-                apply_ui(st, tray, visual);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::Refresh => {
-                if st.workspace.is_none() {
-                    // Keep the unconfigured tray responsive while detecting a
-                    // folder added by another CLI process.
-                    request_recent_fetch(st, proxy);
-                } else {
-                    request_periodic_status_fetch(st, proxy);
+                // Other CLI processes can add or stop folders while the tray is
+                // open. Refresh the shared registry on every UI refresh so a
+                // new mirrored folder appears within one polling interval.
+                st.invalidate_recent();
+                st.cached_recent();
+                if st.adopt_recent_if_unconfigured() {
+                    st.last_status = None;
                 }
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::StatusReady {
                 generation,
                 workspace,
-                overview,
+                status,
             } => {
                 let stale =
                     generation != st.task_generation || st.workspace.as_ref() != Some(&workspace);
@@ -2362,18 +295,15 @@ fn main() {
                         st.status_inflight = false;
                         if st.status_pending {
                             st.status_pending = false;
-                            request_status_fetch(st, proxy);
+                            request_status_fetch(&mut st, &proxy);
                         }
                     }
                     return;
                 }
                 st.status_inflight = false;
-                match overview {
-                    Ok(overview) => {
-                        st.last_status = Some(overview.status);
-                        if let Some(recent) = overview.recent {
-                            st.recent = Some(recent);
-                        }
+                match status {
+                    Ok(s) => {
+                        st.last_status = Some(s);
                         st.status_failed = false;
                         st.error_message = None;
                     }
@@ -2384,123 +314,45 @@ fn main() {
                     }
                 }
                 st.check_watch_alive();
-                apply_ui(st, tray, visual);
+                st.cached_recent();
+                apply_ui(&st, &tray, &mut visual);
                 if st.status_pending {
                     st.status_pending = false;
-                    request_status_fetch(st, proxy);
+                    request_status_fetch(&mut st, &proxy);
                 }
-            }
-            Action::RecentReady { generation, recent } => {
-                if !apply_recent_fetch(st, generation, recent) {
-                    if st.workspace.is_none() {
-                        request_recent_fetch(st, proxy);
-                    }
-                    return;
-                }
-                if st.adopt_recent_if_unconfigured() {
-                    st.last_status = None;
-                    request_status_fetch(st, proxy);
-                }
-                apply_ui(st, tray, visual);
             }
             Action::HealthReady { workspace, report } => {
                 st.health_inflight = false;
                 if st.workspace.as_ref() != Some(&workspace) {
-                    apply_ui(st, tray, visual);
+                    apply_ui(&st, &tray, &mut visual);
                     return;
                 }
                 match report {
                     Err(error) => {
                         st.error_message = Some(error.clone());
-                        activate_for_native_dialog();
-                        let _ = rfd::MessageDialog::new()
-                            .set_title("System health check unavailable")
-                            .set_description(dialog_text(error))
-                            .set_level(rfd::MessageLevel::Error)
-                            .set_buttons(rfd::MessageButtons::Ok)
-                            .show();
+                        show_health_unavailable(error);
                     }
                     Ok(report) => {
-                        let needs_repair = health_report_needs_repair(&report);
-                        let has_warning = report
-                            .checks
-                            .iter()
-                            .any(|check| check.status == HealthStatus::Warning);
-                        let mut description = health_report_description(&report);
-                        if needs_repair {
-                            description.push_str(
-                                "\n\nRepair Mirroring reuses this workspace's existing encryption and setup, retries normal synchronization, and reinstalls its background services. Conflicts are never resolved automatically.",
+                        if show_health_dialog(&report) {
+                            begin_workspace_repair(&mut st, workspace, &proxy);
+                        } else if health_report_needs_repair(&report) {
+                            st.error_message = Some(
+                                "System health found issues that need attention.".into(),
                             );
-                        }
-                        activate_for_native_dialog();
-                        let mut dialog = rfd::MessageDialog::new()
-                            .set_title(if needs_repair {
-                                "FeanorFS needs attention"
-                            } else {
-                                "FeanorFS system health"
-                            })
-                            .set_description(dialog_text(description))
-                            .set_level(if needs_repair {
-                                rfd::MessageLevel::Error
-                            } else if has_warning {
-                                rfd::MessageLevel::Warning
-                            } else {
-                                rfd::MessageLevel::Info
-                            });
-                        if needs_repair {
-                            dialog = dialog.set_buttons(rfd::MessageButtons::OkCancelCustom(
-                                HEALTH_REPAIR.into(),
-                                HEALTH_CLOSE.into(),
-                            ));
-                        } else {
-                            dialog = dialog.set_buttons(rfd::MessageButtons::Ok);
-                        }
-                        let choice = dialog.show();
-                        if needs_repair && health_choice_requests_repair(&choice) {
-                            begin_workspace_repair(st, workspace, proxy);
-                        } else {
-                            st.error_message = needs_repair
-                                .then(|| "System health found issues that need attention.".into());
                         }
                     }
                 }
-                apply_ui(st, tray, visual);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::UpdateReady(result) => {
                 st.update_inflight = false;
                 match result {
                     Err(error) => {
                         st.error_message = Some(error.clone());
-                        activate_for_native_dialog();
-                        let _ = rfd::MessageDialog::new()
-                            .set_title("Could not check for updates")
-                            .set_description(dialog_text(error))
-                            .set_level(rfd::MessageLevel::Error)
-                            .set_buttons(rfd::MessageButtons::Ok)
-                            .show();
+                        show_update_error(error);
                     }
                     Ok(result) => {
-                        let available = result.status == UpdateStatus::UpdateAvailable;
-                        activate_for_native_dialog();
-                        let mut dialog = rfd::MessageDialog::new()
-                            .set_title(if available {
-                                "FeanorFS update available"
-                            } else {
-                                "FeanorFS updates"
-                            })
-                            .set_description(dialog_text(update_description(&result)))
-                            .set_level(rfd::MessageLevel::Info);
-                        if available {
-                            dialog = dialog.set_buttons(rfd::MessageButtons::OkCancelCustom(
-                                UPDATE_OPEN.into(),
-                                UPDATE_LATER.into(),
-                            ));
-                        } else {
-                            dialog = dialog.set_buttons(rfd::MessageButtons::Ok);
-                        }
-                        let choice = dialog.show();
-                        if available
-                            && update_choice_opens_release(&choice)
+                        if show_update_dialog(&result)
                             && open::that(&result.release_url).is_err()
                         {
                             st.error_message = Some(
@@ -2510,16 +362,7 @@ fn main() {
                         }
                     }
                 }
-                apply_ui(st, tray, visual);
-            }
-            Action::PeriodicUpdateCheck => {
-                if !st.update_inflight {
-                    st.update_inflight = true;
-                    let proxy = proxy.clone();
-                    std::thread::spawn(move || {
-                        let _ = proxy.send_event(Action::UpdateReady(check_for_updates_periodic()));
-                    });
-                }
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::MenuClick(id) => {
                 if let Some(menu_action) = parse_menu_action(&id) {
@@ -2537,9 +380,9 @@ fn main() {
                             | MenuAction::ForgetUnavailable
                             | MenuAction::SwitchWorkspace(_)
                     );
-                    handle_menu_action(st, menu_action, proxy);
+                    handle_menu_action(&mut st, menu_action, &proxy);
                     if needs_ui {
-                        apply_ui(st, tray, visual);
+                        apply_ui(&st, &tray, &mut visual);
                     }
                 }
             }
@@ -2557,7 +400,7 @@ fn main() {
                     if let Some(wanted_paused) = set_paused {
                         let workspace = st.workspace.clone();
                         let paused_on_disk = workspace.as_deref().is_some_and(is_paused_on_disk);
-                        if let Some(ref mut s) = st.last_status {
+                        if let Some(s) = &mut st.last_status {
                             s.paused = paused_on_disk;
                         }
                         if wanted_paused && !paused_on_disk {
@@ -2566,15 +409,15 @@ fn main() {
                     }
                 } else {
                     st.error_message = None;
-                    if let (Some(p), Some(ref mut s)) = (set_paused, st.last_status.as_mut()) {
+                    if let (Some(p), Some(s)) = (set_paused, st.last_status.as_mut()) {
                         s.paused = p;
                     }
                 }
                 if restart_watch && !st.is_paused() && !st.external_watcher_active() {
                     st.start_watch();
                 }
-                request_status_fetch(st, proxy);
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::SwitchDone {
                 generation,
@@ -2590,13 +433,13 @@ fn main() {
                 } else {
                     st.stop_watch();
                     st.workspace = Some(path);
-                    invalidate_config_cache();
                     st.invalidate_recent();
+                    st.cached_recent();
                     st.reset_watch_policy();
                     st.last_status = None;
                 }
-                request_status_fetch(st, proxy);
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::ForgetUnavailableDone {
                 generation,
@@ -2609,67 +452,52 @@ fn main() {
                 st.switch_inflight = false;
                 match result {
                     Ok(recent) => {
-                        let removed =
-                            before.min(before.saturating_sub(unavailable_workspace_count(&recent)));
+                        let removed = before.min(
+                            before.saturating_sub(unavailable_workspace_count(&recent)),
+                        );
                         st.recent = Some(recent);
+                        st.recent_fetched_at = Some(Instant::now());
                         st.error_message = None;
                         if st.workspace.is_none() {
                             let _ = st.adopt_recent_if_unconfigured();
                         }
-                        let noun = if removed == 1 { "folder" } else { "folders" };
-                        let _ = rfd::MessageDialog::new()
-                            .set_title("Folder list cleaned up")
-                            .set_description(dialog_text(format!(
-                                "Removed {removed} unavailable {noun} from the tray. No files, encrypted setup, credentials, services, hub data, or remote snapshots were changed."
-                            )))
-                            .set_level(rfd::MessageLevel::Info)
-                            .set_buttons(rfd::MessageButtons::Ok)
-                            .show();
+                        show_forget_unavailable_result(removed);
                     }
                     Err(error) => st.error_message = Some(error),
                 }
-                request_status_fetch(st, proxy);
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::SetupDone {
                 generation,
                 path,
                 kind,
-                error,
+                result,
             } => {
                 if generation != st.task_generation {
                     return;
                 }
                 st.setup_inflight = false;
                 st.setup_kind = None;
-                let dialog = if let Some(error) = error {
-                    let configured = workspace_has_config(&path);
-                    let (title, description) = setup_failure_copy(kind, &path, configured, &error);
-                    st.error_message = Some(format!(
-                        "{} Your files were not changed.",
-                        title.trim_end_matches('.')
-                    ));
-                    Some((title, description, false))
-                } else if !workspace_has_config(&path) {
-                    let error = "Setup ended before FeanorFS could save the encrypted folder configuration.";
-                    let (title, description) = setup_failure_copy(kind, &path, false, error);
-                    st.error_message = Some(format!(
-                        "{} Your files were not changed.",
-                        title.trim_end_matches('.')
-                    ));
-                    Some((title, description, false))
-                } else {
+                let dialog = if result.stage == SetupStage::TrayRegistered {
                     st.stop_watch();
                     st.workspace = Some(path.clone());
-                    invalidate_config_cache();
                     st.invalidate_recent();
+                    st.cached_recent();
                     st.reset_watch_policy();
                     st.last_status = None;
                     let (title, description) = setup_success_copy(kind, &path);
                     Some((title, description, true))
+                } else {
+                    let (title, description) = setup_failure_copy(kind, &path, &result);
+                    st.error_message = Some(format!(
+                        "{} Your files were not changed.",
+                        title.trim_end_matches('.')
+                    ));
+                    Some((title, description, false))
                 };
-                request_status_fetch(st, proxy);
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
                 if let Some((title, description, success)) = dialog {
                     show_setup_result_dialog(title, description, success);
                 }
@@ -2681,8 +509,8 @@ fn main() {
                 st.setup_inflight = false;
                 st.setup_kind = None;
                 st.error_message = None;
-                request_status_fetch(st, proxy);
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::StopDone {
                 generation,
@@ -2698,13 +526,13 @@ fn main() {
                 } else {
                     st.workspace = None;
                     st.last_status = None;
-                    invalidate_config_cache();
                     st.invalidate_recent();
                     st.reset_watch_policy();
-                    request_recent_fetch(st, proxy);
+                    st.cached_recent();
+                    let _ = st.adopt_recent_if_unconfigured();
                 }
-                request_status_fetch(st, proxy);
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::PairReady {
                 generation,
@@ -2716,19 +544,11 @@ fn main() {
                     return;
                 }
                 st.error_message = Some("Waiting for the other computer…".into());
-                apply_ui(st, tray, visual);
-                let description = pairing_dialog_description(&code, expires_in_seconds);
-                copy_pairing_clipboard(&code);
-                let _ = rfd::MessageDialog::new()
-                    .set_title("Share selected folder")
-                    .set_description(dialog_text(description))
-                    .set_level(rfd::MessageLevel::Info)
-                    .set_buttons(rfd::MessageButtons::OkCancel)
-                    .show();
-                clear_pairing_clipboard(&code);
+                apply_ui(&st, &tray, &mut visual);
+                show_pairing_dialog(&code, expires_in_seconds);
                 st.cancel_pairing();
                 st.error_message = Some("Closing secure pairing…".into());
-                apply_ui(st, tray, visual);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::PairDone {
                 generation,
@@ -2754,11 +574,10 @@ fn main() {
                     )
                 };
                 if st.quit_pending {
-                    st.stop_watch();
-                    std::process::exit(0);
+                    quit_tray(&mut st);
                 }
-                request_status_fetch(st, proxy);
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
             Action::RecoveryDone {
                 generation,
@@ -2775,18 +594,11 @@ fn main() {
                     if workspace_has_config(&path) {
                         st.stop_watch();
                         st.workspace = Some(path);
-                        invalidate_config_cache();
                         st.invalidate_recent();
+                        st.cached_recent();
                         st.reset_watch_policy();
                         st.last_status = None;
-                        let _ = rfd::MessageDialog::new()
-                            .set_title("Workspace restored")
-                            .set_description(dialog_text(
-                                "The encrypted recovery kit was authenticated. FeanorFS restored the workspace and enabled automatic syncing.",
-                            ))
-                            .set_level(rfd::MessageLevel::Info)
-                            .set_buttons(rfd::MessageButtons::Ok)
-                            .show();
+                        show_workspace_restored_dialog();
                     } else {
                         st.error_message = Some(
                             "The recovery kit was accepted, but automatic mirroring was not enabled. Existing files were preserved. Try restoring again; if this continues, choose Check System Health… from the tray."
@@ -2795,811 +607,19 @@ fn main() {
                     }
                 } else {
                     st.error_message = None;
-                    let _ = rfd::MessageDialog::new()
-                        .set_title("Recovery kit saved")
-                        .set_description(dialog_text(
-                            "The workspace capability is encrypted. Keep the kit and its passphrase in separate safe places.",
-                        ))
-                        .set_level(rfd::MessageLevel::Info)
-                        .set_buttons(rfd::MessageButtons::Ok)
-                        .show();
+                    show_recovery_kit_saved_dialog();
                 }
-                request_status_fetch(st, proxy);
-                apply_ui(st, tray, visual);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
             }
         }
-    }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn catch_handler_contains_panics_and_logs_them() {
-        let home = std::path::PathBuf::from(
-            std::env::var_os("FEANORFS_HOME").expect("isolated FEANORFS_HOME"),
-        );
-        std::fs::create_dir_all(&home).unwrap();
-        let log = home.join("tray-panic.log");
-        let _ = std::fs::remove_file(&log);
-        let caught = catch_handler(|| panic!("injected tray handler panic"));
-        assert!(!caught, "a panicking handler must be contained, not abort");
-        let content = std::fs::read_to_string(&log).expect("panic log must be written");
-        assert!(content.contains("injected tray handler panic"));
-        // A healthy handler keeps returning true.
-        assert!(catch_handler(|| {}));
-        std::fs::remove_file(log).unwrap();
-    }
-
-    use feanorfs_common::tray_contract::{
-        RecentWorkspaceEntry, TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry,
-        TrayStatusResult,
-    };
     use icons::visual_from_state;
-
-    fn make_status(mirror_state: &str, paused: bool) -> TrayStatusResult {
-        TrayStatusResult {
-            mirror_state: mirror_state.into(),
-            paused,
-            watching: true,
-            workspace_path: "/tmp/test".into(),
-            workspace_id: "test-workspace".into(),
-            workspace_label: "test".into(),
-            pending_conflict_count: 0,
-            pending_conflicts: vec![],
-            agents: TrayAgentsSummary {
-                working: 0,
-                need_attention: 0,
-                entries: vec![],
-            },
-        }
-    }
-
-    fn menu_revision_fixture() -> AppState {
-        let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
-        state.owns_watch = false;
-        state.managed_service = Some(false);
-        state.error_message = Some("an actionable error".into());
-        state.setup_inflight = true;
-        state.setup_kind = Some(SetupKind::AddFolder);
-        state.stop_inflight = true;
-        state.switch_inflight = true;
-        state.pair_inflight = true;
-        state.recovery_inflight = true;
-        state.health_inflight = true;
-        state.update_inflight = true;
-        state.last_status = Some(TrayStatusResult {
-            mirror_state: "conflict".into(),
-            paused: true,
-            watching: true,
-            workspace_path: "/tmp/test".into(),
-            workspace_id: "test-workspace".into(),
-            workspace_label: "test".into(),
-            pending_conflict_count: 2,
-            pending_conflicts: vec![TrayConflictEntry {
-                path: "notes.txt".into(),
-                kind: "edit_edit".into(),
-                label: "Both sides changed notes.txt".into(),
-                choices: vec!["local".into(), "cloud".into(), "both".into()],
-            }],
-            agents: TrayAgentsSummary {
-                working: 1,
-                need_attention: 1,
-                entries: vec![TrayAgentEntry {
-                    name: "agent".into(),
-                    state: "changes".into(),
-                    change_count: 2,
-                    conflict_count: 1,
-                }],
-            },
-        });
-        state.recent = Some(RecentWorkspacesResult {
-            active: Some("/tmp/test".into()),
-            workspaces: vec![RecentWorkspaceEntry {
-                path: "/tmp/test".into(),
-                workspace_id: "test-workspace".into(),
-                label: "test".into(),
-            }],
-        });
-        state
-    }
-
-    #[test]
-    fn stale_recent_fetch_cannot_replace_newer_registry_state() {
-        let mut state = menu_revision_fixture();
-        state.task_generation = 2;
-        state.recent_inflight = true;
-        let expected = state.recent.clone().unwrap();
-        let stale = RecentWorkspacesResult {
-            active: Some("/tmp/stale".into()),
-            workspaces: vec![RecentWorkspaceEntry {
-                path: "/tmp/stale".into(),
-                workspace_id: "stale-workspace".into(),
-                label: "stale".into(),
-            }],
-        };
-
-        assert!(!apply_recent_fetch(&mut state, 1, Some(stale)));
-        assert!(!state.recent_inflight);
-        assert_eq!(
-            state.recent.as_ref().unwrap().active,
-            expected.active,
-            "an earlier fetch must not overwrite a later task generation"
-        );
-    }
-
-    fn assert_menu_revision_changes(mut state: AppState, mutate: impl FnOnce(&mut AppState)) {
-        let before = menu_revision(&state);
-        mutate(&mut state);
-        assert_ne!(
-            menu_revision(&state),
-            before,
-            "menu revision must change when visible state changes"
-        );
-    }
-
-    /// The pre-optimization implementation serialized each projection before
-    /// hashing it. Keep this test-only copy as the baseline for the ignored
-    /// profile below; production uses `Hash` directly and allocates nothing.
-    fn menu_revision_serializing(state: &AppState) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        state.workspace.hash(&mut hasher);
-        state.owns_watch.hash(&mut hasher);
-        state.managed_service.hash(&mut hasher);
-        state.error_message.hash(&mut hasher);
-        state.setup_inflight.hash(&mut hasher);
-        state.setup_kind.hash(&mut hasher);
-        state.stop_inflight.hash(&mut hasher);
-        state.switch_inflight.hash(&mut hasher);
-        state.pair_inflight.hash(&mut hasher);
-        state.recovery_inflight.hash(&mut hasher);
-        state.health_inflight.hash(&mut hasher);
-        state.update_inflight.hash(&mut hasher);
-        if let Some(status) = state.last_status.as_ref() {
-            if let Ok(encoded) = serde_json::to_vec(status) {
-                encoded.hash(&mut hasher);
-            }
-        }
-        if let Some(recent) = state.recent.as_ref() {
-            if let Ok(encoded) = serde_json::to_vec(recent) {
-                encoded.hash(&mut hasher);
-            }
-        }
-        hasher.finish()
-    }
-
-    #[test]
-    fn empty_state_is_safe_before_setup() {
-        let mut state = AppState::new(None);
-        assert!(state.workspace.is_none());
-        assert!(state.watch_child.is_none());
-        assert!(!state.setup_inflight);
-        assert_eq!(state.setup_kind, None);
-        assert!(!state.stop_inflight);
-        assert!(!state.switch_inflight);
-        assert!(!state.pair_inflight);
-        assert!(!state.recovery_inflight);
-        assert!(!state.health_inflight);
-        assert!(!state.update_inflight);
-        assert!(!state.recent_inflight);
-        assert!(state.pair_cancel.is_none());
-        assert_eq!(state.last_menu_revision.get(), None);
-        assert!(!state.has_managed_service());
-    }
-
-    #[test]
-    fn only_one_tray_instance_can_hold_the_user_lock() {
-        let root = std::env::temp_dir().join(format!(
-            "feanorfs-tray-instance-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let lock_path = root.join("tray-instance.lock");
-        let first = acquire_tray_instance_lock_at(&lock_path)
-            .unwrap()
-            .expect("first tray owns the lock");
-        assert!(acquire_tray_instance_lock_at(&lock_path).unwrap().is_none());
-        drop(first);
-        let replacement = acquire_tray_instance_lock_at(&lock_path)
-            .unwrap()
-            .expect("lock is released when the tray exits");
-        drop(replacement);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn periodic_status_ticks_do_not_queue_behind_a_slow_scan() {
-        let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
-        state.status_inflight = true;
-
-        assert!(prepare_status_fetch(&mut state, false).is_none());
-        assert!(!state.status_pending);
-
-        assert!(prepare_status_fetch(&mut state, true).is_none());
-        assert!(state.status_pending);
-    }
-
-    #[test]
-    fn normal_background_sync_is_never_labeled_as_a_terminal_process() {
-        let status = make_status("idle", false);
-        let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
-        state.managed_service = Some(true);
-        assert!(!unmanaged_terminal_watcher_active(&state, &status));
-
-        state.managed_service = Some(false);
-        assert!(unmanaged_terminal_watcher_active(&state, &status));
-    }
-
-    #[test]
-    fn folder_setup_has_immediate_activity_and_clear_completion_copy() {
-        let path = Path::new("/Users/test/project");
-        let mut state = AppState::new(Some(path.to_path_buf()));
-        state.setup_inflight = true;
-        state.setup_kind = Some(SetupKind::AddFolder);
-        assert_eq!(activity_header(&state), Some("FeanorFS — adding folder…"));
-
-        let (title, success) = setup_success_copy(SetupKind::AddFolder, path);
-        assert_eq!(title, "Folder ready");
-        assert!(success.contains("sync automatically"));
-
-        let (title, failure) =
-            setup_failure_copy(SetupKind::AddFolder, path, true, "mirror offline");
-        assert_eq!(title, "Folder wasn’t added");
-        assert!(failure.contains("already has FeanorFS setup"));
-        assert!(failure.contains("files and encrypted setup were not changed"));
-        assert!(failure.contains("choose Add Folder again"));
-        assert!(failure.contains("mirror offline"));
-    }
-
-    #[test]
-    fn partial_setup_failures_name_the_completed_stage_and_safe_retry() {
-        let path = Path::new("/Users/test/project");
-        let cases = [
-            (
-                "Initial sync did not complete. Details: mirror offline",
-                "Folder setup saved — sync paused",
-                "without pairing again",
-            ),
-            (
-                "Initial sync completed, but automatic background sync could not be installed",
-                "Folder synced — automatic sync needs repair",
-                "retry automatic background sync and the tray",
-            ),
-            (
-                "Initial sync and automatic background sync completed, but the system tray could not be installed",
-                "Folder synced — tray needs repair",
-                "retry the tray registration",
-            ),
-        ];
-
-        for (error, expected_title, expected_retry) in cases {
-            let (title, description) = setup_failure_copy(SetupKind::JoinFolder, path, true, error);
-            assert_eq!(title, expected_title);
-            assert!(description.contains(expected_retry));
-            assert!(description.contains("workspace identity"));
-        }
-    }
-
-    #[test]
-    fn unchanged_refresh_does_not_replace_the_native_menu() {
-        let mut state = AppState::new(Some(PathBuf::from("/tmp/test")));
-        state.last_status = Some(make_status("idle", false));
-        let initial = menu_revision(&state);
-
-        // Background-refresh bookkeeping has no visible menu
-        // effect, so it must not close an open macOS status menu.
-        state.recent_inflight = true;
-        assert_eq!(menu_revision(&state), initial);
-
-        state.last_status.as_mut().unwrap().paused = true;
-        assert_ne!(menu_revision(&state), initial);
-    }
-
-    #[test]
-    fn menu_revision_tracks_representative_top_level_visible_state_changes() {
-        let changes: [fn(&mut AppState); 6] = [
-            |state| state.workspace = None,
-            |state| state.owns_watch = true,
-            |state| state.error_message = Some("a different error".into()),
-            |state| state.setup_inflight = false,
-            |state| state.setup_kind = Some(SetupKind::JoinFolder),
-            |state| state.health_inflight = false,
-        ];
-        for change in changes {
-            assert_menu_revision_changes(menu_revision_fixture(), change);
-        }
-    }
-
-    #[test]
-    fn menu_revision_tracks_managed_service_watcher_label_changes() {
-        let mut state = menu_revision_fixture();
-        assert!(unmanaged_terminal_watcher_active(
-            &state,
-            state.last_status.as_ref().expect("fixture status")
-        ));
-        let before = menu_revision(&state);
-        state.managed_service = Some(true);
-        assert!(!unmanaged_terminal_watcher_active(
-            &state,
-            state.last_status.as_ref().expect("fixture status")
-        ));
-        assert_ne!(menu_revision(&state), before);
-    }
-
-    #[test]
-    fn menu_revision_tracks_representative_status_conflict_and_agent_changes() {
-        let baseline = menu_revision(&menu_revision_fixture());
-        let changes: [fn(&mut TrayStatusResult); 6] = [
-            |status| status.mirror_state = "idle".into(),
-            |status| status.paused = false,
-            |status| status.pending_conflict_count = 3,
-            |status| status.pending_conflicts[0].path = "other.txt".into(),
-            |status| status.agents.entries[0].state = "conflicts".into(),
-            |status| {
-                status.agents.entries.push(TrayAgentEntry {
-                    name: "third-agent".into(),
-                    state: "offline".into(),
-                    change_count: 0,
-                    conflict_count: 0,
-                })
-            },
-        ];
-        for change in changes {
-            let mut state = menu_revision_fixture();
-            change(state.last_status.as_mut().expect("fixture status"));
-            assert_ne!(
-                menu_revision(&state),
-                baseline,
-                "menu revision must include representative rendered status/conflict/agent changes"
-            );
-        }
-    }
-
-    #[test]
-    fn menu_revision_tracks_representative_recent_workspace_changes() {
-        let baseline = menu_revision(&menu_revision_fixture());
-        let changes: [fn(&mut RecentWorkspacesResult); 3] = [
-            |recent| recent.active = Some("/tmp/other".into()),
-            |recent| recent.workspaces[0].path = "/tmp/other".into(),
-            |recent| {
-                recent.workspaces.push(RecentWorkspaceEntry {
-                    path: "/tmp/third".into(),
-                    workspace_id: "third-workspace".into(),
-                    label: "third".into(),
-                })
-            },
-        ];
-        for change in changes {
-            let mut state = menu_revision_fixture();
-            change(state.recent.as_mut().expect("fixture recent workspaces"));
-            assert_ne!(
-                menu_revision(&state),
-                baseline,
-                "menu revision must include representative rendered recent-workspace changes"
-            );
-        }
-    }
-
-    #[test]
-    fn menu_revision_ignores_refresh_bookkeeping_without_menu_effect() {
-        let mut state = menu_revision_fixture();
-        let baseline = menu_revision(&state);
-        state.status_inflight = true;
-        state.status_pending = true;
-        state.recent_inflight = true;
-        state.watch_failures = 2;
-        state.respawn_disabled = true;
-        assert_eq!(menu_revision(&state), baseline);
-    }
-
-    #[test]
-    #[ignore = "manual profile; run with --ignored --nocapture"]
-    fn profile_menu_revision_allocation_baseline_vs_structural_hash() {
-        const ITERATIONS: usize = 20_000;
-        let state = menu_revision_fixture();
-
-        let started = Instant::now();
-        let mut serialized_sum = 0_u64;
-        for _ in 0..ITERATIONS {
-            serialized_sum = serialized_sum.wrapping_add(std::hint::black_box(
-                menu_revision_serializing(std::hint::black_box(&state)),
-            ));
-        }
-        let serialized_elapsed = started.elapsed();
-
-        let started = Instant::now();
-        let mut structural_sum = 0_u64;
-        for _ in 0..ITERATIONS {
-            structural_sum = structural_sum.wrapping_add(std::hint::black_box(menu_revision(
-                std::hint::black_box(&state),
-            )));
-        }
-        let structural_elapsed = started.elapsed();
-
-        assert_eq!(
-            serialized_sum,
-            menu_revision_serializing(&state).wrapping_mul(ITERATIONS as u64),
-            "serialized baseline must remain deterministic"
-        );
-        assert_eq!(
-            structural_sum,
-            menu_revision(&state).wrapping_mul(ITERATIONS as u64),
-            "structural revision must remain deterministic"
-        );
-
-        eprintln!(
-            "menu_revision profile ({ITERATIONS} iterations): serialized={serialized_elapsed:?} structural={structural_elapsed:?} checksums={serialized_sum}/{structural_sum}"
-        );
-    }
-
-    #[test]
-    fn first_run_hint_prompts_only_for_an_unconfigured_tray() {
-        assert!(first_run_requested(&[OsString::from("--first-run")]));
-        assert!(!first_run_requested(&[OsString::from("--not-first-run")]));
-        assert!(should_prompt_first_run(true, None));
-        assert!(!should_prompt_first_run(
-            true,
-            Some(Path::new("/configured"))
-        ));
-        assert!(!should_prompt_first_run(false, None));
-    }
-
-    #[test]
-    fn version_probe_is_explicit() {
-        assert!(version_requested(&[OsString::from("--version")]));
-        assert!(version_requested(&[OsString::from("-V")]));
-        assert!(!version_requested(&[OsString::from("--first-run")]));
-    }
-
-    #[test]
-    fn first_run_custom_buttons_route_to_existing_start_and_join_actions() {
-        assert_eq!(
-            first_run_choice(rfd::MessageDialogResult::Custom(FIRST_RUN_START.into())),
-            FirstRunChoice::Start
-        );
-        assert_eq!(
-            first_run_choice(rfd::MessageDialogResult::Custom(FIRST_RUN_JOIN.into())),
-            FirstRunChoice::Join
-        );
-        assert_eq!(
-            first_run_choice(rfd::MessageDialogResult::Custom(FIRST_RUN_LATER.into())),
-            FirstRunChoice::Later
-        );
-        assert_eq!(
-            first_run_choice(rfd::MessageDialogResult::Cancel),
-            FirstRunChoice::Later
-        );
-    }
-
-    #[test]
-    fn health_copy_uses_generic_labels_and_never_doctor_details() {
-        let report = HealthReport {
-            ok: false,
-            checks: vec![
-                feanorfs::HealthCheck {
-                    name: "server".into(),
-                    status: HealthStatus::Failure,
-                },
-                feanorfs::HealthCheck {
-                    name: "relay".into(),
-                    status: HealthStatus::Warning,
-                },
-                feanorfs::HealthCheck {
-                    name: "unknown_future_check".into(),
-                    status: HealthStatus::Failure,
-                },
-            ],
-        };
-        let copy = health_report_description(&report);
-        assert!(health_report_needs_repair(&report));
-        assert!(copy.contains("Mirror connection"));
-        assert!(copy.contains("Off-LAN connection"));
-        assert!(copy.contains("FeanorFS component"));
-        assert!(!copy.contains("server"));
-        assert!(!copy.contains("relay"));
-        assert!(!copy.contains("unknown_future_check"));
-    }
-
-    #[test]
-    fn healthy_report_is_plain_and_needs_no_repair() {
-        let report = HealthReport {
-            ok: true,
-            checks: vec![feanorfs::HealthCheck {
-                name: "e2ee".into(),
-                status: HealthStatus::Ok,
-            }],
-        };
-        assert!(!health_report_needs_repair(&report));
-        assert!(health_report_description(&report).contains("healthy"));
-    }
-
-    #[test]
-    fn health_repair_requires_the_explicit_custom_button() {
-        assert!(health_choice_requests_repair(
-            &rfd::MessageDialogResult::Custom(HEALTH_REPAIR.into())
-        ));
-        assert!(!health_choice_requests_repair(
-            &rfd::MessageDialogResult::Custom(HEALTH_CLOSE.into())
-        ));
-        assert!(!health_choice_requests_repair(
-            &rfd::MessageDialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn health_check_blocks_mutations_but_keeps_open_and_quit_available() {
-        assert!(action_allowed_while_background_check_runs(
-            &MenuAction::OpenFolder
-        ));
-        assert!(action_allowed_while_background_check_runs(
-            &MenuAction::Quit
-        ));
-        assert!(!action_allowed_while_background_check_runs(
-            &MenuAction::SyncNow
-        ));
-        assert!(!action_allowed_while_background_check_runs(
-            &MenuAction::StopMirroring
-        ));
-    }
-
-    #[test]
-    fn update_copy_and_open_choice_are_status_driven() {
-        let available = UpdateCheckResult {
-            status: UpdateStatus::UpdateAvailable,
-            current_version: "0.4.0".into(),
-            latest_version: "0.5.0".into(),
-            release_url: "https://github.com/rapm94/feanorfs/releases/tag/v0.5.0".into(),
-        };
-        let copy = update_description(&available);
-        assert!(copy.contains("0.5.0"));
-        assert!(copy.contains("will not download or execute"));
-        assert!(update_choice_opens_release(
-            &rfd::MessageDialogResult::Custom(UPDATE_OPEN.into())
-        ));
-        assert!(!update_choice_opens_release(
-            &rfd::MessageDialogResult::Custom(UPDATE_LATER.into())
-        ));
-        assert!(!update_choice_opens_release(
-            &rfd::MessageDialogResult::Cancel
-        ));
-
-        let current = UpdateCheckResult {
-            status: UpdateStatus::UpToDate,
-            latest_version: "0.4.0".into(),
-            ..available.clone()
-        };
-        assert!(update_description(&current).contains("up to date"));
-        let development = UpdateCheckResult {
-            status: UpdateStatus::DevelopmentBuild,
-            current_version: "0.6.0".into(),
-            ..available
-        };
-        assert!(update_description(&development).contains("newer"));
-    }
-
-    #[test]
-    fn pairing_duration_is_plain_language() {
-        assert_eq!(format_duration(30), "30 seconds");
-        assert_eq!(format_duration(60), "1 minute");
-        assert_eq!(format_duration(300), "5 minutes");
-    }
-
-    #[test]
-    fn off_lan_pairing_dialog_keeps_long_capability_in_clipboard() {
-        let capability = format!("fnp2-{}", "ab".repeat(300));
-        let description = pairing_dialog_description(&capability, 300);
-        assert!(description.contains("one-time sharing code"));
-        assert!(description.contains("Join a Shared Folder"));
-        assert!(!description.contains("Terminal"));
-        assert!(!description.contains(&capability));
-    }
-
-    #[test]
-    fn configured_recent_workspace_skips_stale_entries() {
-        let root = std::env::temp_dir().join(format!(
-            "feanorfs-tray-recent-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let stale = root.join("stale");
-        let configured = root.join("configured");
-        std::fs::create_dir_all(&configured).unwrap();
-
-        let recent = RecentWorkspacesResult {
-            active: Some(stale.to_string_lossy().into_owned()),
-            workspaces: vec![RecentWorkspaceEntry {
-                path: configured.to_string_lossy().into_owned(),
-                workspace_id: "fsw1-test".into(),
-                label: "configured".into(),
-            }],
-        };
-        assert_eq!(
-            configured_recent_workspace_with(&recent, |path| path == configured),
-            Some(configured)
-        );
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn parse_menu_action_known_ids() {
-        assert!(matches!(
-            parse_menu_action("add-folder"),
-            Some(MenuAction::AddFolder)
-        ));
-        assert!(matches!(
-            parse_menu_action("join-computer"),
-            Some(MenuAction::JoinComputer)
-        ));
-        assert!(matches!(
-            parse_menu_action("stop-mirroring"),
-            Some(MenuAction::StopMirroring)
-        ));
-        assert!(matches!(
-            parse_menu_action("open"),
-            Some(MenuAction::OpenFolder)
-        ));
-        assert!(matches!(
-            parse_menu_action("pause"),
-            Some(MenuAction::TogglePause)
-        ));
-        assert!(matches!(
-            parse_menu_action("sync-now"),
-            Some(MenuAction::SyncNow)
-        ));
-        assert!(matches!(parse_menu_action("pair"), Some(MenuAction::Pair)));
-        assert!(matches!(
-            parse_menu_action("recovery-export"),
-            Some(MenuAction::ExportRecovery)
-        ));
-        assert!(matches!(
-            parse_menu_action("recovery-import"),
-            Some(MenuAction::ImportRecovery)
-        ));
-        assert!(matches!(
-            parse_menu_action("forget-unavailable"),
-            Some(MenuAction::ForgetUnavailable)
-        ));
-        assert!(matches!(
-            parse_menu_action("health"),
-            Some(MenuAction::CheckHealth)
-        ));
-        assert!(matches!(
-            parse_menu_action("update"),
-            Some(MenuAction::CheckUpdates)
-        ));
-        assert!(matches!(parse_menu_action("quit"), Some(MenuAction::Quit)));
-    }
-
-    #[test]
-    fn unavailable_workspace_is_labeled_disabled_and_counted() {
-        let root = std::env::temp_dir().join(format!(
-            "feanorfs-tray-unavailable-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let available = root.join("available");
-        let unavailable = root.join("unavailable");
-        std::fs::create_dir_all(&available).unwrap();
-        let recent = RecentWorkspacesResult {
-            active: Some(unavailable.to_string_lossy().into_owned()),
-            workspaces: vec![
-                RecentWorkspaceEntry {
-                    path: unavailable.to_string_lossy().into_owned(),
-                    workspace_id: "fsw1-unavailable".into(),
-                    label: "offline drive".into(),
-                },
-                RecentWorkspaceEntry {
-                    path: available.to_string_lossy().into_owned(),
-                    workspace_id: "fsw1-available".into(),
-                    label: "available".into(),
-                },
-            ],
-        };
-
-        let has_config = |path: &Path| path == available;
-        assert_eq!(unavailable_workspace_count_with(&recent, has_config), 1);
-        let unavailable_item = workspace_switch_item_with(
-            "offline drive",
-            &unavailable.to_string_lossy(),
-            recent.active.as_deref(),
-            has_config,
-        );
-        assert!(!unavailable_item.available);
-        assert!(unavailable_item.selected);
-        assert!(unavailable_item.label.contains("offline drive"));
-        assert!(unavailable_item.label.ends_with("— unavailable"));
-        assert!(unavailable_item.label.chars().count() <= 52);
-
-        let available_item =
-            workspace_switch_item_with("available", &available.to_string_lossy(), None, has_config);
-        assert!(available_item.available);
-        assert!(!available_item.selected);
-        assert!(available_item.label.starts_with("available"));
-        assert!(available_item.label.ends_with("available"));
-        assert!(available_item.label.chars().count() <= 52);
-
-        // The tray's in-memory selection is authoritative for Open Folder and
-        // every other folder-scoped action, even before a cached registry is
-        // refreshed. Both followed folders remain present in the selector.
-        let mut state = AppState::new(Some(available.clone()));
-        state.recent = Some(recent);
-        let items = mirrored_folder_menu_items_with(&state, has_config);
-        assert_eq!(items.len(), 2);
-        assert_eq!(
-            items.iter().filter(|item| item.selected).count(),
-            1,
-            "exactly one folder must be visibly selected"
-        );
-        let selected = items.iter().find(|item| item.selected).unwrap();
-        assert_eq!(selected.id, format!("switch:{}", available.display()));
-        assert!(selected.available);
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn parse_menu_action_keep_prefixes() {
-        assert!(matches!(
-            parse_menu_action("keep-local:src/main.rs"),
-            Some(MenuAction::Keep { ref path, ref choice }) if path == "src/main.rs" && choice == "local"
-        ));
-        assert!(matches!(
-            parse_menu_action("keep-cloud:src/lib.rs"),
-            Some(MenuAction::Keep { ref path, ref choice }) if path == "src/lib.rs" && choice == "cloud"
-        ));
-        assert!(matches!(
-            parse_menu_action("keep-both:README.md"),
-            Some(MenuAction::Keep { ref path, ref choice }) if path == "README.md" && choice == "both"
-        ));
-    }
-
-    #[test]
-    fn parse_menu_action_bulk_keep_choices() {
-        assert!(matches!(
-            parse_menu_action("keep-all-local"),
-            Some(MenuAction::KeepAll { ref choice }) if choice == "local"
-        ));
-        assert!(matches!(
-            parse_menu_action("keep-all-cloud"),
-            Some(MenuAction::KeepAll { ref choice }) if choice == "cloud"
-        ));
-    }
-
-    #[test]
-    fn parse_menu_action_land_prefix() {
-        assert!(matches!(
-            parse_menu_action("land:ci1"),
-            Some(MenuAction::Land { ref agent }) if agent == "ci1"
-        ));
-    }
-
-    #[test]
-    fn parse_menu_action_switch_prefix() {
-        match parse_menu_action("switch:/Users/test/project") {
-            Some(MenuAction::SwitchWorkspace(ref p)) => {
-                assert_eq!(p.to_string_lossy(), "/Users/test/project");
-            }
-            other => panic!("expected SwitchWorkspace, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_menu_action_unknown_returns_none() {
-        assert!(parse_menu_action("random-id").is_none());
-        assert!(parse_menu_action("").is_none());
-        assert!(parse_menu_action("header").is_none());
-    }
 
     #[test]
     fn visual_from_state_all_mirror_values() {
@@ -3628,20 +648,25 @@ mod tests {
     }
 
     #[test]
-    fn header_label_idle() {
-        let s = make_status("idle", false);
-        assert!(header_label(&s).contains("in sync with your shared WIP"));
+    fn version_flag_never_starts_the_ui() {
+        assert!(print_version_and_exit(&["--version".into()]));
+        assert!(print_version_and_exit(&["-V".into()]));
+        assert!(!print_version_and_exit(&[]));
+        assert!(!print_version_and_exit(&["--first-run".into()]));
     }
 
     #[test]
-    fn header_label_paused() {
-        let s = make_status("idle", true);
-        assert!(header_label(&s).contains("(paused)"));
+    fn only_the_exact_managed_argument_marks_a_managed_launch() {
+        assert!(managed_tray_launch(&[MANAGED_TRAY_ARG.into()]));
+        assert!(!managed_tray_launch(&[]));
+        assert!(!managed_tray_launch(&["--first-run".into()]));
+        assert!(!managed_tray_launch(&["--managed-extra".into()]));
     }
 
     #[test]
-    fn header_label_error() {
-        let s = make_status("error", false);
-        assert!(header_label(&s).contains("error"));
+    fn runner_test_profiles_exit_before_claiming_the_user_tray() {
+        assert!(runner_test_launch(Some("test".as_ref()), None));
+        assert!(runner_test_launch(None, Some("1".as_ref())));
+        assert!(!runner_test_launch(None, None));
     }
 }
