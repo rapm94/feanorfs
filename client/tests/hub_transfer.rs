@@ -47,7 +47,12 @@ async fn hub_transfer_copies_history_between_hubs_through_concurrent_object_phas
     assert!(result.objects >= 4, "files plus trees and snapshots");
     assert!(result.snapshots >= 1);
 
-    let source_head = source_server.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+    let source_head = source_server
+        .api
+        .get_head(WORKSPACE_ID)
+        .await
+        .unwrap()
+        .unwrap();
     let destination_head = destination_server
         .api
         .get_head(WORKSPACE_ID)
