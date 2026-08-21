@@ -4,6 +4,7 @@ use crate::{load_config, open_api_client, open_client_db, save_config_secure, Ap
 use anyhow::{bail, Context, Result};
 use feanorfs_agent_core::{lock::SyncLock, ObjectStore, SwapHeadResult};
 use feanorfs_common::{hash_bytes, is_valid_hash, TreeEntryKind};
+use futures_util::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -218,19 +219,26 @@ async fn transfer_snapshot_history(
         verify_destination_head(destination_api, workspace_id, destination_head).await?;
         return Ok(history);
     }
-    for hash in &history.hashes {
-        let ciphertext = source_api
-            .download_file(hash)
-            .await
-            .with_context(|| format!("read source object {hash}"))?;
-        if hash_bytes(&ciphertext) != *hash {
-            bail!("source object hash mismatch for {hash}");
-        }
-        destination_api
-            .upload_object(workspace_id, hash, ciphertext)
-            .await
-            .with_context(|| format!("write destination object {hash}"))?;
-    }
+    // Matches the hub's MAX_UPLOAD_REQUESTS admission permits: a higher
+    // in-flight count turns excess uploads into instant 503s.
+    const TRANSFER_CONCURRENCY: usize = 4;
+    futures_util::stream::iter(history.hashes.iter())
+        .map(|hash| async move {
+            let ciphertext = source_api
+                .download_file(hash)
+                .await
+                .with_context(|| format!("read source object {hash}"))?;
+            if hash_bytes(&ciphertext) != *hash {
+                bail!("source object hash mismatch for {hash}");
+            }
+            destination_api
+                .upload_object(workspace_id, hash, ciphertext)
+                .await
+                .with_context(|| format!("write destination object {hash}"))
+        })
+        .buffer_unordered(TRANSFER_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
 
     if source_api.get_head(workspace_id).await?.as_deref() != Some(&source_head) {
         bail!("source workspace changed during transfer; destination head was not published");
