@@ -1585,9 +1585,11 @@ mod response_reader_tests {
                         )
                     })
             }) || error.chain().any(|cause| {
-                cause.downcast_ref::<reqwest::Error>().is_some_and(|transport| {
-                    transport.is_request() || transport.is_connect() || transport.is_body()
-                })
+                cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|transport| {
+                        transport.is_request() || transport.is_connect() || transport.is_body()
+                    })
             }),
             "expected typed transport error for truncated body, got: {error:#}"
         );
