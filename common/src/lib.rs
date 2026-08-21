@@ -590,7 +590,7 @@ pub fn pack_bytes(data: &[u8], password: &str, path: &str) -> Result<Vec<u8>> {
 
 /// Decrypts packed blob (ChaCha20-Poly1305 or legacy XOR per policy).
 pub fn unpack_bytes(data: &[u8], password: &str, path: &str) -> Result<Vec<u8>> {
-    unpack_bytes_with_policy(data, password, path, LegacyPolicy::AllowXorFallback)
+    unpack_bytes_checked(data, password, path, LegacyPolicy::AllowXorFallback, None)
 }
 
 /// Decrypt with an explicit legacy-blob policy (format v2 uses `Reject`).
@@ -599,6 +599,28 @@ pub fn unpack_bytes_with_policy(
     password: &str,
     path: &str,
     policy: LegacyPolicy,
+) -> Result<Vec<u8>> {
+    unpack_bytes_checked(data, password, path, policy, None)
+}
+
+/// Decrypt with an explicit legacy-blob policy and an optional expected
+/// plaintext size.
+///
+/// The expected size disambiguates the dangerous overlap between two blob
+/// shapes: a legacy v1 blob whose first plaintext byte collides with the
+/// AEAD prefix byte (ciphertext length == plaintext length, XOR rescue is
+/// correct) versus an AEAD blob whose authentication FAILED because of a
+/// wrong key or corruption (length carries the nonce+tag overhead, XOR
+/// "rescue" yields silent garbage). When the caller knows the size and the
+/// blob cannot be a length-matched legacy collision, authentication failure
+/// is reported instead of returning unauthenticated output. Pass `None`
+/// only where no size expectation exists.
+pub fn unpack_bytes_checked(
+    data: &[u8],
+    password: &str,
+    path: &str,
+    policy: LegacyPolicy,
+    expected_plaintext_size: Option<u64>,
 ) -> Result<Vec<u8>> {
     if data.first() == Some(&AEAD_PREFIX_BYTE) && data.len() > 13 {
         use chacha20poly1305::aead::{Aead, KeyInit};
@@ -610,6 +632,16 @@ pub fn unpack_bytes_with_policy(
         match cipher.decrypt(nonce, &data[13..]) {
             Ok(plain) => return Ok(plain),
             Err(_) if policy == LegacyPolicy::AllowXorFallback => {
+                // A genuine prefix-collision legacy blob is exactly its own
+                // plaintext length; anything else is AEAD-shaped and must
+                // not degrade into unauthenticated output.
+                if let Some(expected) = expected_plaintext_size {
+                    if data.len() as u64 != expected {
+                        anyhow::bail!(
+                            "wrong encryption key for this workspace (decryption failed)"
+                        );
+                    }
+                }
                 return Ok(crypt_bytes(data, password, path));
             }
             Err(_) => {
@@ -1138,6 +1170,77 @@ mod tests {
         let err =
             unpack_bytes_with_policy(&xored, "pw", "legacy.txt", LegacyPolicy::Reject).unwrap_err();
         assert!(err.to_string().contains("legacy"));
+    }
+
+    #[test]
+    fn wrong_key_on_aead_blob_fails_when_plaintext_size_known() {
+        let plain = vec![0x5a_u8; 64];
+        let packed = pack_bytes(&plain, "key-a", "blob.bin").unwrap();
+        assert_eq!(packed.first(), Some(&AEAD_PREFIX_BYTE));
+        let err = unpack_bytes_checked(
+            &packed,
+            "key-b",
+            "blob.bin",
+            LegacyPolicy::AllowXorFallback,
+            Some(plain.len() as u64),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wrong encryption key"));
+    }
+
+    #[test]
+    fn legacy_prefix_collision_rescues_when_size_matches() {
+        let password = "legacy-password";
+        let path = "legacy.bin";
+        let first_keystream_byte = crypt_bytes(&[0], password, path)[0];
+        let mut plaintext = vec![0x5a_u8; 32];
+        plaintext[0] = first_keystream_byte ^ AEAD_PREFIX_BYTE;
+        let ciphertext = crypt_bytes(&plaintext, password, path);
+        assert_eq!(
+            unpack_bytes_checked(
+                &ciphertext,
+                password,
+                path,
+                LegacyPolicy::AllowXorFallback,
+                Some(plaintext.len() as u64),
+            )
+            .unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn unknown_size_preserves_documented_legacy_fallback() {
+        let plain = vec![0x5a_u8; 64];
+        let packed = pack_bytes(&plain, "key-a", "blob.bin").unwrap();
+        let recovered = unpack_bytes_checked(
+            &packed,
+            "key-b",
+            "blob.bin",
+            LegacyPolicy::AllowXorFallback,
+            None,
+        )
+        .unwrap();
+        assert_eq!(recovered.len(), packed.len());
+    }
+
+    #[test]
+    fn size_mismatch_fails_even_for_legacy_shaped_blob() {
+        let password = "legacy-password";
+        let path = "legacy.bin";
+        let first_keystream_byte = crypt_bytes(&[0], password, path)[0];
+        let mut plaintext = vec![0x5a_u8; 32];
+        plaintext[0] = first_keystream_byte ^ AEAD_PREFIX_BYTE;
+        let ciphertext = crypt_bytes(&plaintext, password, path);
+        let err = unpack_bytes_checked(
+            &ciphertext,
+            password,
+            path,
+            LegacyPolicy::AllowXorFallback,
+            Some(plaintext.len() as u64 + 1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wrong encryption key"));
     }
 
     #[test]

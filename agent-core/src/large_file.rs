@@ -2,7 +2,9 @@
 
 use crate::SyncCtx;
 use anyhow::{bail, Context as _, Result};
-use feanorfs_common::{hash_bytes, is_valid_hash, pack_bytes, unpack_bytes_with_policy};
+use feanorfs_common::{
+    hash_bytes, is_valid_hash, pack_bytes, unpack_bytes_checked, unpack_bytes_with_policy,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -250,8 +252,13 @@ pub(crate) async fn materialize_to(
 ) -> Result<MaterializedFile> {
     let root = download_verified(ctx, encrypted_hash, root_download_limit(expected_size)).await?;
     if root.first() != Some(&CHUNKED_PREFIX_BYTE) {
-        let plaintext =
-            unpack_bytes_with_policy(&root, ctx.password_str(), relative_path, ctx.policy)?;
+        let plaintext = unpack_bytes_checked(
+            &root,
+            ctx.password_str(),
+            relative_path,
+            ctx.policy,
+            (expected_size != 0).then_some(expected_size),
+        )?;
         if expected_size != 0 && plaintext.len() as u64 != expected_size {
             bail!("downloaded file size mismatch for {relative_path}");
         }
@@ -309,8 +316,13 @@ pub async fn read_bytes(
 ) -> Result<Vec<u8>> {
     let root = download_verified(ctx, encrypted_hash, root_download_limit(expected_size)).await?;
     if root.first() != Some(&CHUNKED_PREFIX_BYTE) {
-        let plaintext =
-            unpack_bytes_with_policy(&root, ctx.password_str(), relative_path, ctx.policy)?;
+        let plaintext = unpack_bytes_checked(
+            &root,
+            ctx.password_str(),
+            relative_path,
+            ctx.policy,
+            (expected_size != 0).then_some(expected_size),
+        )?;
         if expected_size != 0 && plaintext.len() as u64 != expected_size {
             bail!("downloaded file size mismatch for {relative_path}");
         }
