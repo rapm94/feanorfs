@@ -62,6 +62,10 @@ fn load_update_state_at(path: &Path) -> Option<UpdateState> {
     serde_json::from_slice(&content).ok()
 }
 
+/// Private atomic visibility: the periodic update-throttle
+/// state is replaced via a 0o600 temp file and atomic rename, without a
+/// parent-directory sync. Losing the rename to a crash only forces an earlier
+/// re-check; the payload is bounded by `MAX_UPDATE_STATE_BYTES` before write.
 fn save_update_state_at(path: &Path, state: &UpdateState) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec(state)?;
     ensure!(

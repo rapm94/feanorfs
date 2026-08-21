@@ -70,6 +70,7 @@ fn digest(
         verification: VerificationSummary {
             status: VerificationStatus::Passed,
             summary: "84 tests passed".to_string(),
+            ..VerificationSummary::default()
         },
         outcome: "Integrated parser implementation and tests.".to_string(),
         risks: vec![],
@@ -203,12 +204,12 @@ async fn dispatcher_lifecycle_completes_over_http_hub() {
         assignment_id: assigned.assignment_id.clone(),
         attempt: 0,
         about_snapshot: head.clone(),
-        digest: digest(
+        digest: Box::new(digest(
             &assigned.assignment_id,
             &assigned.selected,
             &head,
             IntegratorOutcomeState::Completed,
-        ),
+        )),
     })
     .unwrap();
     let result_sent = send_message(
@@ -284,12 +285,12 @@ async fn fast_acceptance_and_result_complete_in_one_observe_pass() {
                 assignment_id: assigned.assignment_id.clone(),
                 attempt: 0,
                 about_snapshot: head.clone(),
-                digest: digest(
+                digest: Box::new(digest(
                     &assigned.assignment_id,
                     &assigned.selected,
                     &head,
                     IntegratorOutcomeState::Completed,
-                ),
+                )),
             })
             .unwrap(),
         ),
@@ -1098,6 +1099,167 @@ async fn cursor_reset_fails_closed_and_revocable() {
         .await
         .unwrap();
     assert_eq!(next.attempt, 0);
+}
+
+/// Rewinds the dispatcher state to the exact crash window inside `offer_next`:
+/// the attempt is persisted as offered but neither the request message id nor
+/// the inbox cursor was recorded yet.
+fn simulate_crash_before_offer_record(workspace: &std::path::Path) -> String {
+    let state_dir = feanorfs_agent_core::ensure_workspace_state(workspace).unwrap();
+    let state_path = state_dir.join("orchestrator").join("integrator-state.json");
+    let raw = std::fs::read_to_string(&state_path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let original = value["active"]["attempts"][0]["request_message_id"]
+        .as_str()
+        .expect("offer recorded a request message id")
+        .to_string();
+    value["active"]["attempts"][0]["request_message_id"] = serde_json::Value::Null;
+    value["active"]["inbox_cursor"] = serde_json::Value::Null;
+    std::fs::write(&state_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    original
+}
+
+async fn selected_request_count(ctx: &SyncCtx<'_>, selected: &str) -> usize {
+    inbox(
+        ctx,
+        AgentInboxQuery {
+            recipient: selected.to_string(),
+            after: None,
+            limit: 50,
+        },
+    )
+    .await
+    .unwrap()
+    .messages
+    .len()
+}
+
+/// A crash after publishing but before recording the offer adopts the existing
+/// request instead of publishing a duplicate.
+#[tokio::test]
+async fn resume_adopts_a_published_but_unrecorded_offer() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = seeded_v3_ctx(&server, &client).await;
+    let ctx = ctx_from(&server, &client, &config);
+    let head = ctx.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+
+    let assigned = integrator_assign(&ctx, assign_input(&head, "Integrate parser tests"))
+        .await
+        .unwrap();
+    let original = simulate_crash_before_offer_record(client.workspace.path());
+
+    let observed = integrator_resume(&ctx, IntegratorObserveOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(observed.action, "recovered_offer");
+
+    let status = integrator_status(&ctx, Some(&assigned.assignment_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        status.attempts[0].request_message_id.as_deref(),
+        Some(original.as_str())
+    );
+    assert_eq!(selected_request_count(&ctx, &assigned.selected).await, 1);
+}
+
+/// A crash before the request ever reached the stream republishes exactly one
+/// new offer.
+#[tokio::test]
+async fn resume_republishes_an_unpublished_offer_once() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = seeded_v3_ctx(&server, &client).await;
+    let ctx = ctx_from(&server, &client, &config);
+    let head = ctx.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+
+    let assigned = integrator_assign(&ctx, assign_input(&head, "Original task summary"))
+        .await
+        .unwrap();
+    let _ = simulate_crash_before_offer_record(client.workspace.path());
+
+    // The published request no longer matches the persisted assignment, so
+    // recovery must treat the offer as absent and send a fresh one.
+    let state_dir = feanorfs_agent_core::ensure_workspace_state(client.workspace.path()).unwrap();
+    let state_path = state_dir.join("orchestrator").join("integrator-state.json");
+    let raw = std::fs::read_to_string(&state_path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    value["active"]["task_summary"] = serde_json::Value::String("Changed task summary".into());
+    std::fs::write(&state_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    let observed = integrator_resume(&ctx, IntegratorObserveOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(observed.action, "offered");
+
+    let status = integrator_status(&ctx, Some(&assigned.assignment_id))
+        .await
+        .unwrap();
+    let republished = status.attempts[0]
+        .request_message_id
+        .as_deref()
+        .expect("republished offer records its request");
+    assert_ne!(republished, assigned.request_message_id);
+    assert_eq!(selected_request_count(&ctx, &assigned.selected).await, 2);
+}
+
+/// Two matching published requests are ambiguous: recovery fails closed into
+/// requires_human instead of guessing.
+#[tokio::test]
+async fn resume_refuses_ambiguous_duplicate_offers() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = seeded_v3_ctx(&server, &client).await;
+    let ctx = ctx_from(&server, &client, &config);
+    let head = ctx.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+
+    let assigned = integrator_assign(&ctx, assign_input(&head, "Integrate parser tests"))
+        .await
+        .unwrap();
+
+    // Publish a byte-equivalent second request, then rewind to the crash
+    // window so recovery observes both.
+    let duplicate_body = encode_integrator_profile(&IntegratorProfile::Assignment {
+        assignment_id: assigned.assignment_id.clone(),
+        attempt: 0,
+        selected: assigned.selected.clone(),
+        about_snapshot: head.clone(),
+        roster_fingerprint: assigned.roster_fingerprint.clone(),
+        neutral_integrator: assigned.neutral_integrator,
+        task: "Integrate parser tests".to_string(),
+    })
+    .unwrap();
+    send_message(
+        &ctx,
+        AgentMessageInput {
+            to: assigned.selected.clone(),
+            kind: AgentMessageKind::Request,
+            body: duplicate_body,
+            about_snapshot: Some(head.clone()),
+            reply_to: None,
+            from: Some("human".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    let _ = simulate_crash_before_offer_record(client.workspace.path());
+
+    let observed = integrator_resume(&ctx, IntegratorObserveOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(observed.action, "requires_human");
+    assert!(observed.cursor_reset);
+    assert_eq!(
+        observed.state,
+        Some(feanorfs_common::IntegratorAssignmentState::RequiresHuman)
+    );
+    let status = integrator_status(&ctx, Some(&assigned.assignment_id)).await;
+    assert!(
+        status.is_err()
+            || status.unwrap().state == feanorfs_common::IntegratorAssignmentState::RequiresHuman,
+        "ambiguous assignment must be terminal or requires-human"
+    );
 }
 
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

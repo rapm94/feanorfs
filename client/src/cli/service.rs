@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use super::process_tree;
-use super::start::{finish_sync_watch, WatchMode};
+use super::start::{finish_sync_watch, SetupStageError, WatchMode};
 use super::supervisor::{self};
 use super::util::output_json;
+use feanorfs_common::tray_contract::{SetupCommitted, SetupRecovery, SetupResult, SetupStage};
 
 /// Background state of a managed component (workspace, hub, tray, supervisor).
 pub(crate) use supervisor::ServiceState as BackgroundStatus;
@@ -269,17 +270,40 @@ fn install_result(workspace: &Path) -> anyhow::Result<ServiceResult> {
 pub(crate) fn install_and_start(workspace: &Path) -> anyhow::Result<()> {
     let spec = ServiceSpec::load(workspace)?;
     let status = supervisor::install_workspace(&spec.workspace).map_err(|error| {
-        anyhow::anyhow!(
-            "Initial sync completed, but automatic background sync could not be installed. Rerun `feanorfs start -- {}` to retry this stage; the completed sync and encrypted workspace identity will be preserved. Details: {error:#}",
-            spec.workspace.display()
-        )
+        SetupStageError {
+            result: SetupResult::staged(
+                SetupStage::InitialSync,
+                SetupCommitted {
+                    workspace_configured: true,
+                    initial_sync_completed: true,
+                    ..SetupCommitted::default()
+                },
+                SetupRecovery::RetryStart,
+                &format!(
+                    "Initial sync completed, but automatic background sync could not be installed. Rerun `feanorfs start -- {}` to retry this stage; the completed sync and encrypted workspace identity will be preserved. Details: {error:#}",
+                    spec.workspace.display()
+                ),
+            ),
+        }
     })?;
     println!("Automatic background sync installed.");
     let tray = install_tray_if_available(&spec).map_err(|error| {
-        anyhow::anyhow!(
-            "Initial sync and automatic background sync completed, but the system tray could not be installed. Rerun `feanorfs start -- {}` to retry only the remaining lifecycle checks; synced files and encrypted workspace identity will be preserved. Details: {error:#}",
-            spec.workspace.display()
-        )
+        SetupStageError {
+            result: SetupResult::staged(
+                SetupStage::ServiceInstalled,
+                SetupCommitted {
+                    workspace_configured: true,
+                    initial_sync_completed: true,
+                    background_service_installed: true,
+                    ..SetupCommitted::default()
+                },
+                SetupRecovery::RetryTray,
+                &format!(
+                    "Initial sync and automatic background sync completed, but the system tray could not be installed. Rerun `feanorfs start -- {}` to retry only the remaining lifecycle checks; synced files and encrypted workspace identity will be preserved. Details: {error:#}",
+                    spec.workspace.display()
+                ),
+            ),
+        }
     })?;
     let result = ServiceResult {
         action: "install",
@@ -498,7 +522,10 @@ fn windows_tray_task_action(spec: &TrayServiceSpec) -> anyhow::Result<(String, S
     if program.contains('"') {
         anyhow::bail!("Windows paths containing double quotes cannot be installed as tasks");
     }
-    Ok((program, String::new()))
+    Ok((
+        program,
+        feanorfs_common::tray_contract::MANAGED_TRAY_ARG.to_string(),
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -543,6 +570,40 @@ mod tests {
             Some(fake_tray.clone()),
         );
         assert_eq!(found, Some(fake_tray));
+    }
+
+    #[test]
+    fn hidden_service_actions_are_parseable() {
+        let command = ServiceAction::augment_subcommands(clap::Command::new("service"));
+        let names: Vec<&str> = command
+            .get_subcommands()
+            .map(|sub| sub.get_name())
+            .collect();
+        assert!(
+            names.contains(&"runner-run"),
+            "hidden `runner-run` action missing"
+        );
+        assert!(
+            names.contains(&"supervise"),
+            "hidden `supervise` action missing"
+        );
+        #[cfg(unix)]
+        assert!(
+            names.contains(&"exec-gate"),
+            "hidden `exec-gate` action missing"
+        );
+    }
+
+    #[test]
+    fn service_module_never_invokes_platform_service_managers() {
+        // Per-workspace platform service installation belongs to the single
+        // supervisor (`supervisor.rs`); this module stays a thin adapter.
+        let source = include_str!("service.rs");
+        let body = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !body.contains("service_manager"),
+            "service.rs must not invoke platform service managers itself"
+        );
     }
 
     #[test]

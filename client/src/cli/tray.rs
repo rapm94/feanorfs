@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 use super::pair::{receive, PairCode};
-use super::start::{run_start, StartOptions};
+use super::start::{run_start_typed, write_setup_result_line, StartOptions};
 use super::util::output_json;
 
 const MAX_PAIRING_STDIN_BYTES: u64 = 1024;
@@ -178,7 +178,7 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
             if !read_join_decision(&mut stdin)? {
                 anyhow::bail!("Join canceled. No FeanorFS setup or workspace files were changed.");
             }
-            Box::pin(run_start(
+            let result = run_start_typed(
                 current_dir,
                 StartOptions {
                     target: None,
@@ -196,8 +196,20 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                     recovery_invite: Some(invite),
                     pair_code: None,
                 },
-            ))
-            .await?;
+            )
+            .await;
+            // The typed setup result is the final stdout line of the join
+            // protocol; the bundled tray classifies from it, never from text.
+            write_setup_result_line(&result)?;
+            if result.stage != feanorfs_common::tray_contract::SetupStage::TrayRegistered {
+                anyhow::bail!(
+                    "{}",
+                    result
+                        .detail
+                        .as_deref()
+                        .unwrap_or("FeanorFS setup did not complete")
+                );
+            }
         }
     }
     Ok(())

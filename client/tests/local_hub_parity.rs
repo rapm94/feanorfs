@@ -445,6 +445,90 @@ async fn parity_manifest_valid_and_errors() {
         None,
     )
     .await;
+    // Immutable manifest: the same snapshot id with a different canonical
+    // hash list is a typed Conflict on both adapters (400).
+    h.cmp(
+        Method::POST,
+        "/api/manifest",
+        &format!("workspace_id=ws&snapshot_id={snap}"),
+        format!("{}\n", mk_hash(b"other")).into_bytes(),
+        None,
+    )
+    .await;
+    // Unchanged manifest re-stamp stays 200 on both adapters.
+    h.cmp(
+        Method::POST,
+        "/api/manifest",
+        &format!("workspace_id=ws&snapshot_id={snap}"),
+        format!("{blob}\n").into_bytes(),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn parity_migration_different_token_is_locked() {
+    let h = Harness::new(None).await;
+    let token = mk_hash(b"fence-tok");
+    h.cmp(
+        Method::POST,
+        "/api/workspace/migration",
+        "workspace_id=ws",
+        vec![],
+        Some(&token),
+    )
+    .await;
+    // A second migration attempt with a different token is LockedByOther on
+    // both adapters (423); the same token remains idempotent (200).
+    h.cmp(
+        Method::POST,
+        "/api/workspace/migration",
+        "workspace_id=ws",
+        vec![],
+        Some(&mk_hash(b"other-tok")),
+    )
+    .await;
+    h.cmp(
+        Method::POST,
+        "/api/workspace/migration",
+        "workspace_id=ws",
+        vec![],
+        Some(&token),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn parity_set_format_without_manifested_head_is_500() {
+    // A v3 transition without a manifested snapshot head is the typed
+    // MissingManifestHead precondition: 500 with an empty body on both
+    // adapters, and the workspace format stays unchanged.
+    let h = Harness::new(None).await;
+    h.cmp(
+        Method::POST,
+        "/api/workspace/format",
+        "workspace_id=ws&format_version=3",
+        vec![],
+        None,
+    )
+    .await;
+    h.cmp(
+        Method::GET,
+        "/api/workspace/format",
+        "workspace_id=ws",
+        vec![],
+        None,
+    )
+    .await;
+    // Unsupported format values are rejected identically.
+    h.cmp(
+        Method::POST,
+        "/api/workspace/format",
+        "workspace_id=ws&format_version=4",
+        vec![],
+        None,
+    )
+    .await;
 }
 
 #[tokio::test]

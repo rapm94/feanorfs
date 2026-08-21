@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::serve::{run_serve, ServeCli};
-use super::start::{run_start, StartOptions};
+use super::start::{run_start, run_start_json, StartOptions};
 use super::util::{
     acquire_token, copy_to_clipboard, initialize_local_mirror, initialize_new_mirror,
     invite_from_config, join_from_invite, link_existing_mirror, output_json, print_invite,
@@ -198,14 +198,28 @@ pub enum WorkspaceAction {
     /// Stdio MCP tool server for orchestrators
     #[command(hide = true)]
     Mcp,
+    /// Retire the global workspace state registered for a folder (explicit
+    /// tombstone with grace, quarantine, and verified deletion).
+    #[command(hide = true)]
+    Retire {
+        path: Option<String>,
+        /// Grace in seconds before the tombstoned state is quarantined.
+        #[arg(long)]
+        grace: Option<u64>,
+        /// Process expired tombstones and quarantined state without retiring
+        /// a specific folder.
+        #[arg(long)]
+        sweep: bool,
+    },
     /// Tray companion commands (status, pause, recent workspaces).
     #[command(hide = true)]
     Tray {
         #[command(subcommand)]
         action: super::tray::TrayAction,
     },
+    /// Register FeanorFS MCP and collaboration skill with detected agent hosts (Codex, Claude, Gemini, OpenCode, Cursor)
+    Integrate(super::integrate::IntegrateCli),
 }
-
 pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> anyhow::Result<()> {
     match action {
         WorkspaceAction::Start {
@@ -222,26 +236,27 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
             foreground,
             accept_join,
         } => {
-            Box::pin(run_start(
-                current_dir,
-                StartOptions {
-                    target,
-                    folder,
-                    workspace,
-                    encryption_key,
-                    server_token,
-                    lan,
-                    local,
-                    host,
-                    relay,
-                    no_watch,
-                    foreground,
-                    accept_join,
-                    recovery_invite: None,
-                    pair_code: None,
-                },
-            ))
-            .await
+            let opts = StartOptions {
+                target,
+                folder,
+                workspace,
+                encryption_key,
+                server_token,
+                lan,
+                local,
+                host,
+                relay,
+                no_watch,
+                foreground,
+                accept_join,
+                recovery_invite: None,
+                pair_code: None,
+            };
+            if json {
+                Box::pin(run_start_json(current_dir, opts)).await
+            } else {
+                Box::pin(run_start(current_dir, opts)).await
+            }
         }
         WorkspaceAction::Setup {
             workspace,
@@ -393,10 +408,80 @@ pub async fn run(current_dir: &Path, action: WorkspaceAction, json: bool) -> any
             println!("The previous hub data was preserved as a rollback copy.");
             Ok(())
         }
+        WorkspaceAction::Retire { path, grace, sweep } => {
+            run_retire(path.as_deref(), grace, sweep, json)
+        }
         WorkspaceAction::Events => super::events::run_events(current_dir).await,
         WorkspaceAction::Mcp => super::mcp::run_mcp(current_dir).await,
         WorkspaceAction::Tray { action } => super::tray::run(current_dir, action, json).await,
+        WorkspaceAction::Integrate(cli) => super::integrate::run(current_dir, cli, json).await,
     }
+}
+
+#[derive(Debug, Serialize)]
+struct RetireResult {
+    tombstone: Option<feanorfs_agent_core::workspace_state_registry::TombstoneRecord>,
+    sweep: feanorfs_agent_core::workspace_state_registry::RetirementSweep,
+}
+
+fn run_retire(
+    path: Option<&str>,
+    grace: Option<u64>,
+    sweep: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    if path.is_none() && !sweep {
+        anyhow::bail!("a folder path or --sweep is required");
+    }
+    let tombstone = match path {
+        Some(path) => {
+            let grace_seconds = grace.unwrap_or(
+                feanorfs_agent_core::workspace_state_registry::DEFAULT_RETIRE_GRACE_SECS,
+            );
+            Some(
+                feanorfs_agent_core::workspace_state_registry::retire_workspace_state(
+                    Path::new(path),
+                    std::time::Duration::from_secs(grace_seconds),
+                )?,
+            )
+        }
+        None => None,
+    };
+    let sweep = feanorfs_agent_core::workspace_state_registry::sweep_retired_state()?;
+    let result = RetireResult { tombstone, sweep };
+    if json {
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
+    if let Some(tombstone) = &result.tombstone {
+        if tombstone.quarantined {
+            println!(
+                "Retired workspace state slot {} and quarantined it immediately.",
+                tombstone.slot
+            );
+        } else {
+            println!(
+                "Retired workspace state slot {} ({}s grace before quarantine).",
+                tombstone.slot, tombstone.grace_seconds
+            );
+        }
+    }
+    if result.sweep.quarantined.is_empty()
+        && result.sweep.deleted.is_empty()
+        && result.sweep.retained.is_empty()
+    {
+        return Ok(());
+    }
+    for slot in &result.sweep.quarantined {
+        println!("Quarantined expired retired state slot {slot}.");
+    }
+    for slot in &result.sweep.deleted {
+        println!("Deleted verified retired state slot {slot}.");
+    }
+    for slot in &result.sweep.retained {
+        println!("Retained state slot {slot} (held by live processes or unverified).");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -809,6 +894,7 @@ fn doctor_label(name: &str) -> &str {
         "local_state" => "Local sync state",
         "executable_version" => "Executable version",
         "update_available" => "Release awareness",
+        "live_reconciliation" => "Live agent reconciliation",
         _ => name,
     }
 }
@@ -1363,6 +1449,53 @@ async fn run_doctor(current_dir: &Path, json: bool) -> anyhow::Result<()> {
             format!("secure connection settings could not be opened ({error}); local files were not changed"),
             Some("Re-link with the original invite so TLS trust and credentials can be restored."),
         ),
+    }
+
+    // Fixed, secret-free live-reconciliation health: aggregate the bounded
+    // controller status files; never scan worktree contents.
+    match super::agent_live::live_reconciliation_health(current_dir) {
+        Ok(health) if health.agents_live > 0 => {
+            if health.agents_attention > 0 {
+                result.add(
+                    "live_reconciliation",
+                    DoctorCheckStatus::Warning,
+                    format!(
+                        "{} active agent(s) need attention; {} settled",
+                        health.agents_attention,
+                        health.agents_live.saturating_sub(health.agents_attention)
+                    ),
+                    Some("Run `feanorfs agent status <name>` and resolve conflicts explicitly with `feanorfs conflicts keep`."),
+                );
+            } else if health.agents_offline > 0 {
+                result.add(
+                    "live_reconciliation",
+                    DoctorCheckStatus::Warning,
+                    format!(
+                        "{} active agent(s) are retryably offline with local work preserved",
+                        health.agents_offline
+                    ),
+                    None,
+                );
+            } else {
+                result.add(
+                    "live_reconciliation",
+                    DoctorCheckStatus::Ok,
+                    format!(
+                        "{} active agent(s) are continuously reconciled",
+                        health.agents_live
+                    ),
+                    None,
+                );
+            }
+        }
+        _ => {
+            result.add(
+                "live_reconciliation",
+                DoctorCheckStatus::Info,
+                "no active agents are being continuously reconciled",
+                Some("Launch one with `feanorfs agent run <name> -- <command>` or enable its configured runner."),
+            );
+        }
     }
 
     match crate::open_client_db(current_dir).await {

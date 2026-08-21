@@ -137,11 +137,12 @@ pub(crate) async fn read_hub_dto(pool: &sqlx::SqlitePool) -> Result<MigrationHub
         for r in sqlx::query(q).fetch_all(pool).await? {
             let ws: String = r.get("workspace_id");
             let p: String = r.get("path");
+            let size = feanorfs_common::file_size_from_db(r.get::<i64, _>("size"))?;
             s.workspaces.entry(ws).or_default().files.insert(
                 p,
                 MigrationHubFile {
                     hash: r.get("hash"),
-                    size: feanorfs_common::file_size_from_db(r.get::<i64, _>("size")),
+                    size,
                     mtime: r.get("mtime"),
                     mode: r.get::<i32, _>("mode") as u32,
                     deleted: r.get::<i32, _>("deleted") != 0,

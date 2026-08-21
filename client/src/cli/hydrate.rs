@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 use clap::Subcommand;
 use feanorfs_client::ApiClient;
 use feanorfs_client::ClientDb;

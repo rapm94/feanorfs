@@ -1,11 +1,11 @@
-//! Regression: routine tray polling must be constant-cost.
-//!
-//! The managed worker publishes a bounded secret-free status snapshot after
-//! each sync; `do_tray_status` reads it without scanning the project or taking
-//! the sync lock. These tests prove polling cannot delay file-change
-//! synchronization even in a large workspace.
-
 feanorfs_test_support::isolate_test_process!();
+
+// Regression: routine tray polling must be constant-cost.
+//
+// The managed worker publishes a bounded secret-free status snapshot after
+// each sync; `do_tray_status` reads it without scanning the project or taking
+// the sync lock. These tests prove polling cannot delay file-change
+// synchronization even in a large workspace.
 
 mod support;
 
@@ -20,6 +20,12 @@ use support::{
 };
 
 const LARGE_WORKSPACE_FILES: usize = 1000;
+
+/// Decoy files parked in an unreadable sentinel directory.
+/// A refresh that scans the workspace with even one file per directory entry
+/// must touch them; a constant-cost refresh never does.
+const SENTINEL_DIR_FILES: usize = 2000;
+const SENTINEL_ROOT_FILES: usize = 100;
 
 fn make_v3(client: &support::TestClient) -> feanorfs_client::Config {
     let mut config = load_config(client.workspace.path()).unwrap();
@@ -278,4 +284,115 @@ async fn tray_overview_cli_emits_one_combined_document() {
             .iter()
             .any(|workspace| workspace.workspace_id == config.workspace_id)
     }));
+}
+
+/// Routine tray refresh must read a fixed-size/bounded set
+/// of status files (`worker-status.json`, supervisor snapshots/agent cache,
+/// the recent registry) independent of workspace size.
+///
+/// The fixture arms a permission sentinel: after the bounded status state is
+/// published, the project tree is stuffed with decoy files and then made
+/// unreadable. Any refresh that grows with workspace size — scanning the
+/// tree, reading conflict records from project state, counting files — must
+/// open the decoys and fails loudly (permission denied). A constant-cost
+/// refresh never touches them: it returns the exact baseline document, and
+/// the aggregate `tray overview` (routine status + one bounded recent-store
+/// read) works too.
+#[cfg(unix)]
+#[tokio::test]
+async fn tray_refresh_reads_only_bounded_status_state_regardless_of_workspace_size() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let config = make_v3(&client);
+    let root = client.workspace.path();
+
+    // Baseline: one synced file, a published worker snapshot, and a recent
+    // registry entry. The interval-gated maintenance stamp is already warm
+    // from fixture setup, so no one-time workspace walk can fire while the
+    // sentinel permissions are armed.
+    write_workspace_file(root, "seed.txt", b"seed").await;
+    do_push_only(
+        &server.api,
+        &client.db,
+        root,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    publish_worker_status(root, &MirrorState::Idle, &client.db)
+        .await
+        .unwrap();
+    register_workspace(root).unwrap();
+    let baseline = serde_json::to_value(do_tray_status(root).await.unwrap()).unwrap();
+
+    // Sentinel-dir fixture: a bucket of decoys plus root-level decoys. Any
+    // scan must traverse them; once the sentinel permissions are applied,
+    // every such open fails loudly instead of silently scaling.
+    let decoys = root.join("decoys");
+    std::fs::create_dir_all(&decoys).unwrap();
+    for i in 0..SENTINEL_DIR_FILES {
+        write_workspace_file(&decoys, &format!("f{i:05}.txt"), b"decoy").await;
+    }
+    for i in 0..SENTINEL_ROOT_FILES {
+        write_workspace_file(root, &format!("decoy-root-{i:03}.txt"), b"decoy").await;
+    }
+
+    // Restore permissions before the TempDir cleanup so the fixture can be
+    // removed; runs on unwind as well as success.
+    struct RestorePermissions(Vec<PathBuf>);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+    let restore = RestorePermissions(
+        std::iter::once(decoys.clone())
+            .chain((0..SENTINEL_ROOT_FILES).map(|i| root.join(format!("decoy-root-{i:03}.txt"))))
+            .collect(),
+    );
+
+    std::fs::set_permissions(&decoys, std::fs::Permissions::from_mode(0o000)).unwrap();
+    for i in 0..SENTINEL_ROOT_FILES {
+        std::fs::set_permissions(
+            root.join(format!("decoy-root-{i:03}.txt")),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+    }
+
+    // Routine refresh: succeeds with byte-identical output because it reads
+    // only the bounded status state, never the workspace tree. Growing the
+    // workspace (SENTINEL_DIR_FILES + SENTINEL_ROOT_FILES extra files) must
+    // change nothing.
+    let again = serde_json::to_value(do_tray_status(root).await.unwrap()).unwrap();
+    assert_eq!(again, baseline);
+
+    // The aggregate overview (routine status plus one bounded recent-store
+    // read) also succeeds with the project tree unreadable.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_feanorfs"))
+        .args(["--json", "tray", "overview"])
+        .current_dir(root)
+        .env(
+            "FEANORFS_HOME",
+            std::env::var_os("FEANORFS_HOME").expect("isolated test profile"),
+        )
+        .output()
+        .expect("run tray overview");
+    assert!(
+        output.status.success(),
+        "tray overview must not scan the workspace: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let overview: TrayOverviewResult =
+        serde_json::from_slice(&output.stdout).expect("parse one overview document");
+    assert_eq!(overview.status.workspace_id, config.workspace_id);
+    assert_eq!(overview.status.mirror_state, "idle");
+
+    drop(restore);
 }

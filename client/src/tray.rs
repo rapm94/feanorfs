@@ -64,6 +64,20 @@ pub async fn publish_worker_status(
     db: &ClientDb,
 ) -> anyhow::Result<()> {
     let records = db.list_conflict_records().await?;
+    let continuous = feanorfs_agent_core::live_reconciliation_health(current_dir)
+        .ok()
+        .map(|health| feanorfs_common::ContinuousHealth {
+            agents_live: health.agents_live,
+            agents_attention: health.agents_attention,
+            agents_offline: health.agents_offline,
+        });
+    // Constant-cost resolution counts/status projection (one bounded JSON
+    // read; no scan, no lock). The tray never resolves: mutation stays in
+    // the CLI (`feanorfs agent resolution prepare|submit|apply`).
+    let resolution = feanorfs_agent_core::ResolutionStore::open(current_dir)
+        .ok()
+        .and_then(|store| store.load().ok())
+        .map(resolution_health_projection);
     let snapshot = WorkerStatusSnapshot {
         mirror_state: mirror_state_str(*mirror_state),
         pending_conflict_count: conflict_count(records.len()),
@@ -79,6 +93,8 @@ pub async fn publish_worker_status(
             .collect(),
         published_at_ms: chrono::Utc::now().timestamp_millis(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        continuous,
+        resolution,
     };
     let Some(status_path) = worker_status_path(current_dir) else {
         return Ok(());
@@ -86,12 +102,62 @@ pub async fn publish_worker_status(
     let Some(state) = status_path.parent() else {
         return Ok(());
     };
-    feanorfs_agent_core::fs_util::atomic_write(
+    feanorfs_agent_core::fs_util::atomic_write_visible(
         state,
         WORKER_STATUS_FILE,
         serde_json::to_vec(&snapshot)?.as_slice(),
     )
     .await
+}
+
+/// Bounded counts/status projection of the resolution store for the tray.
+/// Metadata only (ids/state/counts); never paths, identities, or bodies.
+fn resolution_health_projection(
+    state: feanorfs_agent_core::ResolutionStateFile,
+) -> feanorfs_common::tray_contract::ResolutionHealth {
+    let mut health = feanorfs_common::tray_contract::ResolutionHealth {
+        active: 0,
+        submitted: 0,
+        completed: 0,
+        revoked: 0,
+        requires_human: 0,
+    };
+    for record in state.jobs {
+        use feanorfs_agent_core::ResolutionAssignmentState;
+        use feanorfs_common::ResolutionOutcome;
+        match record.assignment_state {
+            ResolutionAssignmentState::Completed => health.completed += 1,
+            ResolutionAssignmentState::Revoked | ResolutionAssignmentState::Superseded => {
+                health.revoked += 1;
+            }
+            ResolutionAssignmentState::Active => {
+                if record
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.outcome == ResolutionOutcome::RequiresHuman)
+                {
+                    health.requires_human += 1;
+                }
+                if record.result.is_some() {
+                    health.submitted += 1;
+                } else {
+                    health.active += 1;
+                }
+            }
+            // In-flight guarded publication: neither completed nor safely
+            // terminal; it stays visible as submitted work.
+            ResolutionAssignmentState::PublicationUncertain => {
+                health.submitted += 1;
+            }
+            // Terminal states where nothing was published and the conflict
+            // survives for manual action. They fit no automation bucket:
+            // the conflict registry (not this health) drives tray attention.
+            ResolutionAssignmentState::Stale
+            | ResolutionAssignmentState::Deferred
+            | ResolutionAssignmentState::KeepUnresolved => {}
+        }
+    }
+    health
 }
 
 /// Drops stale worker state after a local control action.
@@ -237,6 +303,16 @@ fn workspace_label(current_dir: &Path) -> String {
         .to_string()
 }
 
+/// Exact UTF-8 workspace identity for tray status/selection. Display labels
+/// may be lossy; this identity must never be, or distinct unencodable
+/// workspaces would collide.
+fn exact_workspace_path(current_dir: &Path) -> Result<String> {
+    current_dir
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("workspace path is not valid UTF-8"))
+}
+
 async fn load_agents_summary(
     current_dir: &Path,
     db: &ClientDb,
@@ -332,7 +408,7 @@ async fn cheap_tray_status(
         mirror_state: mirror_state_str(mirror),
         paused: is_paused(current_dir),
         watching: is_watching(current_dir),
-        workspace_path: current_dir.to_string_lossy().into_owned(),
+        workspace_path: exact_workspace_path(current_dir)?,
         workspace_id: config.workspace_id.clone(),
         workspace_label: workspace_label(current_dir),
         pending_conflict_count: conflict_count(records.len()),
@@ -357,19 +433,9 @@ pub async fn do_tray_status_with(current_dir: &Path, fresh: bool) -> Result<Tray
         let workspace_id = feanorfs_agent_core::load_workspace_id_from_state(&state)?;
         let syncing = is_syncing_at_state(&state);
         if let Some(snapshot) = load_worker_status_at_state(&state) {
-            return Ok(snapshot_tray_status(
-                current_dir,
-                &state,
-                &workspace_id,
-                &snapshot,
-                syncing,
-            ));
+            return snapshot_tray_status(current_dir, &state, &workspace_id, &snapshot, syncing);
         }
-        return Ok(missing_snapshot_tray_status(
-            current_dir,
-            &state,
-            &workspace_id,
-        ));
+        return missing_snapshot_tray_status(current_dir, &state, &workspace_id);
     }
 
     let config = load_config(current_dir)?;
@@ -402,7 +468,7 @@ pub async fn do_tray_status_with(current_dir: &Path, fresh: bool) -> Result<Tray
         mirror_state: mirror_state_str(status.mirror_state),
         paused,
         watching,
-        workspace_path: current_dir.to_string_lossy().into_owned(),
+        workspace_path: exact_workspace_path(current_dir)?,
         workspace_id: config.workspace_id,
         workspace_label: workspace_label(current_dir),
         pending_conflict_count,
@@ -418,13 +484,13 @@ fn snapshot_tray_status(
     workspace_id: &str,
     snapshot: &WorkerStatusSnapshot,
     syncing: bool,
-) -> TrayStatusResult {
+) -> Result<TrayStatusResult> {
     let agents = cached_agents_at_state(state).unwrap_or(TrayAgentsSummary {
         working: 0,
         need_attention: 0,
         entries: vec![],
     });
-    TrayStatusResult {
+    Ok(TrayStatusResult {
         mirror_state: if syncing {
             "syncing".into()
         } else {
@@ -432,25 +498,25 @@ fn snapshot_tray_status(
         },
         paused: is_paused_at_state(state),
         watching: is_watching_at_state(state),
-        workspace_path: current_dir.to_string_lossy().into_owned(),
+        workspace_path: exact_workspace_path(current_dir)?,
         workspace_id: workspace_id.to_string(),
         workspace_label: workspace_label(current_dir),
         pending_conflict_count: snapshot.pending_conflict_count,
         pending_conflicts: snapshot.pending_conflicts.clone(),
         agents,
-    }
+    })
 }
 
 fn missing_snapshot_tray_status(
     current_dir: &Path,
     state: &Path,
     workspace_id: &str,
-) -> TrayStatusResult {
-    TrayStatusResult {
+) -> Result<TrayStatusResult> {
+    Ok(TrayStatusResult {
         mirror_state: "syncing".into(),
         paused: is_paused_at_state(state),
         watching: is_watching_at_state(state),
-        workspace_path: current_dir.to_string_lossy().into_owned(),
+        workspace_path: exact_workspace_path(current_dir)?,
         workspace_id: workspace_id.to_string(),
         workspace_label: workspace_label(current_dir),
         pending_conflict_count: 0,
@@ -460,7 +526,7 @@ fn missing_snapshot_tray_status(
             need_attention: 0,
             entries: Vec::new(),
         }),
-    }
+    })
 }
 
 async fn conflict_entries(db: &ClientDb) -> Result<(u32, Vec<TrayConflictEntry>)> {
@@ -519,6 +585,64 @@ pub async fn build_conflict_show(
 mod tests {
     use super::*;
 
+    /// The tray's resolution health projection must count every assignment
+    /// state correctly at constant cost (one bounded load, metadata only).
+    #[test]
+    fn resolution_health_projection_counts_every_assignment_state() {
+        use feanorfs_agent_core::{
+            PersistedResolutionJob, ResolutionAssignmentState, ResolutionStateFile,
+        };
+        use feanorfs_common::resolution_contract::resolution_fixtures;
+
+        let base_job = resolution_fixtures::job();
+        let record = |state: ResolutionAssignmentState,
+                      result: Option<feanorfs_common::ResolutionResult>| {
+            PersistedResolutionJob {
+                schema_version: feanorfs_common::RESOLUTION_SCHEMA_VERSION,
+                job: base_job.clone(),
+                assignment_state: state,
+                created_at_ms: 1,
+                verified_at_ms: None,
+                result,
+                question_generation: 0,
+            }
+        };
+        let state = ResolutionStateFile {
+            jobs: vec![
+                record(ResolutionAssignmentState::Active, None),
+                record(
+                    ResolutionAssignmentState::Active,
+                    Some(resolution_fixtures::result()),
+                ),
+                record(
+                    ResolutionAssignmentState::Active,
+                    Some(resolution_fixtures::human_result()),
+                ),
+                record(ResolutionAssignmentState::PublicationUncertain, None),
+                record(ResolutionAssignmentState::Completed, None),
+                record(ResolutionAssignmentState::Revoked, None),
+                record(ResolutionAssignmentState::Superseded, None),
+                // Terminal states with the conflict preserved fit no automation
+                // bucket: they must not inflate active/submitted/completed.
+                record(ResolutionAssignmentState::Stale, None),
+                record(ResolutionAssignmentState::Deferred, None),
+                record(ResolutionAssignmentState::KeepUnresolved, None),
+            ],
+            ..ResolutionStateFile::default()
+        };
+        let health = resolution_health_projection(state);
+        assert_eq!(
+            health,
+            feanorfs_common::tray_contract::ResolutionHealth {
+                active: 1,
+                submitted: 3, // candidate + requires_human + publication-uncertain
+                completed: 1,
+                revoked: 2,
+                requires_human: 1,
+            }
+        );
+    }
+
     #[test]
     fn worker_status_roundtrips_and_invalidation() {
         let dir = tempfile::tempdir().unwrap();
@@ -538,6 +662,8 @@ mod tests {
             }],
             published_at_ms: 42,
             version: env!("CARGO_PKG_VERSION").into(),
+            continuous: None,
+            resolution: None,
         };
         let path = worker_status_path(root).expect("state dir must exist after publish");
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -581,6 +707,8 @@ mod tests {
             pending_conflicts: vec![conflict; MAX_TRAY_CONFLICT_ENTRIES + 1],
             published_at_ms: 42,
             version: env!("CARGO_PKG_VERSION").into(),
+            continuous: None,
+            resolution: None,
         };
         std::fs::write(&path, serde_json::to_vec(&oversized).unwrap()).unwrap();
         assert!(load_worker_status(root).is_none());
@@ -591,6 +719,8 @@ mod tests {
             pending_conflicts: Vec::new(),
             published_at_ms: 42,
             version: "0.0.0".into(),
+            continuous: None,
+            resolution: None,
         };
         std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
         assert!(load_worker_status(root).is_none());

@@ -234,8 +234,8 @@ async fn nested_mcp_agent_send_uses_the_shared_workspace_root() {
         String::from_utf8_lossy(&output.stderr)
     );
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let sent: AgentSendResult = serde_json::from_value(response["result"].clone()).unwrap();
-
+    let sent: AgentSendResult =
+        serde_json::from_value(response["result"]["structuredContent"].clone()).unwrap();
     let inbox = run_cli(
         &workspace,
         &state_root,
@@ -366,7 +366,10 @@ async fn nested_mcp_conflicts_keep_resolves_relative_and_absolute_sources() {
         response.get("error").is_none(),
         "nested conflicts_keep failed: {response}"
     );
-    assert_eq!(response["result"]["resolved"], "conflict.txt");
+    assert_eq!(
+        response["result"]["structuredContent"]["resolved"],
+        "conflict.txt"
+    );
     assert_eq!(
         std::fs::read(workspace.join("conflict.txt")).unwrap(),
         b"reconciled"
@@ -377,7 +380,7 @@ async fn nested_mcp_conflicts_keep_resolves_relative_and_absolute_sources() {
         "nested absolute conflicts_keep failed: {absolute_response}"
     );
     assert_eq!(
-        absolute_response["result"]["resolved"],
+        absolute_response["result"]["structuredContent"]["resolved"],
         "absolute-conflict.txt"
     );
     assert_eq!(

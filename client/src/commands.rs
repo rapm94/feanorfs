@@ -44,6 +44,23 @@ impl std::fmt::Display for MirrorState {
     }
 }
 
+/// True when an open failed because the path genuinely does not exist:
+/// the typed no-follow open error kind or a chained plain I/O NotFound.
+fn is_genuinely_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<feanorfs_agent_core::workspace_read::CandidateOpenError>()
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    feanorfs_agent_core::workspace_read::CandidateOpenError::NotFound(_)
+                )
+            })
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
 pub fn derive_mirror_state(
     response: Option<&SyncResponse>,
     pending_paths: Option<&HashSet<String>>,
@@ -277,12 +294,7 @@ async fn do_hydrate_with_ctx(
                 .is_none_or(|target| entry.path == target)
     }) {
         if let Err(error) = read_root.open_regular(&entry.path) {
-            let genuinely_missing = error.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
-            });
-            if !genuinely_missing {
+            if !is_genuinely_missing(&error) {
                 return Err(error);
             }
         }
@@ -381,13 +393,7 @@ async fn do_cat_with_ctx(ctx: &SyncCtx<'_>, target_path: &str) -> Result<CatResu
 
     let source = match read_root.open_regular(target_path) {
         Ok(source) => source,
-        Err(error)
-            if error.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| matches!(error.kind(), std::io::ErrorKind::NotFound))
-            }) =>
-        {
+        Err(error) if is_genuinely_missing(&error) => {
             return Ok(CatResult {
                 content: Vec::new(),
                 hydrated_first,

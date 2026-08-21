@@ -1,15 +1,18 @@
 pub mod agent;
+pub mod agent_live;
 pub mod agent_runner;
 pub mod conflicts;
 pub mod events;
 pub mod history;
 pub mod hub_service;
 pub mod hydrate;
+pub mod integrate;
 pub mod integrator;
 pub mod mcp;
 pub mod pair;
 mod process_tree;
 pub mod recovery;
+pub mod resolution;
 pub mod runner;
 pub mod serve;
 pub mod service;
@@ -19,6 +22,7 @@ pub mod sync;
 pub mod tray;
 pub mod update;
 pub mod util;
+pub mod work;
 pub mod workspace;
 
 pub use util::{setup_logging, LoggingMode};
@@ -30,10 +34,8 @@ pub use util::{setup_logging, LoggingMode};
 /// state, so temp directories alone do not isolate their teardown. Keep their
 /// lifecycle operations serialized while preserving production lock behavior.
 pub(crate) struct RunnerTestWorkspace {
-    // `Option` lets `Drop` remove the directory explicitly before releasing
-    // the process-wide fixture guard.
-    directory: Option<tempfile::TempDir>,
     _serial_guard: std::sync::MutexGuard<'static, ()>,
+    directory: tempfile::TempDir,
 }
 
 #[cfg(test)]
@@ -44,27 +46,13 @@ impl RunnerTestWorkspace {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self {
-            directory: Some(tempfile::tempdir().expect("create isolated runner test workspace")),
             _serial_guard: serial_guard,
+            directory: tempfile::tempdir().expect("create isolated runner test workspace"),
         }
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
-        self.directory
-            .as_ref()
-            .expect("runner test workspace is available until drop")
-            .path()
-    }
-}
-
-#[cfg(test)]
-impl Drop for RunnerTestWorkspace {
-    fn drop(&mut self) {
-        if let Some(directory) = self.directory.take() {
-            // Match TempDir's best-effort cleanup while retaining the fixture
-            // guard until the directory teardown has completed.
-            let _ = directory.close();
-        }
+        self.directory.path()
     }
 }
 

@@ -452,6 +452,10 @@ pub(crate) fn read_service_identity(marker: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Records the program paths of the installed service (executable-identity
+/// marker). Atomic visibility: temp + rename without a
+/// parent-directory sync; the marker is non-secret and its loss only triggers
+/// an identity re-check.
 pub(crate) fn record_service_identity(marker: &Path, programs: &[&Path]) -> anyhow::Result<()> {
     let identity = service_identity(programs)?;
     let mut file = atomic_write_file::AtomicWriteFile::open(marker)
@@ -526,7 +530,8 @@ pub(crate) fn windows_register_task(
         "$action=New-ScheduledTaskAction -Execute $program -Argument $arguments};",
         "$trigger=New-ScheduledTaskTrigger -AtLogOn -User $user;",
         "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries ",
-        "-DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero);",
+        "-DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) ",
+        "-RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1);",
         "$params=@{TaskPath=$taskPath;TaskName=$taskName;Action=$action;",
         "Trigger=$trigger;Settings=$settings;Force=$true};",
         "if($interactive){$params.Principal=New-ScheduledTaskPrincipal ",

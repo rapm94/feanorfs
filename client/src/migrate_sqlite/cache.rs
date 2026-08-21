@@ -214,12 +214,13 @@ async fn read_files(pool: &sqlx::SqlitePool) -> Result<BTreeMap<String, Migratio
     let mut m = BTreeMap::new();
     for r in rows {
         let p: String = r.get("path");
+        let size = feanorfs_common::file_size_from_db(r.get::<i64, _>("size"))?;
         m.insert(
             p,
             MigrationCacheEntry {
                 plaintext_hash: r.get("plaintext_hash"),
                 encrypted_hash: r.get("encrypted_hash"),
-                size: feanorfs_common::file_size_from_db(r.get::<i64, _>("size")),
+                size,
                 mtime: r.get("mtime"),
                 server_mtime: r.get("server_mtime"),
                 mode: u32::try_from(r.get::<i32, _>("mode")).unwrap_or(0),

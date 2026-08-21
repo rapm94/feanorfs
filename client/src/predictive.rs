@@ -1,6 +1,6 @@
 use crate::api::ApiClient;
 use crate::local::ClientDb;
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use feanorfs_common::{FileState, SyncResponse};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -69,6 +69,10 @@ pub async fn prefetch_related(
     }
     let work = async {
         let mut report = PrefetchReport::default();
+        ensure!(
+            feanorfs_agent_core::workspace_is_configured(base),
+            "predictive hydration requires a configured workspace"
+        );
         let ctx = feanorfs_agent_core::sync_pass::build_ctx_or_fallback(
             api,
             db,

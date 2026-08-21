@@ -403,7 +403,7 @@ async fn load_journal(base: &Path) -> Result<Option<MigrationJournal>> {
 async fn write_journal(base: &Path, journal: &MigrationJournal) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(journal)?;
     let state = feanorfs_agent_core::ensure_workspace_state(base)?;
-    crate::fs_util::atomic_write(&state, JOURNAL_PATH, &bytes).await
+    crate::fs_util::atomic_write_durable(&state, JOURNAL_PATH, &bytes).await
 }
 
 async fn remove_journal(base: &Path) -> Result<()> {

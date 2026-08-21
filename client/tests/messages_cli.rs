@@ -211,10 +211,12 @@ async fn cli_json_human_and_mcp_signal_adapters_roundtrip() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(responses.len(), 4);
-    assert!(responses[0]["result"]["message_id"].is_string());
+    assert!(responses[0]["result"]["structuredContent"]["message_id"].is_string());
     assert_eq!(responses[1]["error"]["code"], -32602);
     assert_eq!(responses[2]["error"]["code"], -32602);
-    let messages = responses[3]["result"]["messages"].as_array().unwrap();
+    let messages = responses[3]["result"]["structuredContent"]["messages"]
+        .as_array()
+        .unwrap();
     assert!(messages.iter().any(|message| {
         message["from"] == "mcp-agent"
             && message["kind"] == "status"

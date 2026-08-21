@@ -5,11 +5,14 @@ feanorfs_test_support::isolate_test_process!();
 mod support;
 
 use feanorfs_agent_core::{
-    RunnerAttention, RunnerExecutionMode, RunnerInvocation, RunnerPhase, RunnerStore,
+    RunnerAdmissionReject, RunnerAttention, RunnerExecutionMode, RunnerInvocation, RunnerPhase,
+    RunnerScopeMode, RunnerStore, RunnerWorkWaitKind,
 };
 use feanorfs_client::{do_push_only, load_config, save_config, spawn_agent, SyncCtx};
 use feanorfs_common::{AgentInboxQuery, AgentMessageInput, AgentMessageKind, AgentSendResult};
 use serde::{Deserialize, Serialize};
+#[cfg(debug_assertions)]
+use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
 #[cfg(unix)]
@@ -17,7 +20,9 @@ use std::os::unix::io::AsRawFd as _;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+#[cfg(debug_assertions)]
+use std::process::ExitStatus;
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 use support::{
     spawn_test_client_with_server, spawn_test_server, write_workspace_file, TestClient, TestServer,
@@ -189,6 +194,7 @@ fn spawn_worker(
     TestChild::new(command.spawn().unwrap())
 }
 
+#[cfg(debug_assertions)]
 fn spawn_foreground_worker(
     fixture: &RunnerFixture,
     helper_mode: &str,
@@ -339,6 +345,396 @@ async fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.output().await.unwrap()
 }
 
+// Accepted-work admission and scope-guard integration helpers
+
+/// Configures the runner with an explicit scope mode (admission/scope guard
+/// behavior under test).
+async fn setup_runner_scoped(scope_mode: feanorfs_agent_core::RunnerScopeMode) -> RunnerFixture {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let mut config = load_config(client.workspace.path()).unwrap();
+    config.format_version = 3;
+    save_config(client.workspace.path(), &config).unwrap();
+    write_workspace_file(client.workspace.path(), "seed.txt", b"seed").await;
+    do_push_only(
+        &server.api,
+        &client.db,
+        client.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    spawn_agent(
+        client.workspace.path(),
+        &client.db,
+        &server.api,
+        WORKSPACE_ID,
+        AGENT,
+        Some(TEST_PASSWORD),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let ctx =
+        SyncCtx::from_config(&server.api, &client.db, client.workspace.path(), &config).unwrap();
+    let head = ctx.api.get_head(ctx.workspace_id()).await.unwrap().unwrap();
+    let helper_program = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let fixed_args = vec![
+        "--ignored".to_string(),
+        "--exact".to_string(),
+        "runner_child_helper".to_string(),
+        "--nocapture".to_string(),
+        "--test-threads=1".to_string(),
+    ];
+    let fixture = RunnerFixture {
+        _server: server,
+        client,
+        config,
+        helper_program,
+        fixed_args,
+    };
+    RunnerStore::configure_scoped(
+        fixture.root(),
+        AGENT,
+        &fixture.helper_program,
+        fixture.fixed_args.clone(),
+        60,
+        &head,
+        scope_mode,
+    )
+    .unwrap()
+    .set_enabled(true)
+    .unwrap();
+    fixture
+}
+
+/// The configured agent's private worktree (the child's working directory).
+fn agent_worktree(fixture: &RunnerFixture) -> PathBuf {
+    feanorfs_agent_core::agent_dir(fixture.root(), AGENT).unwrap()
+}
+
+/// Runs `agent work propose` through the real CLI and returns the proposal
+/// signal message id (the intent message id the runner admission binds to).
+async fn work_propose(
+    fixture: &RunnerFixture,
+    task: &str,
+    sequence: u64,
+    paths: &[&str],
+    to: Option<&str>,
+) -> String {
+    work_propose_full(fixture, task, AGENT, sequence, None, paths, to).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn work_propose_full(
+    fixture: &RunnerFixture,
+    task: &str,
+    agent: &str,
+    sequence: u64,
+    causal_base: Option<&str>,
+    paths: &[&str],
+    to: Option<&str>,
+) -> String {
+    let mut args = vec![
+        "--json".to_string(),
+        "agent".to_string(),
+        "work".to_string(),
+        "propose".to_string(),
+        "--task".to_string(),
+        task.to_string(),
+        "--agent".to_string(),
+        agent.to_string(),
+        "--sequence".to_string(),
+        sequence.to_string(),
+        "--coordinator".to_string(),
+        "human".to_string(),
+    ];
+    if let Some(base) = causal_base {
+        args.push("--causal-base".to_string());
+        args.push(base.to_string());
+    }
+    for path in paths {
+        args.push("--path".to_string());
+        args.push(path.to_string());
+    }
+    if let Some(to) = to {
+        args.push("--to".to_string());
+        args.push(to.to_string());
+    }
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_cli(fixture.root(), &refs).await;
+    assert_cli_success(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["message_id"]
+        .as_str()
+        .expect("work propose json message_id")
+        .to_string()
+}
+
+/// Sends one coordinator `accept` decision for an exact proposal through the
+/// real CLI and returns the decision signal message id.
+async fn work_decide_accept(fixture: &RunnerFixture, proposal_message_id: &str) -> String {
+    let output = run_cli(
+        fixture.root(),
+        &[
+            "--json",
+            "agent",
+            "work",
+            "decide",
+            proposal_message_id,
+            "--kind",
+            "accept",
+        ],
+    )
+    .await;
+    assert_cli_success(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["message_id"]
+        .as_str()
+        .expect("work decide json message_id")
+        .to_string()
+}
+
+/// Proposes a work intent with one declared dependency through the real CLI.
+async fn work_propose_dependency(
+    fixture: &RunnerFixture,
+    task: &str,
+    sequence: u64,
+    paths: &[&str],
+    dependency: &str,
+) -> String {
+    let mut args = vec![
+        "--json".to_string(),
+        "agent".to_string(),
+        "work".to_string(),
+        "propose".to_string(),
+        "--task".to_string(),
+        task.to_string(),
+        "--agent".to_string(),
+        AGENT.to_string(),
+        "--sequence".to_string(),
+        sequence.to_string(),
+        "--coordinator".to_string(),
+        "human".to_string(),
+        "--dependency".to_string(),
+        dependency.to_string(),
+    ];
+    for path in paths {
+        args.push("--path".to_string());
+        args.push(path.to_string());
+    }
+    args.push("--to".to_string());
+    args.push(AGENT.to_string());
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_cli(fixture.root(), &refs).await;
+    assert_cli_success(&output);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["message_id"]
+        .as_str()
+        .expect("work propose json message_id")
+        .to_string()
+}
+
+/// Author-side scope amendment signed by the proposal author with the exact
+/// applied coordinator decision as approval. An amendment that expands the
+/// accepted scope beyond the intent's original declared scope is rejected by
+/// the reducer unless `approval_decision_id` is the applied decision's
+/// message id (new supersession/approval contract); the CLI `work amend`
+/// carries no approval reference, so the test sends the typed profile
+/// directly.
+async fn work_amend_scope(
+    fixture: &RunnerFixture,
+    task: &str,
+    intent: &str,
+    sequence: u64,
+    paths: &[&str],
+    approval_decision_id: &str,
+) {
+    let profile = feanorfs_common::work_contract::WorkProfile::WorkAmendment(
+        feanorfs_common::work_contract::WorkAmendmentProfile {
+            task_id: task.to_string(),
+            intent_message_id: intent.to_string(),
+            sequence,
+            paths: Some(paths.iter().map(|path| path.to_string()).collect()),
+            concerns: None,
+            dependencies: None,
+            approval_decision_id: Some(approval_decision_id.to_string()),
+            reason: None,
+        },
+    );
+    let body = feanorfs_common::work_contract::encode_work_profile(&profile).unwrap();
+    feanorfs_agent_core::send_message(
+        &fixture.ctx(),
+        AgentMessageInput {
+            to: "human".to_string(),
+            kind: AgentMessageKind::Request,
+            body,
+            about_snapshot: None,
+            reply_to: None,
+            // The amendment is an author transition: it must be signed by
+            // the proposal author (the configured runner agent).
+            from: Some(AGENT.to_string()),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Observes signals through the real reducer and returns the projection.
+async fn work_status(fixture: &RunnerFixture) -> feanorfs_common::WorkStatusResult {
+    feanorfs_agent_core::work::work_status(
+        &fixture.ctx(),
+        feanorfs_common::WorkStatusInput::default(),
+    )
+    .await
+    .unwrap()
+}
+
+/// Bytes of one path in the agent worktree (or `None` when absent).
+fn worktree_bytes(fixture: &RunnerFixture, rel: &str) -> Option<Vec<u8>> {
+    std::fs::read(agent_worktree(fixture).join(rel)).ok()
+}
+
+/// Recursive byte-for-byte snapshot of a directory tree (sorted relative
+/// paths with their exact bytes). Used to prove rejections preserve the
+/// agent worktree.
+fn snapshot_dir(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("read snapshot dir {}: {error}", dir.display()))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.as_ref().unwrap().file_name());
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let rel = path.strip_prefix(base).unwrap().to_path_buf();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                walk(&path, base, out);
+            } else {
+                out.push((rel, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if root.exists() {
+        walk(root, root, &mut out);
+    }
+    out
+}
+
+/// Spawns `feanorfs agent run` (the interactive continuous controller) with
+/// an immediately-exiting child command. The controller reconciles the
+/// pre-existing worktree changes under the latest accepted scope guard.
+fn spawn_interactive_run(fixture: &RunnerFixture) -> TestChild {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_feanorfs"));
+    command
+        .args([
+            "agent",
+            "run",
+            AGENT,
+            "--",
+            std::path::Path::new(env!("CARGO_BIN_EXE_feanorfs"))
+                .to_str()
+                .unwrap(),
+            "--version",
+        ])
+        .current_dir(fixture.root())
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+    TestChild::new(command.spawn().unwrap())
+}
+
+/// Bytes of one path in the shared workspace (or `None` when absent).
+fn workspace_bytes(fixture: &RunnerFixture, rel: &str) -> Option<Vec<u8>> {
+    std::fs::read(fixture.root().join(rel)).ok()
+}
+
+/// Messages in one recipient's inbox after a cursor (bodies only).
+async fn inbox_bodies_after(
+    fixture: &RunnerFixture,
+    recipient: &str,
+    cursor: &str,
+) -> Vec<feanorfs_common::AgentMessage> {
+    feanorfs_agent_core::inbox(
+        &fixture.ctx(),
+        feanorfs_common::AgentInboxQuery {
+            recipient: recipient.to_string(),
+            after: Some(cursor.to_string()),
+            limit: 1000,
+        },
+    )
+    .await
+    .unwrap()
+    .messages
+}
+
+/// Asserts the runner never launched a child: no record file was created and
+/// the runner is waiting with the typed kind/reason.
+async fn assert_no_launch_and_wait(
+    fixture: &RunnerFixture,
+    record_path: &Path,
+    expected_kind: feanorfs_agent_core::RunnerWorkWaitKind,
+    expected_reason: Option<feanorfs_agent_core::RunnerAdmissionReject>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        let status = fixture.store().status().unwrap();
+        if status.work_wait.is_some() || status.attention.is_some() {
+            break status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "runner never entered a typed wait: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        !record_path.exists(),
+        "an invalid admission must not launch a child"
+    );
+    let wait = status.work_wait.clone().expect("typed work wait");
+    let projection_dump = async {
+        let ctx = fixture.ctx();
+        feanorfs_agent_core::work::work_status(&ctx, feanorfs_common::WorkStatusInput::default())
+            .await
+            .map(|projection| {
+                format!(
+                    "tasks={:?} incomplete={}",
+                    projection
+                        .tasks
+                        .iter()
+                        .map(|task| (task.task_id.clone(), task.proposals.len()))
+                        .collect::<Vec<_>>(),
+                    projection.projection_incomplete
+                )
+            })
+            .unwrap_or_else(|error| format!("projection error: {error:#}"))
+    }
+    .await;
+    assert_eq!(
+        wait.kind, expected_kind,
+        "rejection kind mismatch; {projection_dump}; full status: {status:?}"
+    );
+    assert_eq!(
+        wait.reason, expected_reason,
+        "rejection reason mismatch; {projection_dump}; full status: {status:?}"
+    );
+    assert_eq!(
+        status.phase,
+        feanorfs_agent_core::RunnerPhase::Idle,
+        "a rejected admission must stay live, never enter attention"
+    );
+}
+
 /// Own a test-spawned process until it has been waited/reaped.  A panic in a
 /// test must not leave a runner worker (or its supervisor) running in the
 /// shared isolated profile, so Drop performs bounded TERM→KILL escalation.
@@ -355,6 +751,7 @@ impl TestChild {
         self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
+    #[cfg(debug_assertions)]
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.child
             .as_mut()
@@ -362,7 +759,7 @@ impl TestChild {
             .try_wait()
     }
 
-    #[cfg(unix)]
+    #[cfg(all(debug_assertions, unix))]
     fn signal(&mut self, signal: libc::c_int) {
         let Some(pid) = self.id() else {
             return;
@@ -379,12 +776,12 @@ impl TestChild {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(debug_assertions, unix))]
     fn terminate(&mut self) {
         self.signal(libc::SIGTERM);
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(debug_assertions, not(unix)))]
     fn terminate(&mut self) {
         let _ = self
             .child
@@ -393,12 +790,12 @@ impl TestChild {
             .start_kill();
     }
 
-    #[cfg(unix)]
+    #[cfg(all(debug_assertions, unix))]
     fn kill(&mut self) {
         self.signal(libc::SIGKILL);
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(debug_assertions, not(unix)))]
     fn kill(&mut self) {
         let _ = self
             .child
@@ -407,6 +804,7 @@ impl TestChild {
             .start_kill();
     }
 
+    #[cfg(debug_assertions)]
     async fn wait_for_exit(&mut self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -716,12 +1114,7 @@ impl ManualSupervisor {
                     && !stop_token.is_empty()
                     && ack["pid"].as_u64() == Some(u64::from(pid))
                     && ack["workspace"].as_str() == Some(canonical.as_str())
-                    // Acknowledgements are runner-scoped. An unrelated registry
-                    // mutation may advance the current generation after this
-                    // runner was reconciled, so equality would create a race.
-                    && ack["registry_generation"]
-                        .as_u64()
-                        .is_some_and(|value| value > 0)
+                    && ack["registry_generation"].as_u64() == Some(registry_generation)
                     && ack["generation"].as_u64().is_some_and(|value| value > 0)
                     && ack["stop_token"].as_str() == Some(stop_token)
                 {
@@ -888,8 +1281,8 @@ async fn visible_runner_cli_reconfigures_redacts_resets_and_preserves_agent_on_r
     let setup_json: serde_json::Value = serde_json::from_str(&setup_stdout).unwrap();
     assert_eq!(setup_json["action"], "setup");
     assert_eq!(setup_json["runner"]["agent"], AGENT);
-    assert_eq!(setup_json["runner"]["enabled"], false);
-    assert_eq!(setup_json["supervisor"]["registered"], false);
+    assert_eq!(setup_json["runner"]["enabled"], json!(false));
+    assert_eq!(setup_json["supervisor"]["registered"], json!(false));
 
     let store = RunnerStore::open_configured(client.workspace.path()).unwrap();
     let session = store
@@ -1011,7 +1404,7 @@ async fn visible_runner_stop_is_idempotent_on_an_empty_profile() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["action"], "stop");
     assert!(value["runner"].is_null());
-    assert_eq!(value["supervisor"]["registered"], false);
+    assert_eq!(value["supervisor"]["registered"], json!(false));
     assert_eq!(value["supervisor"]["state"], "not_installed");
 }
 
@@ -1038,8 +1431,8 @@ async fn visible_runner_setup_is_fresh_without_supervisor_authority() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["action"], "setup");
     assert_eq!(value["runner"]["agent"], AGENT);
-    assert_eq!(value["runner"]["enabled"], false);
-    assert_eq!(value["supervisor"]["registered"], false);
+    assert_eq!(value["runner"]["enabled"], json!(false));
+    assert_eq!(value["supervisor"]["registered"], json!(false));
 }
 
 #[cfg(debug_assertions)]
@@ -1069,8 +1462,8 @@ async fn visible_runner_stop_on_disabled_configured_runner_without_authority_suc
     assert_cli_success(&output);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["action"], "stop");
-    assert_eq!(value["runner"]["enabled"], false);
-    assert_eq!(value["supervisor"]["registered"], false);
+    assert_eq!(value["runner"]["enabled"], json!(false));
+    assert_eq!(value["supervisor"]["registered"], json!(false));
     assert_eq!(value["supervisor"]["state"], "not_installed");
 }
 
@@ -1099,8 +1492,8 @@ async fn visible_runner_repeated_setup_without_supervisor_authority_succeeds() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["action"], "setup");
     assert_eq!(value["runner"]["agent"], AGENT);
-    assert_eq!(value["runner"]["enabled"], false);
-    assert_eq!(value["supervisor"]["registered"], false);
+    assert_eq!(value["runner"]["enabled"], json!(false));
+    assert_eq!(value["supervisor"]["registered"], json!(false));
 }
 
 #[cfg(debug_assertions)]
@@ -1154,7 +1547,7 @@ async fn visible_runner_fresh_setup_waits_for_a_stale_registry_entry() {
     assert_cli_success(&output);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["action"], "setup");
-    assert_eq!(value["supervisor"]["registered"], false);
+    assert_eq!(value["supervisor"]["registered"], json!(false));
     let registry: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
     assert!(registry["runners"].as_array().unwrap().is_empty());
@@ -1202,33 +1595,6 @@ async fn visible_runner_stop_prevents_resurrection_across_manual_supervisor_rest
         first_request.message_id
     );
 
-    // Preserve the live-child snapshot so the restart always models the
-    // exact crash window under test: stop reconciliation has published its
-    // durable acknowledgement, but the matching empty status snapshot has
-    // not yet reached disk. Without this explicit stale snapshot, killing the
-    // first supervisor races its next status write and only sometimes covers
-    // the Windows Job-owned orphan handoff.
-    let status_path = feanorfs_agent_core::global_state_root()
-        .unwrap()
-        .join("supervisor-status.json");
-    let stale_running_status = std::fs::read(&status_path).unwrap();
-    let stale_status: serde_json::Value = serde_json::from_slice(&stale_running_status).unwrap();
-    let canonical = fixture
-        .root()
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    assert_eq!(
-        stale_status["runners"][&canonical]["state"].as_str(),
-        Some("running")
-    );
-    #[cfg(target_os = "windows")]
-    assert_eq!(
-        stale_status["runners"][&canonical]["job_owned"].as_bool(),
-        Some(true)
-    );
-
     assert_cli_success(
         &run_cli_with_manual_supervisor(fixture.root(), &["--json", "agent", "runner", "stop"])
             .await,
@@ -1236,7 +1602,6 @@ async fn visible_runner_stop_prevents_resurrection_across_manual_supervisor_rest
     assert!(!fixture.store().status().unwrap().enabled);
 
     supervisor.shutdown().await;
-    std::fs::write(&status_path, stale_running_status).unwrap();
     let mut restarted = ManualSupervisor::spawn(&fixture, "publish_result", &record_path).await;
     restarted.wait_until_ready().await;
     restarted
@@ -1292,7 +1657,7 @@ async fn invocation_contract_and_child_published_terminal_complete() {
     );
 
     let record = &records[0];
-    assert_eq!(record.invocation.schema_version, 1);
+    assert_eq!(record.invocation.schema_version, 2);
     assert_eq!(record.invocation.agent, AGENT);
     assert_eq!(record.invocation.message.message_id, request.message_id);
     assert_eq!(
@@ -1742,6 +2107,1285 @@ async fn exec_gate_owner_drop_prevents_target_execution() {
         .unwrap()
         .unwrap();
     assert!(!marker.exists());
+}
+
+// Admission truth table and scope-guard integration
+
+/// Sends `count` opaque filler signals through the real encrypted transport
+/// so the reducer/inbox bound can be exhausted deterministically.
+async fn send_filler_signals(fixture: &RunnerFixture, to: &str, count: usize) {
+    for index in 0..count {
+        feanorfs_agent_core::send_message(
+            &fixture.ctx(),
+            feanorfs_common::AgentMessageInput {
+                to: to.to_string(),
+                kind: feanorfs_common::AgentMessageKind::Status,
+                body: format!("filler-{index}"),
+                about_snapshot: None,
+                reply_to: None,
+                from: Some("human".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Materializes the agent worktree at the current head so a byte-for-byte
+/// snapshot taken before a rejected admission cannot differ merely because
+/// the runner's own refresh materialized remote files first.
+async fn materialize_agent(fixture: &RunnerFixture) {
+    feanorfs_agent_core::refresh_agent(
+        fixture.root(),
+        &fixture.client.db,
+        &fixture._server.api,
+        WORKSPACE_ID,
+        AGENT,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+}
+
+/// Full path to the durable reducer state file (manipulated directly only to
+/// simulate crash/eviction states the transport cannot produce).
+fn work_state_path(fixture: &RunnerFixture) -> PathBuf {
+    feanorfs_agent_core::ensure_workspace_state(fixture.root())
+        .unwrap()
+        .join("orchestrator")
+        .join("work-state.json")
+}
+
+/// Full path to the durable runner state file (read directly to inspect the
+/// persisted scope-change dedup record).
+fn runner_state_path(fixture: &RunnerFixture) -> PathBuf {
+    feanorfs_agent_core::agents_dir(fixture.root())
+        .unwrap()
+        .join(AGENT)
+        .join("state/runner/runner-state.json")
+}
+
+async fn scope_change_messages(
+    fixture: &RunnerFixture,
+    after: &str,
+) -> Vec<feanorfs_common::work_contract::ScopeChangeRequestProfile> {
+    inbox_bodies_after(fixture, "human", after)
+        .await
+        .into_iter()
+        .filter_map(|message| {
+            feanorfs_common::work_contract::parse_scope_change_request(&message.body)
+        })
+        .collect()
+}
+
+/// Waits until exactly `count` scope-change requests have been published to
+/// the coordinator's inbox (bounded).
+async fn wait_for_scope_change_count(
+    fixture: &RunnerFixture,
+    after: &str,
+    count: usize,
+) -> Vec<feanorfs_common::work_contract::ScopeChangeRequestProfile> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let requests = scope_change_messages(fixture, after).await;
+        if requests.len() >= count {
+            return requests;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {count} scope-change request(s); got {}",
+            requests.len()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn admission_request_without_intent_never_launches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    materialize_agent(&fixture).await;
+    let worktree_before = snapshot_dir(&agent_worktree(&fixture));
+    send_request(&fixture, AGENT, "plain body with no work intent").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    assert_no_launch_and_wait(
+        &fixture,
+        &record_path,
+        RunnerWorkWaitKind::WaitingAcceptance,
+        Some(RunnerAdmissionReject::RequestWithoutIntent),
+    )
+    .await;
+    assert_eq!(
+        snapshot_dir(&agent_worktree(&fixture)),
+        worktree_before,
+        "a rejected admission must preserve the agent worktree byte-for-byte"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn admission_proposed_not_accepted_never_launches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    materialize_agent(&fixture).await;
+    let worktree_before = snapshot_dir(&agent_worktree(&fixture));
+    // The proposal is sent to the agent but never decided: it stays proposed.
+    work_propose(&fixture, "task-proposed", 1, &["src/**"], Some(AGENT)).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    assert_no_launch_and_wait(
+        &fixture,
+        &record_path,
+        RunnerWorkWaitKind::WaitingAcceptance,
+        Some(RunnerAdmissionReject::ProposalNotAccepted),
+    )
+    .await;
+    assert_eq!(
+        snapshot_dir(&agent_worktree(&fixture)),
+        worktree_before,
+        "a rejected admission must preserve the agent worktree byte-for-byte"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn admission_wrong_agent_never_launches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    materialize_agent(&fixture).await;
+    let worktree_before = snapshot_dir(&agent_worktree(&fixture));
+    // The intent is authored by a different agent but addressed to the
+    // configured runner; admission must reject the author mismatch.
+    let intent = work_propose_full(
+        &fixture,
+        "task-wrong-agent",
+        "other-worker",
+        1,
+        None,
+        &["src/**"],
+        Some(AGENT),
+    )
+    .await;
+    work_decide_accept(&fixture, &intent).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    assert_no_launch_and_wait(
+        &fixture,
+        &record_path,
+        RunnerWorkWaitKind::WaitingAcceptance,
+        Some(RunnerAdmissionReject::WrongAgent),
+    )
+    .await;
+    assert_eq!(
+        snapshot_dir(&agent_worktree(&fixture)),
+        worktree_before,
+        "a rejected admission must preserve the agent worktree byte-for-byte"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn admission_unreachable_base_never_launches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    materialize_agent(&fixture).await;
+    let worktree_before = snapshot_dir(&agent_worktree(&fixture));
+    // A decoy proposal gives us an observed-but-unapplied decision signal to
+    // use as the causal base of the real request. Its scope stays outside the
+    // real request's scope so it cannot count as a blocking overlap.
+    let decoy = work_propose(
+        &fixture,
+        "task-decoy",
+        1,
+        &["decoy-dir/decoy.rs"],
+        Some("human"),
+    )
+    .await;
+    let decision = work_decide_accept(&fixture, &decoy).await;
+    let intent = work_propose_full(
+        &fixture,
+        "task-base",
+        AGENT,
+        1,
+        Some(&decision),
+        &["src/**"],
+        Some(AGENT),
+    )
+    .await;
+    work_decide_accept(&fixture, &intent).await;
+    work_status(&fixture).await;
+
+    // Simulate bounded-eviction crash state: the proposal itself survives
+    // but its causal base is lost from the authenticated applied ancestry
+    // (the only causal-reachability proof admission accepts). The observation
+    // cache must never satisfy the base.
+    let state_path = work_state_path(&fixture);
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    if let Some(seen) = state.get_mut("seen").and_then(|v| v.as_array_mut()) {
+        seen.retain(|id| id.as_str() != Some(decision.as_str()));
+    }
+    let applied = state["applied"].as_array_mut().unwrap();
+    applied.retain(|id| id.as_str() != Some(decision.as_str()));
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    assert_no_launch_and_wait(
+        &fixture,
+        &record_path,
+        RunnerWorkWaitKind::WaitingAcceptance,
+        Some(RunnerAdmissionReject::UnreachableBase),
+    )
+    .await;
+    assert_eq!(
+        snapshot_dir(&agent_worktree(&fixture)),
+        worktree_before,
+        "a rejected admission must preserve the agent worktree byte-for-byte"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn admission_unsettled_dependency_never_launches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    materialize_agent(&fixture).await;
+    let worktree_before = snapshot_dir(&agent_worktree(&fixture));
+    let intent =
+        work_propose_dependency(&fixture, "task-dependent", 1, &["src/**"], "dep-task").await;
+    work_decide_accept(&fixture, &intent).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    assert_no_launch_and_wait(
+        &fixture,
+        &record_path,
+        RunnerWorkWaitKind::DependencyBlocked,
+        Some(RunnerAdmissionReject::UnsettledDependency),
+    )
+    .await;
+    assert_eq!(
+        snapshot_dir(&agent_worktree(&fixture)),
+        worktree_before,
+        "a rejected admission must preserve the agent worktree byte-for-byte"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn admission_superseded_intent_never_launches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    materialize_agent(&fixture).await;
+    let worktree_before = snapshot_dir(&agent_worktree(&fixture));
+    // Two accepted intents for the same (task, agent); the newer supersedes
+    // the older, so the older request must never launch.
+    let first = work_propose(&fixture, "task-superseded", 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &first).await;
+    let second = work_propose(&fixture, "task-superseded", 2, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &second).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    assert_no_launch_and_wait(
+        &fixture,
+        &record_path,
+        RunnerWorkWaitKind::WaitingAcceptance,
+        Some(RunnerAdmissionReject::SupersededIntent),
+    )
+    .await;
+    assert_eq!(
+        snapshot_dir(&agent_worktree(&fixture)),
+        worktree_before,
+        "a rejected admission must preserve the agent worktree byte-for-byte"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn admission_projection_incomplete_never_launches() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    materialize_agent(&fixture).await;
+    let worktree_before = snapshot_dir(&agent_worktree(&fixture));
+    // Flood the signal stream past the reducer observation bound so the
+    // runner's own projection is incomplete and acceptance cannot be proven.
+    // The fillers target a different recipient so the runner's own inbox
+    // read still sees only the one real request.
+    send_filler_signals(&fixture, "other-agent", 1001).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let intent = work_propose(&fixture, "task-incomplete", 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &intent).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    assert_no_launch_and_wait(
+        &fixture,
+        &record_path,
+        RunnerWorkWaitKind::ProjectionIncomplete,
+        Some(RunnerAdmissionReject::ProjectionIncomplete),
+    )
+    .await;
+    assert_eq!(
+        snapshot_dir(&agent_worktree(&fixture)),
+        worktree_before,
+        "an incomplete projection must preserve the agent worktree byte-for-byte"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn admission_cursor_reset_never_launches_and_enters_attention() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    materialize_agent(&fixture).await;
+    let worktree_before = snapshot_dir(&agent_worktree(&fixture));
+    // More than the inbox bound of direct messages forces a cursor reset on
+    // the runner's own read: fail closed, never launch, never claim scope.
+    send_filler_signals(&fixture, AGENT, 1001).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = fixture.store().status().unwrap();
+        if status.attention.is_some() || status.work_wait.is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "runner never entered a typed state: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!record_path.exists());
+    let status = fixture.store().status().unwrap();
+    assert_eq!(status.attention, Some(RunnerAttention::CursorReset));
+    assert_eq!(
+        status.scope_mode,
+        RunnerScopeMode::Enforced,
+        "a cursor reset must never be mistaken for enforced coordination"
+    );
+    assert_eq!(
+        snapshot_dir(&agent_worktree(&fixture)),
+        worktree_before,
+        "a cursor reset must preserve the agent worktree byte-for-byte"
+    );
+    // The worker exits into attention without launching anything.
+    let output = child
+        .wait_with_output_bounded(Duration::from_secs(10))
+        .await
+        .expect("runner worker exits after cursor reset");
+    assert!(output.status.success());
+}
+
+#[tokio::test]
+async fn admission_accepted_amendment_launches_with_amended_scope() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    let intent = work_propose(&fixture, "task-amended", 1, &["src/**"], Some(AGENT)).await;
+    let decision = work_decide_accept(&fixture, &intent).await;
+    // The author expands the accepted scope beyond the original declaration,
+    // which the reducer approves only with the applied decision id; the
+    // launch must bind the post-amendment scope, not the original.
+    work_amend_scope(
+        &fixture,
+        "task-amended",
+        &intent,
+        2,
+        &["out.txt", "src/**"],
+        &decision,
+    )
+    .await;
+    let projection = work_status(&fixture).await;
+    let proposal = projection
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-amended")
+        .unwrap()
+        .proposals
+        .iter()
+        .find(|proposal| proposal.intent_message_id == intent)
+        .unwrap();
+    assert_eq!(
+        proposal.accepted_scope.paths,
+        ["out.txt", "src/**"],
+        "the amendment must replace the accepted scope"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "publish_result", &record_path, None);
+    let records = wait_for_records(&record_path, 1).await;
+    wait_for_idle(&fixture.store()).await;
+    stop_worker(&fixture, child).await;
+    assert_eq!(records[0].invocation.message.message_id, intent);
+    let accepted = records[0].invocation.accepted_work.as_ref().unwrap();
+    assert_eq!(accepted.task_id, "task-amended");
+    assert_eq!(accepted.scope.paths, ["out.txt", "src/**"]);
+}
+
+#[tokio::test]
+async fn legacy_unenforced_runner_launches_without_scope_claim() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner().await;
+    send_request(&fixture, AGENT, "legacy plain request").await;
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "publish_result", &record_path, None);
+    let records = wait_for_records(&record_path, 1).await;
+    wait_for_idle(&fixture.store()).await;
+    stop_worker(&fixture, child).await;
+    let status = fixture.store().status().unwrap();
+    assert_eq!(status.scope_mode, RunnerScopeMode::LegacyUnenforced);
+    assert!(
+        records[0].invocation.accepted_work.is_none(),
+        "a legacy runner must never claim accepted work it did not verify"
+    );
+    assert_eq!(records[0].invocation.message.body, "legacy plain request");
+}
+
+#[tokio::test]
+async fn advisory_runner_launches_without_scope_claim() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Advisory).await;
+    send_request(&fixture, AGENT, "advisory plain request").await;
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "publish_result", &record_path, None);
+    let records = wait_for_records(&record_path, 1).await;
+    wait_for_idle(&fixture.store()).await;
+    stop_worker(&fixture, child).await;
+    let status = fixture.store().status().unwrap();
+    assert_eq!(status.scope_mode, RunnerScopeMode::Advisory);
+    assert!(
+        records[0].invocation.accepted_work.is_none(),
+        "an advisory runner must never claim enforced accepted work"
+    );
+}
+
+#[tokio::test]
+async fn scope_guard_defers_out_of_scope_work_and_publishes_one_request() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    let task = "scope-task";
+    let intent = work_propose(&fixture, task, 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &intent).await;
+    let projection = work_status(&fixture).await;
+    assert!(!projection.projection_incomplete);
+    let proposal = projection
+        .tasks
+        .iter()
+        .find(|t| t.task_id == task)
+        .unwrap()
+        .proposals
+        .iter()
+        .find(|p| p.intent_message_id == intent)
+        .unwrap();
+    assert_eq!(proposal.state, feanorfs_common::WorkTaskState::Accepted);
+
+    // In-scope + out-of-scope edits in the agent worktree.
+    std::fs::create_dir_all(agent_worktree(&fixture).join("src")).unwrap();
+    std::fs::write(agent_worktree(&fixture).join("src/in.txt"), b"in-scope").unwrap();
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"out-of-scope").unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "publish_result", &record_path, None);
+    let records = wait_for_records(&record_path, 1).await;
+    assert_eq!(records[0].invocation.message.message_id, intent);
+    assert_eq!(
+        records[0]
+            .invocation
+            .accepted_work
+            .as_ref()
+            .map(|d| d.task_id.as_str()),
+        Some(task),
+        "an enforced launch must bind the accepted-work descriptor"
+    );
+
+    // The out-of-scope edit must publish exactly one scope-change request
+    // (bounded, deduplicated) and defer the whole land: nothing may reach
+    // the shared workspace until the scope covers the new path.
+    let requests = wait_for_scope_change_count(&fixture, &intent, 1).await;
+    assert_eq!(requests[0].task_id, task);
+    assert_eq!(requests[0].intent_message_id, intent);
+    assert!(
+        requests[0].paths.iter().any(|path| path == "out.txt"),
+        "the scope request must name the out-of-scope path: {:?}",
+        requests[0].paths
+    );
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(
+        scope_change_messages(&fixture, &intent).await.len(),
+        1,
+        "the scope-change request must be published exactly once"
+    );
+    assert_eq!(
+        workspace_bytes(&fixture, "out.txt"),
+        None,
+        "out-of-scope bytes must never land in the shared workspace"
+    );
+    assert_eq!(
+        workspace_bytes(&fixture, "src/in.txt"),
+        None,
+        "a deferred generation must not publish even its in-scope subset"
+    );
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"out-of-scope"[..]),
+        "out-of-scope bytes must remain in the agent worktree byte-for-byte"
+    );
+    assert_eq!(
+        worktree_bytes(&fixture, "src/in.txt").as_deref(),
+        Some(&b"in-scope"[..]),
+        "in-scope bytes must remain untouched while the generation is deferred"
+    );
+    // The dedup record is durable in runner state (fingerprint keyed).
+    let runner_state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(runner_state_path(&fixture)).unwrap()).unwrap();
+    let record = &runner_state["runtime"]["scope_change_request"];
+    assert_eq!(record["task_id"], task);
+    assert_eq!(record["intent_message_id"], intent);
+    assert!(!record["paths_fingerprint"].as_str().unwrap().is_empty());
+    assert_eq!(
+        fixture.store().status().unwrap().scope_mode,
+        RunnerScopeMode::Enforced
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn scope_guard_amendment_lands_deferred_paths_in_next_cycle() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    // Interactive continuous controller: the same scope guard runs, and it
+    // re-evaluates the reducer projection every cycle, so an accepted
+    // amendment brings the deferred path in scope and the next cycle lands
+    // the full generation.
+    let fixture = setup_runner_workspace().await;
+    let task = "interactive-scope";
+    let intent = work_propose(&fixture, task, 1, &["src/**"], None).await;
+    let decision = work_decide_accept(&fixture, &intent).await;
+    work_status(&fixture).await;
+    std::fs::create_dir_all(agent_worktree(&fixture).join("src")).unwrap();
+    std::fs::write(agent_worktree(&fixture).join("src/in.txt"), b"in-scope").unwrap();
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"out-of-scope").unwrap();
+
+    let child = spawn_interactive_run(&fixture);
+    // The controller reconciles the pre-existing edits under the accepted
+    // scope guard; it defers the mixed generation and asks once.
+    let requests = wait_for_scope_change_count(&fixture, &intent, 1).await;
+    assert_eq!(requests[0].task_id, task);
+    assert!(requests[0].paths.iter().any(|path| path == "out.txt"));
+    assert_eq!(workspace_bytes(&fixture, "out.txt"), None);
+    assert_eq!(workspace_bytes(&fixture, "src/in.txt"), None);
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"out-of-scope"[..]),
+        "out-of-scope bytes must remain local until the amendment"
+    );
+
+    // The coordinator accepts an amendment covering the new path; the next
+    // controller cycle must land the whole generation (everything is now in
+    // scope) and exit settled.
+    work_amend_scope(
+        &fixture,
+        task,
+        &intent,
+        2,
+        &["out.txt", "src/**"],
+        &decision,
+    )
+    .await;
+    let output = child
+        .wait_with_output_bounded(Duration::from_secs(60))
+        .await
+        .expect("interactive agent run exits after the amended scope lands");
+    assert!(
+        output.status.success(),
+        "agent run stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        workspace_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"out-of-scope"[..]),
+        "the amended scope must land the previously deferred path"
+    );
+    assert_eq!(
+        workspace_bytes(&fixture, "src/in.txt").as_deref(),
+        Some(&b"in-scope"[..]),
+        "the amended scope must land the originally in-scope path"
+    );
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"out-of-scope"[..]),
+        "the landed path must remain intact in the agent worktree"
+    );
+    assert_eq!(
+        scope_change_messages(&fixture, &intent).await.len(),
+        1,
+        "the amendment must not republish the scope-change request"
+    );
+}
+
+#[tokio::test]
+async fn offline_runner_fails_closed_without_asking_human_or_relinquishing_scope() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    // Point the workspace at an unreachable hub before the worker starts:
+    // preparation cannot complete, so the worker must fail closed without
+    // launching, without asking a human, and without relinquishing scope.
+    let mut offline = fixture.config.clone();
+    offline.server_url = "http://127.0.0.1:1".to_string();
+    save_config(fixture.root(), &offline).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "no_terminal", &record_path, None);
+    let output = child
+        .wait_with_output_bounded(Duration::from_secs(12))
+        .await
+        .expect("offline runner worker exits fail-closed");
+    assert!(!output.status.success());
+    assert!(
+        !record_path.exists(),
+        "an unreachable hub must never launch the configured child"
+    );
+    let status = fixture.store().status().unwrap();
+    assert_eq!(status.scope_mode, RunnerScopeMode::Enforced);
+    assert!(status.enabled);
+    assert_eq!(status.attention, None);
+    assert_eq!(status.work_wait, None);
+    assert_eq!(status.pending_count, 0);
+    assert_eq!(status.active_message_id, None);
+    // Nobody was asked and no scope was given up: the human inbox is empty.
+    let cursor = fixture.store().committed_cursor().unwrap();
+    assert!(inbox_bodies_after(&fixture, "human", &cursor)
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn superseded_intent_during_execution_publishes_nothing_stale() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    let task = "race-supersede";
+    let first = work_propose(&fixture, task, 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &first).await;
+    work_status(&fixture).await;
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"stale-guard").unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "publish_result", &record_path, None);
+    wait_for_records(&record_path, 1).await;
+    wait_for_scope_change_count(&fixture, &first, 1).await;
+
+    // The intent is superseded while the original request is still pinned;
+    // the out-of-scope byte must never publish. The superseded generation
+    // must never launch a second child, while the newly ACCEPTED generation
+    // is current work and may launch exactly once.
+    let second = work_propose(&fixture, task, 2, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &second).await;
+    let records = wait_for_records(&record_path, 2).await;
+    let request_ids: Vec<String> = records
+        .iter()
+        .map(|record: &InvocationRecord| record.invocation.message.message_id.clone())
+        .collect();
+    assert_eq!(
+        request_ids.iter().filter(|id| *id == &first).count(),
+        1,
+        "the superseded request must never relaunch"
+    );
+    assert_eq!(
+        request_ids.iter().filter(|id| *id == &second).count(),
+        1,
+        "the newly accepted generation launches exactly once"
+    );
+    assert_eq!(request_ids.len(), 2, "no other child may run for this task");
+    assert_eq!(scope_change_messages(&fixture, &first).await.len(), 1);
+    assert_eq!(workspace_bytes(&fixture, "out.txt"), None);
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"stale-guard"[..]),
+        "supersession must not publish the out-of-scope byte"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+// CAS-retry scope filtering, tuple dedup, persist-before-publish, and
+// runner-owned land revalidation.
+
+/// Direct guarded scoped land helper: proves the land engine re-applies the
+/// accepted scope on its CAS-retry recomputes, so no retry path can publish
+/// an unfiltered diff.
+async fn guarded_scoped_land(
+    fixture: &RunnerFixture,
+    scope: &feanorfs_common::work_contract::WorkScope,
+) -> feanorfs_common::AgentLandResult {
+    let store = fixture.store();
+    let session = store
+        .execution_session(fixture.root(), RunnerExecutionMode::Supervised)
+        .unwrap();
+    let landed = feanorfs_agent_core::land_agent_guarded_scoped(
+        fixture.root(),
+        &fixture.client.db,
+        &fixture._server.api,
+        WORKSPACE_ID,
+        AGENT,
+        Some(TEST_PASSWORD),
+        &session,
+        Some(scope),
+    )
+    .await
+    .expect("guarded scoped land succeeds");
+    drop(session);
+    landed
+}
+
+/// Polls the controller's continuous status until it enters the expected
+/// typed attention reason (fail-closed land refusals are observable there).
+async fn wait_for_continuous_attention(
+    fixture: &RunnerFixture,
+    expected_reason: &str,
+) -> feanorfs_common::ContinuousAgentStatus {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = feanorfs_agent_core::read_continuous_status(fixture.root(), AGENT)
+            .unwrap()
+            .expect("continuous status exists");
+        if status
+            .attention
+            .as_ref()
+            .is_some_and(|attention| attention.reason == expected_reason)
+        {
+            return status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "controller never entered attention {expected_reason:?}: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn scoped_land_reapplies_scope_filter_after_cas_conflict_retry() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    let task = "cas-scope";
+    let intent = work_propose(&fixture, task, 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &intent).await;
+    work_status(&fixture).await;
+    let scope = feanorfs_common::WorkScope {
+        paths: vec!["src/**".to_string()],
+        concerns: vec!["task behavior".to_string()],
+        dependencies: vec![],
+    };
+    std::fs::create_dir_all(agent_worktree(&fixture).join("src")).unwrap();
+    std::fs::write(agent_worktree(&fixture).join("src/in.txt"), b"in-scope").unwrap();
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"out-of-scope").unwrap();
+
+    // Arm the one-shot CAS-conflict injection: the first swap_head attempt
+    // inside publish_land conflicts, forcing the retry loop to recompute the
+    // diff. The recomputed diff must be re-filtered so the out-of-scope byte
+    // never reaches the shared workspace.
+    let state = feanorfs_agent_core::ensure_workspace_state(fixture.root()).unwrap();
+    tokio::fs::write(
+        state.join(format!("test-land-failpoint-{AGENT}-cas-conflict")),
+        b"once",
+    )
+    .await
+    .unwrap();
+
+    let landed = guarded_scoped_land(&fixture, &scope).await;
+    assert!(landed.conflicts.is_empty());
+    assert_eq!(
+        workspace_bytes(&fixture, "src/in.txt").as_deref(),
+        Some(&b"in-scope"[..]),
+        "the in-scope change must land after the CAS-conflict retry"
+    );
+    assert_eq!(
+        workspace_bytes(&fixture, "out.txt"),
+        None,
+        "the out-of-scope change must never land, even across the injected retry"
+    );
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"out-of-scope"[..]),
+        "the out-of-scope byte must remain in the agent worktree"
+    );
+}
+
+#[tokio::test]
+async fn scoped_land_keeps_mixed_in_and_out_of_scope_operations_partitioned() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    // Seed the base files for the modify/delete/mode-change cases, then
+    // materialize them into the agent worktree.
+    for (rel, bytes) in [
+        ("src/mod.txt", b"base-mod".as_slice()),
+        ("src/del.txt", b"base-del".as_slice()),
+        ("src/mode.txt", b"base-mode".as_slice()),
+        ("out_mod.txt", b"base-out-mod".as_slice()),
+        ("out_del.txt", b"base-out-del".as_slice()),
+        ("out_mode.txt", b"base-out-mode".as_slice()),
+    ] {
+        write_workspace_file(fixture.root(), rel, bytes).await;
+    }
+    do_push_only(
+        &fixture._server.api,
+        &fixture.client.db,
+        fixture.root(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    materialize_agent(&fixture).await;
+
+    let task = "mixed-ops";
+    let intent = work_propose(&fixture, task, 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &intent).await;
+    work_status(&fixture).await;
+    let scope = feanorfs_common::WorkScope {
+        paths: vec!["src/**".to_string()],
+        concerns: vec!["task behavior".to_string()],
+        dependencies: vec![],
+    };
+    let worktree = agent_worktree(&fixture);
+    // In-scope operations: add, modify, delete, mode change.
+    std::fs::write(worktree.join("src/add.txt"), b"added").unwrap();
+    std::fs::write(worktree.join("src/mod.txt"), b"modified").unwrap();
+    std::fs::remove_file(worktree.join("src/del.txt")).unwrap();
+    // Out-of-scope operations: the same four kinds, never to be published.
+    std::fs::write(worktree.join("out_add.txt"), b"out-added").unwrap();
+    std::fs::write(worktree.join("out_mod.txt"), b"out-modified").unwrap();
+    std::fs::remove_file(worktree.join("out_del.txt")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            worktree.join("src/mode.txt"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            worktree.join("out_mode.txt"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    let landed = guarded_scoped_land(&fixture, &scope).await;
+    assert!(landed.conflicts.is_empty());
+    // In-scope: add, modify, delete, mode change all land.
+    assert_eq!(
+        workspace_bytes(&fixture, "src/add.txt").as_deref(),
+        Some(&b"added"[..])
+    );
+    assert_eq!(
+        workspace_bytes(&fixture, "src/mod.txt").as_deref(),
+        Some(&b"modified"[..])
+    );
+    assert_eq!(workspace_bytes(&fixture, "src/del.txt"), None);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(fixture.root().join("src/mode.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "the in-scope mode change must land");
+    }
+    // Out-of-scope: nothing may reach the shared workspace.
+    assert_eq!(workspace_bytes(&fixture, "out_add.txt"), None);
+    assert_eq!(
+        workspace_bytes(&fixture, "out_mod.txt").as_deref(),
+        Some(&b"base-out-mod"[..]),
+        "the out-of-scope modify must never land"
+    );
+    assert_eq!(
+        workspace_bytes(&fixture, "out_del.txt").as_deref(),
+        Some(&b"base-out-del"[..]),
+        "the out-of-scope delete must never land"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(fixture.root().join("out_mode.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "the out-of-scope mode change must never land"
+        );
+    }
+    // The out-of-scope worktree bytes stay untouched byte-for-byte.
+    assert_eq!(
+        worktree_bytes(&fixture, "out_add.txt").as_deref(),
+        Some(&b"out-added"[..])
+    );
+    assert_eq!(
+        worktree_bytes(&fixture, "out_mod.txt").as_deref(),
+        Some(&b"out-modified"[..])
+    );
+    assert_eq!(worktree_bytes(&fixture, "out_del.txt"), None);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(worktree.join("out_mode.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "the out-of-scope mode change stays local");
+    }
+}
+
+/// Spawns `feanorfs agent run` with a long-lived child so the interactive
+/// controller stays live across coordinator transitions.
+#[cfg(unix)]
+fn spawn_interactive_sleep(fixture: &RunnerFixture) -> TestChild {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_feanorfs"));
+    command
+        .args(["agent", "run", AGENT, "--", "sh", "-c", "sleep 30"])
+        .current_dir(fixture.root())
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+    TestChild::new(command.spawn().unwrap())
+}
+
+/// Interactive controller: the latest accepted intent re-guards every cycle,
+/// so a second accepted generation with the same out-of-scope path set
+/// publishes its own request (the dedup tuple includes the intent, never the
+/// fingerprint alone).
+#[cfg(unix)]
+#[tokio::test]
+async fn same_out_of_scope_path_set_under_different_intents_is_not_deduped() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_workspace().await;
+    let task = "dup-intent";
+    let first = work_propose(&fixture, task, 1, &["src/**"], None).await;
+    work_decide_accept(&fixture, &first).await;
+    work_status(&fixture).await;
+    std::fs::create_dir_all(agent_worktree(&fixture).join("src")).unwrap();
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"out").unwrap();
+
+    let child = spawn_interactive_sleep(&fixture);
+    let first_requests = wait_for_scope_change_count(&fixture, &first, 1).await;
+    assert_eq!(first_requests[0].intent_message_id, first);
+    assert_eq!(
+        first_requests[0].operations,
+        vec![feanorfs_common::work_contract::ScopeChangeOperation::Add]
+    );
+
+    // A second accepted generation for the same task and the same path set:
+    // the dedup tuple differs by intent, so a new request is published.
+    let second = work_propose(&fixture, task, 2, &["src/**"], None).await;
+    work_decide_accept(&fixture, &second).await;
+    let second_requests = wait_for_scope_change_count(&fixture, &second, 1).await;
+    assert_eq!(second_requests[0].intent_message_id, second);
+    assert_eq!(
+        second_requests[0].operations,
+        vec![feanorfs_common::work_contract::ScopeChangeOperation::Add]
+    );
+    // The first request was never republished; both generations stay
+    // deferred with the out-of-scope byte local. `scope_change_messages`
+    // counts everything after the cursor, so filter by exact intent id.
+    let first_messages = scope_change_messages(&fixture, &first).await;
+    let second_messages = scope_change_messages(&fixture, &second).await;
+    assert_eq!(
+        first_messages
+            .iter()
+            .filter(|profile| profile.intent_message_id == first)
+            .count(),
+        1
+    );
+    assert_eq!(
+        second_messages
+            .iter()
+            .filter(|profile| profile.intent_message_id == second)
+            .count(),
+        1
+    );
+    assert_eq!(workspace_bytes(&fixture, "out.txt"), None);
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"out"[..])
+    );
+    drop(child);
+}
+
+#[tokio::test]
+async fn same_path_set_with_different_operations_is_not_deduped() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    // Seed out.txt into the base so the same path can be a Modify first and
+    // a Delete second (same task, same intent, different operations).
+    write_workspace_file(fixture.root(), "out.txt", b"base-out").await;
+    do_push_only(
+        &fixture._server.api,
+        &fixture.client.db,
+        fixture.root(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    materialize_agent(&fixture).await;
+    let task = "dup-ops";
+    let intent = work_propose(&fixture, task, 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &intent).await;
+    work_status(&fixture).await;
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"out-modified").unwrap();
+
+    // The hang child keeps the pinned generation active while the blocked
+    // operation set changes under the same (task, intent) tuple.
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "hang", &record_path, None);
+    wait_for_records(&record_path, 1).await;
+    let first_requests = wait_for_scope_change_count(&fixture, &intent, 1).await;
+    assert_eq!(
+        first_requests[0].operations,
+        vec![feanorfs_common::work_contract::ScopeChangeOperation::Modify],
+        "the blocked diff must derive the Modify operation"
+    );
+
+    // Delete the same out-of-scope path: the operation set changes, so the
+    // fingerprint changes and a second request is published under the same
+    // (task, intent).
+    std::fs::remove_file(agent_worktree(&fixture).join("out.txt")).unwrap();
+    // The inbox returns newest-first; find the request by operation, never
+    // by arrival index.
+    let second_requests = wait_for_scope_change_count(&fixture, &intent, 2).await;
+    let delete_request = second_requests
+        .iter()
+        .find(|request| {
+            request.operations == vec![feanorfs_common::work_contract::ScopeChangeOperation::Delete]
+        })
+        .expect("the blocked diff must derive the Delete operation after the same path is removed");
+    assert_eq!(delete_request.intent_message_id, intent);
+    assert!(delete_request.paths.iter().any(|path| path == "out.txt"));
+    assert_eq!(
+        scope_change_messages(&fixture, &intent).await.len(),
+        2,
+        "different operations under the same tuple must not be deduped"
+    );
+    // The seeded base byte must survive: neither the modified nor the
+    // deleted local state may publish.
+    assert_eq!(
+        workspace_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"base-out"[..])
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn publish_pending_scope_change_record_never_republishes_and_enters_attention() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    let task = "pending-record";
+    let intent = work_propose(&fixture, task, 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &intent).await;
+    work_status(&fixture).await;
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"pending").unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "hang", &record_path, None);
+    wait_for_records(&record_path, 1).await;
+    wait_for_scope_change_count(&fixture, &intent, 1).await;
+
+    // Simulate a crash between persist and publish: rewrite the durable
+    // runner record as publish-pending (no message id). A restart must never
+    // republish: the next land attempt marks it awaiting confirmation and
+    // refuses with typed attention.
+    let state_path = runner_state_path(&fixture);
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    let record = &mut state["runtime"]["scope_change_request"];
+    record["message_id"] = serde_json::Value::Null;
+    record["publish_state"] = serde_json::Value::String("publish_pending".to_string());
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    // Wake a controller cycle with an in-scope change: the land must be
+    // refused (typed attention), never publishing a second request.
+    let wake_dir = agent_worktree(&fixture).join("src");
+    std::fs::create_dir_all(&wake_dir).unwrap();
+    std::fs::write(wake_dir.join("wake.txt"), b"wake").unwrap();
+    wait_for_continuous_attention(&fixture, "scope_change_awaiting_confirmation").await;
+
+    assert_eq!(
+        scope_change_messages(&fixture, &intent).await.len(),
+        1,
+        "a publish-pending record must never republish the request"
+    );
+    assert_eq!(workspace_bytes(&fixture, "out.txt"), None);
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"pending"[..])
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(runner_state_path(&fixture)).unwrap()).unwrap();
+    assert_eq!(
+        state["runtime"]["scope_change_request"]["publish_state"], "awaiting_confirmation",
+        "the publish-pending record must be durably marked awaiting confirmation"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn interactive_pending_scope_change_record_blocks_republish_across_restart() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_workspace().await;
+    let task = "interactive-pending";
+    let intent = work_propose(&fixture, task, 1, &["src/**"], None).await;
+    work_decide_accept(&fixture, &intent).await;
+    work_status(&fixture).await;
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"out").unwrap();
+
+    // First run publishes the request; the durable interactive dedup record
+    // is persisted before the send and completed after it. The deferred
+    // generation keeps the controller busy until an accepted amendment, so
+    // the run is terminated rather than awaited.
+    let child = spawn_interactive_sleep(&fixture);
+    wait_for_scope_change_count(&fixture, &intent, 1).await;
+    drop(child);
+    let record_path = feanorfs_agent_core::agents_dir(fixture.root())
+        .unwrap()
+        .join(AGENT)
+        .join("state/scope-change-request.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    assert!(!record["message_id"].is_null());
+
+    // Simulate a crash between persist and publish: strip the message id. A
+    // restart must never republish and must fail closed into typed attention.
+    record["message_id"] = serde_json::Value::Null;
+    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let child = spawn_interactive_run(&fixture);
+    wait_for_continuous_attention(&fixture, "scope_change_awaiting_confirmation").await;
+    let output = child
+        .wait_with_output_bounded(Duration::from_secs(60))
+        .await
+        .expect("second interactive agent run exits");
+    assert!(output.status.success());
+    assert_eq!(
+        scope_change_messages(&fixture, &intent).await.len(),
+        1,
+        "a restart after persist-before-publish must never emit a second request"
+    );
+    assert_eq!(workspace_bytes(&fixture, "out.txt"), None);
+}
+
+#[tokio::test]
+async fn runner_owned_land_refused_when_pinned_generation_is_superseded() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    let task = "supersede-land";
+    let first = work_propose(&fixture, task, 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &first).await;
+    work_status(&fixture).await;
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"stale").unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "hang", &record_path, None);
+    wait_for_records(&record_path, 1).await;
+    wait_for_scope_change_count(&fixture, &first, 1).await;
+
+    // A newer accepted generation supersedes the pinned one while it is
+    // still active: the next land is refused with typed attention and
+    // nothing stale is published.
+    let second = work_propose(&fixture, task, 2, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &second).await;
+    wait_for_continuous_attention(&fixture, "superseded_intent").await;
+    assert_eq!(
+        scope_change_messages(&fixture, &first).await.len(),
+        1,
+        "supersession must not republish the scope-change request"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&record_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count(),
+        1,
+        "a superseded pinned generation must not launch or relaunch anything"
+    );
+    assert_eq!(workspace_bytes(&fixture, "out.txt"), None);
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"stale"[..]),
+        "supersession must leave the conflict/worktree untouched"
+    );
+    stop_worker(&fixture, child).await;
+}
+
+#[tokio::test]
+async fn runner_owned_land_refused_when_projection_is_incomplete() {
+    let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
+    let fixture = setup_runner_scoped(RunnerScopeMode::Enforced).await;
+    let task = "incomplete-land";
+    let intent = work_propose(&fixture, task, 1, &["src/**"], Some(AGENT)).await;
+    work_decide_accept(&fixture, &intent).await;
+    work_status(&fixture).await;
+    std::fs::write(agent_worktree(&fixture).join("out.txt"), b"local").unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let record_path = temp.path().join("invocations.ndjson");
+    let child = spawn_worker(&fixture, "hang", &record_path, None);
+    wait_for_records(&record_path, 1).await;
+    wait_for_scope_change_count(&fixture, &intent, 1).await;
+
+    // Force the projection incomplete (the same sticky flag a bounded
+    // rebuild or cursor reset leaves behind; the flood path is covered by
+    // the admission cursor-reset test): acceptance can no longer be proven,
+    // so the land is refused fail-closed.
+    let state_path = work_state_path(&fixture);
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    state["incomplete"] = serde_json::Value::Bool(true);
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let wake_dir = agent_worktree(&fixture).join("src");
+    std::fs::create_dir_all(&wake_dir).unwrap();
+    std::fs::write(wake_dir.join("wake.txt"), b"wake").unwrap();
+    wait_for_continuous_attention(&fixture, "projection_incomplete").await;
+
+    assert_eq!(
+        scope_change_messages(&fixture, &intent).await.len(),
+        1,
+        "an incomplete projection must never republish the scope-change request"
+    );
+    assert_eq!(workspace_bytes(&fixture, "out.txt"), None);
+    assert_eq!(
+        worktree_bytes(&fixture, "out.txt").as_deref(),
+        Some(&b"local"[..]),
+        "an incomplete projection must leave the worktree untouched"
+    );
+    stop_worker(&fixture, child).await;
 }
 
 #[test]

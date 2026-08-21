@@ -379,6 +379,15 @@ mod cli_tests {
             }
             _ => panic!("expected workspace start command"),
         }
+        let parsed = Cli::try_parse_from(["feanorfs", "--json", "start", "--", "/tmp/workspace"])
+            .expect("tray typed setup shape must remain accepted");
+        match parsed.command {
+            Commands::Workspace(WorkspaceAction::Start { target, folder, .. }) => {
+                assert_eq!(target.as_deref(), Some("/tmp/workspace"));
+                assert!(folder.is_none());
+            }
+            _ => panic!("expected workspace start command"),
+        }
         Cli::try_parse_from(["feanorfs", "--json", "tray", "status"]).unwrap();
         Cli::try_parse_from(["feanorfs", "--json", "tray", "overview"]).unwrap();
         Cli::try_parse_from(["feanorfs", "tray", "pause"]).unwrap();

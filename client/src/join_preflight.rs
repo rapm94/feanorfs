@@ -106,7 +106,7 @@ pub async fn write_ignore_policy(workspace: &Path, policy: &str) -> Result<()> {
         return Ok(());
     }
 
-    crate::fs_util::atomic_write(&state, "ignore", policy.as_bytes())
+    crate::fs_util::atomic_write_durable(&state, "ignore", policy.as_bytes())
         .await
         .context("write global workspace ignore policy")?;
     #[cfg(unix)]

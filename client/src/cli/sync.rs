@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 use clap::Subcommand;
 
 use feanorfs_client::ApiClient;
@@ -303,11 +302,14 @@ async fn run_sync(
         }
         if !no_watch {
             watch::run_watch(
-                &api,
-                &db,
-                current_dir,
-                &config.workspace_id,
-                config.encryption_password.as_deref(),
+                watch::WatchTarget {
+                    api: &api,
+                    db: &db,
+                    dir: current_dir,
+                    workspace_id: &config.workspace_id,
+                    password: config.encryption_password.as_deref(),
+                },
+                lazy,
             )
             .await?;
         }
@@ -334,11 +336,14 @@ fn print_large_file_notice(count: usize, examples: &[String]) {
 async fn run_watch(current_dir: &Path) -> anyhow::Result<()> {
     let (config, db, api) = open(current_dir).await?;
     watch::run_watch(
-        &api,
-        &db,
-        current_dir,
-        &config.workspace_id,
-        config.encryption_password.as_deref(),
+        watch::WatchTarget {
+            api: &api,
+            db: &db,
+            dir: current_dir,
+            workspace_id: &config.workspace_id,
+            password: config.encryption_password.as_deref(),
+        },
+        false,
     )
     .await
 }

@@ -72,6 +72,10 @@ fn load_listen_port(data_dir: &Path) -> anyhow::Result<Option<u16>> {
     Ok(Some(port))
 }
 
+/// Private durable replacement: the private-hub listen
+/// port is persisted via a 0o600 temp file, atomic rename, post-commit mode
+/// fix, and a parent-directory sync on Unix so the hub can bind the same port
+/// after a crash instead of drifting to a fallback.
 fn save_listen_port(data_dir: &Path, port: u16) -> anyhow::Result<()> {
     if port == 0 {
         anyhow::bail!("private-hub listen port must be between 1 and 65535");
@@ -325,6 +329,10 @@ fn load_hub_relay(data_dir: &Path) -> anyhow::Result<Option<feanorfs_common::Rel
     Ok(Some(relay))
 }
 
+/// Private durable replacement: the private-hub relay
+/// configuration is persisted like the listen port — 0o600 temp file, atomic
+/// rename, post-commit mode fix, parent sync on Unix — so a crash cannot drop
+/// the configured opaque relay tunnel.
 fn save_hub_relay(data_dir: &Path, relay: &feanorfs_common::RelayConfig) -> anyhow::Result<()> {
     feanorfs_agent_core::tunnel::validate_config(relay)?;
     std::fs::create_dir_all(data_dir).context("create private-hub data directory")?;

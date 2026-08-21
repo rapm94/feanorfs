@@ -321,7 +321,11 @@ async fn open_conflict_compare(db: &ClientDb, path: &str) -> anyhow::Result<()> 
     let cloud = resolve_artifact(dir, path, ArtifactRole::Cloud);
     if which::which("code").is_ok() {
         let status = Command::new("code")
-            .args(["--diff", &local.to_string_lossy(), &cloud.to_string_lossy()])
+            .args([
+                std::ffi::OsStr::new("--diff"),
+                local.as_os_str(),
+                cloud.as_os_str(),
+            ])
             .status()?;
         if !status.success() {
             anyhow::bail!("editor exited with {:?}", status.code());

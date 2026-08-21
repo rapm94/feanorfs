@@ -27,6 +27,11 @@ pub enum RunnerAction {
         /// Maximum duration of each configured invocation.
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
         timeout: u64,
+        /// Accepted-work enforcement level: legacy-unenforced, advisory, or
+        /// enforced. Enforced runners launch only requests bound to one
+        /// accepted intent and land only within the accepted scope.
+        #[arg(long, default_value = "legacy-unenforced")]
+        scope_mode: String,
         /// Program and fixed arguments. Must follow `--`.
         #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
@@ -72,11 +77,13 @@ pub async fn run(current_dir: &Path, action: RunnerAction, json: bool) -> anyhow
         RunnerAction::Setup {
             agent,
             timeout,
+            scope_mode,
             command,
         } => {
+            let scope_mode = parse_scope_mode(&scope_mode)?;
             let result = {
                 let _control = acquire_runner_control_lock(&workspace).await?;
-                let status = setup_locked(&workspace, &agent, timeout, command).await?;
+                let status = setup_locked(&workspace, &agent, timeout, scope_mode, command).await?;
                 result("setup", &workspace, Some(status))?
             };
             print_result(result, json, None)
@@ -169,10 +176,24 @@ pub async fn run(current_dir: &Path, action: RunnerAction, json: bool) -> anyhow
     }
 }
 
+fn parse_scope_mode(value: &str) -> anyhow::Result<feanorfs_agent_core::RunnerScopeMode> {
+    match value {
+        "legacy-unenforced" | "legacy_unenforced" => {
+            Ok(feanorfs_agent_core::RunnerScopeMode::LegacyUnenforced)
+        }
+        "advisory" => Ok(feanorfs_agent_core::RunnerScopeMode::Advisory),
+        "enforced" => Ok(feanorfs_agent_core::RunnerScopeMode::Enforced),
+        _ => anyhow::bail!(
+            "unsupported scope mode '{value}'; expected legacy-unenforced, advisory, or enforced"
+        ),
+    }
+}
+
 async fn setup_locked(
     workspace: &Path,
     agent: &str,
     timeout_secs: u64,
+    scope_mode: feanorfs_agent_core::RunnerScopeMode,
     command: Vec<String>,
 ) -> anyhow::Result<RunnerStatus> {
     let configured = feanorfs_agent_core::runner_status(workspace)?;
@@ -201,8 +222,15 @@ async fn setup_locked(
             .get_head(&config.workspace_id)
             .await?
             .context("the workspace has no current snapshot head")?;
-        let store =
-            RunnerStore::configure(workspace, agent, &program, fixed_args, timeout_secs, &head)?;
+        let store = RunnerStore::configure_scoped(
+            workspace,
+            agent,
+            &program,
+            fixed_args,
+            timeout_secs,
+            &head,
+            scope_mode,
+        )?;
         supervisor::remove_runner_from_registry(workspace)?;
         if registered_before || authority_before {
             supervisor::wait_for_runner_stopped(workspace)?;
@@ -1049,6 +1077,8 @@ mod tests {
                 last_terminal_kind: None,
                 last_terminal_message_id: None,
                 attention: None,
+                scope_mode: feanorfs_agent_core::RunnerScopeMode::LegacyUnenforced,
+                work_wait: None,
                 updated_at_ms: 1,
                 inbox_failure_count: 0,
             }),

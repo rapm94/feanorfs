@@ -1,5 +1,6 @@
 //! Recently opened workspace folders for the tray switcher.
 
+use crate::workspace_path::CanonicalWorkspacePath;
 use anyhow::{Context, Result};
 use feanorfs_common::tray_contract::{RecentWorkspaceEntry, RecentWorkspacesResult};
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,12 @@ fn load_store(path: &Path) -> Result<RecentStore> {
         .with_context(|| format!("parse recent workspaces {}", path.display()))
 }
 
+/// Private atomic visibility: the tray switcher registry
+/// is replaced via a 0o600 temp file and atomic rename, without a
+/// parent-directory sync. A crash may revert to the previous registry entry,
+/// which only clears the tray's recent-folder list; concurrent writers are
+/// serialized by the store lock, and reads are bounded by
+/// `MAX_RECENT_STATE_BYTES`.
 fn save_store(path: &Path, store: &RecentStore) -> Result<()> {
     let content = serde_json::to_string_pretty(store)?;
     #[cfg(unix)]
@@ -131,30 +138,18 @@ fn update_store<T>(update: impl FnOnce(&mut RecentStore) -> T) -> Result<T> {
     Ok(result)
 }
 
-fn workspace_label(path: &Path) -> String {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("workspace")
-        .to_string()
-}
-
-fn canonical_path_string(workspace_path: &Path) -> String {
-    workspace_path
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
+/// Build an exact registry entry for `workspace_path`.
+///
+/// The stored path is the canonical path as exact UTF-8 (never lossy), so a
+/// non-UTF-8 actionable path is rejected with a typed error before it can be
+/// persisted. The label is a bounded display label for the tray only.
 fn workspace_entry(workspace_path: &Path) -> Result<RecentWorkspaceEntry> {
     let config = crate::load_config(workspace_path)?;
-    let canonical = workspace_path
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_path.to_path_buf());
+    let canonical = CanonicalWorkspacePath::canonicalize(workspace_path)?;
     Ok(RecentWorkspaceEntry {
-        path: canonical.to_string_lossy().into_owned(),
+        path: canonical.as_str().to_owned(),
         workspace_id: config.workspace_id,
-        label: workspace_label(&canonical),
+        label: canonical.display_label(),
     })
 }
 
@@ -293,9 +288,12 @@ pub fn set_active_workspace(workspace_path: &Path) -> Result<()> {
 
 /// Remove a workspace from the tray without deleting its files or FeanorFS metadata.
 pub fn unregister_workspace(workspace_path: &Path) -> Result<RecentWorkspacesResult> {
-    let path = canonical_path_string(workspace_path);
+    // `canonicalize_keep_raw` preserves the legacy ability to remove an entry
+    // whose folder no longer exists while still rejecting non-UTF-8 paths
+    // with a typed error instead of lossy-mangling the registry identity.
+    let path = CanonicalWorkspacePath::canonicalize_keep_raw(workspace_path)?;
     update_store(|store| {
-        remove_workspace(store, &path);
+        remove_workspace(store, path.as_str());
         result_from_store(store)
     })
 }
@@ -337,6 +335,63 @@ mod tests {
             workspace_id: format!("id-{path}"),
             label: path.trim_start_matches('/').into(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_workspace_is_rejected_before_registry_write() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = recent_path().unwrap();
+        let before = fs::read(&path).ok();
+        let non_utf8 = PathBuf::from(std::ffi::OsString::from_vec(vec![b'w', 0x81]));
+
+        let error = unregister_workspace(&non_utf8).unwrap_err();
+
+        // The typed rejection happens before the store lock, load, or write:
+        // the registry file (and any content it had) is untouched.
+        assert!(error.to_string().contains("not valid UTF-8"));
+        assert_eq!(fs::read(&path).ok(), before);
+    }
+
+    #[test]
+    fn register_workspace_round_trips_exact_canonical_path_through_recent_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().canonicalize().unwrap();
+        crate::save_config(
+            &workspace,
+            &crate::Config {
+                server_url: "http://127.0.0.1:1".to_string(),
+                workspace_id: "recent-roundtrip-id".to_string(),
+                encryption_password: Some("e".repeat(64)),
+                server_password: None,
+                tls_ca_pem: None,
+                format_version: 3,
+                hub_local: false,
+                relay: None,
+            },
+        )
+        .unwrap();
+
+        register_workspace(&workspace).unwrap();
+
+        // The persisted entry is the exact canonical string — nothing lossy.
+        let path = recent_path().unwrap();
+        let listed = list_recent_workspaces_at(&path).unwrap();
+        assert_eq!(listed.active.as_deref(), Some(workspace.to_str().unwrap()));
+        assert_eq!(listed.workspaces.len(), 1);
+        assert_eq!(listed.workspaces[0].path, workspace.to_str().unwrap());
+        assert_eq!(listed.workspaces[0].workspace_id, "recent-roundtrip-id");
+
+        // Reloading the raw file yields the same exact entry (UTF-8 round-trip).
+        let store: RecentStore = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(store.workspaces[0].path, workspace.to_str().unwrap());
+
+        // set_active_workspace keeps the identity stable.
+        set_active_workspace(&workspace).unwrap();
+        let listed = list_recent_workspaces_at(&path).unwrap();
+        assert_eq!(listed.active.as_deref(), Some(workspace.to_str().unwrap()));
+        assert_eq!(listed.workspaces[0].path, workspace.to_str().unwrap());
     }
 
     #[test]

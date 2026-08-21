@@ -4,6 +4,7 @@ use feanorfs_client::{
     load_config, load_global_config, register_workspace, save_config_secure,
     save_global_config_secure, watch, ApiClient, Config, GlobalConfig,
 };
+use feanorfs_common::tray_contract::{SetupCommitted, SetupRecovery, SetupResult, SetupStage};
 use feanorfs_common::{
     decode_hub_invite, looks_like_hub_invite, looks_like_invite, HubInvite, WorkspaceInvite,
 };
@@ -187,10 +188,22 @@ pub(crate) async fn finish_sync_watch(
                     );
                 }
             }
-            anyhow::bail!(
+            let message = format!(
                 "Initial sync did not complete. This folder's encrypted FeanorFS setup is saved, and rerunning `feanorfs start -- {}` will resume it without pairing again or changing its workspace identity. Details: {error:#}",
                 work_dir.display()
             );
+            return Err(SetupStageError {
+                result: SetupResult::staged(
+                    SetupStage::Paired,
+                    SetupCommitted {
+                        workspace_configured: true,
+                        ..SetupCommitted::default()
+                    },
+                    SetupRecovery::RetryStart,
+                    &message,
+                ),
+            }
+            .into());
         }
     };
     if sync_result.large_file_count > 0 {
@@ -224,15 +237,20 @@ pub(crate) async fn finish_sync_watch(
         eprintln!("Warning: could not register workspace for tray: {e}");
     }
 
+    let _ = super::integrate::install_detected_hosts_quiet().await;
+
     match watch_mode {
         WatchMode::OneShot => {}
         WatchMode::Foreground => {
             watch::run_watch(
-                &api,
-                &db,
-                work_dir,
-                &config.workspace_id,
-                config.encryption_password.as_deref(),
+                watch::WatchTarget {
+                    api: &api,
+                    db: &db,
+                    dir: work_dir,
+                    workspace_id: &config.workspace_id,
+                    password: config.encryption_password.as_deref(),
+                },
+                false,
             )
             .await?;
         }
@@ -256,6 +274,66 @@ fn watch_mode(opts: &StartOptions) -> WatchMode {
     } else {
         WatchMode::Background
     }
+}
+
+/// Typed setup failure: carries the tray contract outcome while its `Display`
+/// stays the stable human message. The tray classifies from the typed fields
+/// (`stage`, `committed`, `recovery`) and never from that text.
+#[derive(Debug, Clone)]
+pub(crate) struct SetupStageError {
+    pub result: SetupResult,
+}
+
+impl std::fmt::Display for SetupStageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            self.result
+                .detail
+                .as_deref()
+                .unwrap_or("FeanorFS setup did not complete"),
+        )
+    }
+}
+
+impl std::error::Error for SetupStageError {}
+
+fn typed_outcome(result: &anyhow::Result<()>) -> SetupResult {
+    match result {
+        Ok(()) => SetupResult::completed(),
+        Err(error) => error
+            .downcast_ref::<SetupStageError>()
+            .map(|stage| stage.result.clone())
+            .unwrap_or_else(|| SetupResult::generic(&format!("{error:#}"))),
+    }
+}
+
+/// Emit the typed setup outcome as the final single JSON line of stdout.
+/// Human progress output stays on stdout too; the tray contract is that the
+/// setup result is the last line, so the tray never parses human text.
+pub(crate) fn write_setup_result_line(result: &SetupResult) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, result)?;
+    writeln!(stdout)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// `feanorfs --json start`: run the normal start flow, then emit the typed
+/// setup result as the final stdout line — on success and on failure. The
+/// exit status still signals failure; the tray classifies from the typed line.
+pub(crate) async fn run_start_json(current_dir: &Path, opts: StartOptions) -> anyhow::Result<()> {
+    let result = run_start(current_dir, opts).await;
+    write_setup_result_line(&typed_outcome(&result))?;
+    result
+}
+
+/// Machine-mode setup used by the interactive `tray join` protocol: the caller
+/// writes the typed outcome line itself, so this only returns the outcome.
+pub(crate) async fn run_start_typed(current_dir: &Path, opts: StartOptions) -> SetupResult {
+    let result = run_start(current_dir, opts).await;
+    typed_outcome(&result)
 }
 
 async fn ensure_owned_private_hub_for_resume(
@@ -769,6 +847,80 @@ mod tests {
     fn explicit_workspace_id_is_preserved() {
         assert_eq!(new_workspace_id(Some("team-app")).unwrap(), "team-app");
         assert!(new_workspace_id(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn typed_outcome_preserves_staged_failures_and_generic_fallbacks() {
+        let staged = SetupStageError {
+            result: SetupResult::staged(
+                SetupStage::InitialSync,
+                SetupCommitted {
+                    workspace_configured: true,
+                    initial_sync_completed: true,
+                    ..SetupCommitted::default()
+                },
+                SetupRecovery::RetryStart,
+                "Initial sync completed, but automatic background sync could not be installed.",
+            ),
+        };
+        let outcome = typed_outcome(&Err(anyhow::Error::new(staged)));
+        assert_eq!(outcome.stage, SetupStage::InitialSync);
+        assert!(outcome.committed.workspace_configured);
+        assert!(outcome.committed.initial_sync_completed);
+        assert!(!outcome.committed.background_service_installed);
+        assert!(outcome.retryable);
+        assert_eq!(outcome.recovery, Some(SetupRecovery::RetryStart));
+
+        let generic = typed_outcome(&Err(anyhow::anyhow!("connection refused")));
+        assert_eq!(generic.stage, SetupStage::None);
+        assert!(!generic.committed.workspace_configured);
+        assert_eq!(generic.detail.as_deref(), Some("connection refused"));
+
+        let completed = typed_outcome(&Ok(()));
+        assert_eq!(completed.stage, SetupStage::TrayRegistered);
+        assert!(completed.committed.tray_registered);
+        assert!(!completed.retryable);
+        assert_eq!(completed.recovery, None);
+    }
+
+    #[test]
+    fn setup_stage_error_display_is_the_stable_human_message() {
+        let staged = SetupStageError {
+            result: SetupResult::staged(
+                SetupStage::Paired,
+                SetupCommitted {
+                    workspace_configured: true,
+                    ..SetupCommitted::default()
+                },
+                SetupRecovery::RetryStart,
+                "Initial sync did not complete. This folder's encrypted FeanorFS setup is saved.",
+            ),
+        };
+        let rendered = format!("{staged}");
+        assert!(rendered.contains("Initial sync did not complete"));
+        // The human wording is presentation; the typed stage drives the tray.
+        assert_eq!(staged.result.stage, SetupStage::Paired);
+    }
+
+    #[test]
+    fn setup_result_json_round_trips_with_stable_stage_names() {
+        let result = SetupResult::staged(
+            SetupStage::ServiceInstalled,
+            SetupCommitted {
+                workspace_configured: true,
+                initial_sync_completed: true,
+                background_service_installed: true,
+                ..SetupCommitted::default()
+            },
+            SetupRecovery::RetryTray,
+            "system tray could not be installed",
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        let reparsed: SetupResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed, result);
+        assert!(json.contains("\"stage\":\"service_installed\""));
+        assert!(json.contains("\"recovery\":\"retry_tray\""));
+        assert!(json.contains("\"retryable\":true"));
     }
 
     #[test]

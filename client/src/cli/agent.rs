@@ -115,6 +115,19 @@ pub enum AgentAction {
         #[command(subcommand)]
         action: super::integrator::IntegratorAction,
     },
+    /// Encrypted work-intent coordination (propose, decide, amend, yield,
+    /// settle, complete, block, status).
+    Work {
+        #[command(subcommand)]
+        action: super::work::WorkAction,
+    },
+    /// Exact-fingerprint automatic conflict resolution (prepare, status,
+    /// submit, apply). Submit never applies; apply revalidates every
+    /// identity field immediately before a single CAS.
+    Resolution {
+        #[command(subcommand)]
+        action: super::resolution::ResolutionAction,
+    },
     /// Configure and control the workspace's unattended agent runner.
     Runner {
         #[command(subcommand)]
@@ -135,6 +148,10 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
         }
         AgentAction::Integrator { action } => {
             super::integrator::run(current_dir, action, json).await?
+        }
+        AgentAction::Work { action } => super::work::run(current_dir, action, json).await?,
+        AgentAction::Resolution { action } => {
+            super::resolution::run(current_dir, action, json).await?
         }
         AgentAction::Runner { action } => {
             let control_root = control_workspace_root(current_dir)?;
@@ -252,16 +269,17 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                     "Agent workspace '{name}' not found. Run `feanorfs agent spawn {name}` first."
                 );
             }
-            let agent_dir_abs = agent_path.canonicalize().unwrap_or(agent_path.clone());
-            let mut cmd = std::process::Command::new(&command[0]);
-            cmd.args(&command[1..])
-                .current_dir(&agent_path)
-                .env("FEANORFS_AGENT", &name)
-                .env("FEANORFS_AGENT_DIR", agent_dir_abs)
-                .env("FEANORFS_WORKSPACE_ROOT", workspace_root);
-            let status = cmd.status()?;
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
+            let outcome =
+                super::agent_live::run_agent_interactive(current_dir, &name, &command).await?;
+            if json {
+                output_json(&outcome)?;
+            } else {
+                eprintln!("{}", render_live_outcome(&name, &outcome));
+            }
+            if let Some(code) = outcome.child_exit {
+                if code != 0 {
+                    std::process::exit(code);
+                }
             }
         }
         AgentAction::Send {
@@ -302,6 +320,29 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
         }
     }
     Ok(())
+}
+/// Human-readable continuous-run summary: settled, offline, or attention.
+fn render_live_outcome(name: &str, outcome: &super::agent_live::LiveFinalOutcome) -> String {
+    let settled = outcome
+        .settled_snapshot
+        .as_deref()
+        .map(|id| format!(" (snapshot {id})"))
+        .unwrap_or_default();
+    if let Some(attention) = &outcome.attention {
+        format!(
+            "Agent '{name}' needs attention ({reason}): {detail}",
+            reason = terminal_line(&attention.reason),
+            detail = terminal_line(&attention.detail)
+        )
+    } else if outcome.offline {
+        format!(
+            "Agent '{name}' finished offline: changes are preserved. Run `feanorfs agent run {name} -- <command>` again when the hub is reachable to reconcile them."
+        )
+    } else if outcome.settled {
+        format!("Agent '{name}' settled{settled}.")
+    } else {
+        format!("Agent '{name}' stopped with pending work{settled}.")
+    }
 }
 
 fn agent_sender(explicit: Option<String>) -> String {
@@ -456,6 +497,9 @@ async fn run_agent_check(current_dir: &Path, name: &str, json: bool) -> anyhow::
         println!("  Changes to land: {}", result.our_changes.len());
         println!("  Cloud changes:   {}", result.their_changes.len());
         println!("  Needs attention: {}", result.conflicts.len());
+        if let Some(live) = &result.live {
+            println!("  Live: {}", render_live_line(live));
+        }
         if !result.conflict_risk.is_empty() {
             println!("  Consider refresh: {}", result.conflict_risk.join(", "));
         }
@@ -467,6 +511,36 @@ async fn run_agent_check(current_dir: &Path, name: &str, json: bool) -> anyhow::
         }
     }
     Ok(())
+}
+
+/// One bounded human line for the live continuous projection.
+fn render_live_line(live: &feanorfs_common::ContinuousAgentStatus) -> String {
+    let phase = live.phase.as_str();
+    let head = live
+        .observed_head
+        .as_deref()
+        .map(|id| format!(" head={}", id.chars().take(8).collect::<String>()))
+        .unwrap_or_default();
+    let settled = live
+        .settled_snapshot
+        .as_deref()
+        .map(|id| format!(" settled={}", id.chars().take(8).collect::<String>()))
+        .unwrap_or_default();
+    let attention = live
+        .attention
+        .as_ref()
+        .map(|attention| {
+            format!(
+                " !{}: {}",
+                terminal_line(&attention.reason),
+                terminal_line(&attention.detail)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "{phase}{head}{settled} pending_local={} deferred={}{attention}",
+        live.pending_local, live.deferred_count
+    )
 }
 
 async fn run_agent_list_legacy(current_dir: &Path, json: bool) -> anyhow::Result<()> {
@@ -492,20 +566,27 @@ async fn agent_one_line_state(
     password: Option<&str>,
     name: &str,
 ) -> String {
+    let live = match feanorfs_agent_core::live_continuous_status(current_dir, name) {
+        Ok(Some(status)) if status.active => Some(status),
+        _ => None,
+    };
     match check_agent(current_dir, db, api, workspace_id, name, password).await {
         Ok(check) => {
-            if !check.conflicts.is_empty() {
+            let state = if !check.conflicts.is_empty() {
                 format!("{} conflict(s)", check.conflicts.len())
             } else if !check.our_changes.is_empty() {
                 format!("{} change(s)", check.our_changes.len())
             } else {
                 "clean".into()
+            };
+            match live {
+                Some(live) => format!("{state} [{}]", live.phase.as_str()),
+                None => state,
             }
         }
         Err(_) => "(offline)".into(),
     }
 }
-
 async fn run_agent_status_list(current_dir: &Path, json: bool) -> anyhow::Result<()> {
     let db = crate::open_client_db(current_dir).await?;
     let names = list_agents(current_dir, &db).await?;

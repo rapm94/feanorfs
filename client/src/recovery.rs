@@ -5,51 +5,27 @@
 //! client decrypts it locally and hands it to the ordinary `start` path.
 
 use anyhow::{bail, Context as _, Result};
-use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chacha20poly1305::{
-    aead::{Aead as _, KeyInit as _, Payload},
-    Key, XChaCha20Poly1305, XNonce,
-};
+use feanorfs_common::sealed_envelope;
 use feanorfs_common::WorkspaceInvite;
-use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroizing;
 
-const FORMAT_VERSION: u32 = 1;
-const KDF_NAME: &str = "argon2id-v19";
-const CIPHER_NAME: &str = "xchacha20poly1305";
-const KDF_MEMORY_KIB: u32 = 64 * 1024;
-const KDF_ITERATIONS: u32 = 3;
-const KDF_LANES: u32 = 1;
-const SALT_BYTES: usize = 16;
-const NONCE_BYTES: usize = 24;
-const MIN_PASSPHRASE_CHARS: usize = 12;
-const MAX_PASSPHRASE_CHARS: usize = 1024;
-const MAX_KIT_BYTES: usize = 256 * 1024;
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryEnvelope {
-    format_version: u32,
-    kdf: String,
-    cipher: String,
-    salt: String,
-    nonce: String,
-    ciphertext: String,
-}
-
-#[derive(Serialize)]
-struct AuthenticatedHeader<'a> {
-    domain: &'static str,
-    format_version: u32,
-    kdf: &'a str,
-    cipher: &'a str,
-    salt: &'a str,
-    nonce: &'a str,
-}
+/// Workspace recovery-kit domain: tags the authenticated header and carries
+/// the exact bounds for workspace kits.
+const WORKSPACE_DOMAIN: sealed_envelope::EnvelopeDomain = sealed_envelope::EnvelopeDomain {
+    domain: "feanorfs workspace recovery kit",
+    format_version: sealed_envelope::FORMAT_VERSION,
+    kdf: sealed_envelope::KDF_NAME,
+    cipher: sealed_envelope::CIPHER_NAME,
+    noun: "kit",
+    min_passphrase_chars: 12,
+    max_passphrase_chars: Some(1024),
+    max_plaintext_bytes: 128 * 1024,
+    max_envelope_bytes: 256 * 1024,
+    extra_header: Vec::new(),
+};
 
 /// Encrypt a portable workspace capability and write it atomically with
 /// private file permissions.
@@ -59,16 +35,13 @@ pub fn export_recovery_kit(
     passphrase: &str,
     replace_destination: bool,
 ) -> Result<()> {
-    validate_passphrase(passphrase)?;
+    sealed_envelope::validate_passphrase(&WORKSPACE_DOMAIN, passphrase)?;
     validate_invite(invite)?;
     let destination = resolved_destination(destination)?;
     validate_destination(&destination, replace_destination)?;
 
     let envelope = seal(invite, passphrase)?;
-    let encoded = serde_json::to_vec_pretty(&envelope).context("encode recovery kit")?;
-    if encoded.len() > MAX_KIT_BYTES {
-        bail!("encrypted recovery kit exceeds {MAX_KIT_BYTES} bytes");
-    }
+    let encoded = sealed_envelope::encode(&WORKSPACE_DOMAIN, &envelope)?;
     if replace_destination {
         atomic_private_write(&destination, &encoded)
     } else {
@@ -81,138 +54,48 @@ pub fn export_recovery_kit(
 /// configuration. Callers can therefore fail on a wrong passphrase or a
 /// modified kit before the normal onboarding path creates any local state.
 pub fn open_recovery_kit(source: &Path, passphrase: &str) -> Result<WorkspaceInvite> {
-    validate_passphrase(passphrase)?;
+    sealed_envelope::validate_passphrase(&WORKSPACE_DOMAIN, passphrase)?;
     let source = fs::canonicalize(source)
         .with_context(|| format!("resolve recovery kit {}", source.display()))?;
     let file =
         File::open(&source).with_context(|| format!("open recovery kit {}", source.display()))?;
     let length = file.metadata()?.len();
-    if length > MAX_KIT_BYTES as u64 {
-        bail!("recovery kit exceeds {MAX_KIT_BYTES} bytes");
+    if length > WORKSPACE_DOMAIN.max_envelope_bytes as u64 {
+        bail!(
+            "recovery kit exceeds {} bytes",
+            WORKSPACE_DOMAIN.max_envelope_bytes
+        );
     }
-    let mut encoded = Vec::with_capacity(usize::try_from(length).unwrap_or(MAX_KIT_BYTES));
-    file.take(MAX_KIT_BYTES as u64 + 1)
+    let mut encoded =
+        Vec::with_capacity(usize::try_from(length).unwrap_or(WORKSPACE_DOMAIN.max_envelope_bytes));
+    file.take(WORKSPACE_DOMAIN.max_envelope_bytes as u64 + 1)
         .read_to_end(&mut encoded)
         .with_context(|| format!("read recovery kit {}", source.display()))?;
-    if encoded.len() > MAX_KIT_BYTES {
-        bail!("recovery kit exceeds {MAX_KIT_BYTES} bytes");
+    if encoded.len() > WORKSPACE_DOMAIN.max_envelope_bytes {
+        bail!(
+            "recovery kit exceeds {} bytes",
+            WORKSPACE_DOMAIN.max_envelope_bytes
+        );
     }
-    let envelope: RecoveryEnvelope =
+    let envelope: sealed_envelope::SealedEnvelope =
         serde_json::from_slice(&encoded).context("parse recovery kit")?;
     let invite = open(&envelope, passphrase)?;
     validate_invite(&invite)?;
     Ok(invite)
 }
 
-fn seal(invite: &WorkspaceInvite, passphrase: &str) -> Result<RecoveryEnvelope> {
-    let mut salt_bytes = [0_u8; SALT_BYTES];
-    let mut nonce_bytes = [0_u8; NONCE_BYTES];
-    getrandom::fill(&mut salt_bytes)
-        .map_err(|error| anyhow::anyhow!("generate recovery salt: {error}"))?;
-    getrandom::fill(&mut nonce_bytes)
-        .map_err(|error| anyhow::anyhow!("generate recovery nonce: {error}"))?;
-
-    let salt = BASE64.encode(salt_bytes);
-    let nonce = BASE64.encode(nonce_bytes);
-    let aad = authenticated_header(&salt, &nonce)?;
-    let key_bytes = derive_key(passphrase, &salt_bytes)?;
-    let key: &Key = key_bytes.as_ref().try_into().expect("32-byte recovery key");
-    let cipher = XChaCha20Poly1305::new(key);
+fn seal(invite: &WorkspaceInvite, passphrase: &str) -> Result<sealed_envelope::SealedEnvelope> {
     let plaintext = Zeroizing::new(serde_json::to_vec(invite)?);
-    let xnonce: &XNonce = (&nonce_bytes).into();
-    let ciphertext = cipher
-        .encrypt(
-            xnonce,
-            Payload {
-                msg: plaintext.as_ref(),
-                aad: &aad,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("encrypt recovery kit"))?;
-    salt_bytes.zeroize();
-    nonce_bytes.zeroize();
-
-    Ok(RecoveryEnvelope {
-        format_version: FORMAT_VERSION,
-        kdf: KDF_NAME.into(),
-        cipher: CIPHER_NAME.into(),
-        salt,
-        nonce,
-        ciphertext: BASE64.encode(ciphertext),
-    })
+    Ok(sealed_envelope::seal(
+        &WORKSPACE_DOMAIN,
+        passphrase,
+        &plaintext,
+    )?)
 }
 
-fn open(envelope: &RecoveryEnvelope, passphrase: &str) -> Result<WorkspaceInvite> {
-    validate_envelope(envelope)?;
-    let salt = decode_exact::<SALT_BYTES>("salt", &envelope.salt)?;
-    let nonce = decode_exact::<NONCE_BYTES>("nonce", &envelope.nonce)?;
-    let ciphertext = BASE64
-        .decode(&envelope.ciphertext)
-        .context("decode recovery ciphertext")?;
-    let aad = authenticated_header(&envelope.salt, &envelope.nonce)?;
-    let key_bytes = derive_key(passphrase, &salt)?;
-    let key: &Key = key_bytes.as_ref().try_into().expect("32-byte recovery key");
-    let cipher = XChaCha20Poly1305::new(key);
-    let xnonce: &XNonce = (&nonce).into();
-    let plaintext = Zeroizing::new(
-        cipher
-            .decrypt(
-                xnonce,
-                Payload {
-                    msg: &ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("recovery passphrase is incorrect or kit was modified"))?,
-    );
+fn open(envelope: &sealed_envelope::SealedEnvelope, passphrase: &str) -> Result<WorkspaceInvite> {
+    let plaintext = sealed_envelope::open(&WORKSPACE_DOMAIN, passphrase, envelope)?;
     serde_json::from_slice(&plaintext).context("decode encrypted recovery capability")
-}
-
-fn derive_key(passphrase: &str, salt: &[u8; SALT_BYTES]) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(KDF_MEMORY_KIB, KDF_ITERATIONS, KDF_LANES, Some(32))
-        .map_err(|error| anyhow::anyhow!("configure recovery KDF: {error}"))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0_u8; 32]);
-    argon2
-        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
-        .map_err(|error| anyhow::anyhow!("derive recovery key: {error}"))?;
-    Ok(key)
-}
-
-fn authenticated_header(salt: &str, nonce: &str) -> Result<Vec<u8>> {
-    serde_json::to_vec(&AuthenticatedHeader {
-        domain: "feanorfs workspace recovery kit",
-        format_version: FORMAT_VERSION,
-        kdf: KDF_NAME,
-        cipher: CIPHER_NAME,
-        salt,
-        nonce,
-    })
-    .context("encode recovery authentication header")
-}
-
-fn validate_envelope(envelope: &RecoveryEnvelope) -> Result<()> {
-    if envelope.format_version != FORMAT_VERSION {
-        bail!(
-            "unsupported recovery kit format {}",
-            envelope.format_version
-        );
-    }
-    if envelope.kdf != KDF_NAME || envelope.cipher != CIPHER_NAME {
-        bail!("unsupported recovery kit cryptography");
-    }
-    Ok(())
-}
-
-fn validate_passphrase(passphrase: &str) -> Result<()> {
-    let chars = passphrase.chars().count();
-    if chars < MIN_PASSPHRASE_CHARS {
-        bail!("recovery passphrase must contain at least {MIN_PASSPHRASE_CHARS} characters");
-    }
-    if chars > MAX_PASSPHRASE_CHARS {
-        bail!("recovery passphrase exceeds {MAX_PASSPHRASE_CHARS} characters");
-    }
-    Ok(())
 }
 
 fn validate_invite(invite: &WorkspaceInvite) -> Result<()> {
@@ -241,15 +124,6 @@ fn validate_invite(invite: &WorkspaceInvite) -> Result<()> {
             .context("recovery capability has an invalid mirror ignore policy")?;
     }
     Ok(())
-}
-
-fn decode_exact<const N: usize>(name: &str, encoded: &str) -> Result<[u8; N]> {
-    let decoded = BASE64
-        .decode(encoded)
-        .with_context(|| format!("decode recovery {name}"))?;
-    decoded
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("recovery {name} must contain exactly {N} bytes"))
 }
 
 fn resolved_destination(destination: &Path) -> Result<PathBuf> {
@@ -289,6 +163,11 @@ fn validate_destination(destination: &Path, replace_destination: bool) -> Result
     Ok(())
 }
 
+/// Private create-new: writes `bytes` to a random 0o600
+/// temp file, syncs it, and publishes via a hard link so the destination is
+/// never replaced. Exactly one concurrent writer wins; the rest fail. Parent
+/// directory is synced on Unix so a published kit survives power loss. On any
+/// error the temp file is removed.
 fn atomic_private_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("recovery kit has no parent")?;
     let mut random = [0_u8; 16];
@@ -326,6 +205,9 @@ fn atomic_private_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+/// Private durable replacement: mode 0o600 temp file,
+/// atomic rename, post-commit mode fix, and parent-directory sync on Unix so
+/// an exported recovery kit survives power loss (used for `--replace`).
 fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     let mut file = {
@@ -422,7 +304,8 @@ mod tests {
         assert!(export_recovery_kit(&path, &invite(), PASSPHRASE, false).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
 
-        let mut envelope: RecoveryEnvelope = serde_json::from_slice(&original).unwrap();
+        let mut envelope: sealed_envelope::SealedEnvelope =
+            serde_json::from_slice(&original).unwrap();
         let replacement = if envelope.nonce.starts_with('A') {
             "B"
         } else {
@@ -483,8 +366,49 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("oversized.fnrk");
         let file = File::create(&path).unwrap();
-        file.set_len(MAX_KIT_BYTES as u64 + 1).unwrap();
+        file.set_len(WORKSPACE_DOMAIN.max_envelope_bytes as u64 + 1)
+            .unwrap();
         let error = open_recovery_kit(&path, PASSPHRASE).unwrap_err();
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn old_kit_fixture_still_opens() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../common/tests/fixtures/workspace-kit-v1.json"
+        );
+        let recovered = open_recovery_kit(Path::new(fixture), PASSPHRASE).unwrap();
+        assert_eq!(recovered, invite());
+        // A wrong passphrase against the old fixture fails before any state
+        // can change; opening never writes.
+        let error = open_recovery_kit(Path::new(fixture), "another valid passphrase").unwrap_err();
+        assert!(error.to_string().contains("incorrect or kit was modified"));
+    }
+
+    #[test]
+    fn hub_bundle_fixture_is_rejected_by_workspace_kit_reader() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../common/tests/fixtures/hub-bundle-v1.json"
+        );
+        // Cross-domain substitution fails at parse: the workspace reader
+        // rejects the bundle's authenticated `public_ca_fingerprint` field.
+        let error = open_recovery_kit(Path::new(fixture), PASSPHRASE).unwrap_err();
+        assert!(format!("{error:#}").contains("public_ca_fingerprint"));
+    }
+
+    #[test]
+    fn truncated_kit_fails_before_any_write() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("truncated.fnrk");
+        let encoded: Vec<u8>;
+        {
+            let full = root.path().join("full.fnrk");
+            export_recovery_kit(&full, &invite(), PASSPHRASE, false).unwrap();
+            encoded = fs::read(&full).unwrap();
+        }
+        fs::write(&path, &encoded[..encoded.len() / 2]).unwrap();
+        assert!(open_recovery_kit(&path, PASSPHRASE).is_err());
     }
 }

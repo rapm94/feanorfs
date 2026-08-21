@@ -3,6 +3,7 @@ feanorfs_test_support::isolate_test_process!();
 
 pub mod agent;
 pub mod api;
+pub mod backoff;
 pub mod commands;
 pub mod conflict_artifacts;
 pub mod conflicts;
@@ -23,6 +24,7 @@ pub mod summary;
 pub mod tray;
 pub mod tray_state;
 pub mod watch;
+pub mod workspace_path;
 
 pub use agent::{inbox, send_message, signals_since};
 pub use api::ApiClient;
@@ -35,10 +37,17 @@ pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
 pub use conflicts::{resolve_conflict, ResolveKeep};
 pub use ctx::SyncCtx;
 pub use feanorfs_agent_core::{
-    check_agent, clean_agent, commit_agent, integrator_assign, integrator_observe,
-    integrator_resume, integrator_revoke, integrator_status, land_agent, list_agents,
-    materialize_conflicts, refresh_agent, refresh_agent_with_options, spawn_agent,
-    IntegratorObserveOptions, LandOptions, RefreshOptions, Runtime, SpawnOptions, Workspace,
+    answer_resolution, apply_resolution_job, check_agent, clean_agent, commit_agent,
+    defer_resolution, integrator_assign, integrator_observe, integrator_resume, integrator_revoke,
+    integrator_status, land_agent, list_agents, materialize_conflicts, materialize_resolution_legs,
+    prepare_resolution_job, put_resolution_candidate, refresh_agent, refresh_agent_with_options,
+    resolution_protocol_status, resolution_status, retire_workspace_state, send_human_answer,
+    send_resolution_assignment, send_resolution_result, send_resolution_revoke, spawn_agent,
+    submit_resolution_result, sweep_retired_state, work_amend, work_block, work_complete,
+    work_decide, work_propose, work_settle, work_status, work_yield, IntegratorObserveOptions,
+    LandOptions, ProtocolAssignmentState, RefreshOptions, ResolutionApplyOutcome,
+    ResolutionJobStatus, ResolutionProtocolEntryStatus, ResolutionProtocolStatus,
+    ResolutionStatusProjection, RetirementSweep, Runtime, SpawnOptions, TombstoneRecord, Workspace,
     MIN_SUPPORTED_SERVER_VERSION,
 };
 pub use feanorfs_common::{
@@ -67,6 +76,14 @@ pub use feanorfs_common::{
     IntegratorAttemptStatus, IntegratorCandidate, IntegratorDigest, IntegratorDraw,
     IntegratorObserveResult, IntegratorOutcomeState, IntegratorProfile, IntegratorStatusResult,
     VerificationStatus, VerificationSummary,
+};
+pub use feanorfs_common::{
+    WorkAmendInput, WorkAmendmentStatus, WorkBlockInput, WorkCompleteInput, WorkDecideInput,
+    WorkDecisionAccept, WorkDecisionAcceptOverlap, WorkDecisionKind, WorkDecisionNarrow,
+    WorkDecisionOrder, WorkDecisionReject, WorkDecisionStatus, WorkOverlap, WorkOverlapAcceptance,
+    WorkOverlapKind, WorkProposalStatus, WorkProposeInput, WorkSendResult, WorkSettleInput,
+    WorkStatusInput, WorkStatusResult, WorkTaskState, WorkTaskStatus, WorkVerification,
+    WorkVerificationStatus, WorkYieldInput,
 };
 pub use hub_transfer::{transfer_hub, HubTransferResult};
 pub use join_preflight::{preview_join, JoinPathGroup, JoinPreflight};
