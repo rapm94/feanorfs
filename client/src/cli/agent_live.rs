@@ -1899,26 +1899,26 @@ async fn drain_event_burst(
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_reports_events_and_waits_for_the_final_quiet_period() {
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(8);
         tx.send(()).await.unwrap();
         let sender = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(15)).await;
+            // The second event lands inside the original 10 ms quiet window
+            // and the third one after its UNRESTARTED deadline (t=12 > 10):
+            // consuming it is only possible if the timer restarted at the
+            // previous event. Virtual time makes this ordering exact.
+            tokio::time::sleep(Duration::from_millis(5)).await;
             tx.send(()).await.unwrap();
-            // Keep the channel open past the expected quiet period. A closed
-            // channel legitimately lets the drain return immediately because
-            // no later event can arrive.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(7)).await;
+            tx.send(()).await.unwrap();
         });
-        let started = std::time::Instant::now();
-        assert!(drain_event_burst(&mut rx, Duration::from_millis(30), false).await);
+        assert!(drain_event_burst(&mut rx, Duration::from_millis(10), false).await);
         sender.await.unwrap();
         assert!(
-            started.elapsed() >= Duration::from_millis(40),
-            "quiet timer must restart after the last event"
+            rx.try_recv().is_err(),
+            "quiet timer must restart after each burst event"
         );
-        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

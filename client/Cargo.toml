@@ -82,6 +82,7 @@ feanorfs-test-support = { workspace = true }
 feanorfs-server = { workspace = true }
 tempfile = { workspace = true }
 axum = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [package.metadata.binstall]
 # Artifacts are built by cargo-dist (see dist-workspace.toml).
