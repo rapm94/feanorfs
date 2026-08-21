@@ -27,11 +27,11 @@ excerpts and live code as that plan's STOP condition.
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| 001 | Verify decrypted plaintext (AEAD/XOR fallback integrity) | P1 | M | — | TODO |
-| 002 | Bounded-concurrency hub-to-hub transfer | P1 | M | — | TODO |
-| 003 | Split protocol-layer god files (resolution/integrator/work/work_contract) | P2 | M×4 | — | TODO |
-| 004 | AI-2/AI-5/AI-6 acceptance-evidence matrix (spike) | P2 | M | — | TODO |
-| 005 | Node SDK lifecycle e2e smoke test | P2 | M | — | TODO |
+| 001 | Verify decrypted plaintext (AEAD/XOR fallback integrity) | P1 | M | — | DONE `77a2341` (size-discriminated variant; unknown-size fallback retained per common/AGENTS.md contract) |
+| 002 | Bounded-concurrency hub-to-hub transfer | P1 | M | — | DONE `4454333` (cap=4 to match hub upload admission; two-hub e2e test added) |
+| 003 | Split protocol-layer god files (resolution/integrator/work/work_contract) | P2 | M×4 | — | REJECTED (superseded: maintainer's own module splits landed with the WIP snapshot commits) |
+| 004 | AI-2/AI-5/AI-6 acceptance-evidence matrix (spike) | P2 | M | — | DONE (`docs/acceptance-evidence.md` + `scripts/acceptance-matrix.sh`; field rows pending AI-1) |
+| 005 | Node SDK lifecycle e2e smoke test | P2 | M | — | DONE (pre-existing: maintainer's `bindings/ts/test/loop.mjs` already covers init/spawn/land/refresh/conflict path) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
