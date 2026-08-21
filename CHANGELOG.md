@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Deterministic `ffwork1` coordination reducer: canonical-id tie handling
+  converges independently of delivery order and batch boundaries, causal
+  ancestry replaces the observation cache, capabilities survive every
+  transition and rebuild, amendments can no longer enlarge their own grant
+  without an applied coordinator approval decision, and bound exhaustion
+  marks the projection incomplete (rebuild restores completeness).
+- Enforced scope everywhere: the CAS-retry loop re-applies the canonical
+  scope filter, runner-owned land revalidates the pinned generation before
+  every automatic land, deduplication keys on (task, intent, operations,
+  canonical scope), and wait/dedup state persists before the request is
+  published.
+- Exact conflict identity: fingerprint-keyed per-conflict sidecars, registry
+  records bound to their fingerprint, collision-free case-folded and
+  NFC-normalized conflict-copy allocation, create-new atomic version legs,
+  and engine-proven last-resort designation with transitive causal ancestry
+  and persisted `ffint1` fallback evidence.
+- Cross-machine `ffres1` resolution protocol: encrypted assignment/result/
+  revoke/human-answer profiles inside the existing signal stream, a pure
+  deterministic reducer with durable private projection, job import by ID
+  and fingerprint, authenticated leg materialization, and a harness-neutral
+  typed candidate API (`put`/`materialize`/`answer`/`defer`) on every
+  surface.
+- Guarded publication hardening: typed candidate-open outcomes, one active
+  job per fingerprint, crash-recoverable publication-uncertain state,
+  per-fingerprint serialization, and engine-executed fixed-policy
+  verification evidence.
+- Typed human escalation: one bounded question with closed-enum reason and
+  safe options; answers bind to the exact job, assignment, fingerprint, and
+  question generation and re-enter the same guarded publication.
+- Desktop release workflows stage artifacts only: no release polling, no
+  release mutation, trusted-CI verification before packaging, and a required
+  deterministic release-policy gate in CI. Product smokes assert the single
+- Portable workspace-state identity and retirement: Windows identity uses the
+  volume serial, 64-bit file index, and creation time of the workspace root
+  (replacing silent path-only adoption), weak Unix filesystems without birth
+  times now record an explicit best-effort `-weak` identity instead of
+  nothing, and a legacy slot without a recorded identity is adopted exactly
+  once with written provenance — only when its recorded location proves the
+  exact path — instead of being silently reused or hard-failed. A crash-safe
+  identity index (`~/.feanorfs/workspaces/.identity-index.json`) replaces the
+  bounded O(N) moved-workspace scan with a verified O(1) lookup; the index is
+  trusted only while no slot-level mutation postdates it, so duplicate
+  identities still fail closed through the scan. Full-lifetime per-slot state
+  leases serialize path-hash migration and retirement against every live
+  process, and `feanorfs retire <folder>` tombstones workspace state with an
+  authenticated identity/location binding: grace, quarantine retention, and
+  exclusive-lease + identity revalidation gate every move and deletion.
+  Nothing is ever deleted because of age, a missing location, registry
+  absence, or a temporary-looking name.
+- Agent host integrations (`feanorfs integrate [install|status|uninstall]`):
+  automatic detection and atomic, idempotent, reversible registration of the
+  `feanorfs mcp` server and embedded `feanorfs-collaboration` skill for detected
+  agent hosts including Codex, Claude, Gemini/Antigravity, OpenCode, and Cursor.
+  Supports both global user-level and explicit project-level configurations,
+  preserves unrelated settings, refuses to overwrite foreign entries without
+  `--force`, and enforces root-context safety by refusing to mutate user config
+  from root package-manager contexts.
+
+### Fixed
+
+- macOS workspace identity now uses the stable filesystem volume UUID instead
+  of the remount-sensitive device number, while exact legacy identities upgrade
+  in place and mismatched state remains fail-closed. Linux filesystems exposing
+  persistent handles, including Btrfs, use the stable filesystem ID plus a
+  descriptor-anchored kernel file handle for the same reboot-safe behavior;
+  unsupported filesystems retain the exact legacy identity. A workspace
+  containing the global state root
+  no longer mistakes that root for project-local legacy state. A verified-absent
+  `pid:null` workspace watcher can no longer remain stuck in `stopping`, and
+  generic tray onboarding failures no longer incorrectly blame the network.
+- Every normal desktop-tray launch now claims one per-user lifetime lock before
+  native UI initialization. Additional launches, including stale installed
+  copies and isolated data profiles, cannot create duplicate icons. Managed
+  launchers and supervisor handoff retain the exact `--managed` invocation and
+  retry after an external crash, while a one-shot protected Quit marker keeps
+  an explicit user Quit stopped.
+- Supervisor health snapshots now anchor their lifetime to the native process
+  start instead of the end of orphan cleanup, so a slow handoff cannot report
+  live hub and workspace children as stopped.
+
 ## [0.9.4](https://github.com/rapm94/feanorfs/compare/v0.9.3...v0.9.4) - 2026-08-13
 
 ### Fixed
