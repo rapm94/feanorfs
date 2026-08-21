@@ -36,6 +36,8 @@ export interface AgentCheckResult {
   their_changes: FileState[]
   conflicts: ConcurrentEdit[]
   conflict_risk: string[]
+  /** Bounded live continuous-reconciliation projection (present only while active). */
+  live?: ContinuousAgentStatus
 }
 
 export interface AgentLandResult {
@@ -203,7 +205,6 @@ export type IntegratorAssignmentState =
   | 'created'
   | 'offered'
   | 'accepted'
-  | 'active'
   | 'completed'
   | 'blocked'
   | 'revoked'
@@ -213,7 +214,6 @@ export type IntegratorAssignmentState =
 export type IntegratorAttemptState =
   | 'offered'
   | 'accepted'
-  | 'active'
   | 'timed_out'
   | 'superseded'
   | 'revoked'
@@ -321,3 +321,489 @@ export type ConflictMaterializeInput =
 
 export declare function integratorResume(root: string, options?: IntegratorObserveInput): Promise<IntegratorObserveResult>
 export declare function conflictMaterialize(root: string, input: ConflictMaterializeInput): Promise<ConflictMaterializeResult>
+
+// --- Encrypted work-intent protocol (ffwork1, SDK-1 additive) ---
+// Proposals and decisions are ordinary ffmsg1 signals carrying ffwork1
+// profiles. A sent proposal is never a claim of acceptance: the local
+// reducer applies state only after observing the signal.
+
+export type WorkTaskState =
+  | 'proposed'
+  | 'accepted'
+  | 'settled'
+  | 'completed'
+  | 'blocked'
+  | 'yielded'
+  | 'rejected'
+
+export type WorkVerificationStatus = 'passed' | 'failed' | 'skipped'
+
+export interface WorkVerification {
+  status: WorkVerificationStatus
+  summary: string
+}
+
+export type WorkOverlapKind =
+  | 'exact_path'
+  | 'directory_containment'
+  | 'glob_match'
+  | 'same_concern'
+
+export interface WorkOverlapAcceptance {
+  kind: WorkOverlapKind
+  path_a?: string
+  path_b?: string
+  concern?: string
+}
+
+export type WorkDecisionKind =
+  | { kind: 'accept'; reason?: string | null }
+  | { kind: 'reject'; reason: string }
+  | { kind: 'narrow'; paths: string[]; concerns: string[]; reason?: string | null }
+  | { kind: 'order'; after?: string | null; reason?: string | null }
+  | { kind: 'accept_overlap'; overlap: WorkOverlapAcceptance[]; reason?: string | null }
+
+export interface WorkScope {
+  paths: string[]
+  concerns: string[]
+  dependencies: string[]
+}
+
+export interface WorkProposeInput {
+  task_id: string
+  agent?: string | null
+  sequence: number
+  causal_base?: string | null
+  coordinator?: string | null
+  paths: string[]
+  concerns: string[]
+  dependencies: string[]
+  capabilities: string[]
+  about_snapshot?: string | null
+  to?: string | null
+}
+
+export interface WorkDecideInput {
+  proposal_message_id: string
+  kind: WorkDecisionKind
+  about_snapshot?: string | null
+  to?: string | null
+  from?: string | null
+}
+
+export interface WorkAmendInput {
+  task_id: string
+  intent_message_id: string
+  sequence: number
+  paths?: string[] | null
+  concerns?: string[] | null
+  dependencies?: string[] | null
+  reason?: string | null
+  about_snapshot?: string | null
+  to?: string | null
+  from?: string | null
+}
+
+export interface WorkYieldInput {
+  task_id: string
+  intent_message_id: string
+  sequence: number
+  reason?: string | null
+  about_snapshot?: string | null
+  to?: string | null
+  from?: string | null
+}
+
+export interface WorkSettleInput {
+  task_id: string
+  intent_message_id: string
+  sequence: number
+  inspected_snapshot: string
+  verification: WorkVerification
+  about_snapshot?: string | null
+  to?: string | null
+  from?: string | null
+}
+
+export interface WorkCompleteInput {
+  task_id: string
+  intent_message_id: string
+  sequence: number
+  outcome: string
+  about_snapshot?: string | null
+  to?: string | null
+  from?: string | null
+}
+
+export interface WorkBlockInput {
+  task_id: string
+  intent_message_id: string
+  sequence: number
+  reason: string
+  about_snapshot?: string | null
+  to?: string | null
+  from?: string | null
+}
+
+export interface WorkStatusInput {
+  coordinator?: string | null
+}
+
+export interface WorkSendResult {
+  message_id: string
+  about_snapshot: string
+  task_id: string
+  agent: string
+  profile: string
+  state: WorkTaskState
+  scope: WorkScope
+  causal_refs: string[]
+  overlap: WorkOverlapAcceptance[]
+  projection_incomplete: boolean
+}
+
+export interface WorkDecisionStatus {
+  message_id: string
+  coordinator: string
+  kind: WorkDecisionKind
+  ordered_after?: string | null
+}
+
+export interface WorkAmendmentStatus {
+  message_id: string
+  sequence: number
+  reason?: string | null
+}
+
+export interface WorkProposalStatus {
+  agent: string
+  state: WorkTaskState
+  sequence: number
+  intent_message_id: string
+  coordinator?: string | null
+  accepted_scope: WorkScope
+  decision?: WorkDecisionStatus | null
+  accepted_overlap: WorkOverlapAcceptance[]
+  amendments: WorkAmendmentStatus[]
+  causal_refs: string[]
+  inspected_snapshot?: string | null
+  verification?: WorkVerification | null
+  outcome?: string | null
+  reason?: string | null
+  source_message_id: string
+  updated_at_ms: number
+}
+
+export interface WorkTaskStatus {
+  task_id: string
+  state: WorkTaskState
+  proposals: WorkProposalStatus[]
+}
+
+export interface WorkStatusResult {
+  cursor: string
+  cursor_reset: boolean
+  projection_incomplete: boolean
+  messages_processed: number
+  tasks: WorkTaskStatus[]
+  evidence_count: number
+  dropped_count: number
+  updated_at_ms: number
+}
+
+export declare function workPropose(root: string, input: WorkProposeInput): Promise<WorkSendResult>
+export declare function workDecide(root: string, input: WorkDecideInput): Promise<WorkSendResult>
+export declare function workAmend(root: string, input: WorkAmendInput): Promise<WorkSendResult>
+export declare function workYield(root: string, input: WorkYieldInput): Promise<WorkSendResult>
+export declare function workSettle(root: string, input: WorkSettleInput): Promise<WorkSendResult>
+export declare function workComplete(root: string, input: WorkCompleteInput): Promise<WorkSendResult>
+export declare function workBlock(root: string, input: WorkBlockInput): Promise<WorkSendResult>
+export declare function workStatus(root: string, input?: WorkStatusInput): Promise<WorkStatusResult>
+
+// --- Exact conflict resolution (RES-1..RES-7) ---
+// Automatic resolution binds every candidate to the exact current conflict:
+// prepare creates one immutable job, submit records a validated resolver
+// result (submit NEVER applies), apply publishes with guarded revalidation.
+// The hub never merges file content; adapters never reimplement identity
+// canonicalization or fingerprinting.
+
+export interface PreventionReason {
+  type: 'exhausted' | 'violated'
+  detail: string
+}
+
+export interface ConflictLegDescriptor {
+  present: boolean
+  deleted: boolean
+  hash: string
+  size: number
+  mode: number
+}
+
+export interface ConflictIdentity {
+  schema_version: number
+  workspace_id: string
+  current_snapshot: string
+  about_snapshot: string
+  tree_root: string
+  path: string
+  base: ConflictLegDescriptor
+  ours: ConflictLegDescriptor
+  theirs: ConflictLegDescriptor
+  kind: 'edit_edit' | 'edit_delete' | 'delete_edit'
+  task_id?: string | null
+  intent_message_ids?: string[]
+  assignment_id?: string | null
+  attempt?: number | null
+  designated_owner?: string | null
+  verification_policy?: string | null
+}
+
+export interface ArtifactDescriptor {
+  role: 'original' | 'local' | 'cloud'
+  path: string
+}
+
+export interface CandidateDestination {
+  path: string
+  create_new: boolean
+}
+
+export interface VerificationPolicyRef {
+  policy_id: string
+  command_config_ref: string
+  timeout_ms: number
+  freshness_required: boolean
+}
+
+export interface ResolutionJob {
+  schema_version: number
+  job_id: string
+  task_id: string
+  assignment_id: string
+  attempt: number
+  workspace_id: string
+  owner: string
+  conflict: ConflictIdentity
+  conflict_fingerprint: string
+  current_snapshot: string
+  about_snapshot: string
+  tree_root: string
+  accepted_intents?: string[]
+  causal_refs?: string[]
+  artifacts?: ArtifactDescriptor[]
+  candidate_destination: CandidateDestination
+  allowed_output_paths?: string[]
+  verification: VerificationPolicyRef
+  prevention: PreventionReason
+  last_resort_reason: string
+}
+
+export type ResolutionOutcome =
+  | 'candidate_ready'
+  | 'no_change_required'
+  | 'blocked'
+  | 'requires_human'
+  | 'failed'
+  | 'stale'
+
+export type HumanResolutionReason =
+  | 'semantic_ambiguity'
+  | 'unavoidable_data_loss'
+  | 'missing_or_auth_failed_leg'
+  | 'security_compatibility_boundary_change'
+  | 'required_verification_unavailable'
+  | 'indeterminate_ownership'
+  | 'bounded_resolver_exhaustion'
+  | 'unsupported_size_safety_bound'
+  | 'explicit_product_decision'
+
+export interface CandidateDescriptor {
+  path: string
+  hash: string
+  size: number
+  mode: number
+  deleted: boolean
+}
+
+export interface VerificationSummary {
+  status: 'passed' | 'failed' | 'skipped'
+  summary: string
+}
+
+export interface ResolutionResult {
+  schema_version: number
+  outcome: ResolutionOutcome
+  job_id: string
+  assignment_id: string
+  attempt: number
+  owner: string
+  conflict_fingerprint: string
+  candidate?: CandidateDescriptor | null
+  verification: VerificationSummary
+  diagnostics?: string[]
+  question?: string | null
+  human_reason?: HumanResolutionReason | null
+}
+
+export type ResolutionAssignmentState = 'active' | 'revoked' | 'superseded' | 'completed'
+
+export interface ResolutionJobStatus {
+  job_id: string
+  assignment_id: string
+  attempt: number
+  owner: string
+  conflict_fingerprint: string
+  assignment_state: ResolutionAssignmentState
+  outcome?: ResolutionOutcome | null
+  /** Monotonic per-fingerprint question generation of the escalation this job carries. */
+  question_generation: number
+  created_at_ms: number
+  verified_at_ms?: number | null
+}
+
+export interface ResolutionStatusResult {
+  schema_version: number
+  jobs: ResolutionJobStatus[]
+}
+
+export type ResolutionStaleKind =
+  | 'head_changed'
+  | 'conflict_missing'
+  | 'legs_changed'
+  | 'identity_mismatch'
+  | 'assignment_revoked'
+  | 'verification_expired'
+  | 'candidate_missing'
+  | 'candidate_hash_mismatch'
+  | 'candidate_size_mismatch'
+  | 'candidate_mode_mismatch'
+  | 'candidate_path_mismatch'
+  | 'candidate_symlink'
+
+export type ResolutionApplyOutcome =
+  | { outcome: 'published'; head: string }
+  | { outcome: 'stale'; kind: ResolutionStaleKind; diagnostics: string[] }
+
+export declare function resolutionPrepare(
+  root: string,
+  path: string,
+  prevention: PreventionReason,
+): Promise<ResolutionJob>
+export declare function resolutionStatus(
+  root: string,
+  jobId?: string | null,
+): Promise<ResolutionStatusResult>
+export declare function resolutionSubmit(
+  root: string,
+  jobId: string,
+  result: ResolutionResult,
+): Promise<ResolutionResult>
+export declare function resolutionApply(
+  root: string,
+  jobId: string,
+): Promise<ResolutionApplyOutcome>
+
+// --- ffres1 protocol operations (SDK-1 additive) ---
+// Materialize/put bind every identity field to the engine-owned job; answer
+// and publish-answer bind to the live projection so stale answers are
+// impossible by construction. Message-id results match the FFI wire shape.
+
+export interface MaterializedResolutionLeg {
+  role: 'original' | 'local' | 'cloud'
+  path: string
+}
+
+export type HumanResolutionOption = 'defer' | 'keep_unresolved' | 'submit_candidate'
+
+export interface HumanResolutionAnswer {
+  schema_version: number
+  job_id: string
+  assignment_id: string
+  attempt: number
+  conflict_fingerprint: string
+  question_generation: number
+  chosen_option: HumanResolutionOption
+  candidate?: CandidateDescriptor | null
+  verification?: VerificationSummary | null
+}
+
+export interface MessageIdResult {
+  message_id: string
+}
+
+export type ProtocolAssignmentState =
+  | 'assigned'
+  | 'result_received'
+  | 'human_answered'
+  | 'revoked'
+
+export interface ResolutionProtocolEntryStatus {
+  conflict_fingerprint: string
+  job_id: string
+  assignment_id: string
+  attempt: number
+  owner: string
+  state: ProtocolAssignmentState
+  question_generation: number
+  outcome?: ResolutionOutcome | null
+  question?: string | null
+}
+
+export interface ResolutionProtocolStatus {
+  schema_version: number
+  cursor?: string | null
+  projection_incomplete: boolean
+  entries: ResolutionProtocolEntryStatus[]
+}
+
+export declare function resolutionMaterialize(
+  root: string,
+  jobId: string,
+): Promise<MaterializedResolutionLeg[]>
+export declare function resolutionPut(
+  root: string,
+  jobId: string,
+  base64: string,
+): Promise<CandidateDescriptor>
+export declare function resolutionAnswer(
+  root: string,
+  answer: HumanResolutionAnswer,
+): Promise<HumanResolutionAnswer>
+export declare function resolutionDefer(root: string, jobId: string): Promise<null>
+export declare function resolutionProtocolStatus(
+  root: string,
+  rebuild?: boolean,
+): Promise<ResolutionProtocolStatus>
+export declare function resolutionAssign(root: string, jobId: string): Promise<MessageIdResult>
+export declare function resolutionReply(root: string, jobId: string): Promise<MessageIdResult>
+export declare function resolutionRevoke(
+  root: string,
+  jobId: string,
+  superseded?: boolean,
+): Promise<MessageIdResult>
+export declare function resolutionPublishAnswer(
+  root: string,
+  answer: HumanResolutionAnswer,
+): Promise<MessageIdResult>
+
+export interface ContinuousAttention {
+  reason: string
+  detail: string
+}
+
+export interface ContinuousAgentStatus {
+  schema_version: number
+  agent: string
+  active: boolean
+  phase: 'starting' | 'idle' | 'local_dirty' | 'reconciling_local' | 'refreshing_remote' | 'offline' | 'needs_attention' | 'stopping'
+  observed_head?: string
+  observed_tree?: string
+  settled_snapshot?: string
+  pending_local: boolean
+  deferred_count: number
+  attention?: ContinuousAttention | null
+  owner_pid?: number
+  owner_start_id?: string
+  updated_at_ms: number
+}

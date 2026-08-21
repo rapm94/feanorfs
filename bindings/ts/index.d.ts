@@ -62,9 +62,147 @@ export interface LandOptionsJs {
   propose?: boolean
 }
 
+/**
+ * Record one typed human answer bound to one exact escalation. JSON in:
+ * `HumanResolutionAnswer`; JSON out: the recorded answer. The local engine
+ * validates the full binding (job/assignment/attempt/fingerprint/question
+ * generation) and, for `submit_candidate`, runs the inline verification.
+ */
+export declare function resolutionAnswer(root: string, answerJson: string): Promise<string>
+
+/**
+ * Apply a submitted resolution result with guarded publication.
+ * JSON out: `ResolutionApplyOutcome`.
+ */
+export declare function resolutionApply(root: string, jobId: string): Promise<string>
+
+/**
+ * Publish the `ffres1` assignment profile (with the complete immutable job)
+ * for one locally prepared job. JSON out: `{"message_id": "..."}`.
+ */
+export declare function resolutionAssign(root: string, jobId: string): Promise<string>
+
+/**
+ * Record the terminal `Deferred` state for one assignment without any
+ * publication. JSON out: `null`.
+ */
+export declare function resolutionDefer(root: string, jobId: string): Promise<string>
+
+/**
+ * Materialize the authenticated base/ours/theirs legs of one resolution job
+ * into the engine-owned job directory (create-new, no-follow, fsync'd).
+ * JSON out: array of `{"role", "path"}`. Read-only: never changes the
+ * worktree, conflict registry, artifacts, or head.
+ */
+export declare function resolutionMaterialize(root: string, jobId: string): Promise<string>
+
+/**
+ * Prepare one automatic resolution job for the exact current conflict.
+ * JSON in: `PreventionReason` (`{"type":"exhausted"|"violated","detail":…}`);
+ * JSON out: `ResolutionJob`.
+ */
+export declare function resolutionPrepare(root: string, path: string, preventionJson: string): Promise<string>
+
+/**
+ * Observe the encrypted signal stream through the `ffres1` reducer and
+ * report the bounded metadata-only projection (ids/state/counts only).
+ * `rebuild` resets the cursor and re-observes the bounded window.
+ */
+export declare function resolutionProtocolStatus(root: string, rebuild?: boolean | undefined | null): Promise<string>
+
+/**
+ * Publish one typed human answer as an `ffres1` profile. JSON in:
+ * `HumanResolutionAnswer`; JSON out: `{"message_id": "..."}`. The engine
+ * validates the full answer (including `submit_candidate` verification
+ * evidence) before sending.
+ */
+export declare function resolutionPublishAnswer(root: string, answerJson: string): Promise<string>
+
+/**
+ * Write the immutable engine-owned candidate file for one job from bounded
+ * base64 bytes (create-new, no-follow, fsync'd). The base64 parameter is
+ * adapter-bound (1 MiB); JSON out: `CandidateDescriptor`.
+ */
+export declare function resolutionPut(root: string, jobId: string, base64: string): Promise<string>
+
+/**
+ * Publish the `ffres1` result profile for one locally submitted job.
+ * JSON out: `{"message_id": "..."}`.
+ */
+export declare function resolutionReply(root: string, jobId: string): Promise<string>
+
+/**
+ * Publish the `ffres1` revoke/supersede profile for one local job.
+ * JSON out: `{"message_id": "..."}`.
+ */
+export declare function resolutionRevoke(root: string, jobId: string, superseded?: boolean | undefined | null): Promise<string>
+
+/**
+ * Read the bounded resolution status projection (ids/state/counts only).
+ * JSON out: `ResolutionStatusProjection`; pass null `job_id` for the whole
+ * store.
+ */
+export declare function resolutionStatus(root: string, jobId?: string | undefined | null): Promise<string>
+
+/**
+ * Submit one resolution result. JSON in: `ResolutionResult`; JSON out:
+ * `ResolutionResult`. Submission NEVER applies: it validates and records
+ * the result without mutating the worktree, registry, artifacts, or head.
+ */
+export declare function resolutionSubmit(root: string, jobId: string, resultJson: string): Promise<string>
+
 export interface SpawnOptionsJs {
   noSync?: boolean
   replace?: boolean
 }
 
 export declare function undo(root: string, snapshotId: string): Promise<string>
+
+/**
+ * Amend an accepted intent's scope.
+ * JSON in: `WorkAmendInput`; JSON out: `WorkSendResult`.
+ */
+export declare function workAmend(root: string, inputJson: string): Promise<string>
+
+/**
+ * Send a terminal blocker.
+ * JSON in: `WorkBlockInput`; JSON out: `WorkSendResult`.
+ */
+export declare function workBlock(root: string, inputJson: string): Promise<string>
+
+/**
+ * Send a terminal completion.
+ * JSON in: `WorkCompleteInput`; JSON out: `WorkSendResult`.
+ */
+export declare function workComplete(root: string, inputJson: string): Promise<string>
+
+/**
+ * Send one coordinator decision.
+ * JSON in: `WorkDecideInput`; JSON out: `WorkSendResult`.
+ */
+export declare function workDecide(root: string, inputJson: string): Promise<string>
+
+/**
+ * Propose one encrypted work intent.
+ * JSON in: `WorkProposeInput`; JSON out: `WorkSendResult`.
+ */
+export declare function workPropose(root: string, inputJson: string): Promise<string>
+
+/**
+ * Send a settled profile with verification evidence.
+ * JSON in: `WorkSettleInput`; JSON out: `WorkSendResult`.
+ */
+export declare function workSettle(root: string, inputJson: string): Promise<string>
+
+/**
+ * Observe signals through the `ffwork1` reducer and report the bounded
+ * projection. JSON in: `WorkStatusInput` (optional); JSON out:
+ * `WorkStatusResult`.
+ */
+export declare function workStatus(root: string, inputJson?: string | undefined | null): Promise<string>
+
+/**
+ * Send an explicit yield.
+ * JSON in: `WorkYieldInput`; JSON out: `WorkSendResult`.
+ */
+export declare function workYield(root: string, inputJson: string): Promise<string>

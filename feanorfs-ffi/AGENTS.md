@@ -12,8 +12,8 @@ Expose the synchronous FeanorFS agent SDK to C-family consumers as bounded UTF-8
 
 ## Local Contracts
 
-- Raw-pointer exports are `unsafe` for Rust callers. Every non-NULL input points to readable NUL-terminated UTF-8 for the call and is rejected above the 1-MiB adapter cap.
-- Returned strings are immutable `const char *` allocations tracked independently of their contents. Only `ffs_string_free` releases them; deallocation never scans caller-visible bytes.
+- Returned strings are immutable `const char *` allocations tracked independently of their contents. Only `ffs_string_free` releases them; deallocation never scans caller-visible bytes. Every export's header comment states this ownership and freeing rule.
+- Raw-pointer exports are `unsafe` for Rust callers. Every non-NULL input points to readable NUL-terminated UTF-8 for the call and is rejected above the 1-MiB adapter cap. Wrappers are also fully defensive: required/optional C strings are parsed through one bounded helper (`cstr_req`/`cstr_opt`) that null-checks before any dereference.
 - `ffs_last_error` is thread-local, bounded, control-escaped, always returns a freeable non-NULL string, and never exposes an interior NUL.
 - `ffs_runtime_init` is idempotent. Blocking SDK calls must work from ordinary threads and current- or multi-thread Tokio contexts without nested-runtime panics.
 - Parse shared typed request structs and reject unknown/malformed fields before opening workspace state. Agent-name, portable-path, signal, and integrator validation stays in common/agent-core.
@@ -27,6 +27,7 @@ Expose the synchronous FeanorFS agent SDK to C-family consumers as bounded UTF-8
 ## Verification
 
 - `cargo test -p feanorfs-ffi --lib --locked`
+- `cargo test -p feanorfs-ffi --test header_parity --locked` regenerates `feanorfs.h` and asserts the C header enumerates exactly the `#[no_mangle]` exports (F2 symbol parity) and compiles as C.
 - `cargo clippy -p feanorfs-ffi --all-targets --locked -- -D warnings`
 - `cargo build -p feanorfs-ffi --locked` regenerates `feanorfs.h`.
 

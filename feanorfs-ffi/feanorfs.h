@@ -34,6 +34,11 @@ const char *ffs_last_error(void);
 /**
  * List agent workspace names. JSON: `AgentListOfflineResult`. NULL on error.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -41,6 +46,11 @@ const char *ffs_agent_list(const char *root);
 
 /**
  * Spawn an isolated agent workspace. JSON: `SpawnResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
  *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
@@ -53,6 +63,11 @@ const char *ffs_agent_spawn(const char *root,
 /**
  * Return the absolute worktree path for an existing agent. NULL on error.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -61,6 +76,11 @@ const char *ffs_agent_path(const char *root,
 
 /**
  * Preview one agent's changes. JSON: `AgentCheckResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
  *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
@@ -71,6 +91,11 @@ const char *ffs_agent_status(const char *root,
 /**
  * Pull cloud changes into the agent. JSON: `AgentRefreshResult`. NULL on error.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -79,6 +104,11 @@ const char *ffs_agent_refresh(const char *root,
 
 /**
  * Integrate agent work into the main workspace. JSON: `AgentLandResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
  *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
@@ -91,6 +121,11 @@ const char *ffs_agent_land(const char *root,
 /**
  * Remove an agent workspace. JSON: `AgentCleanResult`. NULL on error.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -100,6 +135,11 @@ const char *ffs_agent_clean(const char *root,
 /**
  * List reachable workspace history. JSON: `LogResult`. NULL on error.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -108,6 +148,11 @@ const char *ffs_log(const char *root,
 
 /**
  * Restore a reachable snapshot as a new snapshot. JSON: `UndoResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
  *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
@@ -119,6 +164,11 @@ const char *ffs_undo(const char *root,
  * Send an encrypted agent signal. JSON in: `AgentMessageInput`; JSON out:
  * `AgentSendResult`. NULL on error.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -128,6 +178,11 @@ const char *ffs_agent_send(const char *root,
 /**
  * Read agent signals. JSON in: `AgentInboxQuery`; JSON out: `AgentInboxResult`.
  * NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
  *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
@@ -151,6 +206,11 @@ int32_t ffs_conflicts_keep(const char *root,
  * Assign one batch to a randomly ranked integrator. JSON in:
  * `IntegratorAssignInput`; JSON out: `IntegratorAssignResult`. NULL on error.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -162,6 +222,11 @@ const char *ffs_integrator_assign(const char *root,
  * `IntegratorStatusResult`. NULL on error; pass NULL `assignment_id` for the
  * active assignment.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -171,6 +236,11 @@ const char *ffs_integrator_status(const char *root,
 /**
  * Explicitly revoke the active integrator assignment. JSON out:
  * `IntegratorStatusResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
  *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
@@ -185,6 +255,11 @@ const char *ffs_integrator_revoke(const char *root,
  * `IntegratorObserveResult`. NULL on error; pass NULL `options_json` for
  * conservative defaults.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
@@ -197,10 +272,355 @@ const char *ffs_integrator_resume(const char *root,
  * `all: true`; JSON out: `ConflictMaterializeResult`.
  * NULL on error.
  *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
  * # Safety
  * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
  */
 const char *ffs_conflict_materialize(const char *root,
                                      const char *input_json);
+
+/**
+ * Propose one encrypted work intent. JSON in: `WorkProposeInput`; JSON out:
+ * `WorkSendResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_work_propose(const char *root,
+                             const char *input_json);
+
+/**
+ * Send one coordinator decision. JSON in: `WorkDecideInput`; JSON out:
+ * `WorkSendResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_work_decide(const char *root,
+                            const char *input_json);
+
+/**
+ * Amend an accepted intent's scope. JSON in: `WorkAmendInput`; JSON out:
+ * `WorkSendResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_work_amend(const char *root,
+                           const char *input_json);
+
+/**
+ * Send an explicit yield. JSON in: `WorkYieldInput`; JSON out:
+ * `WorkSendResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_work_yield(const char *root,
+                           const char *input_json);
+
+/**
+ * Send a settled profile with verification evidence. JSON in:
+ * `WorkSettleInput`; JSON out: `WorkSendResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_work_settle(const char *root,
+                            const char *input_json);
+
+/**
+ * Send a terminal completion. JSON in: `WorkCompleteInput`; JSON out:
+ * `WorkSendResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_work_complete(const char *root,
+                              const char *input_json);
+
+/**
+ * Send a terminal blocker. JSON in: `WorkBlockInput`; JSON out:
+ * `WorkSendResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_work_block(const char *root,
+                           const char *input_json);
+
+/**
+ * Observe signals through the `ffwork1` reducer and report the bounded
+ * projection. JSON in: `WorkStatusInput`; JSON out: `WorkStatusResult`.
+ * NULL on error; pass NULL `input_json` for defaults.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_work_status(const char *root,
+                            const char *input_json);
+
+/**
+ * Prepare one automatic resolution job for the exact current conflict.
+ * JSON in: `PreventionReason` (`{"type":"exhausted"|"violated","detail":…}`);
+ * JSON out: `ResolutionJob`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_prepare(const char *root,
+                                   const char *path,
+                                   const char *prevention_json);
+
+/**
+ * Read the bounded resolution status projection (ids/state/counts only).
+ * JSON out: `ResolutionStatusProjection`. Pass NULL `job_id` for the whole
+ * store. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_status(const char *root,
+                                  const char *job_id);
+
+/**
+ * Submit one resolution result. JSON in: `ResolutionResult`; JSON out:
+ * `ResolutionResult`. Submission NEVER applies: it validates and records the
+ * result without mutating the worktree, registry, artifacts, or head. NULL
+ * on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_submit(const char *root,
+                                  const char *job_id,
+                                  const char *result_json);
+
+/**
+ * Apply one submitted resolution result with guarded publication. JSON out:
+ * `ResolutionApplyOutcome`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_apply(const char *root,
+                                 const char *job_id);
+
+/**
+ * Materialize the authenticated base/ours/theirs legs of one resolution job
+ * into the engine-owned job directory. JSON out: array of
+ * `{"role": "original"|"local"|"cloud", "path": "<absolute-path>"}`. NULL
+ * on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_materialize(const char *root,
+                                       const char *job_id);
+
+/**
+ * Write the immutable engine-owned candidate file for one job from bounded
+ * base64 bytes (create-new, no-follow, fsync'd). JSON in: base64 string
+ * (or a JSON string document); JSON out: `CandidateDescriptor`. NULL on
+ * error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_put(const char *root,
+                               const char *job_id,
+                               const char *base64_json);
+
+/**
+ * Record one typed human answer bound to one exact escalation. JSON in:
+ * `HumanResolutionAnswer`; JSON out: the recorded answer. The local engine
+ * validates the full binding (job/assignment/attempt/fingerprint/question
+ * generation) and, for `submit_candidate`, runs the inline verification.
+ * NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_answer(const char *root,
+                                  const char *answer_json);
+
+/**
+ * Record the terminal `Deferred` state for one assignment without any
+ * publication. JSON out: `null`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_defer(const char *root,
+                                 const char *job_id);
+
+/**
+ * Observe the encrypted signal stream through the `ffres1` reducer and
+ * report the bounded metadata-only projection. JSON in: optional `rebuild`
+ * boolean (or `{"rebuild": bool}`); JSON out: `ResolutionProtocolStatus`.
+ * NULL on error; pass NULL `rebuild_json` for defaults.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_protocol_status(const char *root,
+                                           const char *rebuild_json);
+
+/**
+ * Publish the `ffres1` assignment profile (with the complete immutable job)
+ * for one locally prepared job. JSON in: optional flags (pass NULL or `{}`);
+ * JSON out: `{"message_id": "..."}`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_assign(const char *root,
+                                  const char *job_id,
+                                  const char *flags_json);
+
+/**
+ * Publish the `ffres1` result profile for one locally submitted job.
+ * JSON in: optional flags (pass NULL or `{}`); JSON out:
+ * `{"message_id": "..."}`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_reply(const char *root,
+                                 const char *job_id,
+                                 const char *flags_json);
+
+/**
+ * Publish the `ffres1` revoke/supersede profile for one local job.
+ * JSON in: optional flags `{"superseded": bool}` (default false); JSON out:
+ * `{"message_id": "..."}`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_revoke(const char *root,
+                                  const char *job_id,
+                                  const char *flags_json);
+
+/**
+ * Publish one typed human answer as an `ffres1` profile. JSON in:
+ * `HumanResolutionAnswer`; JSON out: `{"message_id": "..."}`. The engine
+ * validates the full answer (including `submit_candidate` verification
+ * evidence) before sending. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_resolution_publish_answer(const char *root,
+                                          const char *answer_json);
 
 #endif  /* FEANORFS_H */

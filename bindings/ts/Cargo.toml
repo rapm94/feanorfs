@@ -10,9 +10,11 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
 feanorfs-agent-core = { workspace = true }
 feanorfs-common = { workspace = true }
-napi = { workspace = true, features = ["napi4", "async"] }
+napi = { workspace = true, features = ["napi4", "async", "dyn-symbols"] }
 napi-derive = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
