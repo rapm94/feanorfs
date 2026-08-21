@@ -192,8 +192,9 @@ done
 
 jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
   "$HOME/.feanorfs/hub-data/service-program" >/dev/null
-jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
-  "$WORKSPACE_STATE/service-program" >/dev/null
+
+# Supervisor-owned workers carry no per-workspace identity marker on fresh
+# installs; that file is legacy per-component state.
 
 # The supervisor owns the tray on macOS; no per-component tray job or
 # identity marker exists on fresh installs (that file is Windows-only).

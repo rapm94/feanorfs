@@ -3255,6 +3255,7 @@ async fn publish_pending_scope_change_record_never_republishes_and_enters_attent
     stop_worker(&fixture, child).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn interactive_pending_scope_change_record_blocks_republish_across_restart() {
     let _serial_guard = REAL_PROCESS_SERIAL.lock().await;
