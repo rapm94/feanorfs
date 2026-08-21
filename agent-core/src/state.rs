@@ -112,16 +112,18 @@ impl LocalStateV1 {
             .context("parse local state JSON (deserialize local state schema version)")?
             .schema_version;
         if version == 0 {
-            bail!(
+            return Err(crate::agent::continuous::unsupported_schema_failure(
                 "local_state.json has invalid schema version 0. \
-                 Remove it and re-initialize, or upgrade feanorfs."
-            );
+                 Remove it and re-initialize, or upgrade feanorfs.",
+            ));
         }
         if version > u64::from(CURRENT_SCHEMA_VERSION) {
-            bail!(
-                "local_state.json schema version {version} is newer than supported \
+            return Err(crate::agent::continuous::unsupported_schema_failure(
+                format!(
+                    "local_state.json schema version {version} is newer than supported \
                  (max {CURRENT_SCHEMA_VERSION}). Upgrade feanorfs to open this workspace."
-            );
+                ),
+            ));
         }
         let state: Self = serde_json::from_str(json).context("deserialize local state")?;
         state.validate_bounds()?;
@@ -254,19 +256,118 @@ pub struct AccessEntryV1 {
     pub updated_at: i64,
 }
 
+/// Stable serialized status of one local conflict record (serde
+/// snake_case on the wire; unknown statuses from newer clients map to
+/// [`Self::Unknown`] so local state never fails to load).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictRecordStatus {
+    /// Ordinary pending conflict. When an identity sidecar exists beside its
+    /// artifacts the record is fingerprinted and eligible for automatic
+    /// resolution; without one it is a legacy path-only record.
+    Pending,
+    /// Legacy path-only record migrated from an older client: visible and
+    /// manually resolvable, but never eligible for automatic prepare/apply.
+    LegacyUnfingerprinted,
+    /// Unknown/unsupported status from a newer client. Excluded from pending
+    /// and automatic listings; never resolved automatically.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ConflictRecordStatus {
+    /// Parses one persisted status string (unknown values stay `Unknown`).
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "pending" => Self::Pending,
+            "legacy_unfingerprinted" => Self::LegacyUnfingerprinted,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Stable wire string for this status.
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::LegacyUnfingerprinted => "legacy_unfingerprinted",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the record is pending (visible and manually resolvable),
+    /// including migrated legacy unfingerprinted records.
+    #[must_use]
+    pub const fn is_pending(self) -> bool {
+        matches!(self, Self::Pending | Self::LegacyUnfingerprinted)
+    }
+}
+
+/// Stable serialized resolution method for history records (serde
+/// snake_case; unknown methods from newer clients map to [`Self::Other`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionMethod {
+    Local,
+    Cloud,
+    Both,
+    File,
+    /// Automatic guarded candidate publication.
+    Candidate,
+    /// Unknown/unsupported method from a newer client.
+    #[serde(other)]
+    Other,
+}
+
+impl ResolutionMethod {
+    /// Parses one persisted method string (unknown values stay `Other`).
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "local" => Self::Local,
+            "cloud" => Self::Cloud,
+            "both" => Self::Both,
+            "file" => Self::File,
+            "candidate" => Self::Candidate,
+            _ => Self::Other,
+        }
+    }
+
+    /// Stable wire string for this method.
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Cloud => "cloud",
+            Self::Both => "both",
+            Self::File => "file",
+            Self::Candidate => "candidate",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictRecordV1 {
     pub path: String,
     pub kind: feanorfs_common::ConflictKind,
     pub conflict_dir: String,
     pub opened_at: i64,
-    pub status: String,
+    pub status: ConflictRecordStatus,
+    /// Fingerprint of the exact conflict identity bound to this record.
+    /// `None` for legacy path-only records. The fingerprint keys the
+    /// identity sidecar (`identity-<first-32-chars>.json`) beside the
+    /// conflict artifacts; a record whose sidecar is missing or mismatched
+    /// is treated as legacy manual-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictResolutionV1 {
     pub path: String,
-    pub method: String,
+    pub method: ResolutionMethod,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_file_hash: Option<String>,
     pub resolved_at: i64,

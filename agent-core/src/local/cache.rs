@@ -5,7 +5,8 @@ use std::path::Path;
 
 use super::{CacheEntry, ClientDb};
 use crate::state::{
-    self, AccessEntryV1, CacheEntryV1, ConflictRecordV1, ConflictResolutionV1, DurableState,
+    self, AccessEntryV1, CacheEntryV1, ConflictRecordStatus, ConflictRecordV1,
+    ConflictResolutionV1, DurableState, ResolutionMethod,
 };
 
 impl ClientDb {
@@ -19,31 +20,33 @@ impl ClientDb {
 
     pub async fn get_cache_entries(&self) -> Result<HashMap<String, CacheEntry>> {
         self.state.with_read(|state| {
-            Ok(state
+            let entries = state
                 .local_files
                 .iter()
                 .map(|(path, entry)| {
-                    (
+                    let size = feanorfs_common::file_size_from_db(entry.size)?;
+                    Ok((
                         path.clone(),
                         CacheEntry {
                             path: path.clone(),
                             plaintext_hash: entry.plaintext_hash.clone(),
                             encrypted_hash: entry.encrypted_hash.clone(),
-                            size: feanorfs_common::file_size_from_db(entry.size),
+                            size,
                             mtime: entry.mtime,
                             server_mtime: entry.server_mtime,
                             mode: u32::try_from(entry.mode).unwrap_or(0),
                             hydrated: entry.hydrated,
                             deleted_at: entry.deleted_at,
                         },
-                    )
+                    ))
                 })
-                .collect())
+                .collect::<Result<HashMap<_, _>, anyhow::Error>>()?;
+            Ok(entries)
         })
     }
 
     pub async fn upsert_cache_entry(&self, entry: &CacheEntry) -> Result<()> {
-        let stored = cache_to_v1(entry);
+        let stored = cache_to_v1(entry)?;
         self.state.with_write(|state| {
             state.local_files.insert(entry.path.clone(), stored);
             Ok(())
@@ -111,7 +114,7 @@ impl ClientDb {
             for entry in entries {
                 state
                     .local_files
-                    .insert(entry.path.clone(), cache_to_v1(entry));
+                    .insert(entry.path.clone(), cache_to_v1(entry)?);
             }
             Ok(())
         })
@@ -129,7 +132,7 @@ impl ClientDb {
             for entry in upserts {
                 state
                     .local_files
-                    .insert(entry.path.clone(), cache_to_v1(entry));
+                    .insert(entry.path.clone(), cache_to_v1(entry)?);
             }
             Ok(())
         })
@@ -160,23 +163,27 @@ impl ClientDb {
             state.conflict_registry.clear();
             state.conflict_resolutions.clear();
 
-            state
+            let local_files = dto
                 .local_files
-                .extend(dto.local_files.iter().map(|(path, entry)| {
-                    (
+                .iter()
+                .map(|(path, entry)| {
+                    let size = feanorfs_common::file_size_to_db(entry.size)?;
+                    Ok((
                         path.clone(),
                         CacheEntryV1 {
                             plaintext_hash: entry.plaintext_hash.clone(),
                             encrypted_hash: entry.encrypted_hash.clone(),
-                            size: feanorfs_common::file_size_to_db(entry.size),
+                            size,
                             mtime: entry.mtime,
                             server_mtime: entry.server_mtime,
                             mode: i32::try_from(entry.mode).unwrap_or(0),
                             hydrated: entry.hydrated,
                             deleted_at: entry.deleted_at,
                         },
-                    )
-                }));
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, anyhow::Error>>()?;
+            state.local_files.extend(local_files);
             state
                 .file_access_log
                 .extend(dto.file_access_log.iter().map(|entry| AccessEntryV1 {
@@ -196,7 +203,9 @@ impl ClientDb {
                             kind: record.kind,
                             conflict_dir: record.conflict_dir.clone(),
                             opened_at: record.opened_at,
-                            status: record.status.clone(),
+                            status: ConflictRecordStatus::from_db_str(&record.status),
+                            // Migrated legacy records carry no fingerprint.
+                            conflict_fingerprint: None,
                         },
                     )
                 }));
@@ -207,7 +216,7 @@ impl ClientDb {
                         .iter()
                         .map(|record| ConflictResolutionV1 {
                             path: record.path.clone(),
-                            method: record.method.clone(),
+                            method: ResolutionMethod::from_db_str(&record.method),
                             source_file_hash: record.source_file_hash.clone(),
                             resolved_at: record.resolved_at,
                             resolver: record.resolver.clone(),
@@ -224,21 +233,22 @@ impl ClientDb {
                 .local_files
                 .iter()
                 .map(|(path, entry)| {
-                    (
+                    let size = feanorfs_common::file_size_from_db(entry.size)?;
+                    Ok((
                         path.clone(),
                         crate::state::MigrationCacheEntry {
                             plaintext_hash: entry.plaintext_hash.clone(),
                             encrypted_hash: entry.encrypted_hash.clone(),
-                            size: feanorfs_common::file_size_from_db(entry.size),
+                            size,
                             mtime: entry.mtime,
                             server_mtime: entry.server_mtime,
                             mode: u32::try_from(entry.mode).unwrap_or(0),
                             hydrated: entry.hydrated,
                             deleted_at: entry.deleted_at,
                         },
-                    )
+                    ))
                 })
-                .collect::<BTreeMap<_, _>>();
+                .collect::<Result<BTreeMap<_, _>, anyhow::Error>>()?;
             let file_access_log = state
                 .file_access_log
                 .iter()
@@ -260,7 +270,7 @@ impl ClientDb {
                             kind: record.kind,
                             conflict_dir: record.conflict_dir.clone(),
                             opened_at: record.opened_at,
-                            status: record.status.clone(),
+                            status: record.status.as_db_str().to_string(),
                         },
                     )
                 })
@@ -270,7 +280,7 @@ impl ClientDb {
                 .iter()
                 .map(|record| crate::state::MigrationConflictResolution {
                     path: record.path.clone(),
-                    method: record.method.clone(),
+                    method: record.method.as_db_str().to_string(),
                     source_file_hash: record.source_file_hash.clone(),
                     resolved_at: record.resolved_at,
                     resolver: record.resolver.clone(),
@@ -287,15 +297,16 @@ impl ClientDb {
     }
 }
 
-fn cache_to_v1(entry: &CacheEntry) -> CacheEntryV1 {
-    CacheEntryV1 {
+fn cache_to_v1(entry: &CacheEntry) -> Result<CacheEntryV1> {
+    let size = feanorfs_common::file_size_to_db(entry.size)?;
+    Ok(CacheEntryV1 {
         plaintext_hash: entry.plaintext_hash.clone(),
         encrypted_hash: entry.encrypted_hash.clone(),
-        size: feanorfs_common::file_size_to_db(entry.size),
+        size,
         mtime: entry.mtime,
         server_mtime: entry.server_mtime,
         mode: i32::try_from(entry.mode).unwrap_or(0),
         hydrated: entry.hydrated,
         deleted_at: entry.deleted_at,
-    }
+    })
 }

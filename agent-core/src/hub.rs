@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::RwLock;
 
+use self::http::json_body;
 use crate::hub_state::HubDb;
 
 const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
@@ -33,6 +34,29 @@ pub struct LocalHub {
     db: HubDb,
     auth_token: Option<String>,
     publication_lock: RwLock<()>,
+    head_notify: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+}
+
+struct LocalHeadNotifier<'a> {
+    hub: &'a LocalHub,
+    workspace_id: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for LocalHeadNotifier<'_> {
+    fn drop(&mut self) {
+        let mut map = self
+            .hub
+            .head_notify
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = map.get(&self.workspace_id).is_some_and(|current| {
+            Arc::ptr_eq(current, &self.notify) && Arc::strong_count(current) == 2
+        });
+        if remove {
+            map.remove(&self.workspace_id);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +103,7 @@ impl LocalHub {
             db: HubDb::open(&data_dir)?,
             auth_token,
             publication_lock: RwLock::new(()),
+            head_notify: Mutex::new(HashMap::new()),
         });
         hub_cache()
             .lock()
@@ -93,6 +118,7 @@ impl LocalHub {
             db: HubDb::open_for_migration(&data_dir)?,
             auth_token: None,
             publication_lock: RwLock::new(()),
+            head_notify: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -126,6 +152,11 @@ impl LocalHub {
         let params = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect::<HashMap<_, _>>();
+        if method == Method::GET && path == "/api/head" {
+            if let Some(after) = params.get("after").cloned() {
+                return self.request_head_with_wait(&params, &after).await;
+            }
+        }
         let request = RoutedRequest {
             method: &method,
             path,
@@ -148,6 +179,121 @@ impl LocalHub {
             return Ok(self.dispatch_request(request));
         }
         Ok(self.dispatch_request(request))
+    }
+
+    /// In-process bounded head-change waiting, mirroring the HTTP route's
+    /// semantics: respond immediately when the head already differs from
+    /// `after`, otherwise wait for the next durable swap or the timeout.
+    async fn request_head_with_wait(
+        &self,
+        params: &HashMap<String, String>,
+        after: &str,
+    ) -> anyhow::Result<Response<Body>> {
+        if !feanorfs_common::is_valid_hash(after) {
+            return Ok(response(StatusCode::BAD_REQUEST, Body::empty()));
+        }
+        let Some(workspace_id) = params
+            .get("workspace_id")
+            .map(String::as_str)
+            .filter(|workspace_id| !workspace_id.is_empty())
+        else {
+            return Ok(response(StatusCode::BAD_REQUEST, Body::empty()));
+        };
+        let requested_wait_ms = match params.get("wait_ms") {
+            None => None,
+            Some(value) => match value.parse::<u64>() {
+                Ok(wait_ms) => Some(wait_ms),
+                Err(_) => return Ok(response(StatusCode::BAD_REQUEST, Body::empty())),
+            },
+        };
+        let respond = |snapshot_id: Option<String>| {
+            json_body(
+                StatusCode::OK,
+                &feanorfs_common::HeadResponse {
+                    snapshot_id,
+                    wait_supported: true,
+                },
+            )
+        };
+        let current = match self.db.get_head(workspace_id) {
+            Ok(current) => current,
+            Err(error) => {
+                return Ok(response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Body::from(error.to_string()),
+                ))
+            }
+        };
+        if current.as_deref() != Some(after) {
+            return Ok(respond(current));
+        }
+        let Some(wait_ms) = requested_wait_ms else {
+            return Ok(respond(current));
+        };
+        let wait_ms = wait_ms.min(crate::head::MAX_HEAD_WAIT_MS);
+        if wait_ms == 0 {
+            return Ok(respond(current));
+        }
+        let notify = {
+            let mut map = self
+                .head_notify
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(map.entry(workspace_id.to_string()).or_default())
+        };
+        let registration = LocalHeadNotifier {
+            hub: self,
+            workspace_id: workspace_id.to_string(),
+            notify,
+        };
+        // Register the notification future before the second head read. A
+        // `notify_waiters` between that read and `select!` must not be lost.
+        let notified = registration.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Re-check after registration: a swap between the initial read and
+        // the registration must never lose the wakeup.
+        match self.db.get_head(workspace_id) {
+            Ok(registered_head) => {
+                if registered_head.as_deref() != Some(after) {
+                    return Ok(respond(registered_head));
+                }
+            }
+            Err(error) => {
+                return Ok(response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Body::from(error.to_string()),
+                ));
+            }
+        }
+        tokio::select! {
+            _ = &mut notified => {
+                let refreshed = match self.db.get_head(workspace_id) {
+                    Ok(refreshed) => refreshed,
+                    Err(error) => {
+                        return Ok(response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Body::from(error.to_string()),
+                        ))
+                    }
+                };
+                Ok(respond(refreshed))
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {
+                Ok(respond(current))
+            }
+        }
+    }
+
+    fn notify_head_waiters(&self, workspace_id: &str) {
+        if let Some(notify) = self
+            .head_notify
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(workspace_id)
+        {
+            notify.notify_waiters();
+        }
     }
 
     fn dispatch_request(&self, request: RoutedRequest<'_>) -> Response<Body> {

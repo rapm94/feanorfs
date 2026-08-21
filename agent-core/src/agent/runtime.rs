@@ -95,9 +95,6 @@ fn migrate_legacy_local_state(base: &Path, name: &str, destination: &Path) -> Re
 }
 
 fn legacy_identity_matches(worktree: &Path, legacy: &Path) -> Result<bool> {
-    let Some(current) = crate::workspace_layout::workspace_identity(worktree)? else {
-        return Ok(false);
-    };
     let identity = legacy.join("identity");
     match fs::symlink_metadata(&identity) {
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {}
@@ -108,10 +105,8 @@ fn legacy_identity_matches(worktree: &Path, legacy: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("inspect legacy agent identity"),
     }
-    Ok(fs::read_to_string(identity)
-        .context("read legacy agent identity")?
-        .trim()
-        == current)
+    let stored = fs::read_to_string(identity).context("read legacy agent identity")?;
+    crate::workspace_layout::workspace_identity_matches(worktree, stored.trim())
 }
 
 fn reject_non_file(path: &Path, label: &str) -> Result<()> {

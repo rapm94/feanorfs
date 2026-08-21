@@ -1,9 +1,11 @@
 use axum::body::Body;
+use feanorfs_common::hub_contract::MigrationWriteOutcome;
 use http::StatusCode;
 use std::collections::HashMap;
 
 use super::http::{check_fence, get_param, json_body, response, status_err, RouteResult};
 use super::LocalHub;
+use crate::hub_state::FormatWrite;
 
 impl LocalHub {
     pub(super) fn route_get_format(&self, params: &HashMap<String, String>) -> RouteResult {
@@ -25,20 +27,21 @@ impl LocalHub {
         let version = get_param(params, "format_version")?
             .parse::<u32>()
             .map_err(|_| (StatusCode::BAD_REQUEST, "invalid format_version".into()))?;
-        if version != 3 {
+        if !feanorfs_common::hub_contract::is_supported_format_version(version) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 "only format version 3 is accepted".into(),
             ));
         }
-        self.db.set_format(workspace_id, version).map_err(|error| {
-            if error.to_string().contains("manifested snapshot head") {
-                (StatusCode::INTERNAL_SERVER_ERROR, String::new())
-            } else {
-                status_err(error)
+        match self.db.set_format(workspace_id, version) {
+            Ok(FormatWrite::Applied) => Ok(response(StatusCode::OK, Body::empty())),
+            // A v3 transition without a manifested head is an internal
+            // precondition failure, matching the server route's 500.
+            Ok(FormatWrite::MissingManifestHead) => {
+                Err((StatusCode::INTERNAL_SERVER_ERROR, String::new()))
             }
-        })?;
-        Ok(response(StatusCode::OK, Body::empty()))
+            Err(error) => Err(status_err(error)),
+        }
     }
 
     pub(super) fn route_begin_migration(
@@ -59,8 +62,8 @@ impl LocalHub {
             return Ok(response(StatusCode::OK, Body::empty()));
         }
         match self.db.begin_migration(workspace_id, token) {
-            Ok(()) => Ok(response(StatusCode::OK, Body::empty())),
-            Err(error) if error.to_string().contains("MIGRATION_LOCKED") => Err((
+            Ok(MigrationWriteOutcome::Acquired) => Ok(response(StatusCode::OK, Body::empty())),
+            Ok(MigrationWriteOutcome::LockedByOther) => Err((
                 StatusCode::LOCKED,
                 "workspace migration is already locked".into(),
             )),

@@ -1,10 +1,12 @@
 mod check;
+pub mod continuous;
 mod diff;
 mod land;
 mod proposal;
 mod refresh;
 mod runner;
 mod runtime;
+mod scope;
 mod spawn;
 
 #[cfg(test)]
@@ -17,14 +19,28 @@ use tokio::fs;
 use crate::api::ApiClient;
 use crate::local::ClientDb;
 use crate::paths::{agent_base_ref, agent_root, agents_dir, validate_name};
-
 pub use check::check_agent;
+pub use continuous::{
+    build_status, classify_continuous_error, land_agent_continuous, land_agent_continuous_scoped,
+    land_agent_guarded, land_agent_guarded_scoped, land_agent_runner_owned,
+    land_agent_runner_owned_scoped, live_continuous_status, live_reconciliation_health,
+    probe_agent_state, read_continuous_status, refresh_agent_continuous,
+    refresh_agent_runner_owned, verify_agent_worktree, write_continuous_status,
+    ContinuousErrorClass, ContinuousOwnerLock, ContinuousProbe, LiveReconciliationHealth,
+};
 pub use land::land_agent;
 pub use refresh::{refresh_agent, refresh_agent_guarded, refresh_agent_with_options};
 pub use runner::{
     remove_configured, runner_process_metadata, runner_status, RunnerAdmission, RunnerAttention,
     RunnerConfig, RunnerExecutionMode, RunnerExecutionSession, RunnerInvocation, RunnerLaunch,
-    RunnerPhase, RunnerProcessMetadata, RunnerStatus, RunnerStore,
+    RunnerOwnership, RunnerPhase, RunnerProcessMetadata, RunnerScopeMode, RunnerStatus,
+    RunnerStore, RunnerWorkWait, RunnerWorkWaitKind, ScopeChangePublishState,
+    ScopeChangeRequestKey,
+};
+pub use scope::{
+    partition_agent_scope, resolve_request_admission, validate_accepted_work,
+    AcceptedWorkDescriptor, AgentScopePartition, RunnerAdmissionReject,
+    ACCEPTED_WORK_SCHEMA_VERSION,
 };
 pub use spawn::spawn_agent;
 

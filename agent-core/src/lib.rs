@@ -14,7 +14,7 @@ pub mod crypto;
 pub mod ctx;
 mod durable;
 pub mod fs_util;
-mod head;
+pub mod head;
 pub mod history;
 pub mod hub;
 mod hub_state;
@@ -27,6 +27,9 @@ mod object_gc;
 pub mod objects;
 pub mod paths;
 mod prepared_tree;
+pub mod resolution;
+pub mod resolution_protocol;
+mod signal_index;
 pub mod snapshot;
 mod snapshot_diff;
 mod state;
@@ -34,15 +37,26 @@ pub mod sync_pass;
 mod tree_reconcile;
 pub mod tunnel;
 mod upload_registry;
+pub mod work;
 pub mod workspace_layout;
 pub mod workspace_read;
+pub mod workspace_state_registry;
 
 pub use agent::{
-    check_agent, clean_agent, commit_agent, land_agent, list_agents, refresh_agent,
-    refresh_agent_guarded, refresh_agent_with_options, remove_configured, runner_process_metadata,
-    runner_status, spawn_agent, RefreshOptions, RunnerAdmission, RunnerAttention, RunnerConfig,
-    RunnerExecutionMode, RunnerExecutionSession, RunnerInvocation, RunnerLaunch, RunnerPhase,
-    RunnerProcessMetadata, RunnerStatus, RunnerStore,
+    build_status, check_agent, classify_continuous_error, clean_agent, commit_agent, land_agent,
+    land_agent_continuous, land_agent_continuous_scoped, land_agent_guarded,
+    land_agent_guarded_scoped, land_agent_runner_owned, land_agent_runner_owned_scoped,
+    list_agents, live_continuous_status, live_reconciliation_health, partition_agent_scope,
+    probe_agent_state, read_continuous_status, refresh_agent, refresh_agent_continuous,
+    refresh_agent_guarded, refresh_agent_runner_owned, refresh_agent_with_options,
+    remove_configured, resolve_request_admission, runner_process_metadata, runner_status,
+    spawn_agent, verify_agent_worktree, write_continuous_status, AcceptedWorkDescriptor,
+    ContinuousErrorClass, ContinuousOwnerLock, ContinuousProbe, LiveReconciliationHealth,
+    RefreshOptions, RunnerAdmission, RunnerAdmissionReject, RunnerAttention, RunnerConfig,
+    RunnerExecutionMode, RunnerExecutionSession, RunnerInvocation, RunnerLaunch, RunnerOwnership,
+    RunnerPhase, RunnerProcessMetadata, RunnerScopeMode, RunnerStatus, RunnerStore, RunnerWorkWait,
+    RunnerWorkWaitKind, ScopeChangePublishState, ScopeChangeRequestKey,
+    ACCEPTED_WORK_SCHEMA_VERSION,
 };
 pub use api::{ApiClient, MIN_SUPPORTED_SERVER_VERSION};
 pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
@@ -54,9 +68,16 @@ pub use feanorfs_common::{
     AgentRefreshResult, ConcurrentEdit, ConflictKind, ConflictRecord, FileState, RelayConfig,
     SpawnResult, WorkspaceInvite, INVITE_PREFIX,
 };
-pub use head::SwapHeadResult;
+pub use head::{
+    wait_for_head_change, HeadObservation, HeadObserver, HeadWaitOutcome, SwapHeadResult,
+    MAX_HEAD_WAIT_MS,
+};
 pub use history::{log, undo};
 pub use hub::LocalHub;
+pub use integrator::{
+    designate_conflict_owner, DesignationRefusal, DesignationRefusalKind, OwnerDesignation,
+    OwnerDesignationEvidence, OwnerDesignationMethod,
+};
 pub use integrator::{
     integrator_assign, integrator_observe, integrator_resume, integrator_revoke, integrator_status,
     materialize_conflicts, IntegratorObserveOptions, IntegratorStateFile, IntegratorStore,
@@ -71,8 +92,29 @@ pub use messages::{inbox, send_message, signals_since};
 pub use objects::ObjectStore;
 pub use paths::legacy_policy_for_config;
 pub use paths::{agent_dir, agent_runner_dir, agents_dir, conflicts_dir, validate_name};
+pub use resolution::{
+    answer_resolution, apply_resolution_job, candidate_path_for, defer_resolution,
+    materialize_resolution_legs, prepare_resolution_job, put_resolution_candidate,
+    recover_uncertain_publications, resolution_status, revoke_resolution_assignment,
+    submit_resolution_result, PersistedResolutionJob, ResolutionApplyOutcome,
+    ResolutionAssignmentState, ResolutionJobStatus, ResolutionOpError, ResolutionStateFile,
+    ResolutionStatusProjection, ResolutionStore,
+};
+pub use workspace_state_registry::{
+    retire_workspace_state, sweep_retired_state, RetirementSweep, TombstoneRecord,
+};
+
+pub use resolution_protocol::{
+    resolution_protocol_status, send_human_answer, send_resolution_assignment,
+    send_resolution_result, send_resolution_revoke, ProtocolAssignmentState,
+    ResolutionProtocolEntryStatus, ResolutionProtocolStatus,
+};
 pub use snapshot::SnapshotEngine;
 pub use snapshot_diff::TreeDiffStats;
+pub use work::{
+    work_amend, work_block, work_complete, work_decide, work_propose, work_settle, work_status,
+    work_yield,
+};
 pub use workspace_layout::{
     ensure_workspace_state, global_state_root, maintain_workspace_state, workspace_is_configured,
     workspace_state_id, workspace_state_path,
@@ -86,6 +128,7 @@ pub use hub_state::{
 };
 #[doc(hidden)]
 pub use local::ClientDb as _ClientDb;
+pub use state::{ConflictRecordStatus, ResolutionMethod};
 #[doc(hidden)]
 pub use state::{
     MigrationAccessEntry, MigrationCacheEntry, MigrationConflictRecord,
@@ -378,6 +421,238 @@ impl Workspace {
             about_snapshot,
             paths,
         ))
+    }
+
+    /// Proposes one `ffwork1` work intent (sends an encrypted signal).
+    pub fn work_propose(
+        &self,
+        input: feanorfs_common::WorkProposeInput,
+    ) -> Result<feanorfs_common::WorkSendResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(work::work_propose(&ctx, input))
+    }
+
+    /// Sends one `ffwork1` coordinator decision for an exact proposal.
+    pub fn work_decide(
+        &self,
+        input: feanorfs_common::WorkDecideInput,
+    ) -> Result<feanorfs_common::WorkSendResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(work::work_decide(&ctx, input))
+    }
+
+    /// Sends one `ffwork1` scope amendment against an accepted intent.
+    pub fn work_amend(
+        &self,
+        input: feanorfs_common::WorkAmendInput,
+    ) -> Result<feanorfs_common::WorkSendResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(work::work_amend(&ctx, input))
+    }
+
+    /// Sends one `ffwork1` explicit yield relinquishing accepted overlap.
+    pub fn work_yield(
+        &self,
+        input: feanorfs_common::WorkYieldInput,
+    ) -> Result<feanorfs_common::WorkSendResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(work::work_yield(&ctx, input))
+    }
+
+    /// Sends one `ffwork1` settled profile with verification evidence.
+    pub fn work_settle(
+        &self,
+        input: feanorfs_common::WorkSettleInput,
+    ) -> Result<feanorfs_common::WorkSendResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(work::work_settle(&ctx, input))
+    }
+
+    /// Sends one `ffwork1` terminal completion.
+    pub fn work_complete(
+        &self,
+        input: feanorfs_common::WorkCompleteInput,
+    ) -> Result<feanorfs_common::WorkSendResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(work::work_complete(&ctx, input))
+    }
+
+    /// Sends one `ffwork1` terminal blocker.
+    pub fn work_block(
+        &self,
+        input: feanorfs_common::WorkBlockInput,
+    ) -> Result<feanorfs_common::WorkSendResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(work::work_block(&ctx, input))
+    }
+
+    /// Observes signals through the `ffwork1` reducer and reports the
+    /// bounded projection (cursor-reset rebuilds are marked incomplete).
+    pub fn work_status(
+        &self,
+        input: feanorfs_common::WorkStatusInput,
+    ) -> Result<feanorfs_common::WorkStatusResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(work::work_status(&ctx, input))
+    }
+
+    /// Prepares one automatic resolution job for the exact current conflict
+    /// at `path`. Requires a real current conflict and a
+    /// typed prevention-exhausted/violated reason; refuses anything else.
+    /// Prepare never mutates the worktree, conflict registry, artifacts, or
+    /// head.
+    pub fn resolution_prepare(
+        &self,
+        path: &str,
+        prevention: feanorfs_common::PreventionReason,
+    ) -> Result<feanorfs_common::ResolutionJob> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution::prepare_resolution_job(&ctx, path, prevention))
+    }
+
+    /// Submits one resolution result for an exact job. Submission NEVER
+    /// applies: it validates result schema/bounds, assignment/attempt/owner/
+    /// fingerprint, and the immutable candidate, then records the result
+    /// without mutating the worktree, registry, artifacts, or head. Apply is
+    /// a separate explicit operation.
+    pub fn resolution_submit(
+        &self,
+        job_id: &str,
+        result: feanorfs_common::ResolutionResult,
+    ) -> Result<feanorfs_common::ResolutionResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution::submit_resolution_result(&ctx, job_id, result))
+    }
+
+    /// Applies one submitted resolution result with guarded publication
+    /// by revalidating every identity field and the candidate
+    /// descriptor immediately before a single CAS; a lost CAS restarts
+    /// complete validation. The current conflict survives unchanged for any
+    /// typed stale outcome.
+    pub fn resolution_apply(&self, job_id: &str) -> Result<resolution::ResolutionApplyOutcome> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution::apply_resolution_job(&ctx, job_id))
+    }
+
+    /// Reads the bounded resolution status projection (ids/state/counts
+    /// only; never paths or bodies). Read-only and constant-cost; first
+    /// converges any crash-left publication-uncertain records.
+    pub fn resolution_status(
+        &self,
+        job_id: Option<&str>,
+    ) -> Result<resolution::ResolutionStatusProjection> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution::resolution_status(&ctx, job_id))
+    }
+
+    /// Writes the immutable engine-owned candidate file for one job from a
+    /// bounded byte stream (create-new, no-follow, fsync'd) and returns its
+    /// plaintext descriptor. Allowed while the job is active and carries no
+    /// candidate-bearing result.
+    pub fn resolution_put_candidate(
+        &self,
+        job_id: &str,
+        bytes: &[u8],
+    ) -> Result<feanorfs_common::CandidateDescriptor> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution::put_resolution_candidate(&ctx, job_id, bytes))
+    }
+
+    /// Records a typed human answer bound to one exact escalation. Defer and
+    /// keep_unresolved record terminal states without publication;
+    /// submit_candidate records a `candidate_ready` result that a later
+    /// guarded apply publishes.
+    pub fn resolution_answer(
+        &self,
+        answer: feanorfs_common::resolution_contract::HumanResolutionAnswer,
+    ) -> Result<feanorfs_common::resolution_contract::HumanResolutionAnswer> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution::answer_resolution(&ctx, answer))
+    }
+
+    /// Records the terminal `Deferred` state for one assignment without any
+    /// publication; the conflict is preserved for later manual action.
+    pub fn resolution_defer(&self, job_id: &str) -> Result<()> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt.block_on(resolution::defer_resolution(&ctx, job_id))
+    }
+
+    /// Materializes the authenticated base/ours/theirs legs of one job into
+    /// the engine-owned job directory (create-new, no-follow, fsync'd) so a
+    /// designated machine can reconstruct the conflict context by ID and
+    /// fingerprint.
+    pub fn resolution_materialize_legs(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<(feanorfs_common::ArtifactRoleName, std::path::PathBuf)>> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution::materialize_resolution_legs(&ctx, job_id))
+    }
+
+    /// Observes the encrypted signal stream through the deterministic
+    /// `ffres1` reducer and returns the bounded metadata-only projection.
+    /// `rebuild` resets the cursor and re-observes the bounded window.
+    pub fn resolution_protocol_status(
+        &self,
+        rebuild: bool,
+    ) -> Result<resolution_protocol::ResolutionProtocolStatus> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution_protocol::resolution_protocol_status(
+                &ctx, rebuild,
+            ))
+    }
+
+    /// Publishes the `ffres1` assignment profile (with the complete
+    /// immutable job) for one locally prepared job.
+    pub fn resolution_assign(&self, job_id: &str) -> Result<String> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution_protocol::send_resolution_assignment(
+                &ctx, job_id,
+            ))
+    }
+
+    /// Publishes the `ffres1` result profile for one locally submitted job.
+    pub fn resolution_reply(&self, job_id: &str) -> Result<String> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution_protocol::send_resolution_result(&ctx, job_id))
+    }
+
+    /// Publishes the `ffres1` revoke/supersede profile for one local job.
+    pub fn resolution_revoke(&self, job_id: &str, superseded: bool) -> Result<String> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution_protocol::send_resolution_revoke(
+                &ctx, job_id, superseded,
+            ))
+    }
+
+    /// Publishes one typed human answer as an `ffres1` profile.
+    pub fn resolution_publish_answer(
+        &self,
+        answer: &feanorfs_common::resolution_contract::HumanResolutionAnswer,
+    ) -> Result<String> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution_protocol::send_human_answer(&ctx, answer))
+    }
+
+    /// Converges every crash-left publication-uncertain record (bookkeeping
+    /// completes when the CAS won; otherwise the record fails closed to
+    /// stale). Returns the number of uncertain records recovered.
+    pub fn resolution_recover(&self) -> Result<usize> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        self.rt
+            .block_on(resolution::recover_uncertain_publications(&ctx))
     }
 }
 

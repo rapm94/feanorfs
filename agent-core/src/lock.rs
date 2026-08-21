@@ -7,6 +7,33 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const STALE_SYNC_SECS: u64 = 600;
 const STALE_LAND_SECS: u64 = 600;
 
+/// Typed marker for an otherwise healthy operation that lost a non-blocking
+/// workspace lock race. Callers may preserve arbitrary context around this
+/// error and still classify the condition without inspecting rendered text.
+#[derive(Debug)]
+pub struct LockContentionError {
+    message: String,
+}
+
+impl std::fmt::Display for LockContentionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LockContentionError {}
+
+fn lock_contention(message: String) -> anyhow::Error {
+    LockContentionError { message }.into()
+}
+
+/// Returns true when any cause in an anyhow chain is typed lock contention.
+pub fn is_lock_contention(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<LockContentionError>().is_some())
+}
+
 fn lock_path(base: &Path, name: &str) -> Result<PathBuf> {
     Ok(crate::workspace_layout::ensure_workspace_state(base)?.join(name))
 }
@@ -134,10 +161,10 @@ impl SyncLock {
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                bail!(
+                Err(lock_contention(format!(
                     "another sync is running on this folder; wait or remove {}",
                     path.display()
-                )
+                )))
             }
             Err(e) => Err(e.into()),
         }
@@ -174,10 +201,10 @@ impl LandLock {
                 Ok(Self { path, _file: file })
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                bail!(
+                Err(lock_contention(format!(
                     "another agent land is in progress; wait or remove {}",
                     path.display()
-                )
+                )))
             }
             Err(e) => Err(e.into()),
         }

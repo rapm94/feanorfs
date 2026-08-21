@@ -55,10 +55,11 @@ impl Default for WorkspaceMetaV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ManifestStore {
-    Stored,
-    Unchanged,
-    Conflict,
+pub enum FormatWrite {
+    /// The format transition was applied.
+    Applied,
+    /// A v3 transition requires a manifested snapshot head.
+    MissingManifestHead,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

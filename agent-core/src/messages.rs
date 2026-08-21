@@ -7,6 +7,7 @@
 //! workspace-head compare-and-swap operation; every CAS retry reloads both the
 //! latest head and its tree root so a retry can never roll back files.
 
+use crate::history::traversal;
 use crate::paths::validate_name;
 use crate::snapshot::SnapshotEngine;
 use crate::{SwapHeadResult, SyncCtx};
@@ -74,7 +75,9 @@ pub async fn send_message(ctx: &SyncCtx<'_>, input: AgentMessageInput) -> Result
             SwapHeadResult::Conflict(current) => expected = current,
         }
     }
-    bail!("workspace head changed too many times while sending signal")
+    Err(crate::agent::continuous::retryable_volatility_failure(
+        "workspace head changed too many times while sending signal",
+    ))
 }
 
 /// Attempts one signal append against `expected_head` without CAS retries.
@@ -186,6 +189,10 @@ async fn prepare_message(
 /// Returns an error for invalid recipients or corrupt head objects.
 pub async fn inbox(ctx: &SyncCtx<'_>, query: AgentInboxQuery) -> Result<AgentInboxResult> {
     validate_recipient(&query.recipient)?;
+    ensure!(
+        query.limit > 0,
+        "inbox limit must be greater than zero; a zero limit would always report a cursor reset"
+    );
     let limit = query.limit.min(AGENT_INBOX_MAX_LIMIT);
     collect_signals(ctx, query.after.as_deref(), Some(&query.recipient), limit).await
 }
@@ -233,18 +240,35 @@ async fn collect_signals(
 
     // First walk the current head, stopping only the path that reaches the
     // supplied cursor. This keeps the common one-new-signal case proportional
-    // to the graph delta instead of rescanning all history. If a multi-parent
-    // snapshot occurs before the cursor, an alternate parent can re-enter the
-    // cursor's older ancestry; a second bounded pass then paints the complete
-    // cursor ancestry so those snapshots are subtracted as required by
+    // to the graph delta instead of rescanning all history. If any multi-
+    // parent snapshot occurs in the head walk, an alternate parent can re-enter
+    // the cursor's older ancestry without passing through the cursor itself;
+    // a second bounded pass then paints the complete cursor ancestry so those
+    // snapshots are subtracted as required by
     // reachable(head) - reachable(cursor).
+    let mut signal_index = match ctx.state_dir() {
+        Ok(state_dir) => crate::signal_index::SignalIndexSession::load(&state_dir),
+        Err(_) => crate::signal_index::SignalIndexSession::disabled(),
+    };
+    async fn walked_snapshot(
+        index: &mut crate::signal_index::SignalIndexSession,
+        engine: &SnapshotEngine<'_, '_>,
+        id: &str,
+    ) -> Result<Snapshot> {
+        if let Some(snapshot) = index.get(id) {
+            return Ok(snapshot);
+        }
+        let snapshot = engine.load_snapshot(id).await?;
+        index.put(id, &snapshot);
+        Ok(snapshot)
+    }
     let mut pending = VecDeque::from([head.clone()]);
     let mut seen_from_head = HashSet::new();
     let mut loaded_snapshots: HashMap<String, Snapshot> = HashMap::new();
     let mut candidate_ids = Vec::new();
     let mut after_found = after.is_none();
     let mut scan_exhausted = false;
-    let mut saw_merge_before_cursor = false;
+    let mut saw_merge_in_head_walk = false;
     while let Some(id) = pending.pop_front() {
         if !seen_from_head.insert(id.clone()) {
             continue;
@@ -256,12 +280,13 @@ async fn collect_signals(
 
         if after == Some(id.as_str()) {
             after_found = true;
-            loaded_snapshots.insert(id.clone(), engine.load_snapshot(&id).await?);
+            let snapshot = walked_snapshot(&mut signal_index, &engine, &id).await?;
+            loaded_snapshots.insert(id, snapshot);
             continue;
         }
 
-        let snapshot = engine.load_snapshot(&id).await?;
-        saw_merge_before_cursor |= snapshot.parents.len() > 1;
+        let snapshot = walked_snapshot(&mut signal_index, &engine, &id).await?;
+        saw_merge_in_head_walk |= snapshot.parents.len() > 1;
         pending.extend(snapshot.parents.iter().cloned());
         loaded_snapshots.insert(id.clone(), snapshot);
         candidate_ids.push(id);
@@ -269,7 +294,7 @@ async fn collect_signals(
 
     let mut cursor_ancestry = HashSet::new();
     let mut cursor_reset = scan_requires_cursor_reset(after, scan_exhausted, after_found);
-    if let Some(after) = after.filter(|_| !cursor_reset && saw_merge_before_cursor) {
+    if let Some(after) = after.filter(|_| !cursor_reset && saw_merge_in_head_walk) {
         let mut cursor_pending = VecDeque::from([after.to_string()]);
         while let Some(id) = cursor_pending.pop_front() {
             if !cursor_ancestry.insert(id.clone()) {
@@ -283,7 +308,7 @@ async fn collect_signals(
                     scan_exhausted = true;
                     break;
                 }
-                let snapshot = engine.load_snapshot(&id).await?;
+                let snapshot = walked_snapshot(&mut signal_index, &engine, &id).await?;
                 let parents = snapshot.parents.clone();
                 loaded_snapshots.insert(id, snapshot);
                 parents
@@ -333,6 +358,7 @@ async fn collect_signals(
     });
     cursor_reset |= messages.len() > limit;
     messages.truncate(limit);
+    signal_index.flush().await;
     Ok(AgentInboxResult {
         cursor: head,
         cursor_reset,
@@ -349,10 +375,11 @@ fn scan_requires_cursor_reset(
 }
 
 fn ensure_signal_format(ctx: &SyncCtx<'_>) -> Result<()> {
-    ensure!(
-        ctx.format_version() >= 3,
-        "agent signals require format v3; run `feanorfs migrate` first"
-    );
+    if ctx.format_version() < 3 {
+        return Err(crate::agent::continuous::unsupported_schema_failure(
+            "agent signals require format v3; run `feanorfs migrate` first",
+        ));
+    }
     Ok(())
 }
 
@@ -392,6 +419,9 @@ async fn write_message_snapshot(
     ctx.api
         .upload_manifest(ctx.workspace_id(), &id, &hashes)
         .await?;
+    if let Ok(state_dir) = ctx.state_dir() {
+        let _ = crate::upload_registry::record_many(&state_dir, &hashes).await;
+    }
     engine.objects.cache_manifest(&id, &hashes).await?;
     Ok(id)
 }
@@ -404,21 +434,26 @@ async fn ensure_reachable(ctx: &SyncCtx<'_>, head: Option<&str>, id: &str) -> Re
         return Ok(());
     }
     let engine = SnapshotEngine::new(ctx);
-    let mut pending = vec![head.to_string()];
-    let mut seen = HashSet::new();
-    while let Some(current) = pending.pop() {
-        if seen.len() >= MAX_SIGNAL_SCAN {
-            bail!("snapshot {id} is not reachable within the scan bound");
+    let outcome = traversal::walk(
+        head,
+        traversal::TraversalBudgets {
+            node_budget: MAX_SIGNAL_SCAN,
+            ..traversal::TraversalBudgets::unlimited()
+        },
+        traversal::ParentOrder::LastFirst,
+        &mut traversal::EngineLoader(&engine),
+        &mut traversal::TargetFinder::new(id),
+    )
+    .await?;
+    match outcome {
+        traversal::TraversalOutcome::Stopped { .. } => Ok(()),
+        traversal::TraversalOutcome::Exhausted { reason, .. } => {
+            bail!("snapshot {id} is not reachable within the scan bound ({reason})")
         }
-        if !seen.insert(current.clone()) {
-            continue;
+        traversal::TraversalOutcome::Complete { .. } => {
+            bail!("snapshot {id} is not reachable from the workspace head")
         }
-        if current == id {
-            return Ok(());
-        }
-        pending.extend(engine.load_snapshot(&current).await?.parents);
     }
-    bail!("snapshot {id} is not reachable from the workspace head")
 }
 
 async fn ensure_signal(ctx: &SyncCtx<'_>, head: Option<&str>, id: &str) -> Result<()> {
@@ -456,9 +491,9 @@ pub async fn append_raw_snapshot(
         .await?
     {
         SwapHeadResult::Swapped => Ok(id),
-        SwapHeadResult::Conflict(_) => {
-            bail!("workspace head changed while appending raw snapshot")
-        }
+        SwapHeadResult::Conflict(_) => Err(crate::agent::continuous::retryable_volatility_failure(
+            "workspace head changed while appending raw snapshot",
+        )),
     }
 }
 

@@ -127,7 +127,7 @@ async fn persist(state_dir: &Path) -> Result<()> {
     hashes.sort_unstable();
     let mut content = hashes.join("\n").into_bytes();
     content.push(b'\n');
-    crate::fs_util::atomic_write(state_dir, REGISTRY_FILE, &content).await
+    crate::fs_util::atomic_write_visible(state_dir, REGISTRY_FILE, &content).await
 }
 
 async fn read_registry_file(path: &Path) -> Result<HashSet<String>> {

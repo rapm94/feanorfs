@@ -1,5 +1,5 @@
 use crate::ctx::SyncCtx;
-use crate::fs_util::atomic_write;
+use crate::fs_util::atomic_write_visible;
 use crate::prepared_tree::{PreparedTreeBundle, OBJECT_DOMAIN};
 use anyhow::{bail, Context, Result};
 use feanorfs_common::{
@@ -388,7 +388,7 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
         let mut manifest = canonical.join("\n").into_bytes();
         manifest.push(b'\n');
         let state = self.ctx.state_dir()?;
-        atomic_write(&state, &format!("manifests/{id}"), &manifest).await?;
+        atomic_write_visible(&state, &format!("manifests/{id}"), &manifest).await?;
         crate::object_gc::prune(self.ctx.base).await
     }
 
@@ -453,7 +453,7 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
 
     async fn cache(&self, id: &str, ciphertext: &[u8]) -> Result<()> {
         let state = self.ctx.state_dir()?;
-        atomic_write(&state, &format!("objects/{id}"), ciphertext)
+        atomic_write_visible(&state, &format!("objects/{id}"), ciphertext)
             .await
             .with_context(|| format!("cache object {id}"))
     }

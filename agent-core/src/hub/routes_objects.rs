@@ -1,10 +1,10 @@
 use axum::body::Body;
+use feanorfs_common::hub_contract::ManifestWriteOutcome;
 use http::StatusCode;
 use std::collections::HashMap;
 
 use super::http::{check_fence, get_param, json_body, response, status_err, RouteResult};
 use super::{LocalHub, MAX_BODY_BYTES, MAX_MANIFEST_BYTES};
-use crate::hub_state::ManifestStore;
 
 impl LocalHub {
     pub(super) fn route_download(&self, hash: &str) -> RouteResult {
@@ -47,7 +47,10 @@ impl LocalHub {
         let snapshot_id = self.db.get_head(workspace_id).map_err(status_err)?;
         Ok(json_body(
             StatusCode::OK,
-            &feanorfs_common::HeadResponse { snapshot_id },
+            &feanorfs_common::HeadResponse {
+                snapshot_id,
+                wait_supported: false,
+            },
         ))
     }
 
@@ -83,10 +86,13 @@ impl LocalHub {
             )
             .map_err(status_err)?;
         if previous == request.expected {
+            // Wake in-process waiters only after the durable swap accepted.
+            self.notify_head_waiters(&request.workspace_id);
             Ok(json_body(
                 StatusCode::OK,
                 &feanorfs_common::HeadResponse {
                     snapshot_id: Some(request.new),
+                    wait_supported: false,
                 },
             ))
         } else {
@@ -94,6 +100,7 @@ impl LocalHub {
                 StatusCode::CONFLICT,
                 &feanorfs_common::HeadResponse {
                     snapshot_id: previous,
+                    wait_supported: false,
                 },
             ))
         }
@@ -128,13 +135,18 @@ impl LocalHub {
             .store_manifest(workspace_id, snapshot_id, hashes)
             .map_err(status_err)?
         {
-            ManifestStore::Stored | ManifestStore::Unchanged => {
+            ManifestWriteOutcome::Stored | ManifestWriteOutcome::Unchanged => {
                 Ok(response(StatusCode::OK, Body::empty()))
             }
-            ManifestStore::Conflict => Err((
+            ManifestWriteOutcome::Conflict => Err((
                 StatusCode::BAD_REQUEST,
                 "snapshot manifest is immutable".into(),
             )),
+            // The in-process store has no manifest capacity limits, but the
+            // shared outcome must still map to the server's status.
+            ManifestWriteOutcome::Capacity => {
+                Err((StatusCode::INSUFFICIENT_STORAGE, String::new()))
+            }
         }
     }
 }

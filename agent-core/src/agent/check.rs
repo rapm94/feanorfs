@@ -30,5 +30,6 @@ pub async fn check_agent(
         their_changes: diff.their_changes,
         conflicts,
         conflict_risk: diff.conflict_risk,
+        live: super::continuous::live_continuous_status(ctx.base, name)?,
     })
 }

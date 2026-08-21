@@ -1,5 +1,5 @@
 use super::super::{
-    AccessEntryV1, ConflictResolutionV1, LocalStateV1, ACCESS_LOG_MAX_ENTRIES,
+    AccessEntryV1, ConflictResolutionV1, LocalStateV1, ResolutionMethod, ACCESS_LOG_MAX_ENTRIES,
     CURRENT_SCHEMA_VERSION,
 };
 use super::{cache_entry, empty_state};
@@ -84,14 +84,14 @@ fn serialization_sorts_borrowed_vectors_without_mutating_state() {
     state.conflict_resolutions = vec![
         ConflictResolutionV1 {
             path: "z.txt".into(),
-            method: "local".into(),
+            method: ResolutionMethod::Local,
             source_file_hash: None,
             resolved_at: 2,
             resolver: "human".into(),
         },
         ConflictResolutionV1 {
             path: "a.txt".into(),
-            method: "cloud".into(),
+            method: ResolutionMethod::Cloud,
             source_file_hash: None,
             resolved_at: 1,
             resolver: "human".into(),

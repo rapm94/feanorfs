@@ -23,15 +23,19 @@ impl LocalHub {
             .get_files(&request.workspace_id)
             .map_err(status_err)?
             .into_iter()
-            .map(|(path, file)| feanorfs_common::FileState {
-                path,
-                hash: file.hash,
-                size: feanorfs_common::file_size_from_db(file.size),
-                mtime: file.mtime,
-                deleted: file.deleted,
-                mode: file.mode,
+            .map(|(path, file)| {
+                let size = feanorfs_common::file_size_from_db(file.size)
+                    .map_err(|e| status_err(anyhow::Error::from(e)))?;
+                Ok(feanorfs_common::FileState {
+                    path,
+                    hash: file.hash,
+                    size,
+                    mtime: file.mtime,
+                    deleted: file.deleted,
+                    mode: file.mode,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let delta = feanorfs_common::compute_sync_delta(&request.files, &server_files);
         Ok(json_body(StatusCode::OK, &delta))
     }
@@ -114,8 +118,11 @@ impl LocalHub {
             Ok(()) => Ok(response(StatusCode::OK, Body::empty())),
             Err(error) => {
                 if is_new {
-                    let message = error.to_string();
-                    let is_referenced = message.contains("committed-but-durability-uncertain")
+                    // When the blob write committed but directory-sync
+                    // durability is uncertain, the blob may or may not exist
+                    // after the failed upsert; retain it only when the
+                    // workspace now references it.
+                    let is_referenced = crate::durable::commit_durability_is_uncertain(&error)
                         && self
                             .db
                             .get_files(workspace_id)

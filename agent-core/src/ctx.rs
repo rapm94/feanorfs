@@ -85,6 +85,23 @@ impl<'a> SyncCtx<'a> {
         }
     }
 
+    /// Build a context with an explicit verified format version. Use when the
+    /// caller already loaded the workspace config and must not downgrade
+    /// format-gated operations (agent signals require format v3).
+    #[must_use]
+    pub fn with_format_version(
+        api: &'a ApiClient,
+        db: &'a ClientDb,
+        base: &'a Path,
+        workspace_id: &str,
+        password: Option<&str>,
+        policy: LegacyPolicy,
+        format_version: u32,
+    ) -> Self {
+        let mut ctx = Self::new(api, db, base, workspace_id, password, policy);
+        ctx.format_version = format_version;
+        ctx
+    }
     /// Build a context from a loaded `Config`.
     pub fn from_config(
         api: &'a ApiClient,

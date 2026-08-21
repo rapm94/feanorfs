@@ -555,11 +555,10 @@ async fn inbox_limit_is_bounded_and_clamped() {
         },
     )
     .await
-    .unwrap();
-    assert!(zero.messages.is_empty());
+    .expect_err("a zero limit is rejected instead of reporting a guaranteed cursor reset");
     assert!(
-        zero.cursor_reset,
-        "limit zero still reports omitted signals"
+        zero.to_string().contains("greater than zero"),
+        "unexpected zero-limit error: {zero}"
     );
 }
 

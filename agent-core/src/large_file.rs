@@ -106,7 +106,9 @@ async fn upload_inner(
     let password = ctx.password_str();
     let plan = plan_file(&mut file, password, relative_path)?;
     if plan.hash != expected_hash {
-        bail!("{relative_path} changed while preparing its chunked upload; retry sync");
+        return Err(crate::agent::continuous::retryable_volatility_failure(
+            format!("{relative_path} changed while preparing its chunked upload; retry sync"),
+        ));
     }
     file.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0_u8; CHUNK_BYTES];
@@ -117,12 +119,16 @@ async fn upload_inner(
         // changes to skipped chunks are still detected by length.
         let read = read_chunk(&mut file, &mut buffer)?;
         if read != expected.plaintext_size as usize {
-            bail!("{relative_path} changed while uploading chunk {index}; retry sync");
+            return Err(crate::agent::continuous::retryable_volatility_failure(
+                format!("{relative_path} changed while uploading chunk {index}; retry sync"),
+            ));
         }
         let ciphertext = seal_chunk(&buffer[..read], password, relative_path, index)?;
         let hash = hash_bytes(&ciphertext);
         if hash != expected.hash {
-            bail!("{relative_path} changed while uploading chunk {index}; retry sync");
+            return Err(crate::agent::continuous::retryable_volatility_failure(
+                format!("{relative_path} changed while uploading chunk {index}; retry sync"),
+            ));
         }
         if !use_registry || !crate::upload_registry::known(&state_dir, &expected.hash).await {
             pending.push((expected.hash.clone(), ciphertext));
@@ -389,7 +395,9 @@ fn plan_file(file: &mut std::fs::File, password: &str, relative_path: &str) -> R
     }
     let after = file.metadata()?;
     if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-        bail!("large file changed while it was being scanned; retry sync");
+        return Err(crate::agent::continuous::retryable_volatility_failure(
+            "large file changed while it was being scanned; retry sync",
+        ));
     }
     let manifest = ChunkManifest {
         format: FORMAT.into(),
@@ -522,6 +530,10 @@ async fn download_verified(ctx: &SyncCtx<'_>, hash: &str, max_bytes: usize) -> R
     Ok(bytes)
 }
 
+/// Atomic visibility: publishes verified large-file
+/// content into the worktree via a sibling temp file, data sync, and atomic
+/// rename, without a parent-directory sync. Worktree durability is provided by
+/// the materialization commit's directory sync, never on the hot path.
 async fn atomic_write_destination(destination: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;

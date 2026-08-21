@@ -5,7 +5,13 @@ use feanorfs_common::{
     FileState, LogEntry, LogResult, SyncResponse, UndoResult, MAX_TREE_OUTPUT_PATHS,
     MAX_TREE_PATH_BYTES_TOTAL,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+// Registered here (crate-internal) so `agent-core/src/lib.rs` stays untouched
+// while it is being reworked concurrently; consumers reach it via
+// `crate::history::traversal`.
+#[path = "traversal.rs"]
+pub(crate) mod traversal;
 
 const MAX_LOG_LIMIT: usize = 1_000;
 const MAX_UNDO_RETRIES: usize = 8;
@@ -14,7 +20,9 @@ const MAX_HISTORY_SNAPSHOTS: usize = 250_000;
 /// Lists reachable snapshots from current workspace head.
 ///
 /// # Errors
-/// Returns an error when head objects cannot be fetched or decoded.
+/// Returns an error when head objects cannot be fetched or decoded, when the
+/// aggregate changed-path limits are exceeded, or when the reachable history
+/// exceeds the traversal bound.
 pub async fn log(ctx: &SyncCtx<'_>, limit: usize) -> Result<LogResult> {
     let Some(head) = ctx.api.get_head(ctx.workspace_id()).await? else {
         return Ok(LogResult {
@@ -22,18 +30,55 @@ pub async fn log(ctx: &SyncCtx<'_>, limit: usize) -> Result<LogResult> {
         });
     };
     let snapshots = SnapshotEngine::new(ctx);
-    let mut pending = vec![head];
-    let mut seen = HashSet::new();
-    let mut entries = Vec::new();
-    let mut changed_path_count = 0_usize;
-    let mut changed_path_bytes = 0_usize;
-    while let Some(id) = pending.pop() {
-        if entries.len() >= limit.min(MAX_LOG_LIMIT) || !seen.insert(id.clone()) {
-            continue;
+    let mut collector = LogCollector {
+        snapshots: &snapshots,
+        entry_limit: limit.min(MAX_LOG_LIMIT),
+        entries: Vec::new(),
+        changed_path_count: 0_usize,
+        changed_path_bytes: 0_usize,
+    };
+    let outcome = traversal::walk(
+        &head,
+        traversal::TraversalBudgets {
+            node_budget: MAX_HISTORY_SNAPSHOTS,
+            ..traversal::TraversalBudgets::unlimited()
+        },
+        traversal::ParentOrder::FirstFirst,
+        &mut traversal::EngineLoader(&snapshots),
+        &mut collector,
+    )
+    .await?;
+    if let traversal::TraversalOutcome::Exhausted { reason, .. } = outcome {
+        bail!("snapshot history exceeds traversal limit ({reason})");
+    }
+    Ok(LogResult {
+        entries: collector.entries,
+    })
+}
+
+/// Visitor for [`log`]: renders each reached snapshot into a [`LogEntry`]
+/// (the history-display policy stays here, outside the shared walk) and stops
+/// once the output limit is reached.
+struct LogCollector<'a, 'b> {
+    snapshots: &'a SnapshotEngine<'a, 'b>,
+    entry_limit: usize,
+    entries: Vec<LogEntry>,
+    changed_path_count: usize,
+    changed_path_bytes: usize,
+}
+
+impl traversal::TraversalVisitor for LogCollector<'_, '_> {
+    async fn visit(
+        &mut self,
+        snapshot: &feanorfs_common::Snapshot,
+        id: &str,
+        _depth: usize,
+    ) -> Result<traversal::VisitControl> {
+        if self.entries.len() >= self.entry_limit {
+            return Ok(traversal::VisitControl::Stop);
         }
-        let snapshot = snapshots.load_snapshot(&id).await?;
         let changed_paths = if snapshot.parents.is_empty() {
-            let mut paths: Vec<_> = snapshots.load_files(&id).await?.into_keys().collect();
+            let mut paths: Vec<_> = self.snapshots.load_files(id).await?.into_keys().collect();
             paths.sort();
             paths
         } else {
@@ -41,41 +86,39 @@ pub async fn log(ctx: &SyncCtx<'_>, limit: usize) -> Result<LogResult> {
             // report second-parent deltas too.
             let mut paths = std::collections::BTreeSet::new();
             for parent in &snapshot.parents {
-                for change in snapshots.diff_snapshots(parent, &id).await?.changes {
+                for change in self.snapshots.diff_snapshots(parent, id).await?.changes {
                     paths.insert(change.path);
                 }
             }
             paths.into_iter().collect()
         };
-        changed_path_count = changed_path_count
+        self.changed_path_count = self
+            .changed_path_count
             .checked_add(changed_paths.len())
             .context("history path counter overflow")?;
-        changed_path_bytes = changed_paths
-            .iter()
-            .try_fold(changed_path_bytes, |total, path| {
-                total
-                    .checked_add(path.len())
-                    .context("history path byte counter overflow")
-            })?;
-        if changed_path_count > MAX_TREE_OUTPUT_PATHS
-            || changed_path_bytes > MAX_TREE_PATH_BYTES_TOTAL
+        self.changed_path_bytes =
+            changed_paths
+                .iter()
+                .try_fold(self.changed_path_bytes, |total, path| {
+                    total
+                        .checked_add(path.len())
+                        .context("history path byte counter overflow")
+                })?;
+        if self.changed_path_count > MAX_TREE_OUTPUT_PATHS
+            || self.changed_path_bytes > MAX_TREE_PATH_BYTES_TOTAL
         {
             bail!("history output exceeds aggregate path limit");
         }
-        pending.extend(snapshot.parents.iter().rev().cloned());
-        if seen.len().saturating_add(pending.len()) > MAX_HISTORY_SNAPSHOTS {
-            bail!("snapshot history exceeds traversal limit");
-        }
-        entries.push(LogEntry {
-            snapshot_id: id,
-            parents: snapshot.parents,
-            author: snapshot.author,
+        self.entries.push(LogEntry {
+            snapshot_id: id.to_string(),
+            parents: snapshot.parents.clone(),
+            author: snapshot.author.clone(),
             created_at_ms: snapshot.created_at_ms,
-            message: snapshot.message,
+            message: snapshot.message.clone(),
             changed_paths,
         });
+        Ok(traversal::VisitControl::Continue)
     }
-    Ok(LogResult { entries })
 }
 
 /// Restores one reachable snapshot by appending a new snapshot.
@@ -117,7 +160,11 @@ pub async fn undo(ctx: &SyncCtx<'_>, selector: &str) -> Result<UndoResult> {
         }
         let content = crate::sync_pass::read_upload_source(&read_root, &state.path, state).await?;
         let (hash, ciphertext) = crate::crypto::seal(&content, ctx.password_str(), &state.path)?;
-        anyhow::ensure!(hash == state.hash, "worktree changed during undo");
+        if hash != state.hash {
+            return Err(crate::agent::continuous::retryable_volatility_failure(
+                "worktree changed during undo",
+            ));
+        }
         if !crate::upload_registry::known(&state_dir, &hash).await {
             ctx.api
                 .upload_object(ctx.workspace_id(), &hash, ciphertext)
@@ -156,10 +203,18 @@ pub async fn undo(ctx: &SyncCtx<'_>, selector: &str) -> Result<UndoResult> {
                 break;
             }
             SwapHeadResult::Conflict(Some(current)) => expected = current,
-            SwapHeadResult::Conflict(None) => bail!("workspace head disappeared during undo"),
+            SwapHeadResult::Conflict(None) => {
+                return Err(crate::agent::continuous::retryable_volatility_failure(
+                    "workspace head disappeared during undo",
+                ))
+            }
         }
     }
-    let snapshot_id = committed.context("workspace head changed too many times during undo")?;
+    let snapshot_id = committed.ok_or_else(|| {
+        crate::agent::continuous::retryable_volatility_failure(
+            "workspace head changed too many times during undo",
+        )
+    })?;
     crate::sync_pass::pause_sync_test(ctx, "undo-after-cas").await?;
     let changed_paths: Vec<_> = snapshots
         .diff_snapshots(&backup, &restored_snapshot_id)
@@ -185,29 +240,49 @@ async fn resolve_reachable(
     if selector.len() < 8 || !selector.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("snapshot id must be at least 8 hexadecimal characters");
     }
-    let mut pending = vec![head.to_string()];
-    let mut seen = HashSet::new();
-    let mut matches = Vec::new();
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        if seen.len() > MAX_HISTORY_SNAPSHOTS {
-            bail!("snapshot history exceeds traversal limit");
-        }
-        let snapshot = snapshots.load_snapshot(&id).await?;
-        if id.starts_with(selector) {
-            matches.push(id.clone());
-        }
-        pending.extend(snapshot.parents);
-        if pending.len() > MAX_HISTORY_SNAPSHOTS {
-            bail!("snapshot history frontier exceeds traversal limit");
-        }
+    let mut collector = PrefixMatcher {
+        selector,
+        matches: Vec::new(),
+    };
+    let outcome = traversal::walk(
+        head,
+        traversal::TraversalBudgets {
+            node_budget: MAX_HISTORY_SNAPSHOTS,
+            ..traversal::TraversalBudgets::unlimited()
+        },
+        traversal::ParentOrder::LastFirst,
+        &mut traversal::EngineLoader(snapshots),
+        &mut collector,
+    )
+    .await?;
+    if let traversal::TraversalOutcome::Exhausted { reason, .. } = outcome {
+        bail!("snapshot history exceeds traversal limit ({reason})");
     }
-    match matches.as_slice() {
+    match collector.matches.as_slice() {
         [id] => Ok(id.clone()),
         [] => bail!("snapshot {selector} is not reachable from current head"),
         _ => bail!("snapshot prefix {selector} is ambiguous"),
+    }
+}
+
+/// Collection policy for [`resolve_reachable`]: records every visited
+/// snapshot id whose prefix matches the undo selector.
+struct PrefixMatcher<'s> {
+    selector: &'s str,
+    matches: Vec<String>,
+}
+
+impl traversal::TraversalVisitor for PrefixMatcher<'_> {
+    async fn visit(
+        &mut self,
+        _snapshot: &feanorfs_common::Snapshot,
+        id: &str,
+        _depth: usize,
+    ) -> Result<traversal::VisitControl> {
+        if id.starts_with(self.selector) {
+            self.matches.push(id.to_string());
+        }
+        Ok(traversal::VisitControl::Continue)
     }
 }
 

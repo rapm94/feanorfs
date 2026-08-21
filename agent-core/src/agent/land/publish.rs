@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use std::path::Path;
 #[cfg(debug_assertions)]
 use tokio::fs;
@@ -15,6 +15,33 @@ pub(super) struct PublishInput<'a, 'ctx> {
     pub(super) name: &'a str,
     pub(super) agent_base: &'a str,
     pub(super) agent_path: &'a Path,
+    /// Canonical accepted-scope path entries (sorted, unique; empty when the
+    /// land is unscoped). Every CAS-retry recompute re-applies this filter so
+    /// no retry path can publish or materialize an unfiltered diff.
+    pub(super) scope_paths: Vec<String>,
+}
+
+/// Re-applies the accepted-scope filter to a freshly recomputed diff. Uses
+/// the same coverage semantics as `scope::filter_diff_by_scope`
+/// (`scope_covers_path` consults only the scope's path entries), so the
+/// canonical sorted path list is a faithful filter input: only in-scope
+/// changes and in-scope conflicts are kept; everything else stays local and
+/// unlanded.
+fn filter_diff_to_scope(mut diff: AgentDiff, scope_paths: &[String]) -> AgentDiff {
+    if scope_paths.is_empty() {
+        return diff;
+    }
+    diff.our_changes.retain(|change| {
+        scope_paths.iter().any(|entry| {
+            feanorfs_common::work_contract::scope_entry_covers_path(entry, &change.path)
+        })
+    });
+    diff.conflicts.retain(|(edit, _)| {
+        scope_paths
+            .iter()
+            .any(|entry| feanorfs_common::work_contract::scope_entry_covers_path(entry, &edit.path))
+    });
+    diff
 }
 
 pub(super) async fn inject_land_failure(base: &Path, name: &str, point: &str) -> Result<()> {
@@ -24,12 +51,36 @@ pub(super) async fn inject_land_failure(base: &Path, name: &str, point: &str) ->
             .join(format!("test-land-failpoint-{name}"));
         if fs::read_to_string(&path).await.ok().as_deref() == Some(point) {
             fs::remove_file(path).await?;
-            bail!("injected agent land failure at {point}");
+            anyhow::bail!("injected agent land failure at {point}");
         }
     }
     #[cfg(not(debug_assertions))]
     let _ = (base, name, point);
     Ok(())
+}
+
+/// Test hook (debug builds): force one CAS conflict on the next `swap_head`
+/// so the retry loop's recompute path is exercised deterministically. The
+/// failpoint file is removed after the first injection (mirroring
+/// [`inject_land_failure`]); the conflicting head is the workspace's current
+/// head, and the retried CAS then succeeds against the recomputed diff.
+async fn inject_cas_conflict(
+    input: &PublishInput<'_, '_>,
+    result: SwapHeadResult,
+) -> Result<SwapHeadResult> {
+    #[cfg(debug_assertions)]
+    {
+        let path = crate::workspace_layout::ensure_workspace_state(input.ctx.base)?
+            .join(format!("test-land-failpoint-{}-cas-conflict", input.name));
+        if fs::read_to_string(&path).await.ok().as_deref() == Some("once") {
+            fs::remove_file(path).await?;
+            let head = input.ctx.api.get_head(input.ctx.workspace_id()).await?;
+            return Ok(SwapHeadResult::Conflict(head));
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = input;
+    Ok(result)
 }
 
 pub(super) async fn publish_land(
@@ -58,7 +109,9 @@ pub(super) async fn publish_land(
                         .await?;
                 let (hash, encrypted) = seal(&bytes, input.ctx.password_str(), &change.path)?;
                 if hash != change.hash {
-                    bail!("agent file changed while preparing land: {}", change.path);
+                    return Err(super::super::continuous::retryable_volatility_failure(
+                        format!("agent file changed while preparing land: {}", change.path),
+                    ));
                 }
                 input
                     .ctx
@@ -86,7 +139,9 @@ pub(super) async fn publish_land(
                         .await?;
                 let (hash, encrypted) = seal(&bytes, input.ctx.password_str(), &conflict.path)?;
                 if hash != ours.hash {
-                    bail!("agent file changed while preparing land: {}", conflict.path);
+                    return Err(super::super::continuous::retryable_volatility_failure(
+                        format!("agent file changed while preparing land: {}", conflict.path),
+                    ));
                 }
                 input
                     .ctx
@@ -129,7 +184,10 @@ pub(super) async fn publish_land(
                 committed_snapshot = Some(diff.current_head.clone());
                 break;
             }
-            diff = compute_agent_diff(input.ctx, input.name).await?;
+            diff = filter_diff_to_scope(
+                compute_agent_diff(input.ctx, input.name).await?,
+                &input.scope_paths,
+            );
             continue;
         }
         let parents = if input.agent_base == diff.current_head {
@@ -147,7 +205,7 @@ pub(super) async fn publish_land(
             })
             .await?;
         inject_land_failure(input.ctx.base, input.name, "after-stage").await?;
-        match input
+        let swap_result = input
             .ctx
             .api
             .swap_head(
@@ -155,21 +213,29 @@ pub(super) async fn publish_land(
                 Some(&diff.current_head),
                 &candidate,
             )
-            .await?
-        {
+            .await?;
+        match inject_cas_conflict(&input, swap_result).await? {
             SwapHeadResult::Swapped => {
                 committed_snapshot = Some(candidate);
                 break;
             }
             SwapHeadResult::Conflict(Some(_)) => {
-                diff = compute_agent_diff(input.ctx, input.name).await?;
+                diff = filter_diff_to_scope(
+                    compute_agent_diff(input.ctx, input.name).await?,
+                    &input.scope_paths,
+                );
             }
             SwapHeadResult::Conflict(None) => {
-                bail!("workspace head disappeared during agent land");
+                return Err(super::super::continuous::retryable_volatility_failure(
+                    "workspace head disappeared during agent land",
+                ));
             }
         }
     }
-    let snapshot_id =
-        committed_snapshot.context("workspace head changed too many times during land")?;
+    let snapshot_id = committed_snapshot.ok_or_else(|| {
+        super::super::continuous::retryable_volatility_failure(
+            "workspace head changed too many times during land",
+        )
+    })?;
     Ok((diff, snapshot_id))
 }

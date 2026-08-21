@@ -39,18 +39,19 @@ impl HubDb {
                     .files
                     .iter()
                     .map(|(path, file)| {
-                        (
+                        let size = feanorfs_common::file_size_to_db(file.size)?;
+                        Ok((
                             path.clone(),
                             LegacyFileV1 {
                                 hash: file.hash.clone(),
-                                size: feanorfs_common::file_size_to_db(file.size),
+                                size,
                                 mtime: file.mtime,
                                 mode: file.mode,
                                 deleted: file.deleted,
                             },
-                        )
+                        ))
                     })
-                    .collect();
+                    .collect::<Result<BTreeMap<_, _>, anyhow::Error>>()?;
                 state.workspaces.insert(
                     workspace_id.clone(),
                     WorkspaceMetaV1 {
@@ -97,19 +98,20 @@ impl HubDb {
                         .files
                         .iter()
                         .map(|(path, file)| {
-                            (
+                            let size = feanorfs_common::file_size_from_db(file.size)?;
+                            Ok((
                                 path.clone(),
                                 MigrationHubFile {
                                     hash: file.hash.clone(),
-                                    size: feanorfs_common::file_size_from_db(file.size),
+                                    size,
                                     mtime: file.mtime,
                                     mode: file.mode,
                                     deleted: file.deleted,
                                 },
-                            )
+                            ))
                         })
-                        .collect::<BTreeMap<_, _>>();
-                    (
+                        .collect::<Result<BTreeMap<_, _>, anyhow::Error>>()?;
+                    Ok((
                         workspace_id.clone(),
                         MigrationHubWorkspace {
                             format_version: workspace.format_version,
@@ -123,9 +125,9 @@ impl HubDb {
                                 }
                             }),
                         },
-                    )
+                    ))
                 })
-                .collect();
+                .collect::<Result<BTreeMap<_, _>, anyhow::Error>>()?;
             Ok(MigrationHubState { workspaces })
         })
     }

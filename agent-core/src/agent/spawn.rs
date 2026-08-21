@@ -129,7 +129,9 @@ fn copy_opened_source(
         || before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
     {
-        bail!("workspace file {logical_path} changed while spawning agent");
+        return Err(super::continuous::retryable_volatility_failure(format!(
+            "workspace file {logical_path} changed while spawning agent"
+        )));
     }
     output.set_permissions(before.permissions())?;
     output.sync_all()?;
@@ -255,10 +257,10 @@ async fn spawn_agent_with_ctx(
 
     let pending = crate::conflicts::pending_conflict_paths(ctx.db).await?;
     if !pending.is_empty() {
-        bail!(
+        return Err(super::continuous::conflict_failure(format!(
             "Your folder needs attention before an agent can copy it. Conflicts: {}",
             pending.into_iter().collect::<Vec<_>>().join(", ")
-        );
+        )));
     }
 
     let base_snapshot = if let Some(last_synced_id) = no_sync_base {

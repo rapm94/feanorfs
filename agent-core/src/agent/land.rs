@@ -41,28 +41,43 @@ pub async fn land_agent(
     }
     let config = crate::local::load_config(base)?;
     let ctx = SyncCtx::from_config(api, db, base, &config)?;
-    land_agent_with_ctx(&ctx, name, clean_after, propose, &runner_guard).await
+    land_agent_with_ctx(&ctx, name, clean_after, propose, &runner_guard, None).await
 }
 
-async fn land_agent_with_ctx(
+pub(super) async fn land_agent_with_ctx(
     ctx: &SyncCtx<'_>,
     name: &str,
     clean_after: bool,
     propose: bool,
     runner_guard: &RunnerOperationGuard,
+    scope: Option<&feanorfs_common::WorkScope>,
 ) -> Result<AgentLandResult> {
     let _land_guard = LandLock::acquire(ctx.base)?;
     let _sync_guard = SyncLock::acquire(ctx.base)?;
     let pending = pending_conflict_paths(ctx.db).await?;
     if !pending.is_empty() {
-        bail!(
+        return Err(super::continuous::conflict_failure(format!(
             "Your folder needs attention before landing agent work. Conflicts: {}",
             pending.into_iter().collect::<Vec<_>>().join(", ")
-        );
+        )));
     }
     let snapshots = SnapshotEngine::new(ctx);
     let agent_base = snapshots.read_agent_base(name).await?;
+    // Canonical accepted-scope path entries (sorted, unique) that publication
+    // re-applies on every CAS-retry recompute, so no retry path can publish
+    // an unfiltered diff.
+    let scope_paths = scope
+        .map(|scope| {
+            let mut entries = scope.paths.clone();
+            entries.sort();
+            entries.dedup();
+            entries
+        })
+        .unwrap_or_default();
     let mut diff = compute_agent_diff(ctx, name).await?;
+    if let Some(scope) = scope {
+        diff = super::scope::filter_diff_by_scope(diff, scope);
+    }
     let initial = build_land_candidate(&snapshots, &diff).await?;
     let current_snapshot = snapshots.load_snapshot(&diff.current_head).await?;
     let current_root = current_snapshot.root.clone();
@@ -81,12 +96,15 @@ async fn land_agent_with_ctx(
             crate::sync_pass::run_sync_pass_locked(ctx, crate::sync_pass::SyncMode::Full, false)
                 .await?;
         if !blocked.is_empty() {
-            bail!(
+            return Err(super::continuous::conflict_failure(format!(
                 "Your folder needs attention before landing agent work. Conflicts: {}",
                 blocked.into_iter().collect::<Vec<_>>().join(", ")
-            );
+            )));
         }
         diff = compute_agent_diff(ctx, name).await?;
+        if let Some(scope) = scope {
+            diff = super::scope::filter_diff_by_scope(diff, scope);
+        }
     }
     let agent_path = agent_dir(ctx.base, name)?;
     let gate_local = if let Some(previous_head) = recovery_gate_head.as_deref() {
@@ -115,10 +133,10 @@ async fn land_agent_with_ctx(
     if !recovering_committed_land {
         let (_, blocked, _) = negotiate_sync_with_conflict_gate(ctx, &gate_local, false).await?;
         if !blocked.is_empty() {
-            bail!(
+            return Err(super::continuous::conflict_failure(format!(
                 "Your folder changed during land and needs attention: {}",
                 blocked.into_iter().collect::<Vec<_>>().join(", ")
-            );
+            )));
         }
     }
     let materialization = feanorfs_common::SyncResponse {
@@ -144,6 +162,7 @@ async fn land_agent_with_ctx(
             name,
             agent_base: &agent_base,
             agent_path: &agent_path,
+            scope_paths,
         },
         diff,
     )
@@ -188,7 +207,39 @@ async fn land_agent_with_ctx(
     if clean_after {
         clean_agent_with_runner_guard(ctx.base, name, runner_guard).await?;
     } else {
-        snapshots.write_agent_base(name, &snapshot_id).await?;
+        let base_snapshot = if diff.their_changes.is_empty() && diff.conflicts.is_empty() {
+            // The committed head exactly describes the agent worktree's new
+            // agreed view, so retain the ordinary fast path.
+            snapshot_id.clone()
+        } else {
+            // The shared head may include disjoint remote paths that are not
+            // in this agent worktree yet. Advancing the agent base straight
+            // to that head would make those absent paths look like agent-local
+            // deletions on the next pass. Record a local-only working-copy
+            // base instead: old base plus the agent changes committed to the
+            // head. Those paths already describe the agent worktree even when
+            // shared-folder materialization was safely diverted. Ordinary
+            // refresh can then see and materialize every still-inbound remote
+            // path.
+            let mut base_state = snapshots.load_state(&agent_base).await?;
+            for change in &diff.our_changes {
+                if change.deleted {
+                    base_state.files.remove(&change.path);
+                } else {
+                    base_state.files.insert(change.path.clone(), change.clone());
+                }
+            }
+            snapshots
+                .write_local(crate::snapshot::SnapshotInput {
+                    files: &base_state.files,
+                    conflicts: &base_state.conflicts,
+                    parents: vec![agent_base.clone()],
+                    author: name,
+                    message: Some("post-land working-copy base".to_string()),
+                })
+                .await?
+        };
+        snapshots.write_agent_base(name, &base_snapshot).await?;
     }
     let message = if landed.is_empty() && conflicts.is_empty() {
         "Nothing to land.".to_string()

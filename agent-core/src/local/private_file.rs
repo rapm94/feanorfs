@@ -1,3 +1,16 @@
+//! Private persistence helpers for engine state.
+//!
+//! `write_private_json` is the engine's **private durable replacement**
+//! policy: mode 0o600 temp file, data sync, atomic rename, then a
+//! parent-directory sync on Unix so the rename survives power loss (the
+//! `local_state.json` and `config.json` state files must not silently revert).
+//! On non-Unix platforms it falls back to [`crate::durable::atomic_overwrite`],
+//! which degrades to atomic visibility on Windows (directory sync is
+//! unavailable there — see the `crate::durable` module docs).
+//!
+//! `create_private_dir` enforces 0o700 on Unix for the private state
+//! directory so secrets written into it are not world-readable.
+
 use anyhow::Result;
 use std::fs;
 use std::path::Path;

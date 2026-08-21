@@ -39,3 +39,38 @@ async fn migration_waits_for_inflight_publication() {
         http::StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn head_wait_rejects_missing_workspace_and_malformed_window() {
+    let directory = tempfile::tempdir().expect("create hub directory");
+    let hub = LocalHub::open(directory.path().join("hub"), None)
+        .await
+        .expect("open hub");
+    let after = "a".repeat(64);
+
+    let missing_workspace = hub
+        .request(
+            Method::GET,
+            "/api/head",
+            &format!("after={after}&wait_ms=1"),
+            Vec::new(),
+            (None, None),
+            None,
+        )
+        .await
+        .expect("missing-workspace request");
+    assert_eq!(missing_workspace.status(), http::StatusCode::BAD_REQUEST);
+
+    let malformed_window = hub
+        .request(
+            Method::GET,
+            "/api/head",
+            &format!("workspace_id=workspace&after={after}&wait_ms=invalid"),
+            Vec::new(),
+            (None, None),
+            None,
+        )
+        .await
+        .expect("malformed-window request");
+    assert_eq!(malformed_window.status(), http::StatusCode::BAD_REQUEST);
+}

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use feanorfs_common::{AgentRefreshResult, SyncResponse};
 use std::path::Path;
 
@@ -64,7 +64,7 @@ pub async fn refresh_agent_guarded(
     refresh_agent_impl(base, db, api, name, RefreshOptions::default()).await
 }
 
-async fn refresh_agent_impl(
+pub(super) async fn refresh_agent_impl(
     base: &Path,
     db: &ClientDb,
     api: &ApiClient,
@@ -102,7 +102,10 @@ async fn refresh_agent_impl(
                         .await?;
                 let (hash, encrypted) = seal(&bytes, ctx.password_str(), &state.path)?;
                 if hash != state.hash {
-                    bail!("agent file changed while preparing refresh: {}", state.path);
+                    return Err(super::continuous::retryable_volatility_failure(format!(
+                        "agent file changed while preparing refresh: {}",
+                        state.path
+                    )));
                 }
                 ctx.api
                     .upload_object(ctx.workspace_id(), &hash, encrypted)

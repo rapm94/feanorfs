@@ -10,6 +10,71 @@ use std::path::PathBuf;
 #[cfg(any(unix, windows))]
 use std::sync::Arc;
 
+/// Typed reason an anchored no-follow regular-file open failed.
+///
+/// [`WorkspaceReadRoot::open_regular`] returns these wrapped in
+/// `anyhow::Error` so every existing caller keeps working while callers that
+/// need the exact reason (the resolution candidate reader) downcast them.
+/// Symlink/reparse detection stays a distinct typed reason produced by the
+/// no-follow metadata/open checks — never by inspecting error text.
+#[derive(Debug)]
+pub enum CandidateOpenError {
+    /// The path does not exist beneath the root (genuine absence).
+    NotFound(String),
+    /// A component or the final file denied read permission.
+    PermissionDenied(String),
+    /// The path resolves through a symlink or reparse alias (never followed).
+    Symlink(String),
+    /// The final component is not a regular file (or an ancestor is not a
+    /// directory).
+    InvalidType(String),
+    /// Any other I/O failure opening or inspecting the path.
+    Io(String),
+}
+
+impl std::fmt::Display for CandidateOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(detail) => write!(formatter, "workspace file not found: {detail}"),
+            Self::PermissionDenied(detail) => {
+                write!(formatter, "workspace file permission denied: {detail}")
+            }
+            Self::Symlink(detail) => {
+                write!(
+                    formatter,
+                    "workspace file resolves through a symlink: {detail}"
+                )
+            }
+            Self::InvalidType(detail) => {
+                write!(formatter, "workspace file is not a regular file: {detail}")
+            }
+            Self::Io(detail) => write!(formatter, "workspace file I/O error: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for CandidateOpenError {}
+
+/// Classifies one raw I/O error from a no-follow open into the typed reason.
+/// Uses raw errno values for `ELOOP`/`ENOTDIR` (their `ErrorKind` variants
+/// are still unstable) so symlink/reparse detection never depends on error
+/// text.
+fn classify_open_error(error: &std::io::Error, detail: String) -> CandidateOpenError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => CandidateOpenError::NotFound(detail),
+        std::io::ErrorKind::PermissionDenied => CandidateOpenError::PermissionDenied(detail),
+        _ => {
+            #[cfg(unix)]
+            match error.raw_os_error() {
+                Some(libc::ELOOP) => return CandidateOpenError::Symlink(detail),
+                Some(libc::ENOTDIR) => return CandidateOpenError::InvalidType(detail),
+                _ => {}
+            }
+            CandidateOpenError::Io(detail)
+        }
+    }
+}
+
 /// A reusable anchor for opening regular files beneath one workspace root.
 ///
 /// Unix callers retain an open directory descriptor, so later reads are not
@@ -134,12 +199,14 @@ impl WorkspaceReadRoot {
             bounded.read_to_end(&mut bytes).await?;
         }
         let after = source.metadata().await?;
-        ensure!(
-            bytes.len() as u64 == before.len()
-                && before.len() == after.len()
-                && before.modified().ok() == after.modified().ok(),
-            "workspace file {relative} changed while it was being read"
-        );
+        if bytes.len() as u64 != before.len()
+            || before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+        {
+            return Err(crate::agent::continuous::retryable_volatility_failure(
+                format!("workspace file {relative} changed while it was being read"),
+            ));
+        }
         Ok((bytes, before))
     }
 
@@ -160,12 +227,15 @@ impl WorkspaceReadRoot {
                 &name,
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
-            .with_context(|| {
-                format!(
-                    "open no-follow directory component {:?} while resolving workspace path {}",
-                    component,
-                    relative.display()
-                )
+            .map_err(|error| {
+                anyhow::Error::new(classify_open_error(
+                    &error,
+                    format!(
+                        "open no-follow directory component {:?} while resolving workspace path {}",
+                        component,
+                        relative.display()
+                    ),
+                ))
             })?;
         }
 
@@ -175,8 +245,13 @@ impl WorkspaceReadRoot {
             &name,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
-        .with_context(|| format!("open no-follow workspace file {}", relative.display()))?;
-        require_regular(&file, relative)?;
+        .map_err(|error| {
+            anyhow::Error::new(classify_open_error(
+                &error,
+                format!("open no-follow workspace file {}", relative.display()),
+            ))
+        })?;
+        require_regular(&file, relative).map_err(anyhow::Error::new)?;
         Ok(file)
     }
 
@@ -190,60 +265,81 @@ impl WorkspaceReadRoot {
             .try_clone()
             .context("duplicate workspace read root handle")?;
         for component in directories.iter().copied() {
-            parent = open_relative_windows(&parent, component, true).with_context(|| {
-                format!(
-                    "open no-follow directory component {:?} while resolving workspace path {}",
-                    component,
-                    relative.display()
-                )
+            parent = open_relative_windows(&parent, component, true).map_err(|error| {
+                anyhow::Error::new(classify_open_error(
+                    &error,
+                    format!(
+                        "open no-follow directory component {:?} while resolving workspace path {}",
+                        component,
+                        relative.display()
+                    ),
+                ))
             })?;
-            require_windows_directory(&parent, relative, "workspace path component")?;
+            require_windows_directory(&parent, relative, "workspace path component")
+                .map_err(anyhow::Error::new)?;
         }
-        let file = open_relative_windows(&parent, file_name, false)
-            .with_context(|| format!("open no-follow workspace file {}", relative.display()))?;
-        require_regular(&file, relative)?;
+        let file = open_relative_windows(&parent, file_name, false).map_err(|error| {
+            anyhow::Error::new(classify_open_error(
+                &error,
+                format!("open no-follow workspace file {}", relative.display()),
+            ))
+        })?;
+        require_regular(&file, relative).map_err(anyhow::Error::new)?;
         Ok(file)
     }
 
     #[cfg(not(any(unix, windows)))]
     fn open_regular_checked(&self, relative: &Path, components: &[&OsStr]) -> Result<File> {
-        require_directory_without_symlink(&self.root, "workspace read root")?;
+        require_directory_without_symlink(&self.root, "workspace read root")
+            .map_err(anyhow::Error::new)?;
 
         let mut candidate = self.root.clone();
         for (index, component) in components.iter().enumerate() {
             candidate.push(component);
-            let metadata = std::fs::symlink_metadata(&candidate).with_context(|| {
-                format!(
-                    "inspect workspace path component {} while resolving {}",
-                    candidate.display(),
-                    relative.display()
-                )
+            let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| {
+                anyhow::Error::new(classify_open_error(
+                    &error,
+                    format!(
+                        "inspect workspace path component {} while resolving {}",
+                        candidate.display(),
+                        relative.display()
+                    ),
+                ))
             })?;
-            ensure!(
-                !metadata.file_type().is_symlink(),
-                "workspace path {} contains a symlink at {}",
-                relative.display(),
-                candidate.display()
-            );
-            if index + 1 == components.len() {
-                ensure!(
-                    metadata.file_type().is_file(),
-                    "workspace path {} is not a regular file",
-                    relative.display()
-                );
-            } else {
-                ensure!(
-                    metadata.file_type().is_dir(),
-                    "workspace path {} has a non-directory ancestor at {}",
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow::Error::new(CandidateOpenError::Symlink(format!(
+                    "workspace path {} contains a symlink at {}",
                     relative.display(),
                     candidate.display()
-                );
+                ))));
+            }
+            if index + 1 == components.len() {
+                if !metadata.file_type().is_file() {
+                    return Err(anyhow::Error::new(CandidateOpenError::InvalidType(
+                        format!(
+                            "workspace path {} is not a regular file",
+                            relative.display()
+                        ),
+                    )));
+                }
+            } else if !metadata.file_type().is_dir() {
+                return Err(anyhow::Error::new(CandidateOpenError::InvalidType(
+                    format!(
+                        "workspace path {} has a non-directory ancestor at {}",
+                        relative.display(),
+                        candidate.display()
+                    ),
+                )));
             }
         }
 
-        let file = File::open(&candidate)
-            .with_context(|| format!("open checked workspace file {}", relative.display()))?;
-        require_regular(&file, relative)?;
+        let file = File::open(&candidate).map_err(|error| {
+            anyhow::Error::new(classify_open_error(
+                &error,
+                format!("open checked workspace file {}", relative.display()),
+            ))
+        })?;
+        require_regular(&file, relative).map_err(anyhow::Error::new)?;
         Ok(file)
     }
 }
@@ -368,7 +464,7 @@ fn open_at(parent: &File, name: &std::ffi::CStr, flags: libc::c_int) -> std::io:
 }
 
 #[cfg(unix)]
-fn require_regular(file: &File, relative: &Path) -> Result<()> {
+fn require_regular(file: &File, relative: &Path) -> std::result::Result<(), CandidateOpenError> {
     use std::mem::MaybeUninit;
     use std::os::fd::AsRawFd as _;
 
@@ -377,16 +473,20 @@ fn require_regular(file: &File, relative: &Path) -> Result<()> {
     // owns a valid descriptor for the duration of the call.
     let result = unsafe { libc::fstat(file.as_raw_fd(), metadata.as_mut_ptr()) };
     if result < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("inspect opened workspace file {}", relative.display()));
+        return Err(CandidateOpenError::Io(format!(
+            "inspect opened workspace file {}: {}",
+            relative.display(),
+            std::io::Error::last_os_error()
+        )));
     }
     // SAFETY: `fstat` succeeded and initialized the complete structure.
     let metadata = unsafe { metadata.assume_init() };
-    ensure!(
-        metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
-        "workspace path {} is not a regular file",
-        relative.display()
-    );
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(CandidateOpenError::InvalidType(format!(
+            "workspace path {} is not a regular file",
+            relative.display()
+        )));
+    }
     Ok(())
 }
 
@@ -533,72 +633,96 @@ fn open_relative_windows(
 }
 
 #[cfg(windows)]
-fn require_windows_directory(file: &File, path: &Path, description: &str) -> Result<()> {
+fn require_windows_directory(
+    file: &File,
+    path: &Path,
+    description: &str,
+) -> std::result::Result<(), CandidateOpenError> {
     use std::os::windows::fs::MetadataExt as _;
 
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect opened {description} {}", path.display()))?;
-    ensure!(
-        metadata.file_attributes() & WINDOWS_ATTRIBUTE_REPARSE_POINT == 0,
-        "{description} {} is a reparse point",
-        path.display()
-    );
-    ensure!(
-        metadata.file_type().is_dir(),
-        "{description} {} is not a directory",
-        path.display()
-    );
+    let metadata = file.metadata().map_err(|error| {
+        CandidateOpenError::Io(format!(
+            "inspect opened {description} {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_attributes() & WINDOWS_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(CandidateOpenError::Symlink(format!(
+            "{description} {} is a reparse point",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(CandidateOpenError::InvalidType(format!(
+            "{description} {} is not a directory",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
 #[cfg(windows)]
-fn require_regular(file: &File, relative: &Path) -> Result<()> {
+fn require_regular(file: &File, relative: &Path) -> std::result::Result<(), CandidateOpenError> {
     use std::os::windows::fs::MetadataExt as _;
 
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect opened workspace file {}", relative.display()))?;
-    ensure!(
-        metadata.file_attributes() & WINDOWS_ATTRIBUTE_REPARSE_POINT == 0,
-        "workspace path {} is a reparse point",
-        relative.display()
-    );
-    ensure!(
-        metadata.file_type().is_file(),
-        "workspace path {} is not a regular file",
-        relative.display()
-    );
+    let metadata = file.metadata().map_err(|error| {
+        CandidateOpenError::Io(format!(
+            "inspect opened workspace file {}: {error}",
+            relative.display()
+        ))
+    })?;
+    if metadata.file_attributes() & WINDOWS_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(CandidateOpenError::Symlink(format!(
+            "workspace path {} is a reparse point",
+            relative.display()
+        )));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(CandidateOpenError::InvalidType(format!(
+            "workspace path {} is not a regular file",
+            relative.display()
+        )));
+    }
     Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn require_regular(file: &File, relative: &Path) -> Result<()> {
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect opened workspace file {}", relative.display()))?;
-    ensure!(
-        metadata.file_type().is_file(),
-        "workspace path {} is not a regular file",
-        relative.display()
-    );
+fn require_regular(file: &File, relative: &Path) -> std::result::Result<(), CandidateOpenError> {
+    let metadata = file.metadata().map_err(|error| {
+        CandidateOpenError::Io(format!(
+            "inspect opened workspace file {}: {error}",
+            relative.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(CandidateOpenError::InvalidType(format!(
+            "workspace path {} is not a regular file",
+            relative.display()
+        )));
+    }
     Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn require_directory_without_symlink(path: &Path, description: &str) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("inspect {description} {}", path.display()))?;
-    ensure!(
-        !metadata.file_type().is_symlink(),
-        "{description} {} is a symlink",
-        path.display()
-    );
-    ensure!(
-        metadata.file_type().is_dir(),
-        "{description} {} is not a directory",
-        path.display()
-    );
+fn require_directory_without_symlink(
+    path: &Path,
+    description: &str,
+) -> std::result::Result<(), CandidateOpenError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        CandidateOpenError::Io(format!("inspect {description} {}: {error}", path.display()))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CandidateOpenError::Symlink(format!(
+            "{description} {} is a symlink",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(CandidateOpenError::InvalidType(format!(
+            "{description} {} is not a directory",
+            path.display()
+        )));
+    }
     Ok(())
 }
 

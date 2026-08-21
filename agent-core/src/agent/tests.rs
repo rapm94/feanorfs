@@ -181,10 +181,9 @@ async fn verified_legacy_agent_cache_is_copied_but_never_removed() {
         .unwrap();
     let legacy_before = std::fs::read(legacy.join("local_state.json")).unwrap();
     let stored_identity = std::fs::read_to_string(legacy.join("identity")).ok();
-    let current_identity = crate::workspace_layout::workspace_identity(&worktree).unwrap();
-    let identity_matches = stored_identity
-        .zip(current_identity)
-        .is_some_and(|(stored, current)| stored.trim() == current);
+    let identity_matches = stored_identity.is_some_and(|stored| {
+        crate::workspace_layout::workspace_identity_matches(&worktree, stored.trim()).unwrap()
+    });
 
     let runtime = open_agent_runtime(base.path(), name).await.unwrap();
     let migrated = runtime

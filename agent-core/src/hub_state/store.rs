@@ -1,7 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use feanorfs_common::hub_contract::{ManifestWriteOutcome, MigrationWriteOutcome};
 use std::path::Path;
 
-use super::{HubDb, HubStateV1, LegacyFileV1, ManifestStore, ManifestV1, CURRENT_HUB_SCHEMA};
+use super::{FormatWrite, HubDb, HubStateV1, LegacyFileV1, ManifestV1, CURRENT_HUB_SCHEMA};
 use crate::durable::{self, DurableJson};
 
 impl HubDb {
@@ -11,14 +12,18 @@ impl HubDb {
         let state = DurableJson::open(&storage_dir, "hub_state.json", HubStateV1::default())?;
         state.with_read(|state| {
             if state.schema_version == 0 {
-                bail!("hub_state.json has invalid schema version 0");
+                return Err(crate::agent::continuous::unsupported_schema_failure(
+                    anyhow::anyhow!("hub_state.json has invalid schema version 0"),
+                ));
             }
             if state.schema_version > CURRENT_HUB_SCHEMA {
-                bail!(
-                    "hub_state.json schema version {} is newer than supported (max {})",
-                    state.schema_version,
-                    CURRENT_HUB_SCHEMA
-                );
+                return Err(crate::agent::continuous::unsupported_schema_failure(
+                    anyhow::anyhow!(
+                        "hub_state.json schema version {} is newer than supported (max {})",
+                        state.schema_version,
+                        CURRENT_HUB_SCHEMA
+                    ),
+                ));
             }
             Ok(())
         })?;
@@ -128,7 +133,7 @@ impl HubDb {
         })
     }
 
-    pub fn set_format(&self, workspace_id: &str, version: u32) -> Result<()> {
+    pub fn set_format(&self, workspace_id: &str, version: u32) -> Result<FormatWrite> {
         let workspace_key = workspace_id.to_string();
         self.state.with_write(|state| {
             let workspace = state.workspaces.entry(workspace_key).or_default();
@@ -140,7 +145,7 @@ impl HubDb {
                     })
                 })
             {
-                bail!("format v3 requires a manifested snapshot head in workspace {workspace_id}");
+                return Ok(FormatWrite::MissingManifestHead);
             }
             workspace.format_version = version;
             if version >= 3 {
@@ -148,7 +153,7 @@ impl HubDb {
                 workspace.migration_fence = None;
                 workspace.fence_locked_at = 0;
             }
-            Ok(())
+            Ok(FormatWrite::Applied)
         })
     }
 
@@ -199,16 +204,16 @@ impl HubDb {
         workspace_id: &str,
         snapshot_id: &str,
         hashes: Vec<String>,
-    ) -> Result<ManifestStore> {
+    ) -> Result<ManifestWriteOutcome> {
         let workspace_id = workspace_id.to_string();
         let snapshot_id = snapshot_id.to_string();
         self.state.with_write(|state| {
             let manifests = &mut state.workspaces.entry(workspace_id).or_default().manifests;
             if let Some(existing) = manifests.get(&snapshot_id) {
                 return Ok(if existing.hashes == hashes {
-                    ManifestStore::Unchanged
+                    ManifestWriteOutcome::Unchanged
                 } else {
-                    ManifestStore::Conflict
+                    ManifestWriteOutcome::Conflict
                 });
             }
             manifests.insert(
@@ -218,25 +223,29 @@ impl HubDb {
                     created_at_ms: chrono::Utc::now().timestamp_millis(),
                 },
             );
-            Ok(ManifestStore::Stored)
+            Ok(ManifestWriteOutcome::Stored)
         })
     }
 
-    pub fn begin_migration(&self, workspace_id: &str, token: &str) -> Result<()> {
+    pub fn begin_migration(
+        &self,
+        workspace_id: &str,
+        token: &str,
+    ) -> Result<MigrationWriteOutcome> {
         let workspace_id = workspace_id.to_string();
         let token = token.to_string();
         self.state.with_write(|state| {
             let workspace = state.workspaces.entry(workspace_id).or_default();
             if workspace.format_version >= 3 {
-                return Ok(());
+                return Ok(MigrationWriteOutcome::Acquired);
             }
             match &workspace.migration_fence {
-                Some(existing) if *existing == token => Ok(()),
-                Some(_) => bail!("MIGRATION_LOCKED"),
+                Some(existing) if *existing == token => Ok(MigrationWriteOutcome::Acquired),
+                Some(_) => Ok(MigrationWriteOutcome::LockedByOther),
                 None => {
                     workspace.migration_fence = Some(token);
                     workspace.fence_locked_at = chrono::Utc::now().timestamp_millis();
-                    Ok(())
+                    Ok(MigrationWriteOutcome::Acquired)
                 }
             }
         })
