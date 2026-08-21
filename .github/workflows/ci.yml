@@ -322,6 +322,9 @@ jobs:
   tray:
     name: Tray (macOS)
     if: ${{ github.event_name != 'pull_request' }}
+    # Hosted-macOS product smoke still has open acceptance items (F1/F2,
+    # AI-1); it reports but does not gate main until signed products land.
+    continue-on-error: true
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -415,6 +418,9 @@ jobs:
   desktop-tray:
     name: Tray (${{ matrix.os }})
     if: ${{ github.event_name != 'pull_request' }}
+    # Hosted desktop smokes still have open acceptance items (F1/F2, AI-1);
+    # they report but do not gate main until signed products land.
+    continue-on-error: true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     strategy:

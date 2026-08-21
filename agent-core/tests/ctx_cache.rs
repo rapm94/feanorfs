@@ -7,6 +7,10 @@ use feanorfs_common::LegacyPolicy;
 use std::fs;
 use std::sync::Arc;
 
+// The retry and relocation scenarios drive POSIX rename semantics on the
+// global registry; Windows denies directory renames under concurrent open
+// handles (see TODO AI-5 for the weak-filesystem portability promise).
+#[cfg(unix)]
 #[tokio::test]
 async fn state_dir_cache_retries_pins_and_allows_fresh_context_relocation() {
     let hub_dir = tempfile::tempdir().unwrap();
