@@ -1570,6 +1570,10 @@ mod response_reader_tests {
             .await
             .unwrap_err();
         let _ = server.await;
+        // Windows surfaces the abort at the hyper send-request layer
+        // (os error 10053) instead of as a mid-body read failure; both are
+        // bounded transport failures. The invariant under test is the
+        // retryable-transport classification, not which layer reports it.
         assert!(
             error.chain().any(|cause| {
                 cause
@@ -1580,8 +1584,16 @@ mod response_reader_tests {
                             ResponseReadError::Transport { .. } | ResponseReadError::Timeout { .. }
                         )
                     })
+            }) || error.chain().any(|cause| {
+                cause.downcast_ref::<reqwest::Error>().is_some_and(|transport| {
+                    transport.is_request() || transport.is_connect() || transport.is_body()
+                })
             }),
             "expected typed transport error for truncated body, got: {error:#}"
+        );
+        assert!(
+            super::is_retryable_transport_error(&error),
+            "truncated body must classify as retryable transport: {error:#}"
         );
     }
 

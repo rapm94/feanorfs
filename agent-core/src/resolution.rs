@@ -680,7 +680,11 @@ fn artifact_descriptors(
         match &state_root {
             Some(root) => absolute
                 .strip_prefix(root)
-                .map(|relative| relative.to_string_lossy().into_owned())
+                // Descriptors are validated against portable forward-slash
+                // rules; Windows separators must not leak into the contract.
+                .map(|relative| {
+                    feanorfs_common::normalize_path(&relative.to_string_lossy())
+                })
                 .unwrap_or_default(),
             None => String::new(),
         }
