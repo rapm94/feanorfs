@@ -136,6 +136,12 @@ pub struct IntegratorDraw {
 }
 
 /// State of one assignment (serde snake_case on the wire).
+///
+/// `Active` (integration work in progress) was removed in the schema-2
+/// contract migration: no production transition ever entered it, and
+/// `Accepted` already covers "the integrator owns the assignment until a
+/// result arrives". Persisted schema-1 state files map `"active"` to
+/// `"accepted"` when the dispatcher store migrates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegratorAssignmentState {
@@ -143,10 +149,9 @@ pub enum IntegratorAssignmentState {
     Created,
     /// Assignment request sent to the current attempt's candidate.
     Offered,
-    /// The selected candidate accepted the assignment.
+    /// The selected candidate accepted the assignment and owns it until a
+    /// result, blocker, timeout, or revocation arrives.
     Accepted,
-    /// Accepted and integration work is in progress.
-    Active,
     /// Integration finished with a verified digest.
     Completed,
     /// The integrator reported a blocker.
@@ -160,12 +165,14 @@ pub enum IntegratorAssignmentState {
 }
 
 /// State of one per-candidate attempt.
+///
+/// `Active` (work in progress) was removed with the schema-2 migration:
+/// nothing ever entered it, and `Accepted` covers the in-flight window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegratorAttemptState {
     Offered,
     Accepted,
-    Active,
     /// Pre-acceptance timeout; this candidate is out of the rotation.
     TimedOut,
     /// Superseded by a later attempt (stale replies are rejected).
@@ -181,7 +188,7 @@ impl IntegratorAttemptState {
     /// Whether this attempt can still accept the assignment.
     #[must_use]
     pub const fn is_open(self) -> bool {
-        matches!(self, Self::Offered | Self::Accepted | Self::Active)
+        matches!(self, Self::Offered | Self::Accepted)
     }
 }
 
@@ -199,11 +206,12 @@ pub struct IntegratorAttempt {
 }
 
 /// Verification outcome inside a digest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationStatus {
     Passed,
     Failed,
+    #[default]
     Unknown,
 }
 
@@ -218,11 +226,111 @@ impl VerificationStatus {
     }
 }
 
+/// One named check recorded by an executed fixed verification policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationCheck {
+    pub name: String,
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Verification summary inside a digest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `status`/`summary` remain the human-facing rendering; the additional
+/// fields are actual fixed-policy evidence produced by the engine when it
+/// executes the referenced policy — never a caller assertion plus a
+/// submission timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationSummary {
     pub status: VerificationStatus,
     pub summary: String,
+    /// Executed policy identity (e.g. the inline verification policy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+    /// Executed policy version.
+    #[serde(default)]
+    pub policy_version: u32,
+    /// Harness-neutral tool reference that ran the policy, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_ref: Option<String>,
+    /// Inputs the policy verified (job id, fingerprint, leg digests).
+    #[serde(default)]
+    pub input_hashes: Vec<String>,
+    /// Plaintext Blake3 of the verified output, when one was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_hash: Option<String>,
+    /// Named checks the executed policy recorded.
+    #[serde(default)]
+    pub checks: Vec<VerificationCheck>,
+}
+
+/// Maximum number of named checks in one verification summary.
+pub const VERIFICATION_MAX_CHECKS: usize = 32;
+
+/// Maximum number of input hashes in one verification summary.
+pub const VERIFICATION_MAX_INPUT_HASHES: usize = 16;
+
+/// Validates a verification summary's evidence block (bounds and formats).
+///
+/// # Errors
+/// Returns an error for out-of-bounds or malformed evidence.
+pub fn validate_verification_evidence(summary: &VerificationSummary) -> anyhow::Result<()> {
+    use anyhow::ensure;
+
+    ensure!(
+        summary.checks.len() <= VERIFICATION_MAX_CHECKS,
+        "verification summary exceeds its check bound"
+    );
+    ensure!(
+        summary.input_hashes.len() <= VERIFICATION_MAX_INPUT_HASHES,
+        "verification summary exceeds its input-hash bound"
+    );
+    for input in &summary.input_hashes {
+        ensure!(
+            input.len() == 64
+                && input
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "verification input hash must be a full 64-hex digest"
+        );
+    }
+    if let Some(output) = &summary.output_hash {
+        ensure!(
+            output.len() == 64
+                && output
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "verification output hash must be a full 64-hex digest"
+        );
+    }
+    if let Some(policy_id) = &summary.policy_id {
+        ensure!(
+            !policy_id.trim().is_empty() && policy_id.len() <= 512,
+            "verification policy id is out of bounds"
+        );
+    }
+    if let Some(tool_ref) = &summary.tool_ref {
+        ensure!(
+            !tool_ref.trim().is_empty() && tool_ref.len() <= 512,
+            "verification tool reference is out of bounds"
+        );
+    }
+    for check in &summary.checks {
+        ensure!(
+            !check.name.trim().is_empty() && check.name.len() <= 128,
+            "verification check name is out of bounds"
+        );
+        if let Some(detail) = &check.detail {
+            ensure!(
+                detail.len() <= 512,
+                "verification check detail is out of bounds"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Terminal outcome state carried by a result digest.
@@ -280,7 +388,7 @@ pub enum IntegratorProfile {
         assignment_id: String,
         attempt: u32,
         about_snapshot: String,
-        digest: IntegratorDigest,
+        digest: Box<IntegratorDigest>,
     },
     /// Candidate -> dispatcher: terminal blocker (kind `blocked`).
     Blocked {
@@ -1192,6 +1300,7 @@ mod tests {
             verification: VerificationSummary {
                 status: VerificationStatus::Passed,
                 summary: "84 tests passed".to_string(),
+                ..VerificationSummary::default()
             },
             outcome: "Integrated parser implementation and tests.".to_string(),
             risks: vec![],
@@ -1297,7 +1406,7 @@ mod tests {
                 assignment_id: ASSIGNMENT.to_string(),
                 attempt: 0,
                 about_snapshot: SNAP_A.to_string(),
-                digest: digest(ASSIGNMENT),
+                digest: Box::new(digest(ASSIGNMENT)),
             },
             IntegratorProfile::Blocked {
                 assignment_id: ASSIGNMENT.to_string(),

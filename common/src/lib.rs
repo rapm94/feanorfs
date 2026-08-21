@@ -1,6 +1,33 @@
+//! Shared wire models, encrypted snapshot types, and AEAD primitives for FeanorFS.
+//!
+//! # Boundary
+//!
+//! This crate is the pure contract/models layer: it performs no filesystem or
+//! network I/O. All hashing of on-disk content happens at the
+//! descriptor-anchored engine boundary (`feanorfs-agent-core`), never here.
+//!
+//! # Persisted size conversions
+//!
+//! `file_size_from_db` / `file_size_to_db` convert between the signed 64-bit
+//! SQLite `INTEGER` representation and native `u64`. These helpers are internal
+//! persistence plumbing with no external (out-of-workspace) consumer, so the
+//! legacy saturating behavior was removed rather than deprecated: a saturated
+//! value could reach allocation, download, or manifest limits as an enormous
+//! valid-looking size. Both helpers now perform checked conversion and return
+//! [`SizeConversionError`] — `CorruptMetadata` for negative stored sizes and
+//! `UnsupportedSize` for native sizes above `i64::MAX` — so persistence/server
+//! paths fail with a typed error instead of persisting or surfacing a
+//! saturated size.
+//!
+//! The former `hash_file` helper (filesystem I/O) was removed; no consumer
+//! existed in the workspace.
+
 pub mod agent_contract;
+pub mod hub_contract;
 pub mod integrator_contract;
 pub mod invite;
+pub mod resolution_contract;
+pub mod sealed_envelope;
 pub mod sync_delta;
 pub mod three_way;
 pub mod tray_contract;
@@ -8,13 +35,16 @@ pub mod tree;
 mod tree_codec;
 mod tree_convert;
 mod tree_diff;
+pub mod work_contract;
 
 pub use agent_contract::{
     encode_agent_message, parse_agent_message, AgentCleanResult, AgentInboxQuery, AgentInboxResult,
     AgentListEntry, AgentListOfflineResult, AgentListResult, AgentMessage, AgentMessageInput,
-    AgentMessageKind, AgentMessagePayload, AgentSendResult, LogEntry, LogResult, SpawnResult,
-    UndoResult, AGENT_INBOX_DEFAULT_LIMIT, AGENT_INBOX_MAX_LIMIT, AGENT_MESSAGE_DISCRIMINATOR,
+    AgentMessageKind, AgentMessagePayload, AgentSendResult, ContinuousAgentStatus,
+    ContinuousAttention, ContinuousPhase, LogEntry, LogResult, SpawnResult, UndoResult,
+    AGENT_INBOX_DEFAULT_LIMIT, AGENT_INBOX_MAX_LIMIT, AGENT_MESSAGE_DISCRIMINATOR,
     AGENT_MESSAGE_MAX_BODY_BYTES, AGENT_MESSAGE_MAX_ENCODED_BYTES, AGENT_NAME_MAX_BYTES,
+    CONTINUOUS_STATUS_SCHEMA_VERSION,
 };
 pub use invite::{
     decode_hub_invite, decode_invite, encode_hub_invite, encode_invite, hub_ca_fingerprint,
@@ -22,9 +52,9 @@ pub use invite::{
     WorkspaceInvite, HUB_INVITE_PREFIX, HUB_MDNS_SERVICE, INVITE_PREFIX,
 };
 pub use tray_contract::{
-    ConflictKeepResult, ConflictShowResult, RecentWorkspaceEntry, RecentWorkspacesResult,
-    TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry, TrayOverviewResult, TrayPauseResult,
-    TrayStatusResult, WorkerStatusSnapshot,
+    ConflictKeepResult, ConflictShowResult, ContinuousHealth, RecentWorkspaceEntry,
+    RecentWorkspacesResult, ResolutionHealth, TrayAgentEntry, TrayAgentsSummary, TrayConflictEntry,
+    TrayOverviewResult, TrayPauseResult, TrayStatusResult, WorkerStatusSnapshot,
 };
 
 pub use integrator_contract::{
@@ -44,6 +74,30 @@ pub use integrator_contract::{
     INTEGRATOR_PROFILE_DISCRIMINATOR, INTEGRATOR_RISK_BYTES,
 };
 
+pub use hub_contract::{
+    is_supported_format_version, parse_migration_token, validate_manifest_hashes,
+    ManifestWriteOutcome, MigrationTokenError, MigrationWriteOutcome, SUPPORTED_FORMAT_VERSION,
+};
+pub use resolution_contract::{
+    compute_conflict_identity_fingerprint, derive_conflict_kind, encode_resolution_profile,
+    parse_resolution_profile, validate_candidate_descriptor, validate_conflict_identity,
+    validate_designation_evidence, validate_human_resolution_answer, validate_resolution_job,
+    validate_resolution_profile, validate_resolution_result, ArtifactDescriptor, ArtifactRoleName,
+    CandidateDescriptor, CandidateDestination, ConflictIdentity, ConflictLegDescriptor,
+    HumanResolutionAnswer, HumanResolutionOption, HumanResolutionReason, OwnerDesignationEvidence,
+    OwnerDesignationMethod, PreventionReason, ResolutionJob, ResolutionOutcome, ResolutionProfile,
+    ResolutionResult, ResolutionRevokeReason, ResolutionStaleKind, VerificationPolicyRef,
+    RESOLUTION_DEFAULT_VERIFICATION_TIMEOUT_MS, RESOLUTION_DIAGNOSTIC_BYTES,
+    RESOLUTION_FINGERPRINT_DOMAIN, RESOLUTION_JOB_DISCRIMINATOR, RESOLUTION_MAX_ADDITIONAL_PATHS,
+    RESOLUTION_MAX_ARTIFACTS, RESOLUTION_MAX_ATTEMPT, RESOLUTION_MAX_CANDIDATE_BYTES,
+    RESOLUTION_MAX_CAUSAL_REFS, RESOLUTION_MAX_DIAGNOSTICS, RESOLUTION_MAX_HASH_BYTES,
+    RESOLUTION_MAX_ID_BYTES, RESOLUTION_MAX_INTENT_IDS, RESOLUTION_MAX_LEG_BYTES,
+    RESOLUTION_MAX_OUTPUT_PATHS, RESOLUTION_MAX_PROFILE_BYTES, RESOLUTION_MAX_QUESTION_BYTES,
+    RESOLUTION_MAX_REASON_BYTES, RESOLUTION_MAX_TIMEOUT_MS,
+    RESOLUTION_MAX_VERIFICATION_SUMMARY_BYTES, RESOLUTION_SCHEMA_VERSION,
+    RESOLUTION_VERIFICATION_CONFIG_REF, RESOLUTION_VERIFICATION_POLICY_ID,
+};
+pub use resolution_contract::{ResolutionAssignmentProfile, ResolutionRevokeProfile};
 pub use sync_delta::compute_sync_delta;
 pub use three_way::{classify_conflict_kind, conflict_candidate_paths, detect_concurrent_edits};
 pub use tree::{
@@ -55,12 +109,31 @@ pub use tree::{
 };
 pub use tree_convert::{flat_to_tree, flat_to_tree_with_conflicts, tree_to_flat};
 pub use tree_diff::diff_trees;
+pub use work_contract::{
+    encode_work_profile, evaluate_scope_overlap, is_directory_glob, is_valid_capability,
+    is_valid_scope_entry, is_valid_task_id, parse_work_profile, transition_rejection,
+    validate_work_amendment, validate_work_blocked, validate_work_completed,
+    validate_work_decision, validate_work_intent, validate_work_profile, validate_work_scope,
+    validate_work_settled, validate_work_superseded, validate_work_yield, WorkAmendInput,
+    WorkAmendmentProfile, WorkAmendmentStatus, WorkBlockInput, WorkBlockedProfile,
+    WorkCompleteInput, WorkCompletedProfile, WorkDecideInput, WorkDecisionAccept,
+    WorkDecisionAcceptOverlap, WorkDecisionKind, WorkDecisionNarrow, WorkDecisionOrder,
+    WorkDecisionProfile, WorkDecisionReject, WorkDecisionStatus, WorkIntentProfile, WorkOverlap,
+    WorkOverlapAcceptance, WorkOverlapKind, WorkProfile, WorkProposalStatus, WorkProposeInput,
+    WorkRejectReason, WorkScope, WorkSendResult, WorkSettleInput, WorkSettledProfile,
+    WorkStatusInput, WorkStatusResult, WorkSupersededProfile, WorkTaskState, WorkTaskStatus,
+    WorkVerification, WorkVerificationStatus, WorkYieldInput, WorkYieldProfile,
+    WORK_MAX_ACTIVE_TASKS, WORK_MAX_AMENDMENTS, WORK_MAX_CAPABILITIES, WORK_MAX_CAPABILITY_BYTES,
+    WORK_MAX_CONCERNS, WORK_MAX_CONCERN_BYTES, WORK_MAX_DEPENDENCIES, WORK_MAX_EVIDENCE,
+    WORK_MAX_OUTCOME_BYTES, WORK_MAX_OVERLAP_ENTRIES, WORK_MAX_PATHS, WORK_MAX_PATHS_TOTAL_BYTES,
+    WORK_MAX_PATH_BYTES, WORK_MAX_PENDING, WORK_MAX_PROFILE_BYTES, WORK_MAX_PROJECTION_ENTRIES,
+    WORK_MAX_PROPOSALS_PER_TASK, WORK_MAX_REASON_BYTES, WORK_MAX_SEEN, WORK_MAX_SOURCE_REFS,
+    WORK_MAX_TASK_ID_BYTES, WORK_MAX_TERMINAL_TASKS, WORK_MAX_VERIFICATION_SUMMARY_BYTES,
+    WORK_PROFILE_DISCRIMINATOR, WORK_SCHEMA_VERSION,
+};
 
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
 use unicode_normalization::UnicodeNormalization as _;
 
 /// Insecure legacy default password used when no E2EE password is configured.
@@ -153,9 +226,21 @@ pub struct SyncResponse {
 }
 
 /// Opaque per-workspace snapshot head returned by the hub.
+///
+/// `wait_supported` is `true` only when the response was produced by a hub
+/// that honored bounded head-wait query parameters (`after`/`wait_ms`). Hubs
+/// that ignore those parameters return the field as `false` (JSON default),
+/// which clients use to select the bounded-polling compatibility fallback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadResponse {
     pub snapshot_id: Option<String>,
+    /// Whether the hub supports bounded opaque head-change waiting.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wait_supported: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Compare-and-swap request for one opaque workspace head.
@@ -224,6 +309,10 @@ pub struct AgentCheckResult {
     pub their_changes: Vec<FileState>,
     pub conflicts: Vec<ConcurrentEdit>,
     pub conflict_risk: Vec<String>,
+    /// Bounded live continuous-reconciliation projection; present only while
+    /// an active controller owns this agent (SDK-1 additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<crate::agent_contract::ContinuousAgentStatus>,
 }
 
 /// Structured result of `agent land` (check + apply).
@@ -290,30 +379,48 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-/// Computes the Blake3 hash of a file on disk.
-pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    // 65_536-byte (64 KiB) buffer — heap-allocated to avoid a large stack frame.
-    let mut buffer = vec![0u8; 65_536];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
+/// Error returned when a persisted file size cannot be represented exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeConversionError {
+    /// A negative size read from storage — indicates corrupt metadata.
+    CorruptMetadata { size: i64 },
+    /// A size too large for the storage representation — cannot be persisted.
+    UnsupportedSize { size: u64 },
+}
+
+impl std::fmt::Display for SizeConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SizeConversionError::CorruptMetadata { size } => {
+                write!(f, "corrupt metadata: stored file size {size} is negative")
+            }
+            SizeConversionError::UnsupportedSize { size } => write!(
+                f,
+                "unsupported file size {size}: exceeds the maximum representable by the storage format"
+            ),
         }
-        hasher.update(&buffer[..n]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Convert file size from SQLite i64 to native u64, saturating at u64::MAX.
-pub fn file_size_from_db(size: i64) -> u64 {
-    u64::try_from(size).unwrap_or(u64::MAX)
+impl std::error::Error for SizeConversionError {}
+
+/// Convert file size from SQLite i64 to native u64.
+///
+/// Returns [`SizeConversionError::CorruptMetadata`] for negative sizes instead
+/// of saturating to `u64::MAX`, so a corrupted row can never surface as an
+/// enormous valid-looking size that would drive allocation, download, or
+/// manifest limits.
+pub fn file_size_from_db(size: i64) -> Result<u64, SizeConversionError> {
+    u64::try_from(size).map_err(|_| SizeConversionError::CorruptMetadata { size })
 }
 
-/// Convert file size from native u64 to SQLite i64, saturating at i64::MAX.
-pub fn file_size_to_db(size: u64) -> i64 {
-    i64::try_from(size).unwrap_or(i64::MAX)
+/// Convert file size from native u64 to SQLite i64.
+///
+/// Returns [`SizeConversionError::UnsupportedSize`] for sizes above `i64::MAX`
+/// instead of saturating to `i64::MAX`, so an oversized file is rejected at
+/// the persistence boundary rather than silently stored as `i64::MAX`.
+pub fn file_size_to_db(size: u64) -> Result<i64, SizeConversionError> {
+    i64::try_from(size).map_err(|_| SizeConversionError::UnsupportedSize { size })
 }
 
 /// Normalizes a path to use forward slashes for cross-platform consistency.
@@ -593,6 +700,9 @@ pub fn canonical_manifest_hashes(snapshot_id: &str, manifest: &str) -> Result<Ve
 }
 
 #[cfg(test)]
+pub use sealed_envelope::{open, seal, EnvelopeDomain, SealError, SealedEnvelope};
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -840,6 +950,65 @@ mod tests {
     #[test]
     fn normalize_path_handles_mixed_separators() {
         assert_eq!(normalize_path(r"src/mixed\path.rs"), "src/mixed/path.rs");
+    }
+
+    // Checked size conversions
+
+    #[test]
+    fn file_size_from_db_accepts_valid_sizes() {
+        assert_eq!(file_size_from_db(0).unwrap(), 0);
+        assert_eq!(file_size_from_db(1).unwrap(), 1);
+        assert_eq!(file_size_from_db(i64::MAX).unwrap(), i64::MAX as u64);
+    }
+
+    #[test]
+    fn file_size_from_db_rejects_negative_without_saturating() {
+        // A negative stored size is corrupt metadata: it must fail with a typed
+        // error instead of saturating to u64::MAX and looking like an enormous
+        // file that would drive allocation/download/manifest limits.
+        let error = file_size_from_db(-1).unwrap_err();
+        assert_eq!(error, SizeConversionError::CorruptMetadata { size: -1 });
+        assert!(error.to_string().contains("corrupt metadata"));
+        let min_error = file_size_from_db(i64::MIN).unwrap_err();
+        assert_eq!(
+            min_error,
+            SizeConversionError::CorruptMetadata { size: i64::MIN }
+        );
+    }
+
+    #[test]
+    fn file_size_to_db_accepts_valid_sizes() {
+        assert_eq!(file_size_to_db(0).unwrap(), 0);
+        assert_eq!(file_size_to_db(i64::MAX as u64).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn file_size_to_db_rejects_oversized_without_saturating() {
+        // A size above i64::MAX cannot be stored in SQLite's signed INTEGER: it
+        // must fail with a typed error instead of saturating to i64::MAX.
+        let error = file_size_to_db(i64::MAX as u64 + 1).unwrap_err();
+        assert_eq!(
+            error,
+            SizeConversionError::UnsupportedSize {
+                size: i64::MAX as u64 + 1
+            }
+        );
+        assert!(error.to_string().contains("unsupported file size"));
+        let max_error = file_size_to_db(u64::MAX).unwrap_err();
+        assert_eq!(
+            max_error,
+            SizeConversionError::UnsupportedSize { size: u64::MAX }
+        );
+    }
+
+    #[test]
+    fn file_size_conversions_roundtrip() {
+        for size in [0u64, 1, 4_096, u32::MAX as u64, i64::MAX as u64] {
+            assert_eq!(
+                file_size_from_db(file_size_to_db(size).unwrap()).unwrap(),
+                size
+            );
+        }
     }
 
     #[test]

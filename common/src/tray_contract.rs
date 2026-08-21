@@ -2,6 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Marks a tray launched by the macOS/Linux supervisor or Windows Task
+/// Scheduler. A managed child that loses the singleton race exits retryably
+/// instead of being mistaken for an explicit user Quit.
+pub const MANAGED_TRAY_ARG: &str = "--managed";
+
 /// Aggregate dashboard for the tray app — one subprocess call instead of three.
 #[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct TrayStatusResult {
@@ -53,8 +58,39 @@ pub struct WorkerStatusSnapshot {
     pub pending_conflicts: Vec<TrayConflictEntry>,
     pub published_at_ms: i64,
     pub version: String,
+    /// Bounded live-reconciliation health; additive, secret-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuous: Option<ContinuousHealth>,
+    /// Bounded resolution counts/status projection (ids/state/counts only,
+    /// never paths or bodies); additive, secret-free. Mutation stays in the
+    /// CLI (`feanorfs agent resolution …`); the tray never resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ResolutionHealth>,
 }
 
+/// Bounded, secret-free resolution counts/status projection for the tray:
+/// constant-cost job counts by lifecycle state, never paths or bodies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolutionHealth {
+    /// Active jobs (prepared, no submitted result).
+    pub active: u32,
+    /// Submitted-but-not-applied jobs (including `requires_human`).
+    pub submitted: u32,
+    /// Completed (published) jobs.
+    pub completed: u32,
+    /// Revoked or superseded jobs.
+    pub revoked: u32,
+    /// Submitted `requires_human` jobs awaiting an explicit human decision.
+    pub requires_human: u32,
+}
+
+/// Fixed, secret-free live-reconciliation health for the tray and `doctor`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContinuousHealth {
+    pub agents_live: u32,
+    pub agents_attention: u32,
+    pub agents_offline: u32,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct TrayAgentsSummary {
     pub working: u32,
@@ -104,6 +140,115 @@ pub struct ConflictShowResult {
     pub is_binary: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+}
+
+/// Typed outcome of one CLI setup/start run (`feanorfs --json start` and the
+/// `tray join` final event).
+///
+/// The tray classifies partial setup failures from `stage`, `committed`, and
+/// `recovery` — never from the human-readable `detail` text. `detail` exists
+/// only for presentation ("Details: …" in dialogs); changing CLI wording can
+/// never change tray state classification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupResult {
+    /// Furthest setup stage completed before the outcome.
+    pub stage: SetupStage,
+    /// Durable effects committed before the outcome.
+    pub committed: SetupCommitted,
+    /// True when rerunning setup/start resumes without redoing completed stages.
+    pub retryable: bool,
+    /// Safe recovery action; absent only when every stage completed.
+    pub recovery: Option<SetupRecovery>,
+    /// Stable human presentation detail; never used for classification.
+    pub detail: Option<String>,
+}
+
+/// Setup stages in completion order.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupStage {
+    /// No setup stage completed; the workspace was not configured.
+    None,
+    /// Workspace identity established (paired, linked, or freshly created); the
+    /// initial sync did not complete.
+    Paired,
+    /// The initial sync completed; the automatic background service is not installed.
+    InitialSync,
+    /// The background service is installed; the system tray is not registered.
+    ServiceInstalled,
+    /// Every setup stage completed.
+    TrayRegistered,
+}
+
+/// Durable effects committed by a setup run.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupCommitted {
+    pub workspace_configured: bool,
+    pub initial_sync_completed: bool,
+    pub background_service_installed: bool,
+    pub tray_registered: bool,
+}
+
+/// Safe recovery action for a partial setup outcome.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRecovery {
+    /// Nothing durable was committed; rerun the whole setup flow.
+    RetrySetup,
+    /// Resume the interrupted setup by rerunning `feanorfs start`; completed
+    /// stages (identity, sync, service) are preserved.
+    RetryStart,
+    /// Reinstall the automatic background service.
+    ReinstallService,
+    /// Re-register the system tray.
+    RetryTray,
+}
+
+impl SetupResult {
+    /// Outcome when every setup stage completed.
+    pub fn completed() -> Self {
+        Self {
+            stage: SetupStage::TrayRegistered,
+            committed: SetupCommitted {
+                workspace_configured: true,
+                initial_sync_completed: true,
+                background_service_installed: true,
+                tray_registered: true,
+            },
+            retryable: false,
+            recovery: None,
+            detail: None,
+        }
+    }
+
+    /// Outcome when the flow failed before any stage committed.
+    pub fn generic(detail: &str) -> Self {
+        Self {
+            stage: SetupStage::None,
+            committed: SetupCommitted::default(),
+            retryable: true,
+            recovery: Some(SetupRecovery::RetrySetup),
+            detail: Some(detail.to_string()),
+        }
+    }
+
+    /// Outcome for a staged failure: `stage` is the furthest stage completed,
+    /// `committed` lists the durable effects, and `detail` is the stable human
+    /// presentation of the error (never classified).
+    pub fn staged(
+        stage: SetupStage,
+        committed: SetupCommitted,
+        recovery: SetupRecovery,
+        detail: &str,
+    ) -> Self {
+        Self {
+            stage,
+            committed,
+            retryable: true,
+            recovery: Some(recovery),
+            detail: Some(detail.to_string()),
+        }
+    }
 }
 
 /// Canonical JSON fixtures — update only with a semver-major contract bump.
@@ -217,6 +362,8 @@ pub mod fixtures {
             }],
             published_at_ms: 1_719_500_000_000,
             version: env!("CARGO_PKG_VERSION").into(),
+            continuous: None,
+            resolution: None,
         }
     }
 

@@ -47,3 +47,19 @@ Shared data models, canonical Merkle tree/snapshot objects, sync delta (`compute
 ## Child DOX Index
 
 No child directories. `src/` is a flat module and `tests/` is a single integration file.
+
+## Continuous status contract
+
+- `agent_contract.rs` owns `ContinuousPhase`, `ContinuousAttention`,
+  `ContinuousAgentStatus`, and `CONTINUOUS_STATUS_SCHEMA_VERSION` with a
+  canonical fixture. The projection is bounded, secret-free, and additive
+  (SDK-1): `agent status` emits it as the optional `live` field of
+  `AgentCheckResult`; `events` and the tray project from it without scanning
+  worktrees.
+- `HeadResponse.wait_supported` is `false` by default and omitted from
+  serialized JSON unless a hub honored bounded head-wait parameters, which is
+  how new clients distinguish waiting hubs from old servers that ignore the
+  query fields.
+- `tray_contract.rs` `WorkerStatusSnapshot.continuous` carries the additive
+  `ContinuousHealth` aggregation (live/attention/offline counts) published by
+  the managed worker; routine tray refreshes never scan agent worktrees.

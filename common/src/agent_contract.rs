@@ -33,6 +33,97 @@ pub struct AgentListOfflineResult {
     pub agents: Vec<String>,
 }
 
+/// Live continuous-reconciliation phase for one active agent.
+///
+/// The same transition and error classification drives interactive
+/// `agent run` owners, configured runner workers, CLI status, events, and
+/// tests. The controller never gains semantic merge authority: every mutation
+/// still flows through the existing land/refresh/conflict machinery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuousPhase {
+    /// Controller started; startup reconciliation has not finished.
+    Starting,
+    /// Settled and waiting for filesystem or head events.
+    Idle,
+    /// A coalesced local burst is waiting for the quiet-period debounce.
+    LocalDirty,
+    /// Outbound land is running.
+    ReconcilingLocal,
+    /// Inbound refresh of the agent worktree is running.
+    RefreshingRemote,
+    /// Retryable transport failures; bounded retry with backoff.
+    Offline,
+    /// Automatic mutation paused for an explicit human/consumer action.
+    NeedsAttention,
+    /// Shutting down; one bounded final reconciliation attempt remains.
+    Stopping,
+}
+
+impl ContinuousPhase {
+    /// Stable human/event spelling matching the serialized wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Idle => "idle",
+            Self::LocalDirty => "local_dirty",
+            Self::ReconcilingLocal => "reconciling_local",
+            Self::RefreshingRemote => "refreshing_remote",
+            Self::Offline => "offline",
+            Self::NeedsAttention => "needs_attention",
+            Self::Stopping => "stopping",
+        }
+    }
+}
+
+/// Fail-closed reason that pauses automatic mutation until explicit action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuousAttention {
+    /// `pending_conflicts` | `unsafe_path` | `corrupt_state` |
+    /// `unsupported_schema` | `ownership_lost`
+    pub reason: String,
+    /// Bounded human-readable detail. Never contains file contents, message
+    /// bodies, credentials, or unbounded errors.
+    pub detail: String,
+}
+
+/// Bounded, secret-free live status projection for one active agent.
+///
+/// Persisted by the continuous controller and read by `agent status`, the
+/// events surface, the tray, and `doctor`. Never contains message bodies, file
+/// contents, credentials, endpoints, or process arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuousAgentStatus {
+    pub schema_version: u32,
+    pub agent: String,
+    pub active: bool,
+    pub phase: ContinuousPhase,
+    /// Last opaque workspace head this controller observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_head: Option<String>,
+    /// Tree root of `observed_head`; signal-only heads change the head id but
+    /// keep this value, which is how controllers skip file work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_tree: Option<String>,
+    /// Latest reachable snapshot carrying the settled tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_snapshot: Option<String>,
+    pub pending_local: bool,
+    pub deferred_count: u32,
+    pub attention: Option<ContinuousAttention>,
+    /// Owner process identity captured for bounded diagnostics. Readers use
+    /// the OS-backed ownership lease—not this advisory value—to reject stale
+    /// status left by a dead owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_start_id: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+/// Current schema version persisted by continuous controllers.
+pub const CONTINUOUS_STATUS_SCHEMA_VERSION: u32 = 1;
+
 /// `feanorfs --json agent clean` result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentCleanResult {
@@ -320,6 +411,7 @@ pub mod fixtures {
             their_changes: vec![],
             conflicts: vec![],
             conflict_risk: vec!["notes.md".to_string()],
+            live: None,
         }
     }
 
@@ -457,6 +549,35 @@ pub mod fixtures {
     pub fn agent_inbox_json() -> String {
         serde_json::to_string(&agent_inbox_result()).unwrap()
     }
+
+    /// Canonical live-status projection for a settled, active controller.
+    pub fn continuous_agent_status() -> ContinuousAgentStatus {
+        ContinuousAgentStatus {
+            schema_version: CONTINUOUS_STATUS_SCHEMA_VERSION,
+            agent: "worker".to_string(),
+            active: true,
+            phase: ContinuousPhase::Idle,
+            observed_head: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            observed_tree: Some(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            ),
+            settled_snapshot: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            pending_local: false,
+            deferred_count: 0,
+            attention: None,
+            owner_pid: None,
+            owner_start_id: None,
+            updated_at_ms: 1_719_500_000_000,
+        }
+    }
+
+    pub fn continuous_agent_status_json() -> String {
+        serde_json::to_string(&continuous_agent_status()).unwrap()
+    }
 }
 
 /// Canonical integrator-assignment fixture types (SDK-1 additive).
@@ -503,6 +624,7 @@ pub mod integrator_fixtures {
             verification: VerificationSummary {
                 status: VerificationStatus::Passed,
                 summary: "84 tests passed".to_string(),
+                ..VerificationSummary::default()
             },
             outcome: "Integrated parser implementation and tests.".to_string(),
             risks: vec![],
@@ -691,6 +813,22 @@ mod tests {
             (AgentMessageKind::Blocked, "blocked"),
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(name));
+        }
+        for (phase, name) in [
+            (ContinuousPhase::Starting, "starting"),
+            (ContinuousPhase::Idle, "idle"),
+            (ContinuousPhase::LocalDirty, "local_dirty"),
+            (ContinuousPhase::ReconcilingLocal, "reconciling_local"),
+            (ContinuousPhase::RefreshingRemote, "refreshing_remote"),
+            (ContinuousPhase::Offline, "offline"),
+            (ContinuousPhase::NeedsAttention, "needs_attention"),
+            (ContinuousPhase::Stopping, "stopping"),
+        ] {
+            assert_eq!(phase.as_str(), name);
+            assert_eq!(
+                serde_json::to_value(phase).unwrap(),
+                serde_json::json!(name)
+            );
         }
     }
 

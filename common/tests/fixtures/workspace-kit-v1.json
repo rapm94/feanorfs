@@ -1,0 +1,8 @@
+{
+  "format_version": 1,
+  "kdf": "argon2id-v19",
+  "cipher": "xchacha20poly1305",
+  "salt": "EccG9+RkSGQat8BDl3NN0g==",
+  "nonce": "ZDmz9zqxxoMDbCFk647yoQN1JvwfAvPU",
+  "ciphertext": "nSJquw2egLaUpwnXpF5ix+q7R7J3Ii8toyRSk8w2SVvIMFhHV3JKx96RTXwHq2/6Ka4H2lAGrL2ViFL03kVG4KorIDm/hS7T5xkEt1Pn+TC6J0v9KH9tpSzuM3vrlnkV+QfVEXo6/4e3nKMrDNRVjY/w5+Ngohxaff87TgLA2RTi1FJWwkNgNo2d7LjDon9ThQF6DMa57Irk+6NHn9UTBFAi8kM+TW3Ie1v/JwBsWp8g9WD2jaVihE0icYuaeTE08yp2vbw3ED3QcntNHaCv/hjgGxYN8ScMgxPjIdxcdjFyw0cpK9GQdK6/8H9EzL1VaM6O4CbH8SXg+XNMwzKDQNniR6/M0loT8DufQp1jrnLWypg4yZXncJTn20gVSbTWG5fgGH3yPk5KU//XRwJ9nX5D5vGCv0/vGBIUnnxbh7c5I7hdf9hNplI2CecAIPA6qo50xozeZJ6qpxYi+qJVh134dipEhZBFaIyskS4HZnLeGzbPnBmUrQLZ+a+CwOkbAMha9EFNyX/pCTX0FQ=="
+}
