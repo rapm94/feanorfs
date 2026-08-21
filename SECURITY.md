@@ -321,9 +321,12 @@ Full analysis: [docs/threat-model.md](docs/threat-model.md). Open security work 
 
 ### Open security work
 
-Ownership, dependencies, and release evidence for legacy-crypto retirement,
-hosted identity/default relay work, and independent review are tracked only in
-[TODO.md](TODO.md).
+Current committed security and release follow-up is tracked in
+[TODO.md](TODO.md). Legacy-crypto removal is not yet an approved compatibility
+change; hosted recovery and a default relay are not current product
+commitments; and an independent cryptographic review has not been scheduled.
+Any of those initiatives requires an explicit product decision, owner, and
+acceptance criteria before it is added to the authoritative TODO.
 
 ## Cryptographic primitives
 

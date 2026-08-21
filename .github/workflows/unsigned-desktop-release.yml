@@ -25,140 +25,61 @@ concurrency:
 
 jobs:
   validate-release:
-    if: ${{ inputs.confirm_unsigned && github.repository == 'rapm94/feanorfs' }}
+    if: ${{ inputs.confirm_unsigned }}
     name: Validate immutable release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      actions: read
       contents: read
-    outputs:
-      release_id: ${{ steps.source.outputs.release_id }}
-      sha: ${{ steps.source.outputs.sha }}
-      tag: ${{ steps.source.outputs.tag }}
-      version: ${{ steps.source.outputs.version }}
     steps:
-      - name: Require matching prerelease tag and release
-        id: source
+      - name: Require matching tag and release
         env:
-          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INVOCATION_REF: ${{ github.ref }}
-          INVOCATION_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Invalid stable release tag $RELEASE_TAG"; exit 1 ;;
+          esac
+          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+          if [ "$tag_type" = tag ]; then
+            tag_sha="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
+          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
+          test "$tag_sha" = "$release_sha"
+      - name: Require trusted main CI and Security for the release commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ "$REPOSITORY" != "rapm94/feanorfs" ] || [ "$EVENT_NAME" != workflow_dispatch ]; then
-            echo "::error::Unsigned preview publication requires a manual rapm94/feanorfs dispatch."
-            exit 1
-          fi
-          if [ "$INVOCATION_REF" != "refs/tags/$RELEASE_TAG" ]; then
-            echo "::error::Dispatch ref $INVOCATION_REF is not refs/tags/$RELEASE_TAG."
-            exit 1
-          fi
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid canonical stable release tag $RELEASE_TAG"
-            exit 1
-          fi
-          release_json="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG")"
-          release_id="$(jq -r '.id' <<<"$release_json")"
-          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
-            echo "::error::Release API returned an invalid release ID."
-            exit 1
-          fi
-          if ! jq -e --arg tag "$RELEASE_TAG" \
-            '.tag_name == $tag and .prerelease == true' <<<"$release_json" >/dev/null; then
-            echo "::error::Unsigned preview artifacts require the exact requested prerelease tag."
-            exit 1
-          fi
           tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
           tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
           tag_type="$(jq -r '.object.type' <<<"$tag_object")"
           if [ "$tag_type" = tag ]; then
             annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
             tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
-            tag_type="$(jq -r '.object.type' <<<"$annotated")"
-          fi
-          if [ "$tag_type" != commit ]; then
-            echo "::error::Release tag does not resolve directly to a commit."
-            exit 1
-          fi
-          if [ "$INVOCATION_SHA" != "$tag_sha" ]; then
-            echo "::error::Dispatch SHA $INVOCATION_SHA does not match $RELEASE_TAG at $tag_sha."
-            exit 1
-          fi
-          release_target="$(jq -r '.target_commitish' <<<"$release_json")"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          if [ "$tag_sha" != "$release_sha" ]; then
-            echo "::error::Release targets $release_sha, but $RELEASE_TAG resolves to $tag_sha."
-            exit 1
-          fi
-          release_runs="$(gh api --method GET "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
-            -f head_sha="$tag_sha" -f event=push -f per_page=100)"
-          if ! jq -e --arg repository "$REPOSITORY" --arg tag "$RELEASE_TAG" --arg sha "$tag_sha" \
-            'any(.workflow_runs[];
-              .conclusion == "success" and
-              .event == "push" and
-              .head_branch == $tag and
-              .head_sha == $sha and
-              .head_repository.full_name == $repository and
-              .repository.full_name == $repository)' \
-            <<<"$release_runs" >/dev/null; then
-            echo "::error::No successful cargo-dist release run exists for $RELEASE_TAG at $tag_sha."
-            exit 1
-          fi
-          {
-            echo "release_id=$release_id"
-            echo "sha=$tag_sha"
-            echo "tag=$RELEASE_TAG"
-            echo "version=${RELEASE_TAG#v}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Checkout verified preview commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ steps.source.outputs.sha }}
-
-      - name: Require trusted main CI, Security, and matching version
-        env:
-          EXPECTED_SHA: ${{ steps.source.outputs.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.source.outputs.tag }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          actual_sha="$(git rev-parse HEAD)"
-          if [ "$actual_sha" != "$EXPECTED_SHA" ]; then
-            echo "::error::Checkout is $actual_sha, expected $EXPECTED_SHA."
-            exit 1
-          fi
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [ -z "$version" ] || [ "$RELEASE_TAG" != "v$version" ]; then
-            echo "::error::Tag $RELEASE_TAG does not match workspace version v$version."
-            exit 1
-          fi
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$EXPECTED_SHA" origin/main; then
-            echo "::error::Unsigned preview commit is not reachable from origin/main."
-            exit 1
           fi
 
           trusted_run_id() {
             local workflow_file="$1"
             local workflow_name="$2"
+            local expected_sha="$3"
             local runs
             runs="$(gh api --method GET \
               "repos/$REPOSITORY/actions/workflows/$workflow_file/runs" \
               -f branch=main \
-              -f head_sha="$EXPECTED_SHA" \
+              -f head_sha="$expected_sha" \
               -f event=push \
               -f per_page=100)"
             jq -r \
               --arg repository "$REPOSITORY" \
-              --arg sha "$EXPECTED_SHA" \
+              --arg sha "$expected_sha" \
               --arg workflow "$workflow_name" \
               '[.workflow_runs[] | select(
                 .name == $workflow and
@@ -171,27 +92,26 @@ jobs:
               )] | first | .id // empty' <<<"$runs"
           }
 
-          ci_run_id="$(trusted_run_id ci.yml CI)"
+          ci_run_id="$(trusted_run_id ci.yml CI "$tag_sha")"
           if [ -z "$ci_run_id" ]; then
-            echo "::error::No successful trusted main-push CI run exists for $EXPECTED_SHA."
+            echo "::error::No successful trusted main-push CI run exists for $tag_sha."
             exit 1
           fi
-          security_run_id="$(trusted_run_id security.yml Security)"
+          security_run_id="$(trusted_run_id security.yml Security "$tag_sha")"
           if [ -z "$security_run_id" ]; then
-            echo "::error::No successful trusted Security run exists for $EXPECTED_SHA."
+            echo "::error::No successful trusted Security run exists for $tag_sha."
             exit 1
           fi
           security_jobs="$(gh api --method GET \
             "repos/$REPOSITORY/actions/runs/$security_run_id/jobs?filter=latest&per_page=100")"
-          if ! jq -e --arg sha "$EXPECTED_SHA" \
+          if ! jq -e --arg sha "$tag_sha" \
             'any(.jobs[];
               .name == "Security success" and
               .conclusion == "success" and
               .head_sha == $sha)' <<<"$security_jobs" >/dev/null; then
-            echo "::error::Security success did not pass for $EXPECTED_SHA."
+            echo "::error::Security success did not pass for $tag_sha."
             exit 1
           fi
-
 
   build-macos:
     needs: validate-release
@@ -207,14 +127,14 @@ jobs:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
     steps:
-      - name: Checkout verified preview commit
+      - name: Checkout release tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.validate-release.outputs.sha }}
+          ref: refs/tags/${{ inputs.release_tag }}
           persist-credentials: false
           submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -236,7 +156,7 @@ jobs:
       - name: Upload native binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: unsigned-macos-${{ matrix.target }}-${{ needs.validate-release.outputs.sha }}
+          name: unsigned-macos-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/feanorfs
             target/${{ matrix.target }}/release/feanorfs-tray
@@ -248,7 +168,6 @@ jobs:
       - validate-release
       - build-macos
     name: Publish attested unsigned universal macOS installers
-    environment: prod
     runs-on: macos-latest
     timeout-minutes: 45
     permissions:
@@ -256,25 +175,25 @@ jobs:
       attestations: write
       id-token: write
     steps:
-      - name: Checkout verified preview commit
+      - name: Checkout release tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.validate-release.outputs.sha }}
+          ref: refs/tags/${{ inputs.release_tag }}
           persist-credentials: false
           submodules: recursive
       - name: Download arm64 binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: unsigned-macos-aarch64-apple-darwin-${{ needs.validate-release.outputs.sha }}
+          name: unsigned-macos-aarch64-apple-darwin
           path: native/arm64
       - name: Download x86_64 binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: unsigned-macos-x86_64-apple-darwin-${{ needs.validate-release.outputs.sha }}
+          name: unsigned-macos-x86_64-apple-darwin
           path: native/x86_64
       - name: Assemble, package, and smoke universal product
         env:
-          RELEASE_TAG: ${{ needs.validate-release.outputs.tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           chmod 755 native/arm64/feanorfs native/arm64/feanorfs-tray
           chmod 755 native/x86_64/feanorfs native/x86_64/feanorfs-tray
@@ -326,55 +245,22 @@ jobs:
             FeanorFS-macOS-UNSIGNED.txt
       - name: Upload unsigned macOS release assets
         env:
-          EXPECTED_RELEASE_ID: ${{ needs.validate-release.outputs.release_id }}
-          EXPECTED_SHA: ${{ needs.validate-release.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.validate-release.outputs.tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
           REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$EXPECTED_RELEASE_ID" =~ ^[0-9]+$ ]]; then
-            echo "::error::Validated release ID is invalid."
-            exit 1
-          fi
-          release_json="$(gh api "repos/$REPOSITORY/releases/$EXPECTED_RELEASE_ID")"
-          if ! jq -e \
-            --argjson id "$EXPECTED_RELEASE_ID" \
-            --arg tag "$RELEASE_TAG" \
-            '.id == $id and .tag_name == $tag and .prerelease == true' \
-            <<<"$release_json" >/dev/null; then
-            echo "::error::Preview release identity, tag, or prerelease state changed."
-            exit 1
-          fi
-
-          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
-          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
-          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
-          if [ "$tag_type" = tag ]; then
-            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
-            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
-            tag_type="$(jq -r '.object.type' <<<"$annotated")"
-          fi
-          release_target="$(jq -r '.target_commitish' <<<"$release_json")"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          if [ "$tag_type" != commit ] || [ "$tag_sha" != "$EXPECTED_SHA" ] || \
-            [ "$release_sha" != "$EXPECTED_SHA" ]; then
-            echo "::error::Preview release target or tag changed after validation; refusing to upload."
-            exit 1
-          fi
-          gh release upload "$RELEASE_TAG" \
-            FeanorFS-macOS-unsigned.pkg \
-            FeanorFS-macOS-unsigned.pkg.sha256 \
-            FeanorFS-macOS-unsigned.dmg \
-            FeanorFS-macOS-unsigned.dmg.sha256 \
-            FeanorFS-macOS-UNSIGNED.txt \
-            --repo "$REPOSITORY" \
-            --clobber
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          FeanorFS-macOS-unsigned.pkg
+          FeanorFS-macOS-unsigned.pkg.sha256
+          FeanorFS-macOS-unsigned.dmg
+          FeanorFS-macOS-unsigned.dmg.sha256
+          FeanorFS-macOS-UNSIGNED.txt
+          --repo "$REPOSITORY"
+          --clobber
 
   publish-windows:
     needs: validate-release
     name: Publish attested unsigned Windows installer
-    environment: prod
     runs-on: windows-latest
     timeout-minutes: 45
     permissions:
@@ -382,13 +268,13 @@ jobs:
       attestations: write
       id-token: write
     steps:
-      - name: Checkout verified preview commit
+      - name: Checkout release tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ needs.validate-release.outputs.sha }}
+          ref: refs/tags/${{ inputs.release_tag }}
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - name: Build CLI and tray
@@ -396,7 +282,7 @@ jobs:
       - name: Compile, verify, and smoke unsigned installer
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ needs.validate-release.outputs.tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
           if (-not $iscc) {
@@ -460,47 +346,15 @@ jobs:
       - name: Upload unsigned Windows release assets
         shell: bash
         env:
-          EXPECTED_RELEASE_ID: ${{ needs.validate-release.outputs.release_id }}
-          EXPECTED_SHA: ${{ needs.validate-release.outputs.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.validate-release.outputs.tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
           REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$EXPECTED_RELEASE_ID" =~ ^[0-9]+$ ]]; then
-            echo "::error::Validated release ID is invalid."
-            exit 1
-          fi
-          release_json="$(gh api "repos/$REPOSITORY/releases/$EXPECTED_RELEASE_ID")"
-          if ! jq -e \
-            --argjson id "$EXPECTED_RELEASE_ID" \
-            --arg tag "$RELEASE_TAG" \
-            '.id == $id and .tag_name == $tag and .prerelease == true' \
-            <<<"$release_json" >/dev/null; then
-            echo "::error::Preview release identity, tag, or prerelease state changed."
-            exit 1
-          fi
-
-          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
-          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
-          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
-          if [ "$tag_type" = tag ]; then
-            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
-            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
-            tag_type="$(jq -r '.object.type' <<<"$annotated")"
-          fi
-          release_target="$(jq -r '.target_commitish' <<<"$release_json")"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          if [ "$tag_type" != commit ] || [ "$tag_sha" != "$EXPECTED_SHA" ] || \
-            [ "$release_sha" != "$EXPECTED_SHA" ]; then
-            echo "::error::Preview release target or tag changed after validation; refusing to upload."
-            exit 1
-          fi
-          gh release upload "$RELEASE_TAG" \
-            FeanorFS-windows-x86_64-unsigned-setup.exe \
-            FeanorFS-windows-x86_64-unsigned-setup.exe.sha256 \
-            FeanorFS-windows-x86_64-unsigned.zip \
-            FeanorFS-windows-x86_64-unsigned.zip.sha256 \
-            FeanorFS-windows-UNSIGNED.txt \
-            --repo "$REPOSITORY" \
-            --clobber
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          FeanorFS-windows-x86_64-unsigned-setup.exe
+          FeanorFS-windows-x86_64-unsigned-setup.exe.sha256
+          FeanorFS-windows-x86_64-unsigned.zip
+          FeanorFS-windows-x86_64-unsigned.zip.sha256
+          FeanorFS-windows-UNSIGNED.txt
+          --repo "$REPOSITORY"
+          --clobber

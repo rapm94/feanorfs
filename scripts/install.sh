@@ -25,6 +25,8 @@ launch_desktop_tray() {
         return
     fi
 
+    feanorfs integrate >/dev/null 2>&1 || true
+
     if [ "$platform" = macos ]; then
         if [ -d "$tray" ] && /usr/bin/open -g "$tray" --args --first-run >/dev/null 2>&1; then
             echo "FeanorFS is now in your menu bar."

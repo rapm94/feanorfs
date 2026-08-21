@@ -430,6 +430,26 @@ reconnected instead—then removes only those tray-list records. It does not
 delete files, encrypted setup, credentials, services, hub data, or remote
 snapshots.
 
+### `retire` — explicitly remove leftover workspace state (hidden)
+
+```bash
+feanorfs retire ~/projects/old-app --grace 604800   # tombstone; 7 days default
+feanorfs retire ~/projects/old-app --grace 0        # quarantine immediately
+feanorfs retire --sweep                             # process expired tombstones only
+```
+
+When a mirrored folder is deleted, its encrypted global workspace state stays
+under `~/.feanorfs/workspaces/` because FeanorFS never infers orphanhood.
+`retire <folder>` explicitly tombstones that state: the request records the
+slot's filesystem identity and canonical path, refuses when the folder is
+still live or another process holds the slot, and keeps the bytes in place
+for a grace period (7 days by default) so the decision is reversible. After
+grace, a sweep moves the slot into `~/.feanorfs/quarantine/`; after the
+quarantine retention window (24 h, `FEANORFS_RETIRE_QUARANTINE_SECS`
+override), it is deleted only after re-verifying that the recorded folder is
+still gone under an exclusive state lease. State without a recorded identity
+or without an explicit tombstone is never retired or deleted.
+
 ### `recovery` — encrypted workspace access backup and restore
 
 From a mirrored folder:
@@ -766,7 +786,7 @@ feanorfs agent inbox [--for <NAME>] [--after <HEAD>] [--limit <N>]
 | `refresh` | Pull cloud changes the agent hasn't touched. `--replace` discards agent-local edits after preserving them as a parent snapshot. |
 | `land` | Apply clean work, upload, register conflicts |
 | `clean` | Remove agent dir and snapshot rows |
-| `run` | Run a command in the agent dir — not a sandbox. Sets `FEANORFS_AGENT`, `FEANORFS_AGENT_DIR`, and the absolute shared control root in `FEANORFS_WORKSPACE_ROOT`. |
+| `run` | Run a command in the agent dir with continuous reconciliation for the command's lifetime — not a sandbox. Sets `FEANORFS_AGENT`, `FEANORFS_AGENT_DIR`, and the absolute shared control root in `FEANORFS_WORKSPACE_ROOT`. |
 | `send` | Publish one encrypted signal tied to a snapshot; sender defaults to `FEANORFS_AGENT`, then `human` |
 | `inbox` | Read signals addressed to you (or `*` broadcasts); pass `--after` the previous cursor for new-signal deltas; a reset cursor means older signals may have been missed |
 
@@ -776,6 +796,66 @@ Agent signals are encrypted snapshots with no file-tree changes: they create
 no project files, never dirty Git, and keep the hub opaque. See
 [agent-communication.md](agent-communication.md) for the protocol, JSON
 contracts, and safety rules.
+
+### Continuous active agents
+
+While an agent is **active**, FeanorFS reconciles it automatically. Activation
+is explicit and process-lifetime: `feanorfs agent run <name> -- <command>`, or
+an enabled configured runner for that agent. `agent spawn` alone never
+activates anything, and upgrading FeanorFS never activates a dormant agent.
+
+```text
+agent edits files
+    -> 500 ms quiet-period debounce
+    -> automatic land (clean=false, propose=false) advances shared WIP
+    -> other active agents wake on the opaque head change
+    -> automatic refresh applies paths they have not touched
+```
+
+- **No transfer commands.** An active agent never runs `sync`, `push`, `pull`,
+  `land`, or `refresh` during normal operation; those remain diagnostics and
+  recovery tools. No Git repository or Git command is required or used.
+- **Shared WIP, not approval.** Every automatically published snapshot is
+  unfinished transport state. Only an explicit `result` signal referencing a
+  settled snapshot claims that code was inspected or tested.
+- **Conflicts stay explicit.** Overlapping edits pause automatic mutation and
+  materialize `.original`/`.local`/`.cloud` legs in private global state.
+  Resolve with `feanorfs conflicts keep`; FeanorFS never merges content.
+- **Signals wake, never activate.** A snapshot-linked `ffmsg1` signal wakes
+  event/runner consumers immediately, but never starts a model.
+
+While the command is alive, watch the live projection:
+
+```bash
+feanorfs agent status <name>    # "Live: idle head=… settled=…" when active
+feanorfs events                 # agent_reconcile_started/reconciled/deferred/attention
+```
+
+On child exit FeanorFS drains the final burst and makes one bounded final
+reconciliation attempt, then prints the honest outcome:
+
+```text
+Agent 'worker' settled (snapshot <64-hex>).        # everything reconciled
+Agent 'worker' finished offline: …                 # work preserved; reactivate to retry
+Agent 'worker' needs attention (pending_conflicts) # explicit resolution required
+```
+
+An interactive controller stops with its child, including after an offline
+final attempt. Run `agent run` again after connectivity returns to reconcile
+the preserved work. An enabled configured runner continues retrying only while
+its worker/controller remains active.
+
+Failure semantics are bounded: filesystem bursts coalesce into one dirty
+generation, one operation mutates one agent at a time, retryable transport
+failures retry with backoff, and conflicts/corrupt state/unsafe layouts stop
+for attention instead of looping. If a duplicate owner is started, the second
+one fails before any mutation; exiting the owner is the rollback and always
+preserves the worktree, base ref, snapshots, and credentials.
+
+Head-change waiting rides the existing authenticated `GET /api/head` route
+with optional bounded wait parameters; old hubs ignore them, and clients
+detect that and keep bounded periodic polling — never a busy loop. Continuous
+reconciliation requires a format-v3 workspace.
 
 ### Agent runner
 
@@ -1075,7 +1155,7 @@ feanorfs conflicts keep <path> --local | --cloud | --both | --file <reconciled>
 4. **Verify** in a spawned agent workspace: `agent spawn verify` → copy candidate → `agent run verify -- <tests>`.
 5. Only a green run earns `feanorfs conflicts keep <path> --file <candidate>`.
 
-**Tiered policy:** clean `--propose` → reconciler agent → human escalation (binary files, sensitivity-list paths, or N failed verifications).
+**Tiered policy:** proactive `ffwork1` coordination first; engine-proven last resort with a causally-behind designated agent; typed human escalation only for a closed-enum ambiguity.
 
 Resolution history: `feanorfs conflicts history --json` (records method, resolver from `FEANORFS_AGENT` or `human`).
 

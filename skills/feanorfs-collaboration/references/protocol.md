@@ -150,6 +150,14 @@ inbox without the stale `--after` cursor, reconcile the bounded recent view,
 and replace the stored cursor with the inbox result. An authorized
 orchestrator also calls `agent inbox` for each ordinary wakeup's typed message.
 
+Active agents (continuous reconciliation) also project metadata-only
+lifecycle records — `agent_reconcile_started`, `agent_reconciled` (with the
+settled snapshot), `agent_reconcile_deferred`, and `agent_reconcile_attention`.
+Head-change wakeups ride the same bounded head observer as the watcher and
+runner; on old hubs the periodic window is the recovery backstop. While
+active, an agent must not run `sync`/`land`/`refresh` itself: it waits for
+`agent status` to expose a settled snapshot before a terminal `result`, and
+stops on `needs_attention` or cursor reset.
 ## Safety
 
 - Routing is not an access-control boundary; sender attribution is not
@@ -176,7 +184,7 @@ ffint1:{"type":"accepted","assignment_id":"<32-hex>","attempt":0,"about_snapshot
 ```
 
 ```text
-ffint1:{"type":"result","assignment_id":"<32-hex>","attempt":0,"about_snapshot":"<64-hex>","digest":{"assignment_id":"<32-hex>","integrator":"agent-b","about_snapshot":"<64-hex>","inspected_snapshot":"<64-hex>","state":"completed","landed_paths":12,"resolved_conflicts":3,"remaining_conflicts":0,"verification":{"status":"passed","summary":"84 tests passed"},"outcome":"Integrated parser implementation and tests.","risks":[],"decision_required":null}}
+ffint1:{"type":"result","assignment_id":"<32-hex>","attempt":0,"about_snapshot":"<64-hex>","digest":{"assignment_id":"<32-hex>","integrator":"agent-b","about_snapshot":"<64-hex>","inspected_snapshot":"<64-hex>","state":"completed","landed_paths":12,"resolved_conflicts":3,"remaining_conflicts":0,"verification":{"status":"passed","summary":"84 tests passed","policy_version":0,"input_hashes":[],"checks":[]},"outcome":"Integrated parser implementation and tests.","risks":[],"decision_required":null}}
 ```
 
 ```text

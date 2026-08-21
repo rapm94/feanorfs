@@ -37,12 +37,8 @@ assemble() {
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
   mkdir -p "$build_dir/payload/usr/local/bin"
   mkdir -p "$build_dir/scripts"
-  source_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
   install -m 755 "$feanorfs_bin" "$build_dir/payload/usr/local/bin/feanorfs"
   install -m 755 "$tray_bin" "$app/Contents/MacOS/feanorfs-tray"
-  install -m 755 \
-    "$source_dir/migrate-macos-user-bins.sh" \
-    "$build_dir/scripts/migrate-macos-user-bins.sh"
 
   info_plist="$app/Contents/Info.plist"
   cat > "$info_plist" <<EOF
@@ -77,6 +73,13 @@ EOF
 #!/bin/sh
 set -eu
 
+# Terminal/headless installers set this explicitly and perform any interactive
+# handoff themselves. Finder's Installer.app does not, so a normal desktop
+# install opens the same tray-first onboarding used on every other platform.
+if [ "${FEANORFS_NO_LAUNCH:-}" = 1 ]; then
+  exit 0
+fi
+
 console_user="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
 case "$console_user" in
   ''|root|loginwindow|_mbsetupuser) exit 0 ;;
@@ -86,63 +89,18 @@ case "$console_uid" in
   ''|*[!0-9]*) exit 0 ;;
 esac
 
-script_dir="$(CDPATH='' cd -- "$(/usr/bin/dirname -- "$0")" && pwd)"
-package_version="$(/usr/libexec/PlistBuddy \
-  -c 'Print :CFBundleShortVersionString' \
-  /Applications/FeanorFS.app/Contents/Info.plist 2>/dev/null || true)"
-/usr/bin/sudo -H -u "$console_user" \
-  "$script_dir/migrate-macos-user-bins.sh" "$package_version"
-
-existing_setup=false
-if /usr/bin/sudo -H -u "$console_user" \
-  /bin/sh -c 'test -s "$HOME/.feanorfs/recent.json"'; then
-  existing_setup=true
-fi
-
-# A tray from the previous package can be running through LaunchServices rather
-# than the managed login job. Quiesce both forms before refreshing workers so a
-# long status scan cannot hold a workspace lock or keep the old singleton alive.
-/bin/launchctl bootout "gui/$console_uid/com.feanorfs.tray" >/dev/null 2>&1 || true
-for pattern in 'feanorfs-tray' '(^|/)feanorfs --json tray status$'; do
-  if [ "$pattern" = feanorfs-tray ]; then
-    match_flag=-x
-  else
-    match_flag=-f
-  fi
-  /usr/bin/pgrep -u "$console_uid" "$match_flag" "$pattern" 2>/dev/null |
-    while IFS= read -r pid; do
-      case "$pid" in
-        ''|*[!0-9]*) continue ;;
-      esac
-      /bin/kill -TERM "$pid" 2>/dev/null || true
-    done
-done
-
 if /bin/launchctl print "gui/$console_uid" >/dev/null 2>&1; then
-  refresh_succeeded=false
-  if /bin/launchctl asuser "$console_uid" \
+  if ! /bin/launchctl asuser "$console_uid" \
     /usr/bin/sudo -H -u "$console_user" \
     /usr/bin/env FEANORFS_TRAY_BIN=/Applications/FeanorFS.app/Contents/MacOS/feanorfs-tray \
     /usr/local/bin/feanorfs service refresh-installation \
     >/dev/null 2>&1; then
-    refresh_succeeded=true
-  else
     echo "FeanorFS was installed, but existing login services could not be refreshed automatically." >&2
   fi
-  if [ "$existing_setup" = false ] || [ "$refresh_succeeded" = false ]; then
-    # A fresh install needs the one-time native Start/Join choice. Stop the
-    # just-registered supervisor job for this session so the hinted launch wins
-    # the singleton race; the job remains installed for the next login.
-    /bin/launchctl bootout "gui/$console_uid/com.feanorfs.agent" >/dev/null 2>&1 || true
-    # Terminal/headless installers perform their own interactive handoff. The
-    # flag suppresses only that UI; migration and service refresh still run.
-    if [ "${FEANORFS_NO_LAUNCH:-}" != 1 ]; then
-      /bin/launchctl asuser "$console_uid" \
-        /usr/bin/sudo -u "$console_user" \
-        /usr/bin/open -g /Applications/FeanorFS.app --args --first-run \
-        >/dev/null 2>&1 || true
-    fi
-  fi
+  /bin/launchctl asuser "$console_uid" \
+    /usr/bin/sudo -u "$console_user" \
+    /usr/bin/open -g /Applications/FeanorFS.app --args --first-run \
+    >/dev/null 2>&1 || true
 fi
 exit 0
 EOF

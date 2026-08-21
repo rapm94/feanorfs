@@ -1,6 +1,6 @@
 ---
 name: feanorfs-collaboration
-description: Coordinate FeanorFS coding agents across machines through encrypted snapshot-tied signals (feanorfs agent send / agent inbox, MCP agent_send / agent_inbox), including handling one configured local runner-child invocation. Use when an agent must request platform-specific work, report a bounded result or blocker, check incoming coordination signals, or parse a RunnerInvocation and publish its correlated terminal reply. Configure or control a persistent runner only when the user explicitly asks. Never use for file sync itself, conflict merging, or chat.
+description: Coordinate coding agents across machines with FeanorFS encrypted signals, agent workspaces, and conflict resolution. Use when an agent must send or read snapshot-linked messages, spawn or land isolated agent work, resolve overlapping edits, or operate inside a FeanorFS runner child.
 ---
 
 # FeanorFS multi-agent collaboration
@@ -9,12 +9,42 @@ Coordinate coding agents in a shared FeanorFS workspace through the encrypted
 signal protocol. Treat routing and authorship as advisory. Keep signals out of
 project files and Git state.
 
+## Continuous active agents (no manual transfers)
+
+When you are running under `feanorfs agent run` (or as an enabled configured
+runner's child), your agent worktree is continuously reconciled:
+
+1. **Never run `feanorfs sync`, `push`, `pull`, `agent land`, or
+   `agent refresh` yourself.** The live controller lands your saved changes
+   after each quiet burst and refreshes paths you have not touched. Manual
+   transfer commands are rejected while the controller owns your agent.
+2. **Wait for a settled snapshot before a verification result.** Read
+   `feanorfs --json agent status <name>` and use its `live.settled_snapshot`
+   as the `--about` snapshot of a `result` terminal. If it is absent, do not
+   publish a result; a correlated `blocked` reply may retain the request's
+   snapshot without claiming that pending work settled. Never claim a snapshot
+   you did not inspect; a signal-only head changes the observed head id but not
+   the tree or the existing settled snapshot.
+3. **Stop on attention.** If status shows `needs_attention` (conflicts,
+   unsafe path, corrupt state) or the runner reports `cursor_reset` /
+   `ambiguous_execution`, stop mutating files and await explicit resolution.
+   Overlapping edits are never merged automatically.
+4. **Expect bounded final reconciliation on exit.** After your process ends,
+   FeanorFS makes one bounded final attempt and reports settled/offline/
+   attention. Offline work is preserved. An interactive owner must be run
+   again after connectivity returns; an enabled configured runner retries
+   while its controller remains active.
+
 ## Identify your agent
 
-1. Use a workspace-unique agent name (for example `linux-dev`, `mac-test`, `ci1`).
-2. Work inside the agent workspace via `feanorfs agent run <name> -- <command>` so `FEANORFS_AGENT` is set, or pass `--from <name>` explicitly.
-3. Keep the original shared workspace root available. Inside `feanorfs agent run`, CLI signal commands (`agent inbox`, `agent send`) and MCP automatically use that control workspace. Run `agent refresh` and other FeanorFS lifecycle commands from the shared root; the isolated agent worktree itself has no project-local FeanorFS configuration.
-4. Never claim an identity you are not authorized to use; attribution is advisory in this protocol.
+1. Prefer `FEANORFS_AGENT` (set by `agent run` and runner children).
+2. Fall back to a name you know you were spawned as.
+3. Never claim a different agent's name; attribution stays advisory.
+4. Use a workspace-unique agent name (for example `linux-dev`, `mac-test`, `ci1`).
+5. Keep the original shared workspace root available: CLI signal commands
+   (`agent inbox`, `agent send`) and MCP use that control workspace from
+   inside `agent run`; the isolated agent worktree has no project-local
+   FeanorFS configuration.
 
 ## Check your inbox
 
@@ -145,3 +175,102 @@ for the current attempt:
 
 Dispatchers own dispatch state; you do not. Never act after supersession, and
 never treat assignment as a security claim — it is advisory coordination.
+
+## Work-intent protocol (proposal before mutation)
+
+Coordinate intended write scope through encrypted `ffwork1` profiles before
+mutating files. This is a prevention layer, not access control: identity,
+path claims, and authorship remain advisory, and the hub never decides.
+
+1. **Propose before mutation.** Before editing a scope that other agents may
+   touch, run `feanorfs agent work propose --task <id> --path <p>...`
+   (exact canonical paths or `dir/**` containment globs, sorted and unique)
+   with `--coordinator <name>` when the proposal names one. Treat the result
+   as `proposed`, never as accepted.
+2. **Acceptance requires an observed decision.** Only the coordinator named
+   by the proposal (or the operating context, default `human`) can apply a
+   decision: `feanorfs agent work decide <proposal-message-id> --kind
+   accept|reject|narrow|order|accept-overlap`. Do not start editing an
+   accepted scope until `feanorfs agent work status` shows the proposal
+   `accepted`; silence and timeouts never imply acceptance or yield.
+3. **Observe continuously.** Run `feanorfs agent work status` before and
+   after each mutation, and before declaring completion. If it reports
+   `projection_incomplete`, acceptance is not fully provable: stop mutating
+   until the closure is complete. Re-propose with a higher `--sequence` after
+   a rejection instead of reusing an old proposal id.
+4. **Amend explicitly.** Scope changes after acceptance go through
+   `feanorfs agent work amend --task <id> --intent <intent-message-id>` with
+   replacement paths/concerns/dependencies. Never silently edit outside the
+   accepted scope.
+5. **Yield explicitly.** Relinquish accepted overlap with
+   `feanorfs agent work yield` while preserving local work; hand the overlap
+   back to the coordinator instead of racing.
+6. **Settle and finish.** Attach verification evidence naming the snapshot
+   actually inspected (`feanorfs agent work settle --inspected <snapshot>`),
+   then `feanorfs agent work complete` or `feanorfs agent work block`.
+   Reference the exact accepted intent message id in every transition.
+7. **No clock-only ownership inference.** Never claim another agent's scope
+   because a timestamp is older or newer; causal references and observed
+   decisions are the only authority. Author transitions key by
+   `(task_id, agent, sequence)`; decisions key by exact proposal message id
+   plus the authorized coordinator identity.
+8. **Harness-neutral.** This protocol works identically through the CLI,
+   Rust SDK, C FFI, TypeScript, MCP (`work_*` tools), and NDJSON `work_*`
+   wakeups. Send operations never mutate the projection; only an observed
+   signal does. Unknown/malformed `ffwork` profiles are ignored by the typed
+   surfaces and never partially apply.
+
+## Exact conflict resolution (scope first, resolution last)
+
+Automatic conflict resolution is a last-resort pipeline for conflicts that
+prevention could not avoid. Scope comes first; resolution comes last;
+candidate submission never publishes; only guarded apply does. Legacy
+path-only conflicts stay on the manual `conflicts keep` path and can never
+enter automatic prepare/apply.
+
+1. **Scope first, always.** Propose and observe accepted scope through the
+   work-intent protocol (`feanorfs agent work propose …` / `work status`)
+   before touching any path a conflict may involve. Never prepare a
+   resolution job for a conflict you did not help scope.
+2. **Prepare only after prevention is exhausted.** Run
+   `feanorfs agent resolution prepare <path> --reason exhausted|violated
+   --detail <text>` only when a real current conflict exists and every
+   bounded prevention path is genuinely exhausted (or violated). Read the
+   returned job: verify the `job_id`, `assignment_id`, `attempt`, `owner`,
+   and the exact `conflict_fingerprint`. Prepare is read-only: it never
+   mutates the worktree, conflict registry, artifacts, or head.
+3. **Write the candidate to the engine-owned destination only.** The job's
+   `candidate_destination` is create-new and immutable; create the candidate
+   there and never overwrite it. The job's `allowed_output_paths` bound every
+   path the harness may touch.
+4. **Submit a validated result; submission never applies.** Submit one
+   `ResolutionResult` (`feanorfs agent resolution submit <job-id> --result
+   <file>`) with the exact job/assignment/attempt/fingerprint, a candidate
+   descriptor whose hash/size/mode/deletion match the file, and passed
+   verification evidence. Replay is rejected. Submission changes nothing
+   outside the job store.
+5. **Apply only with fresh verification.** `feanorfs agent resolution apply
+   <job-id>` is the only publishing operation; it revalidates every identity
+   field and the candidate immediately before one CAS. A typed stale outcome
+   means the current conflict survived unchanged — stop, re-inspect, and
+   re-prepare against the new head; never retry the same candidate blindly.
+6. **Escalate with exactly one bounded question.** Send `requires_human`
+   (one `question`, one typed `human_reason`) only for the allowed reasons:
+   semantic ambiguity, unavoidable data loss, missing/authentication-failed
+   leg, security/compatibility boundary change, required verification
+   unavailable, indeterminate ownership, bounded resolver exhaustion,
+   unsupported size/safety bound, or one explicit product decision. Offline
+   conditions, first timeouts, signal-only heads, stale candidates, and
+   ordinary lost CAS are never human reasons.
+7. **Status is metadata only.** `feanorfs agent resolution status [<job-id>]`
+   reports ids/state/counts (assignment state, submitted outcome) — never
+   paths or bodies. The NDJSON stream emits `resolution_prepared`,
+   `resolution_submitted`, `resolution_applied`, and `resolution_revoked`
+   metadata wakeups on transitions.
+8. **Protocol observation is metadata only.** `feanorfs agent resolution protocol-status [--rebuild]` projects the encrypted `ffres1` signal stream (ids/state/counts only). `feanorfs agent resolution assign <job-id>` publishes the assignment profile, `feanorfs agent resolution reply <job-id>` publishes the result profile, and `feanorfs agent resolution revoke <job-id> [--superseded]` publishes the revoke/supersede profile. The NDJSON stream adds `resolution_assigned`, `resolution_result_received`, and `resolution_human_answered` wakeups on protocol transitions.
+9. **Human escalation is exact and local-first.** `feanorfs agent resolution answer <job-id> --defer|--keep-unresolved|--candidate <file>` records one typed human answer bound to the live projection (identity fields are never caller-supplied, so stale answers are impossible by construction); `feanorfs agent resolution publish-answer <job-id> --defer|--keep-unresolved|--candidate <file>` sends the `ffres1` human-answer profile. `feanorfs agent resolution defer <job-id>` records the terminal deferred state. `feanorfs agent resolution materialize <job-id>` reconstructs the conflict legs by id. `feanorfs agent resolution put <job-id> <file>` writes the immutable engine-owned candidate.
+10. **The tray only projects.** Tray/menu surfaces show resolution counts and
+   status; mutation stays in the CLI (`feanorfs agent resolution
+   prepare|submit|apply|answer|defer|assign|reply|revoke|publish-answer`).
+   Manual `conflicts keep` and human resolution remain available for every
+   pending conflict.

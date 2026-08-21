@@ -150,6 +150,43 @@ limits follow from the shared-workspace trust model:
 **Result:** **Defended against for passive capture and wrong-code substitution;
 denial of service remains possible.**
 
+### Continuous active-agent reconciliation
+
+Automatic land/refresh for actively owned agents (`agent run` lifetime or an
+enabled configured runner) reuses the existing snapshot, conflict, and
+lease machinery, and adds these limits to the model:
+
+- **Incomplete WIP becomes visible.** Automatic snapshots are unfinished
+  transport state. The debounce and stable-read machinery reduce torn edits,
+  but never eliminate them; only an explicit `result` referencing a settled
+  snapshot claims inspection/testing. Reviewers must not treat WIP heads as
+  verified.
+- **Stale controller status is never authoritative.** Status projections are
+  advisory; readers verify the process-lifetime lease before trusting
+  `active`, and every controller re-reads files/head at startup instead of
+  trusting its own previous status.
+- **Waiter exhaustion is bounded.** Head-wait capacity is bounded globally
+  and per opaque workspace; waits are capped below the transport read-idle
+  timeout and released on disconnect, so a malicious participant can at most
+  exhaust its own share of waiter slots, not wedge the hub. Old hubs ignore
+  wait parameters; clients fall back to bounded jittered polling.
+- **Process isolation limits are unchanged.** Continuous controllers spawn
+  processes only through the existing explicit activation surfaces (the user
+  launches `agent run`, or an operator configured and enabled a runner).
+  Agent worktrees remain data isolation, never process sandboxing; a
+  compromised active agent can read anything its user account can read.
+- **Ownership is fail-closed.** One process-lifetime lease owns
+  reconciliation per agent; a second owner, manual land/refresh during
+  active ownership, missing/replaced worktrees, and corrupt controller
+  state stop for explicit attention instead of mutating.
+- **No replay of ambiguous execution.** The continuous controller retries
+  idempotent file reconciliation, but an interrupted runner request is still
+  marked ambiguous and never replayed automatically.
+
+**Result:** **Defended against for cross-machine tampering within the
+existing shared-key trust model; incomplete-WIP visibility, waiter capacity
+exhaustion, and data-only isolation remain documented product limits.**
+
 ### Random integrator assignment (dispatcher)
 
 The consumer-layer orchestrator that randomly picks one temporary integrator
@@ -334,11 +371,48 @@ Unauthenticated and malleable — an attacker who knows plaintext at a position 
 | Replay attacks (old snapshot heads or blobs) | Low | Immutable history and observed-regression warnings; no external transparency log is claimed | Accepted limitation |
 | Update-metadata redirection or code execution | Medium | HTTPS-only bounded no-redirect GitHub API request, pinned API version, stable-semver parsing, exact official tag-URL validation in CLI and tray, explicit browser-open choice, no artifact download/install/execute | Implemented; platform signature/checksum/attestation gates remain authoritative |
 
+## Automatic conflict resolution
+
+The engine's automatic resolution path is the last resort after proactive
+`ffwork1` coordination failed to prevent a conflict. Its trust boundaries:
+
+- **Last-resort eligibility is engine-proven.** A job can be prepared only
+  when the authenticated projection shows no non-terminal coordination for
+  the path; caller prose, skill assertions, or booleans never authorize
+  preparation. Legacy unfingerprinted conflicts are manual-only forever.
+- **The engine never produces candidates.** The designated agent/harness
+  materializes the authenticated legs locally, produces only a candidate
+  plus evidence through typed engine APIs (`put`/`submit`), and the engine
+  executes a fixed verification policy before anything can be recorded.
+- **Designation is auditable.** The causally behind eligible agent is
+  selected from transitive ancestry over applied coordination messages;
+  only a documented tie or unavailable-owner case falls back to a
+  deterministic `ffint1` ranking whose nonce, roster, and ranking are
+  persisted and published. Capabilities, explicit yield, task ownership,
+  accepted scope, and existing assignments are enforced from projection
+  state, never from caller labels.
+- **Publication is guarded.** Immediately before the single head
+  compare-and-swap, the engine reloads and revalidates the complete
+  identity, registry record, head, causal references, candidate, result,
+  scope, and ownership. A lost CAS restarts full validation; failures of
+  any kind leave the conflict and its artifacts intact for manual action.
+- **Humans are asked only for a typed ambiguity.** A human request is one
+  bounded question with a closed-enum reason and typed safe options
+  (defer/keep unresolved); answers bind to the exact job, assignment,
+  fingerprint, and question generation and re-enter the same guarded
+  publication validation as an agent result.
+- **The hub stays opaque.** `ffres1` assignment/result/revoke/answer
+  profiles travel inside the existing encrypted signal stream; the hub
+  gains no semantic route, no plaintext metadata, and no resolution logic.
+
 ## Remaining security work
 
-Ownership, dependencies, and acceptance evidence for legacy-crypto retirement,
-hosted recovery, the default relay, and independent review are tracked only in
-[TODO.md](../TODO.md).
+Current committed security and release follow-up is tracked in
+[TODO.md](../TODO.md). Legacy-crypto removal is not yet an approved
+compatibility change; hosted recovery and a default relay are not current
+product commitments; and an independent cryptographic review has not been
+scheduled. Any of those initiatives requires an explicit product decision,
+owner, and acceptance criteria before it is added to the authoritative TODO.
 
 ## Process isolation (agents)
 
@@ -350,4 +424,4 @@ FeanorFS's agent workspaces provide **data isolation, not process sandboxing.**
 
 **Composition rule:** run untrusted or highly autonomous agents inside a sandboxed harness (Claude Code / Cursor sandboxes, containers, `sandbox-exec`, firejail) pointed at the agent folder. FeanorFS contains honest mistakes; the sandbox contains everything else.
 
-**Reconciliation trust:** conflict resolution is performed by a consumer (human or LLM), never by FeanorFS. Resolution requires explicit `conflicts keep`; all versions remain recoverable. LLM merges should be verified in a spawned agent workspace before `conflicts keep --file`.
+**Reconciliation trust:** manual conflict resolution is performed by a consumer (human or LLM) through explicit `conflicts keep`; all versions remain recoverable. Automatic resolution is a bounded engine-mediated last resort with the same trust boundary: FeanorFS never merges or chooses file content — it designates a resolver from authenticated protocol state, transports an immutable job, executes a fixed verification policy, and publishes only an exact still-current candidate through one compare-and-swap. See [Automatic conflict resolution](#automatic-conflict-resolution). LLM merges should be verified in a spawned agent workspace before `conflicts keep --file`.

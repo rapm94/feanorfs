@@ -47,10 +47,13 @@ echo "Installed /usr/local/bin/feanorfs and /Applications/FeanorFS.app."
 if [ "${FEANORFS_NO_LAUNCH:-}" = 1 ] || [ "$(id -u)" -eq 0 ]; then
   echo "Open FeanorFS from Applications to start mirroring a folder."
   echo "Headless setup: feanorfs start [folder]"
-elif /usr/bin/open -g /Applications/FeanorFS.app --args --first-run >/dev/null 2>&1; then
-  echo "FeanorFS is now in your menu bar."
-  echo "Choose Start Mirroring a Folder… to begin—no Terminal setup is required."
 else
-  echo "FeanorFS was installed, but the menu-bar app could not open in this session."
-  echo "Open FeanorFS from Applications, or run: feanorfs start [folder]"
+  feanorfs integrate >/dev/null 2>&1 || true
+  if /usr/bin/open -g /Applications/FeanorFS.app --args --first-run >/dev/null 2>&1; then
+    echo "FeanorFS is now in your menu bar."
+    echo "Choose Start Mirroring a Folder… to begin—no Terminal setup is required."
+  else
+    echo "FeanorFS was installed, but the menu-bar app could not open in this session."
+    echo "Open FeanorFS from Applications, or run: feanorfs start [folder]"
+  fi
 fi

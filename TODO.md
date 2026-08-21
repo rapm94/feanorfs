@@ -6,174 +6,106 @@ backlog history.
 
 ## Founder tasks
 
-These require account ownership, infrastructure ownership, or representative
-human acceptance. Never commit credentials or paste them into issues, logs, or
-chat.
+These require account ownership or representative human acceptance. Never
+commit credentials or paste them into issues, logs, or chat.
 
 ### F1. Provide trusted desktop-signing access
 
 - [ ] Add Developer ID Application/Installer and App Store Connect notarization
   credentials to GitHub Actions for the universal macOS `.dmg`/`.pkg`.
 - [ ] Configure Azure Artifact Signing through GitHub OIDC for the Windows CLI,
-  tray, and installer `.exe`, and provide the stable public signer identities
-  that release verification must enforce.
+  tray, and installer `.exe`.
 
-Done when one immutable tag publishes notarized macOS and Authenticode Windows
-products whose evidence matches the approved signer identities. Unsigned
-releases must remain clearly labeled as development builds.
+Done when the fail-closed workflows publish notarized macOS and Authenticode
+Windows products from one immutable tag. Unsigned GitHub releases must not be
+presented as trusted macOS or Windows installers.
 
-### F2. Provide the production off-LAN relay
+### F2. Accept onboarding on ordinary desktop sessions
 
-- [ ] Choose the production relay domain, hosting account, budget, retention
-  policy, abuse controls, and privacy terms.
-- [ ] Add its deployment credentials through GitHub/environment secret stores;
-  never place them in the repository or client builds.
+Blocked on F1 for macOS and Windows.
 
-Done when a normal user can pair away from home without configuring a relay URL,
-while the relay remains unable to see workspace IDs, bearer tokens, paths, or
-encrypted payload contents.
+- [ ] Install through the trusted `.dmg`, `.exe`, `.deb`, `.rpm`, and
+  `.pkg.tar.zst` products as ordinary users; accept or report a reproducible
+  defect in tray-first Start/Join/Not Now, login persistence, update behavior,
+  and clean uninstall.
+- [ ] Repeat the released Arch package and tray flow in a real CachyOS Wayland
+  session. The currently available CachyOS session is i3/X11, so automated SSH
+  evidence cannot honestly satisfy the Wayland acceptance requirement.
 
-### F3. Accept the ordinary-user desktop experience
-
-- [ ] Exercise install, Start/Join/Not Now, folder switching, login persistence,
-  upgrade, recovery, and uninstall on supported macOS, Windows, Debian/Ubuntu,
-  Fedora, and Arch/CachyOS desktop sessions.
-- [ ] Record only OS/version and secret-free acceptance or a reproducible defect.
-
-Signed macOS and Windows acceptance is blocked on F1. Off-LAN default pairing
-acceptance is blocked on F2.
+Record only OS/version and secret-free acceptance or reproduction evidence.
 
 ### F4. Lock the GitHub release control plane
 
-- [ ] Add rules for every tag ref (not only `v*`) that restrict creation to
-  the approved release automation identity, prevent update/deletion, and apply
-  to administrators as well as other actors. This is the residual gate for
-  cargo-dist's broad generated SemVer-like `release.yml` tag trigger. Reusable
-  platform jobs now enforce repository-owned exact-SHA CI/Security checks before
-  the single announcement, but tag mutation during the run must still be denied
-  by the control plane rather than workflow convention.
+- [ ] Protect every tag accepted by the generated release workflow (not only
+  `v*`): restrict creation to the release automation identity and prevent
+  update/deletion, including by administrators.
 - [ ] Protect the `prod` environment with required reviewers, release-only
   deployment policy, and no administrator bypass.
 - [ ] Enable required Code Owner reviews through the repository branch rules for
   the release/distribution surfaces already mapped in `.github/CODEOWNERS`.
 
-Done when GitHub's rules/environment APIs report these controls enabled, only
-approved release automation can create any tag that matches the generated
-release trigger, no actor can update/delete any tag ref, and a non-release SHA
-cannot obtain production approval.
+Done when GitHub's APIs report these controls enabled. This requires a distinct
+release identity and an independent reviewer; repository code cannot create
+either safely.
 
 ## AI tasks
 
-### AI-1. Finish installed-product mixed-version upgrade proof
+### AI-1. Complete released-product installation acceptance
 
-The current branch adds useful partial evidence: source-level previous-release
-state compatibility in `scripts/smoke-upgrade.sh`, same-path executable
-identity unit coverage, a side-effect-free tray `--version` probe, `doctor`
-executable-version diagnostics, and an authenticated hub minimum-version
-probe. It does **not** yet start the previous release's separate hub, workspace
-worker, CLI, and tray through each native installer and login manager.
+- [ ] Install the exact published products on macOS, CachyOS, and Windows.
+  Verify matching versions, managed services, mDNS, `doctor`, and a bounded
+  cross-machine sync while preserving the Mac workspaces as authoritative.
 
-- [ ] On supported macOS, Windows, Debian/Ubuntu, Fedora, and Arch/CachyOS
-  products, install the previous release, create a real automatic private hub
-  plus workspace/tray login jobs, install the new product, and prove every
-  registered job and live process converges to the new executable bytes.
-- [ ] Preserve and compare workspace identity, credential references/E2EE
-  access, files, hub identity, opaque head, and exact reachable snapshot
-  history across each upgrade. Clean up every test service/process.
-- [ ] Exercise an actually incompatible advertised hub version through CLI,
-  Rust, C, and TypeScript entry points and require one actionable fail-closed
-  minimum-version error. Retain explicit compatibility evidence for the
-  previous endpoint-less release.
+Done when the installed binaries have exact-release provenance and a
+secret-free post-install record. Source builds, mounted installers, ad-hoc
+signatures, and services executing from the development checkout do not count.
 
-### AI-2. Eliminate generated cargo-dist workflow trust exceptions
+### AI-2. Mixed-version protocol peers on released products
 
-The repository now pins generated action references and attests archives,
-checksums, and `dist-manifest.json` through `dist-workspace.toml`. Cargo-dist
-0.32.0 still generates workflow-wide `contents: write`, dynamic shell template
-expansion, an unpinned optional container expression, and an unverified
-`curl | sh` bootstrap; direct edits to `release.yml` are forbidden.
+- [ ] Exercise an older released product against a newer one (and vice versa)
+  for `ffwork1` intents and `ffres1` assignment/result/answer profiles:
+  unknown or malformed profiles must not create or alter typed protocol
+  projection entries (observation cursors and bounded seen-ID bookkeeping may
+  advance), and legacy unfingerprinted conflicts must stay manual-only. Use the
+  installed products from AI-1.
 
-- [ ] Adopt a maintained cargo-dist release or a pinned, reviewed generator fork
-  that emits per-job least privilege and moves tag/matrix data out of shell
-  template expansion.
-- [ ] Replace the generated bootstrap with a version-and-digest-bound cargo-dist
-  acquisition path and ensure every generated container image is digest-pinned.
-- [ ] Regenerate `release.yml` from `dist-workspace.toml`; do not patch generated
-  YAML after generation.
+Done when the two released versions converge on identical projections without
+corruption, or a reproducible defect is recorded with OS/version evidence.
 
-Done when `dist generate --check` passes and full-workflow pedantic `zizmor`
-reports no medium-or-higher findings for generated `release.yml`.
+### AI-5. Verify portable workspace-state identity and retirement on CI
 
-### AI-3. Integrate the default relay after F2
+Implementation landed: stable `windows-v2` volume/file-index/creation-time
+identity, explicit `-weak` Unix identities without birth times, one-time
+provenance-recorded adoption of legacy path-only slots (recorded `location`
+must prove the exact path), the crash-safe `.identity-index.json` replacing
+the O(N) moved-workspace scan (mtime-guarded so duplicate identities still
+fail closed), full-lifetime per-slot state leases serializing path-hash
+migration and retirement, and `feanorfs retire <folder>` tombstone
+grace/quarantine/verified-deletion with fail-closed lease and identity
+revalidation. macOS unit/integration evidence passes locally, including
+cross-process lease contention, real same-path replacement, relocation, and
+the full tombstone lifecycle.
 
-Blocked on F2 (founder chooses the production relay endpoint). The existing
-opaque relay APIs (`serve --relay`, `fnp2` pairing, inner-TLS tunnel), the
-relay-only `doctor` probe, and the relay OCI product already cover the
-transport surface; what remains is provisioning the chosen endpoint and adding
-health/failover telemetry that contains no capabilities or workspace data,
-then covering LAN-to-off-LAN fallback in product smoke tests.
+- [ ] Confirm the same matrix on the Linux and Windows CI runners (cfg-gated
+  tests added; `windows-v2` type-checked standalone) before the next release.
 
-### AI-4. Finish randomized-integrator field verification
+Done when same-path replacement, relocation, adoption refusal, lease
+contention, and tombstone cleanup pass on macOS, Linux, and Windows runners
+with no split or retired live state.
 
-The randomized integrator assignment layer (PRD `prd-random-integrator-assignment.md`) is
-implemented end to end: canonical `ffint1` contract and auditable Blake3 ranking in
-`common/src/integrator_contract.rs`; dispatcher state machine, crash-safe
-`orchestrator/integrator-state.json` persistence, and read-only cross-machine conflict
-materialization in `agent-core/src/integrator.rs`; CLI (`agent integrator assign|status|revoke|resume`,
-`conflicts materialize`), MCP tools, metadata-only NDJSON integrator events, C FFI, TypeScript
-wrappers, docs, and the collaboration skill. Unit, state-machine, FFI-smoke, and HTTP-hub
-integration tests cover the full lifecycle, timeout/blocked fallback, stale replies,
-cursor-reset fail-closed, hub-storage privacy, and staleness-safe materialization.
+### AI-6. Finish continuous-agent field verification
 
-Remaining field evidence (not code-complete in the repo):
+- [ ] Validate installed macOS, Windows, and Linux process ownership and
+  shutdown: `agent run` final flush under each native installer, supervisor
+  restart during active reconciliation, and duplicate-owner rejection from
+  separate processes.
+- [ ] Run a network-isolated two-active-agent soak with live feedback, a
+  genuine conflict, explicit resolution, disconnection, and recovery,
+  instrumented for zero lost updates and zero echo loops.
+- [ ] Measure the small-file two-client LAN convergence target (p95 < 3 s,
+  excluding backoff and conflict resolution) with the head-wait path active.
 
-- [ ] Run a real two-computer (or network-isolated equivalent) dispatcher/worker/integrator
-  scenario through the installed skill: assign, accept, materialize, reconcile with
-  `conflicts keep --file`, digest, fallback, and revocation.
-- [ ] Exercise macOS, Windows, and Linux protected-state behavior for
-  `orchestrator/integrator-state.json` and the dispatcher lock (permissions, crash recovery).
-- [ ] Validate the extended `feanorfs-collaboration` skill against cooperative and
-  stale-agent scenarios (forward-testing the integrator role rules).
-
-### AI-5. Make workspace-state identity and retirement portable
-
-Unix workspaces with a stable birth identity now relocate safely and reject a
-same-path replacement, and agent runtime state no longer creates top-level
-workspace slots. Windows and filesystems without a stable birth identity still
-need an upgrade-safe identity migration; historical state also lacks the
-provenance required for automatic retirement.
-
-- [ ] Add stable Windows and weak-filesystem identity without silently adopting
-  an existing path-only slot during upgrade or same-path folder replacement.
-- [ ] Replace the bounded O(N) moved-workspace search with a crash-safe identity
-  index and serialize path-hash migration with full-lifetime cross-process state
-  leases.
-- [ ] Record authenticated ephemeral/tombstone provenance prospectively, then
-  quarantine and grace expired state before deletion with fail-closed lease and
-  identity revalidation. Never infer orphanhood from age, a missing location,
-  registry absence, or a temporary-looking path.
-
-Done when same-path replacement and relocation pass on macOS, Linux, and
-Windows; concurrent old/new processes cannot split or retire live state; and
-cleanup deletes only explicitly proven future-ephemeral/tombstoned state.
-
-## Shipped AI work (removed per closeout)
-
-Code review sweep fixes (docs/code-review-sweep.md): live-lock staleness
-guard, placeholder readonly hydration fix, summary-tool EPIPE fallback, and a
-precise watcher temp-file filter.
-
-Merkle snapshot-engine review fixes (docs/snapshot-engine-review.md):
-critical stale-mtime download bug (updates no longer silently revert), conflict leg-size and
-flatten consistency fixes, 64 MiB manifest cap, multi-parent log diffs, runnable `smoke-test.sh`
-wired into CI as `source-smoke`, durable uploaded-object dedupe with self-healing retry,
-cache-first large-file reads, throttled local GC, undo upload skip, and bounded-concurrency
-chunk uploads.
-
-
-Completed and removed with acceptance evidence in the AI session that shipped
-them: constant-cost tray status (size/entry-bounded worker-published
-`worker-status.json`, cache-free routine reads, explicit fresh-status path,
-large-workspace polling regression), and throttled periodic release awareness
-(`update --periodic` with `~/.feanorfs/update-state.json`, shared `--json`
-result across CLI/tray/`doctor`, no download/install/execute).
+Done when the verification matrix in `prd-continuous-agent-development.md`
+passes on installed products with no lost updates, automatic merge, unbounded
+loop, plaintext regression, Git dependency, or false exactly-once execution
+claim.

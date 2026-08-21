@@ -122,8 +122,11 @@ transport. Its compact sequence is:
    optional. This one-terminal child contract is not an exactly-once transport
    guarantee.
 4. The runner observes that correlated terminal before completing the request.
-   For a known child/invocation failure it attempts a generic correlated
-   `blocked` fallback. If terminal delivery cannot be established, or its
+   A `result` completes the request only when its `about_snapshot` exactly
+   matches the final snapshot proven settled by the controller; a stale result
+   is ignored. A correlated `blocked` terminal may still complete an
+   offline/attention outcome. For a known child/invocation failure it attempts
+   a generic correlated `blocked` fallback. If terminal delivery cannot be established, or its
    durable inbox/execution state is unsafe, it stops for attention; it does
    not replay the request. A local refresh/preparation failure before launch
    is `preparation_failed`: no child ran, but the pending request remains
@@ -242,6 +245,40 @@ Human output is concise. Global `--json` emits the stable result types below.
   It contains no message body, ID, routing, path, or integrator fields and
   means older wakeups may have been missed.
 
+## Continuous wakeup (active agents)
+
+For active agents, wakeup is prompt but the wire format is unchanged: no
+chat table, no heartbeats, no token streaming. The existing authenticated
+`GET /api/head` route accepts optional bounded wait parameters
+(`after`/`wait_ms`); waiters wake only after a durable head swap. Clients
+share one bounded head observer, so the workspace watcher, the events loop,
+and the agent runner all react to the same opaque head change instead of
+independently polling it.
+
+Causal continuity stays snapshot-linked:
+
+```text
+code snapshot S1
+    -> feedback signal about S1 (about_snapshot=S1)
+    -> code snapshot S2 (continuous land while active)
+    -> result about the settled snapshot S2 actually tested
+```
+
+- A **signal-only head** (same tree root, new message) wakes inbox/event
+  consumers and writes zero files. Controllers compare decrypted tree roots,
+  not head ids, so feedback never triggers file work or refresh echoes.
+- Wakeup is **not activation**: no head or message change ever starts an
+  inactive model. The runner or orchestrator decides when to present
+  feedback.
+- A terminal `result` must reference a reachable settled snapshot matching
+  the tree actually inspected or tested. Active agents read the settled
+  snapshot from `agent status` (the bounded `live` projection) before
+  replying, and the configured runner flushes the final file generation
+  before delivering its terminal reply.
+- Old hubs ignore the wait parameters; clients detect the unsupported
+  response and keep bounded periodic polling with jitter — never a busy
+  loop. Mixed versions degrade to the previous safe behavior.
+
 ## Collaboration skill
 
 An installable agent skill ships at `skills/feanorfs-collaboration/`. It
@@ -249,22 +286,13 @@ teaches agents to identify themselves, check the inbox at lifecycle points,
 refresh before acting on a request, send one bounded `status` update only when
 useful, finish each request with exactly one `result` or `blocked` reply,
 state the snapshot actually tested, avoid secrets and raw logs, and treat
-routing/authorship/path claims as advisory. For activation choices, see
+routing/authorship/path claims as advisory. While an agent is active under
+continuous reconciliation it never runs `land`/`refresh`/`sync` itself; it
+waits for a settled snapshot before sending a verification result and still
+stops on cursor reset or attention. For activation choices, see
 [Transport is not activation](#transport-is-not-activation) and
 [Local runner delivery](#local-runner-delivery).
 
-## Safety and privacy
-
-- Recipient routing is **not an access-control boundary**: every workspace
-  participant can read every signal.
-- Sender attribution is **not cryptographically signed** in v1; any
-  participant can claim any agent name.
-- Never send credentials, recovery kits, pairing codes, `.env` values, or any
-  secret intended for fewer than all workspace participants — even though
-  transport is end-to-end encrypted.
-- Signals are coordination checkpoints, not chat, token streams, or build
-  logs. Each signal advances the workspace head and uploads a reachability
-  manifest; keep volume low.
 ## Randomized integrator assignment (`ffint1`)
 
 When several agents produce overlapping work in one workspace, the user
@@ -355,6 +383,45 @@ summary, counts (landed/resolved/remaining), at most 10 risks, and at most
 one decision question. No code, patches, raw logs, credentials, `.env`
 values, or model reasoning are ever placed in signal bodies.
 
+### Exact conflict resolution jobs (`ffres1`)
+
+Automatic resolution is a separate exact-fingerprint pipeline from the
+explicit `conflicts keep` path. The engine binds every candidate to the
+exact current conflict and only the engine publishes; a harness produces a
+candidate, and the hub never merges file content.
+
+1. **Prepare** (`feanorfs agent resolution prepare <path> --reason
+   exhausted|violated --detail <text>`) requires a real current conflict in
+   the workspace head and a typed prevention-exhausted/violated reason.
+   Legacy unfingerprinted records (path-only, no identity sidecar) are
+   visible and manually resolvable but can never enter automatic
+   prepare/apply. The returned `ResolutionJob` carries the exact
+   `conflict_fingerprint`, assignment/attempt/owner, engine-owned immutable
+   `candidate_destination`, and the verification policy reference. Prepare
+   never mutates the worktree, registry, artifacts, or head.
+2. **Submit** (`feanorfs agent resolution submit <job-id> --result
+   <file-or->`) records one validated resolver result. **Submit never
+   applies**: it checks result schema/bounds, assignment/attempt/owner/
+   fingerprint, and re-hashes the immutable candidate, then records the
+   result without touching the worktree, registry, artifacts, or head.
+   Replay (a second result for one job) is rejected.
+3. **Apply** (`feanorfs agent resolution apply <job-id>`) is the only
+   publishing operation. It revalidates every identity field and the
+   candidate descriptor immediately before a single CAS; a lost CAS discards
+   the plan and restarts complete validation (never a path-removal retry).
+   Any typed stale outcome (`head_changed`, `identity_mismatch`,
+   `assignment_revoked`, `candidate_hash_mismatch`, …) leaves the current
+   conflict and its evidence untouched. Cleanup of the job, candidate, and
+   artifacts happens only after confirmed publication.
+4. **Status** (`feanorfs agent resolution status [<job-id>]`) reads a
+   bounded ids/state/counts projection (assignment state, submitted outcome,
+   timestamps) — never paths, identities, or bodies. NDJSON events emit
+   metadata-only `resolution_prepared` / `resolution_submitted` /
+   `resolution_applied` / `resolution_revoked` wakeups on state transitions.
+
+The human path (`conflicts keep`, tray counts/status) remains fully
+functional; the tray only projects resolution counts and never resolves.
+
 ### Troubleshooting
 
 | Symptom | Meaning | Next step |
@@ -398,3 +465,88 @@ values, or model reasoning are ever placed in signal bodies.
    else. When the implementations disagree on product behavior, step 5
    instead carries one focused question and the assignment stops at
    `requires_human` until the user decides — no version is ever discarded.
+
+## Work-intent protocol (`ffwork1`)
+
+Agents announce and negotiate intended write scope before editing through
+encrypted `ffwork1` profiles carried inside ordinary `ffmsg1` signal bodies.
+This is a prevention and coordination layer, not access control: identity,
+path claims, and authorship remain advisory. There is no new message kind, no
+server route, and no hub involvement.
+
+### Model
+
+- An **author** proposes bounded work for one task (`work_intent`: task id,
+  causal base, paths, concerns, dependencies, capabilities, author sequence).
+  Paths are canonical portable workspace-relative paths or the supported
+  `dir/**` containment glob; collections must be sorted and unique.
+- The proposal may name one **coordinator**, or the operating context
+  supplies one (default `human`). Only that identity's decisions apply; the
+  hub never decides.
+- A **decision** (`work_decision`) accepts, rejects, narrows (a reduced scope
+  inside the proposal), orders (relative to another proposal), or explicitly
+  accepts elevated overlap risk (`accept_overlap` with derivable overlap
+  entries). A decision references the exact proposal message id.
+- After acceptance the author may **amend** scope/dependencies, **yield**
+  (relinquish accepted overlap while preserving local work), **settle**
+  (attach verification evidence naming the inspected snapshot), and finish
+  with **complete** or **block** (terminal). A coordinator may **supersede**
+  an applied decision, returning the proposal to pending.
+
+### Deterministic projection
+
+A local reducer in each workspace observes signals through the existing
+`signals_since` traversal — never a second message store — and projects
+deterministic state under the protected `orchestrator/` boundary
+(`work-state.json`, advisory lock, atomic replacement, schema-versioned):
+
+- Author transitions key by `(task_id, agent, sequence)`; a transition cannot
+  decrease sequence, change immutable identity, skip required states, or act
+  for another author.
+- Decisions key by exact proposal message id plus the authorized coordinator
+  identity. A decision from any other identity is retained as invalid
+  evidence and never changes accepted state.
+- Causal dominance wins. Concurrent same-author updates use the canonical
+  message id only as a deterministic tie-breaker; the losing branch is
+  retained as bounded protocol evidence. Duplicate delivery is idempotent.
+- Clock fields are display/liveness hints only; no timeout alone transfers
+  authority or implies acceptance.
+- After a cursor reset the reducer rebuilds from the bounded reachable
+  closure and reports `projection_incomplete=true` instead of inferring
+  acceptance it cannot prove. State is bounded: active tasks, terminal
+  history, evidence, seen ids, and pending transitions each have explicit
+  caps; bound exhaustion drops deterministically and is counted.
+
+### CLI
+
+```text
+feanorfs agent work propose --task <id> --path <p>... [--agent <name>] \
+  [--sequence <n>] [--causal-base <id>] [--coordinator <name>] \
+  [--concern <c>]... [--dependency <task>]... [--capability <cap>]... [--about <id>]
+
+feanorfs agent work decide <proposal-message-id> --kind accept|reject|narrow|order|accept-overlap \
+  [--reason <r>] [--path <p>]... [--concern <c>]... [--after <id>] [--overlap <json>]...
+
+feanorfs agent work amend --task <id> --intent <id> [--path <p>]... [--concern <c>]... [--dependency <task>]...
+feanorfs agent work yield --task <id> --intent <id> [--reason <r>]
+feanorfs agent work settle --task <id> --intent <id> --inspected <snapshot> --verification <status> --summary <text>
+feanorfs agent work complete --task <id> --intent <id> --outcome <text>
+feanorfs agent work block --task <id> --intent <id> --reason <text>
+feanorfs agent work status [--coordinator <name>]
+```
+
+Human output never claims a proposed scope is accepted: proposals report
+`proposed` until an observed decision applies, and a cursor reset or bound
+exhaustion marks the projection incomplete. Automation uses global `--json`
+(`WorkSendResult` / `WorkStatusResult`; see [agent-api.md](agent-api.md)).
+
+### Events
+
+`feanorfs events` emits metadata-only `work_*` wakeups (IDs/state/counts
+only — never path sets, scopes, or bodies):
+
+```json
+{"event":"work_intent","message_id":"<64-hex>","from":"linux-dev","to":"*","kind":"request","about_snapshot":"<64-hex>","task_id":"parser-impl","agent":"linux-dev","sequence":1}
+{"event":"work_decision","message_id":"<64-hex>","task_id":"","proposal_message_id":"<64-hex>","decision":"accept"}
+{"event":"work_settled","message_id":"<64-hex>","task_id":"parser-impl","sequence":3,"verification":"passed"}
+```

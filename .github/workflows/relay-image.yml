@@ -57,19 +57,9 @@ jobs:
             echo "::error::Checkout is $actual_sha, expected event SHA $EXPECTED_SHA."
             exit 1
           fi
-          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
-          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
-          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
-          if [ "$tag_type" = tag ]; then
-            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
-            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
-            tag_type="$(jq -r '.object.type' <<<"$annotated")"
-          fi
-          if [ "$tag_type" != commit ] || [ "$tag_sha" != "$EXPECTED_SHA" ]; then
-            echo "::error::Tag resolves to $tag_type $tag_sha, expected commit $EXPECTED_SHA."
-            exit 1
-          fi
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          evidence="$(scripts/release-evidence.sh "$RELEASE_TAG" "$EXPECTED_SHA")"
+          echo "$evidence"
+          version="$(sed -n 's/^evidence_version=//p' <<<"$evidence")"
           if [ -z "$version" ] || [ "$RELEASE_TAG" != "v$version" ]; then
             echo "::error::Tag $RELEASE_TAG does not match workspace version v$version."
             exit 1

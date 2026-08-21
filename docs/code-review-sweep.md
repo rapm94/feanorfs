@@ -297,3 +297,25 @@ this path" as "this path was deleted".
   idle.
 - `cargo test --workspace --all-features --locked` — all suites pass;
   clippy `-D warnings` clean; fmt clean.
+
+
+## Logic-gap sweep — watcher permanently silenced after one failed sync
+
+- [x] **L4 — One failed sync permanently stopped automatic sync.**
+  The watch loop computed `backoff = backoff_duration(consecutive_errors)` at
+  the top of every iteration and `continue`d whenever it was non-zero. Once
+  any sync failed (transient hub restart, offline laptop, hub upgrade),
+  `consecutive_errors` stayed ≥ 1, so both the event and periodic paths
+  skipped every sync forever — while still refreshing `watch.pid` every 45 s,
+  so the tray kept reporting "watching" and the worker status froze at
+  "offline". Observed live: a supervised workspace watcher silent for two
+  days after a hub restart; manual syncs worked fine. *Fix (`client/src/watch.rs`):
+  a `SyncRetryGate` holds the next-attempt deadline; a failure waits
+  `backoff_duration(errors)` (10 s → 300 s cap) and then retries, and a
+  success resets the error count (the periodic path previously never reset
+  it even on success).* Regression tests
+  `retry_gate_waits_out_backoff_then_recovers` and
+  `retry_wait_is_pending_until_an_armed_deadline` prove that a failure arms a
+  bounded retry, an unarmed gate cannot spin, and the deadline wakes the
+  watcher. Live installed-product outage/recovery evidence remains part of
+  `TODO.md` AI-6.

@@ -236,11 +236,16 @@ function Assert-HealthyProduct {
     }
 
     Assert-TaskAction $supervisorTask $cli '^service supervise$'
-    Assert-TaskAction $trayTask $tray '^$'
+    Assert-TaskAction $trayTask $tray '^--managed$'
     $trayTaskXml = [xml](Export-ScheduledTask -TaskPath $trayTask.TaskPath -TaskName $trayTask.TaskName)
     $trayLogonType = [string]$trayTaskXml.Task.Principals.Principal.LogonType
     if ($trayLogonType -ne "InteractiveToken") {
         throw "Windows tray task is not registered in the interactive user session."
+    }
+    $trayRestartCount = [int]$trayTaskXml.Task.Settings.RestartOnFailure.Count
+    $trayRestartInterval = [string]$trayTaskXml.Task.Settings.RestartOnFailure.Interval
+    if ($trayRestartCount -lt 1 -or $trayRestartInterval -ne "PT1M") {
+        throw "Windows tray task does not retry singleton handoff failures."
     }
 
     # The hub and the workspace watcher are children of the supervisor task;

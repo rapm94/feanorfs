@@ -11,6 +11,7 @@ tests used by local verification and GitHub release workflows.
 - `package-macos.sh`, `package-linux.sh`, `linux-package.nfpm.yaml`, and `windows-installer.iss` — exact native desktop installer assembly and metadata.
 - `update-release-product-state.sh`, `check-release-readiness.sh`, `release-plz-cargo.sh`, and `test-release-plz-cargo.sh` — deterministic product-change carrier, pre-tag Cargo/Node/changelog/tag/installer/artifact agreement gate, and locked single-crate historical release adapter plus its hermetic test.
 - `test-release-workflow-policy.sh` — static contract for the cargo-dist reusable jobs, exact staged-asset barrier, optional signing gates, and one-time announcement ordering.
+- `release-evidence.sh` and `test-release-evidence.sh` — exact tag/release/SHA/version evidence plus its offline input, success-output, and mismatch contract test.
 - `smoke-macos-product.sh`, `smoke-macos-keychain.sh`, `smoke-linux-packages.sh`, `smoke-windows-installer.ps1`, and `smoke-windows-product.ps1` — installed-product lifecycle, signed-credential, clean-distribution, and native-installer proof.
 - `smoke-relay-container.sh` — hardened opaque-relay image proof.
 - `test-install-routing.sh` and `test-install-routing.ps1` — fail-closed installer routing tests.

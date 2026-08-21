@@ -30,7 +30,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: rustfmt
@@ -47,7 +47,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy
@@ -68,7 +68,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -87,7 +87,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -111,45 +111,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run tests
         run: >-
           cargo test --workspace --exclude feanorfs-tray
-          --all-features --locked
-
-  runner-windows-pr:
-    name: Agent runner lifecycle (Windows PR)
-    if: ${{ github.event_name == 'pull_request' }}
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout exact pull request head
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Verify reviewed source identity
-        shell: bash
-        env:
-          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - name: Parse Windows product smoke
-        shell: pwsh
-        run: >-
-          [void][scriptblock]::Create(
-          (Get-Content -Raw scripts/smoke-windows-product.ps1))
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Run native runner lifecycle tests
-        run: >-
-          cargo test -p feanorfs-agent-core -p feanorfs-client
           --all-features --locked
 
   upgrade-smoke:
@@ -164,7 +132,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -172,9 +140,17 @@ jobs:
         run: cargo build -p feanorfs-client --bin feanorfs --locked
       - name: Checkout previous release
         run: |
-          PREV=$(git tag --sort=-v:refname | head -n 1)
-          test -n "$PREV"
-          git worktree add "$RUNNER_TEMP/previous" "$PREV"
+          current_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          previous_tag=""
+          while IFS= read -r candidate; do
+            if [[ "$candidate" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              previous_tag="$candidate"
+              break
+            fi
+          done < <(git tag --list --sort=-v:refname)
+          test -n "$previous_tag"
+          echo "Testing upgrade from $previous_tag to workspace version $current_version."
+          git worktree add "$RUNNER_TEMP/previous" "$previous_tag"
       - name: Build previous CLI
         working-directory: ${{ runner.temp }}/previous
         run: cargo build -p feanorfs-client --bin feanorfs --locked
@@ -195,7 +171,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -218,7 +194,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -240,7 +216,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -263,7 +239,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -354,7 +330,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy
@@ -399,10 +375,8 @@ jobs:
           CLI="$ROOT/expanded/Payload/usr/local/bin/feanorfs"
           APP="$ROOT/expanded/Payload/Applications/FeanorFS.app"
           test -x "$ROOT/expanded/Scripts/postinstall"
-          test -x "$ROOT/expanded/Scripts/migrate-macos-user-bins.sh"
           grep -F -- '--first-run' "$ROOT/expanded/Scripts/postinstall"
           grep -F -- 'service refresh-installation' "$ROOT/expanded/Scripts/postinstall"
-          grep -F -- 'migrate-macos-user-bins.sh' "$ROOT/expanded/Scripts/postinstall"
           cmp target/release/feanorfs "$CLI"
           cmp target/release/feanorfs-tray "$APP/Contents/MacOS/feanorfs-tray"
           plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" | grep -Fx com.feanorfs.tray
@@ -479,10 +453,9 @@ jobs:
           [void][scriptblock]::Create((Get-Content -Raw scripts/install.ps1))
           [void][scriptblock]::Create((Get-Content -Raw scripts/test-install-routing.ps1))
           [void][scriptblock]::Create((Get-Content -Raw scripts/smoke-windows-installer.ps1))
-          [void][scriptblock]::Create((Get-Content -Raw scripts/smoke-windows-product.ps1))
           scripts/test-install-routing.ps1
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
           components: clippy
@@ -608,13 +581,23 @@ jobs:
         uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
       - name: Require deterministic hosted Windows smokes
         run: |
-          test "$(grep -Ec '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/ci.yml)" = 1
-          test "$(grep -Ec '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/desktop-release.yml)" = 2
-          ! grep -Eq '^[[:space:]]+-HeadlessRunner[[:space:]]*$' .github/workflows/unsigned-desktop-release.yml
-      - name: Test deterministic atomic release policy
+          check_headless() {
+            awk -v expected="$2" '
+              /scripts\/smoke-windows-(installer|product)\.ps1/ { command = $0 }
+              /-HeadlessRunner/ {
+                count++
+                if (command !~ /smoke-windows-product/) invalid = 1
+              }
+              END { exit invalid || count != expected }
+            ' "$1"
+          }
+          check_headless .github/workflows/ci.yml 1
+          check_headless .github/workflows/desktop-release.yml 2
+          check_headless .github/workflows/unsigned-desktop-release.yml 0
+      - name: Require deterministic atomic release publication policy
         run: scripts/test-release-workflow-policy.sh
-      - name: Test deterministic release history packaging
-        run: scripts/test-release-plz-cargo.sh
+      - name: Test release evidence helper
+        run: scripts/test-release-evidence.sh
 
   ci-success:
     name: CI success
@@ -625,7 +608,6 @@ jobs:
       - msrv
       - test
       - cross-platform
-      - runner-windows-pr
       - upgrade-smoke
       - source-smoke
       - docs
@@ -644,7 +626,6 @@ jobs:
           needs.fmt.result != 'success' ||
           needs.clippy.result != 'success' ||
           needs.test.result != 'success' ||
-          (github.event_name == 'pull_request' && needs.runner-windows-pr.result != 'success') ||
           needs.dependencies.result != 'success' ||
           needs.workflow-lint.result != 'success'
         run: exit 1

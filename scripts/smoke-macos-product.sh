@@ -71,10 +71,16 @@ cleanup() {
   printf '' | /usr/bin/pbcopy 2>/dev/null || true
   "$FEANORFS" service uninstall "$WORKSPACE" >/dev/null 2>&1 || true
   "$FEANORFS" service uninstall "$JOINED_WORKSPACE" >/dev/null 2>&1 || true
-  if [[ -f "$HOME/Library/LaunchAgents/com.feanorfs.agent.plist" ]]; then
-    /bin/launchctl unload "$HOME/Library/LaunchAgents/com.feanorfs.agent.plist" >/dev/null 2>&1 || true
-  fi
-  rm -f "$HOME"/Library/LaunchAgents/com.feanorfs.*.plist
+  for plist in "$HOME"/Library/LaunchAgents/com.feanorfs.{agent,tray,hub}.plist; do
+    if [[ -f "$plist" ]]; then
+      /bin/launchctl unload "$plist" >/dev/null 2>&1 || true
+    fi
+  done
+  rm -f \
+    "$HOME"/Library/LaunchAgents/com.feanorfs.sync-*.plist \
+    "$HOME/Library/LaunchAgents/com.feanorfs.agent.plist" \
+    "$HOME/Library/LaunchAgents/com.feanorfs.tray.plist" \
+    "$HOME/Library/LaunchAgents/com.feanorfs.hub.plist"
   rm -rf "$HOME/.feanorfs"
   rm -rf "$ROOT"
 }
@@ -155,26 +161,21 @@ jq -e --arg port "$HUB_PORT" \
 "$FEANORFS" start "$WORKSPACE" >/dev/null
 "$FEANORFS" service status "$WORKSPACE" | grep -q 'Automatic sync is running'
 
-# One single supervisor launch agent owns every worker: exactly one
-# background item on macOS, working unsigned.
-AGENT_PLIST="$HOME/Library/LaunchAgents/com.feanorfs.agent.plist"
-[[ -f "$AGENT_PLIST" ]]
-[[ ! -e "$HOME/Library/LaunchAgents/com.feanorfs.hub.plist" ]]
-[[ ! -e "$HOME/Library/LaunchAgents/com.feanorfs.tray.plist" ]]
-[[ -z "$(find "$HOME/Library/LaunchAgents" -maxdepth 1 -name 'com.feanorfs.sync-*.plist' -print -quit)" ]]
-agent_json="$(/usr/bin/plutil -convert json -o - "$AGENT_PLIST")"
-jq -e --arg bin "$FEANORFS"   '.ProgramArguments == [$bin, "service", "supervise"]'   <<<"$agent_json" >/dev/null
-
-# The supervisor spawns the hub worker, the workspace watcher, and the tray.
-for _ in {1..40}; do
-  if pgrep -f "$FEANORFS service hub-run $HOME/.feanorfs/hub-data" >/dev/null     && pgrep -f "$FEANORFS service run $WORKSPACE" >/dev/null     && pgrep -f "$FEANORFS_TRAY" >/dev/null; then
-    break
-  fi
-  sleep 0.25
+# One supervisor login job owns the private hub, every workspace watcher, and
+# the tray; legacy per-component jobs must never exist in the installed product.
+SUPERVISOR_PLIST="$HOME/Library/LaunchAgents/com.feanorfs.agent.plist"
+[[ -f "$SUPERVISOR_PLIST" ]]
+for legacy in \
+  "$HOME/Library/LaunchAgents/com.feanorfs.hub.plist" \
+  "$HOME/Library/LaunchAgents/com.feanorfs.tray.plist"; do
+  [[ ! -e "$legacy" ]]
 done
-pgrep -f "$FEANORFS service hub-run $HOME/.feanorfs/hub-data" >/dev/null
-pgrep -f "$FEANORFS service run $WORKSPACE" >/dev/null
-pgrep -f "$FEANORFS_TRAY" >/dev/null
+[[ -z "$(find "$HOME/Library/LaunchAgents" -maxdepth 1 -name 'com.feanorfs.sync-*.plist' -print -quit)" ]]
+
+supervisor_json="$(/usr/bin/plutil -convert json -o - "$SUPERVISOR_PLIST")"
+jq -e --arg bin "$FEANORFS" \
+  '.ProgramArguments == [$bin, "service", "supervise"] and (.EnvironmentVariables == null)' \
+  <<<"$supervisor_json" >/dev/null
 
 for private_file in \
   "$HOME/.feanorfs/hub-data/auth-token" \
@@ -186,10 +187,11 @@ for private_file in \
 done
 
 jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
-  "$HOME/.feanorfs/supervisor-service-program" >/dev/null
-[[ ! -e "$HOME/.feanorfs/hub-data/service-program" ]]
-[[ ! -e "$WORKSPACE_STATE/service-program" ]]
-[[ ! -e "$HOME/.feanorfs/tray-service-program" ]]
+  "$HOME/.feanorfs/hub-data/service-program" >/dev/null
+jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
+  "$WORKSPACE_STATE/service-program" >/dev/null
+jq -e 'length == 2 and all(.[][1]; length == 64)' \
+  "$HOME/.feanorfs/tray-service-program" >/dev/null
 
 CA="$HOME/.feanorfs/hub-data/tls/ca-cert.pem"
 [[ "$(curl --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://127.0.0.1:$HUB_PORT/api/workspaces")" == "401" ]]
@@ -205,19 +207,16 @@ fi
   and ([.checks[].name] | sort == [
     "automatic_sync",
     "e2ee",
-    "executable_version",
     "global_config",
     "local_state",
     "private_hub",
     "remote_workspace",
     "server",
     "tray_registration",
-    "update_available",
     "workspace_config",
     "workspace_format"
   ])
-  and ([.checks[] | select(.name == "update_available" and .status == "info")] | length == 1)
-  and all(.checks[] | select(.name != "update_available"); .status == "ok")
+  and all(.checks[]; .status == "ok")
 ' >/dev/null
 TRAY_STATUS="$ROOT/tray-status.json"
 tray_ready=false
@@ -247,7 +246,7 @@ MCP_OUT="$ROOT/mcp.jsonl"
     "$FEANORFS" mcp >"$MCP_OUT"
 )
 jq -s -e \
-  'length == 3 and .[0].result.serverInfo.name == "feanorfs" and (.[1].result.tools | length) == 16 and .[2].result.mirror_state == "idle"' \
+  'length == 3 and .[0].result.serverInfo.name == "feanorfs" and (.[1].result.tools | length) == 37 and .[2].result.mirror_state == "idle"' \
   "$MCP_OUT" >/dev/null
 
 echo "Smoke: encrypted workspace recovery"
