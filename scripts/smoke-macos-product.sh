@@ -173,8 +173,12 @@ done
 [[ -z "$(find "$HOME/Library/LaunchAgents" -maxdepth 1 -name 'com.feanorfs.sync-*.plist' -print -quit)" ]]
 
 supervisor_json="$(/usr/bin/plutil -convert json -o - "$SUPERVISOR_PLIST")"
+# The supervisor may carry only the documented path-propagation variables;
+# anything else (secrets, endpoints) must never enter service environment.
 jq -e --arg bin "$FEANORFS" \
-  '.ProgramArguments == [$bin, "service", "supervise"] and (.EnvironmentVariables == null)' \
+  '(.ProgramArguments == [$bin, "service", "supervise"]) and
+   (((.EnvironmentVariables // {}) | keys | sort) as $keys |
+    ($keys - ["FEANORFS_HOME", "FEANORFS_TRAY_BIN"] | length) == 0)' \
   <<<"$supervisor_json" >/dev/null
 
 for private_file in \

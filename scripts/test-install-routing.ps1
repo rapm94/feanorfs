@@ -324,11 +324,12 @@ try {
     $env:FEANORFS_NO_LAUNCH = "1"
     & "$PSScriptRoot/install.ps1" *> (Join-Path $root "desktop-no-launch.log")
     if (
-        $global:FeanorFSInstallerTestProcesses.Count -ne 1 -or
+        $global:FeanorFSInstallerTestProcesses.Count -ne 2 -or
         $global:FeanorFSInstallerTestCliVersionChecks -ne 1 -or
-        (Split-Path -Leaf $global:FeanorFSInstallerTestProcesses[0].FilePath) -ne $setupName
+        (Split-Path -Leaf $global:FeanorFSInstallerTestProcesses[0].FilePath) -ne $setupName -or
+        ($global:FeanorFSInstallerTestProcesses[1].ArgumentList -join ' ') -notmatch 'integrate'
     ) {
-        throw "Windows no-launch path did not run only the canonical setup."
+        throw "Windows no-launch path did not run only the canonical setup and integration pass."
     }
     $noLaunchLog = Get-Content -Raw (Join-Path $root "desktop-no-launch.log")
     if ($noLaunchLog -notlike "*Headless setup: feanorfs start*") {
