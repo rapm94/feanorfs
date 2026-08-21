@@ -169,6 +169,9 @@ impl From<&str> for CanonicalWorkspacePath {
 mod tests {
     use super::*;
 
+    // Constructing invalid-UTF-8 OsStr bytes is a Unix-only capability;
+    // Windows paths are always UTF-16 re-encodable.
+    #[cfg(unix)]
     #[test]
     fn canonicalize_rejects_non_utf8_paths_with_typed_error() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -207,6 +210,7 @@ mod tests {
         assert!(matches!(error, WorkspacePathError::Canonicalize { .. }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn canonicalize_keep_raw_preserves_missing_folder_but_rejects_non_utf8() {
         use std::os::unix::ffi::OsStringExt as _;

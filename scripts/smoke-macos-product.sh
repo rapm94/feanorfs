@@ -194,8 +194,10 @@ jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
   "$HOME/.feanorfs/hub-data/service-program" >/dev/null
 jq -e '(length == 1) and ((.[0][1] | length) == 64)' \
   "$WORKSPACE_STATE/service-program" >/dev/null
-jq -e 'length == 2 and all(.[][1]; length == 64)' \
-  "$HOME/.feanorfs/tray-service-program" >/dev/null
+
+# The supervisor owns the tray on macOS; no per-component tray job or
+# identity marker exists on fresh installs (that file is Windows-only).
+[[ ! -e "$HOME/.feanorfs/tray-service-program" ]]
 
 CA="$HOME/.feanorfs/hub-data/tls/ca-cert.pem"
 [[ "$(curl --cacert "$CA" -o /dev/null -sS -w '%{http_code}' "https://127.0.0.1:$HUB_PORT/api/workspaces")" == "401" ]]
