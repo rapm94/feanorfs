@@ -160,9 +160,7 @@ finally {
 
 Write-Host "Installed the signed FeanorFS setup product to $installDir with PATH, Start-menu, and uninstall integration."
 
-try {
-    $null = Start-Process -FilePath $installedCli -ArgumentList @("integrate") -Wait -PassThru -NoNewWindow -ErrorAction SilentlyContinue
-} catch {}
+$null = Start-Process -FilePath $installedCli -ArgumentList @("integrate") -Wait -PassThru -NoNewWindow -ErrorAction SilentlyContinue
 
 Write-Host ""
 if ($installedTray) {

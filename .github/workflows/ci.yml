@@ -584,7 +584,7 @@ jobs:
           check_headless() {
             awk -v expected="$2" '
               /scripts\/smoke-windows-(installer|product)\.ps1/ { command = $0 }
-              /-HeadlessRunner/ {
+              /[-]HeadlessRunner/ {
                 count++
                 if (command !~ /smoke-windows-product/) invalid = 1
               }

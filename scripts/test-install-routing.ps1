@@ -285,12 +285,16 @@ try {
     if (-not (Test-Path -PathType Leaf $installedCli) -or -not (Test-Path -PathType Leaf $installedTray)) {
         throw "Canonical Windows setup did not produce the expected installed payload."
     }
-    if ($global:FeanorFSInstallerTestProcesses.Count -ne 2 -or
+    if ($global:FeanorFSInstallerTestProcesses.Count -ne 3 -or
         $global:FeanorFSInstallerTestCliVersionChecks -ne 1) {
-        throw "Canonical Windows install did not execute one setup, one CLI version probe, and one tray launch."
+        throw "Canonical Windows install did not execute one setup, one CLI version probe, one integration pass, and one tray launch."
     }
     $setupProcess = $global:FeanorFSInstallerTestProcesses[0]
-    $trayProcess = $global:FeanorFSInstallerTestProcesses[1]
+    $integrateProcess = $global:FeanorFSInstallerTestProcesses[1]
+    if (($integrateProcess.ArgumentList -join ' ') -notmatch 'integrate') {
+        throw "Canonical Windows install did not run the post-install integration pass."
+    }
+    $trayProcess = $global:FeanorFSInstallerTestProcesses[2]
     $expectedArguments = @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
