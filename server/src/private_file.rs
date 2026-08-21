@@ -1,3 +1,20 @@
+//! Private persistence helpers for the hub server.
+//!
+//! The server must not depend on the engine, so these helpers are the server's
+//! own implementations of the two private policies from the shared taxonomy
+//! (documented in `agent-core/src/durable.rs`):
+//!
+//! - `atomic_private_write` — **private durable replacement**: mode 0o600
+//!   temp file, atomic rename, parent-directory sync on Unix. On Windows the
+//!   parent sync is unavailable and the guarantee degrades to atomic
+//!   visibility.
+//! - `atomic_private_create_new` — **private create-new**: random 0o600 temp
+//!   file, data sync, then a hard link into the destination so publication
+//!   fails instead of replacing an existing file; parent sync on Unix.
+//! - `durable_remove_if_exists` — removal plus parent sync on Unix.
+//!
+//! `create_private_dir` enforces 0o700 on Unix.
+
 use anyhow::{Context as _, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;

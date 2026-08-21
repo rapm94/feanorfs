@@ -1,4 +1,5 @@
 use anyhow::{ensure, Context, Result};
+use feanorfs_common::hub_contract::{ManifestWriteOutcome, MigrationWriteOutcome};
 use feanorfs_common::{
     canonical_manifest_hashes, file_size_from_db, file_size_to_db, is_valid_hash, FileState,
     MANIFEST_MAX_ENTRIES,
@@ -30,14 +31,6 @@ pub enum HeadSwap {
     Swapped,
     Conflict(Option<String>),
     MissingManifest,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManifestWrite {
-    Stored,
-    Unchanged,
-    Conflict,
-    Capacity,
 }
 
 pub(crate) struct GcLiveSet {
@@ -227,21 +220,24 @@ impl Db {
 
         let files = rows
             .into_iter()
-            .map(|r| FileState {
-                path: r.get::<String, _>("path"),
-                hash: r.get::<String, _>("hash"),
-                size: file_size_from_db(r.get::<i64, _>("size")),
-                mtime: r.get::<i64, _>("mtime"),
-                deleted: r.get::<bool, _>("deleted"),
-                mode: u32::try_from(r.get::<i64, _>("mode")).unwrap_or(0),
+            .map(|r| {
+                let size = file_size_from_db(r.get::<i64, _>("size"))?;
+                Ok(FileState {
+                    path: r.get::<String, _>("path"),
+                    hash: r.get::<String, _>("hash"),
+                    size,
+                    mtime: r.get::<i64, _>("mtime"),
+                    deleted: r.get::<bool, _>("deleted"),
+                    mode: u32::try_from(r.get::<i64, _>("mode")).unwrap_or(0),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
         Ok(files)
     }
 
     pub async fn upsert_file(&self, workspace_id: &str, file: &FileState) -> Result<()> {
-        let size = file_size_to_db(file.size);
+        let size = file_size_to_db(file.size)?;
         sqlx::query(
             "INSERT INTO files (workspace_id, path, hash, size, mtime, mode, deleted, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -407,9 +403,9 @@ impl Db {
             .store_canonical_manifest(workspace_id, snapshot_id, &hashes)
             .await?
         {
-            ManifestWrite::Stored | ManifestWrite::Unchanged => Ok(()),
-            ManifestWrite::Conflict => anyhow::bail!("snapshot manifest is immutable"),
-            ManifestWrite::Capacity => anyhow::bail!(
+            ManifestWriteOutcome::Stored | ManifestWriteOutcome::Unchanged => Ok(()),
+            ManifestWriteOutcome::Conflict => anyhow::bail!("snapshot manifest is immutable"),
+            ManifestWriteOutcome::Capacity => anyhow::bail!(
                 "manifest storage capacity reached; run hub GC before publishing another snapshot"
             ),
         }
@@ -420,7 +416,7 @@ impl Db {
         workspace_id: &str,
         snapshot_id: &str,
         hashes: &[String],
-    ) -> Result<ManifestWrite> {
+    ) -> Result<ManifestWriteOutcome> {
         ensure!(
             is_valid_hash(snapshot_id),
             "invalid snapshot id for manifest"
@@ -462,9 +458,9 @@ impl Db {
             let unchanged = canonical_manifest_hashes(snapshot_id, existing)? == hashes;
             transaction.rollback().await?;
             return Ok(if unchanged {
-                ManifestWrite::Unchanged
+                ManifestWriteOutcome::Unchanged
             } else {
-                ManifestWrite::Conflict
+                ManifestWriteOutcome::Conflict
             });
         }
 
@@ -489,7 +485,7 @@ impl Db {
             canonical.len(),
         ) {
             transaction.rollback().await?;
-            return Ok(ManifestWrite::Capacity);
+            return Ok(ManifestWriteOutcome::Capacity);
         }
         sqlx::query(
             "INSERT INTO snapshot_manifests (workspace_id, snapshot_id, manifest, created_at_ms)
@@ -502,7 +498,7 @@ impl Db {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(ManifestWrite::Stored)
+        Ok(ManifestWriteOutcome::Stored)
     }
 
     pub async fn manifest_exists(&self, workspace_id: &str, snapshot_id: &str) -> Result<bool> {
@@ -531,7 +527,11 @@ impl Db {
             .unwrap_or(2))
     }
 
-    pub async fn begin_migration(&self, workspace_id: &str, token: &str) -> Result<()> {
+    pub async fn begin_migration(
+        &self,
+        workspace_id: &str,
+        token: &str,
+    ) -> Result<MigrationWriteOutcome> {
         let mut transaction = self.pool.begin().await?;
         let format = sqlx::query_scalar::<_, i64>(
             "SELECT format_version FROM workspace_formats WHERE workspace_id = ?",
@@ -541,7 +541,7 @@ impl Db {
         .await?
         .unwrap_or(2);
         if format >= 3 {
-            return Ok(());
+            return Ok(MigrationWriteOutcome::Acquired);
         }
         sqlx::query(
             "INSERT INTO migration_fences (workspace_id, token) VALUES (?, ?)
@@ -557,9 +557,11 @@ impl Db {
         .bind(workspace_id)
         .fetch_one(&mut *transaction)
         .await?;
-        anyhow::ensure!(current == token, "workspace migration is already locked");
+        if current != token {
+            return Ok(MigrationWriteOutcome::LockedByOther);
+        }
         transaction.commit().await?;
-        Ok(())
+        Ok(MigrationWriteOutcome::Acquired)
     }
 
     pub async fn migration_token(&self, workspace_id: &str) -> Result<Option<String>> {

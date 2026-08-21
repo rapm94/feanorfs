@@ -1,10 +1,4 @@
 use anyhow::{bail, Context as _, Result};
-use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chacha20poly1305::{
-    aead::{Aead as _, KeyInit as _, Payload},
-    Key, XChaCha20Poly1305, XNonce,
-};
 use rcgen::Issuer;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -16,19 +10,32 @@ use crate::private_file::{
     atomic_private_create_new, atomic_private_write, create_private_dir, durable_remove_if_exists,
     open_private_lock,
 };
+use feanorfs_common::sealed_envelope;
 
-const FORMAT_VERSION: u32 = 1;
-const KDF_NAME: &str = "argon2id-v19";
-const CIPHER_NAME: &str = "xchacha20poly1305";
-const KDF_MEMORY_KIB: u32 = 64 * 1024;
-const KDF_ITERATIONS: u32 = 3;
-const KDF_LANES: u32 = 1;
-const SALT_BYTES: usize = 16;
-const NONCE_BYTES: usize = 24;
-const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
-const MIN_PASSPHRASE_CHARS: usize = 12;
 const RECOVERY_MARKER: &str = "recovery-import.json";
 const RUNTIME_LOCK: &str = "hub-runtime.lock";
+
+/// Hub recovery-bundle domain without the dynamic authenticated header
+/// fields. `hub_domain(fingerprint)` clones this and binds the fingerprint
+/// into the authenticated header.
+const HUB_DOMAIN_BASE: sealed_envelope::EnvelopeDomain = sealed_envelope::EnvelopeDomain {
+    domain: "feanorfs hub recovery bundle",
+    format_version: sealed_envelope::FORMAT_VERSION,
+    kdf: sealed_envelope::KDF_NAME,
+    cipher: sealed_envelope::CIPHER_NAME,
+    noun: "bundle",
+    min_passphrase_chars: 12,
+    max_passphrase_chars: None,
+    max_plaintext_bytes: 1024 * 1024,
+    max_envelope_bytes: 2 * 1024 * 1024,
+    extra_header: Vec::new(),
+};
+
+fn hub_domain(fingerprint: &str) -> sealed_envelope::EnvelopeDomain {
+    let mut domain = HUB_DOMAIN_BASE.clone();
+    domain.extra_header = vec![("public_ca_fingerprint", fingerprint.to_string())];
+    domain
+}
 
 #[derive(Debug)]
 pub struct HubRuntimeGuard {
@@ -46,22 +53,28 @@ struct RecoveryEnvelope {
     ciphertext: String,
 }
 
+impl RecoveryEnvelope {
+    /// Move the shared envelope fields into the primitive's envelope type
+    /// without copying; the server-specific `public_ca_fingerprint` field
+    /// stays in the caller (it is bound into the authenticated header via
+    /// the domain's extra header fields).
+    fn into_sealed_envelope(self) -> sealed_envelope::SealedEnvelope {
+        sealed_envelope::SealedEnvelope {
+            format_version: self.format_version,
+            kdf: self.kdf,
+            cipher: self.cipher,
+            salt: self.salt,
+            nonce: self.nonce,
+            ciphertext: self.ciphertext,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct RecoverySecrets {
     ca_cert_pem: String,
     ca_key_pem: String,
     auth_token: String,
-}
-
-#[derive(Serialize)]
-struct AuthenticatedHeader<'a> {
-    domain: &'static str,
-    format_version: u32,
-    kdf: &'a str,
-    cipher: &'a str,
-    salt: &'a str,
-    nonce: &'a str,
-    public_ca_fingerprint: &'a str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,7 +132,7 @@ pub fn export_recovery_bundle(
     passphrase: &str,
     replace_destination: bool,
 ) -> Result<RecoveryExportResult> {
-    validate_passphrase(passphrase)?;
+    sealed_envelope::validate_passphrase(&HUB_DOMAIN_BASE, passphrase)?;
     let _guard = acquire_hub_runtime(data_dir)?;
     ensure_recovery_complete(data_dir)?;
     let destination = ensure_recovery_bundle_is_external(data_dir, destination)?;
@@ -130,8 +143,11 @@ pub fn export_recovery_bundle(
     let fingerprint = crate::tls::certificate_fingerprint(&secrets.ca_cert_pem);
     let envelope = seal(&secrets, passphrase, &fingerprint)?;
     let encoded = serde_json::to_vec_pretty(&envelope).context("encode recovery bundle")?;
-    if encoded.len() > MAX_BUNDLE_BYTES {
-        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
+    if encoded.len() > HUB_DOMAIN_BASE.max_envelope_bytes {
+        bail!(
+            "recovery bundle exceeds {} bytes",
+            HUB_DOMAIN_BASE.max_envelope_bytes
+        );
     }
     write_recovery_bundle(&destination, &encoded, replace_destination)
         .with_context(|| format!("write recovery bundle {}", destination.display()))?;
@@ -147,15 +163,15 @@ pub fn import_recovery_bundle(
     passphrase: &str,
     replace_existing_identity: bool,
 ) -> Result<RecoveryImportResult> {
-    validate_passphrase(passphrase)?;
+    sealed_envelope::validate_passphrase(&HUB_DOMAIN_BASE, passphrase)?;
     let source = ensure_recovery_bundle_is_external(data_dir, source)?;
     let encoded = read_bounded_recovery_bundle(&source)?;
     let envelope: RecoveryEnvelope =
         serde_json::from_slice(&encoded).context("parse recovery bundle")?;
-    let secrets = open(&envelope, passphrase)?;
+    let (secrets, header_fingerprint) = open(envelope, passphrase)?;
     validate_recovery_secrets(&secrets)?;
     let fingerprint = crate::tls::certificate_fingerprint(&secrets.ca_cert_pem);
-    if fingerprint != envelope.public_ca_fingerprint {
+    if fingerprint != header_fingerprint {
         bail!("recovery bundle CA fingerprint does not match its encrypted contents");
     }
     let bundle_hash = feanorfs_common::hash_bytes(&encoded);
@@ -164,7 +180,9 @@ pub fn import_recovery_bundle(
     let marker_path = data_dir.join(RECOVERY_MARKER);
     let marker = load_marker(&marker_path)?;
     let resumed = if let Some(marker) = &marker {
-        if marker.format_version != FORMAT_VERSION || marker.bundle_hash != bundle_hash {
+        if marker.format_version != sealed_envelope::FORMAT_VERSION
+            || marker.bundle_hash != bundle_hash
+        {
             bail!(
                 "a different or unreadable recovery import is already pending at {}; resume with the original bundle",
                 marker_path.display()
@@ -184,7 +202,7 @@ pub fn import_recovery_bundle(
 
     if !resumed {
         let marker = RecoveryMarker {
-            format_version: FORMAT_VERSION,
+            format_version: sealed_envelope::FORMAT_VERSION,
             bundle_hash,
         };
         let encoded_marker = serde_json::to_vec_pretty(&marker)?;
@@ -208,7 +226,7 @@ pub fn rotate_hub_identity(
     passphrase: &str,
     replace_destination: bool,
 ) -> Result<IdentityRotationResult> {
-    validate_passphrase(passphrase)?;
+    sealed_envelope::validate_passphrase(&HUB_DOMAIN_BASE, passphrase)?;
 
     if data_dir.join(RECOVERY_MARKER).exists() {
         let imported = import_recovery_bundle(data_dir, recovery_destination, passphrase, true)
@@ -243,8 +261,11 @@ pub fn rotate_hub_identity(
     let fingerprint = crate::tls::certificate_fingerprint(&rotated.ca_cert_pem);
     let envelope = seal(&rotated, passphrase, &fingerprint)?;
     let encoded = serde_json::to_vec_pretty(&envelope).context("encode rotated recovery bundle")?;
-    if encoded.len() > MAX_BUNDLE_BYTES {
-        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
+    if encoded.len() > HUB_DOMAIN_BASE.max_envelope_bytes {
+        bail!(
+            "recovery bundle exceeds {} bytes",
+            HUB_DOMAIN_BASE.max_envelope_bytes
+        );
     }
     write_recovery_bundle(
         &resolved_recovery_destination,
@@ -259,7 +280,7 @@ pub fn rotate_hub_identity(
     })?;
 
     let marker = RecoveryMarker {
-        format_version: FORMAT_VERSION,
+        format_version: sealed_envelope::FORMAT_VERSION,
         bundle_hash: feanorfs_common::hash_bytes(&encoded),
     };
     atomic_private_write(
@@ -307,117 +328,29 @@ fn seal(
     passphrase: &str,
     fingerprint: &str,
 ) -> Result<RecoveryEnvelope> {
-    let mut salt_bytes = [0_u8; SALT_BYTES];
-    let mut nonce_bytes = [0_u8; NONCE_BYTES];
-    getrandom::fill(&mut salt_bytes)
-        .map_err(|error| anyhow::anyhow!("generate recovery salt: {error}"))?;
-    getrandom::fill(&mut nonce_bytes)
-        .map_err(|error| anyhow::anyhow!("generate recovery nonce: {error}"))?;
-    let salt = BASE64.encode(salt_bytes);
-    let nonce = BASE64.encode(nonce_bytes);
-    let aad = authenticated_header(&salt, &nonce, fingerprint)?;
-    let key_bytes = derive_key(passphrase, &salt_bytes)?;
-    let key: &Key = key_bytes.as_ref().try_into().expect("32-byte recovery key");
-    let cipher = XChaCha20Poly1305::new(key);
+    let domain = hub_domain(fingerprint);
     let plaintext = Zeroizing::new(serde_json::to_vec(secrets)?);
-    let xnonce: &XNonce = (&nonce_bytes).into();
-    let ciphertext = cipher
-        .encrypt(
-            xnonce,
-            Payload {
-                msg: plaintext.as_ref(),
-                aad: &aad,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("encrypt recovery bundle"))?;
-    salt_bytes.zeroize();
-    nonce_bytes.zeroize();
-
+    let base = sealed_envelope::seal(&domain, passphrase, &plaintext)?;
     Ok(RecoveryEnvelope {
-        format_version: FORMAT_VERSION,
-        kdf: KDF_NAME.into(),
-        cipher: CIPHER_NAME.into(),
-        salt,
-        nonce,
+        format_version: base.format_version,
+        kdf: base.kdf,
+        cipher: base.cipher,
+        salt: base.salt,
+        nonce: base.nonce,
         public_ca_fingerprint: fingerprint.into(),
-        ciphertext: BASE64.encode(ciphertext),
+        ciphertext: base.ciphertext,
     })
 }
 
-fn open(envelope: &RecoveryEnvelope, passphrase: &str) -> Result<RecoverySecrets> {
-    validate_envelope(envelope)?;
-    let salt = decode_exact::<SALT_BYTES>("salt", &envelope.salt)?;
-    let nonce = decode_exact::<NONCE_BYTES>("nonce", &envelope.nonce)?;
-    let ciphertext = BASE64
-        .decode(&envelope.ciphertext)
-        .context("decode recovery ciphertext")?;
-    let aad = authenticated_header(
-        &envelope.salt,
-        &envelope.nonce,
-        &envelope.public_ca_fingerprint,
-    )?;
-    let key_bytes = derive_key(passphrase, &salt)?;
-    let key: &Key = key_bytes.as_ref().try_into().expect("32-byte recovery key");
-    let cipher = XChaCha20Poly1305::new(key);
-    let xnonce: &XNonce = (&nonce).into();
-    let plaintext = Zeroizing::new(
-        cipher
-            .decrypt(
-                xnonce,
-                Payload {
-                    msg: &ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| {
-                anyhow::anyhow!("recovery passphrase is incorrect or bundle was modified")
-            })?,
-    );
-    serde_json::from_slice(&plaintext).context("decode encrypted recovery contents")
-}
-
-fn derive_key(passphrase: &str, salt: &[u8; SALT_BYTES]) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(KDF_MEMORY_KIB, KDF_ITERATIONS, KDF_LANES, Some(32))
-        .map_err(|error| anyhow::anyhow!("configure recovery KDF: {error}"))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0_u8; 32]);
-    argon2
-        .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
-        .map_err(|error| anyhow::anyhow!("derive recovery key: {error}"))?;
-    Ok(key)
-}
-
-fn authenticated_header(salt: &str, nonce: &str, fingerprint: &str) -> Result<Vec<u8>> {
-    serde_json::to_vec(&AuthenticatedHeader {
-        domain: "feanorfs hub recovery bundle",
-        format_version: FORMAT_VERSION,
-        kdf: KDF_NAME,
-        cipher: CIPHER_NAME,
-        salt,
-        nonce,
-        public_ca_fingerprint: fingerprint,
-    })
-    .context("encode recovery authentication header")
-}
-
-fn validate_envelope(envelope: &RecoveryEnvelope) -> Result<()> {
-    if envelope.format_version != FORMAT_VERSION {
-        bail!(
-            "unsupported recovery bundle format {}",
-            envelope.format_version
-        );
-    }
-    if envelope.kdf != KDF_NAME || envelope.cipher != CIPHER_NAME {
-        bail!("unsupported recovery bundle cryptography");
-    }
-    Ok(())
-}
-
-fn validate_passphrase(passphrase: &str) -> Result<()> {
-    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
-        bail!("recovery passphrase must contain at least {MIN_PASSPHRASE_CHARS} characters");
-    }
-    Ok(())
+fn open(envelope: RecoveryEnvelope, passphrase: &str) -> Result<(RecoverySecrets, String)> {
+    let mut envelope = envelope;
+    let header_fingerprint = std::mem::take(&mut envelope.public_ca_fingerprint);
+    let domain = hub_domain(&header_fingerprint);
+    let base = envelope.into_sealed_envelope();
+    let plaintext = sealed_envelope::open(&domain, passphrase, &base)?;
+    let secrets: RecoverySecrets =
+        serde_json::from_slice(&plaintext).context("decode encrypted recovery contents")?;
+    Ok((secrets, header_fingerprint))
 }
 
 fn write_recovery_bundle(destination: &Path, encoded: &[u8], replace: bool) -> Result<()> {
@@ -480,26 +413,24 @@ fn read_bounded_recovery_bundle(source: &Path) -> Result<Vec<u8>> {
     let file =
         File::open(source).with_context(|| format!("open recovery bundle {}", source.display()))?;
     let length = file.metadata()?.len();
-    if length > MAX_BUNDLE_BYTES as u64 {
-        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
+    if length > HUB_DOMAIN_BASE.max_envelope_bytes as u64 {
+        bail!(
+            "recovery bundle exceeds {} bytes",
+            HUB_DOMAIN_BASE.max_envelope_bytes
+        );
     }
-    let mut encoded = Vec::with_capacity(usize::try_from(length).unwrap_or(MAX_BUNDLE_BYTES));
-    file.take(MAX_BUNDLE_BYTES as u64 + 1)
+    let mut encoded =
+        Vec::with_capacity(usize::try_from(length).unwrap_or(HUB_DOMAIN_BASE.max_envelope_bytes));
+    file.take(HUB_DOMAIN_BASE.max_envelope_bytes as u64 + 1)
         .read_to_end(&mut encoded)
         .with_context(|| format!("read recovery bundle {}", source.display()))?;
-    if encoded.len() > MAX_BUNDLE_BYTES {
-        bail!("recovery bundle exceeds {MAX_BUNDLE_BYTES} bytes");
+    if encoded.len() > HUB_DOMAIN_BASE.max_envelope_bytes {
+        bail!(
+            "recovery bundle exceeds {} bytes",
+            HUB_DOMAIN_BASE.max_envelope_bytes
+        );
     }
     Ok(encoded)
-}
-
-fn decode_exact<const N: usize>(label: &str, encoded: &str) -> Result<[u8; N]> {
-    let decoded = BASE64
-        .decode(encoded)
-        .with_context(|| format!("decode recovery {label}"))?;
-    decoded
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("recovery {label} has the wrong length"))
 }
 
 fn load_marker(path: &Path) -> Result<Option<RecoveryMarker>> {
@@ -677,7 +608,8 @@ mod tests {
         let bundle_dir = tempfile::tempdir().unwrap();
         let bundle = bundle_dir.path().join("oversized.fnr-recovery");
         let file = File::create(&bundle).unwrap();
-        file.set_len(MAX_BUNDLE_BYTES as u64 + 1).unwrap();
+        file.set_len(HUB_DOMAIN_BASE.max_envelope_bytes as u64 + 1)
+            .unwrap();
         let error = import_recovery_bundle(&target, &bundle, PASSPHRASE, false)
             .expect_err("oversized bundle must fail");
         assert!(error.to_string().contains("exceeds"));
@@ -714,7 +646,7 @@ mod tests {
         assert!(import_recovery_bundle(target.path(), &bundle, PASSPHRASE, false).is_err());
 
         let marker = RecoveryMarker {
-            format_version: FORMAT_VERSION,
+            format_version: sealed_envelope::FORMAT_VERSION,
             bundle_hash: feanorfs_common::hash_bytes(&encoded),
         };
         atomic_private_write(
@@ -824,7 +756,7 @@ mod tests {
         atomic_private_write(
             &hub.path().join(RECOVERY_MARKER),
             &serde_json::to_vec_pretty(&RecoveryMarker {
-                format_version: FORMAT_VERSION,
+                format_version: sealed_envelope::FORMAT_VERSION,
                 bundle_hash: feanorfs_common::hash_bytes(&encoded),
             })
             .unwrap(),
@@ -855,5 +787,43 @@ mod tests {
         assert_eq!(unchanged.ca_cert_pem, old.ca_cert_pem);
         assert_eq!(unchanged.auth_token, old.auth_token);
         assert!(!hub.path().join(RECOVERY_MARKER).exists());
+    }
+
+    #[test]
+    fn old_bundle_fixture_still_imports() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../common/tests/fixtures/hub-bundle-v1.json"
+        );
+        let encoded = fs::read(fixture).expect("hub bundle fixture exists");
+        let envelope: RecoveryEnvelope = serde_json::from_slice(&encoded).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let imported =
+            import_recovery_bundle(target.path(), Path::new(fixture), PASSPHRASE, false).unwrap();
+        assert_eq!(
+            imported.public_ca_fingerprint,
+            envelope.public_ca_fingerprint
+        );
+        assert!(!target.path().join(RECOVERY_MARKER).exists());
+        let secrets = load_recovery_secrets(target.path()).unwrap();
+        assert_eq!(
+            crate::tls::certificate_fingerprint(&secrets.ca_cert_pem),
+            envelope.public_ca_fingerprint
+        );
+    }
+
+    #[test]
+    fn truncated_bundle_fails_before_any_write() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../common/tests/fixtures/hub-bundle-v1.json"
+        );
+        let encoded = fs::read(fixture).expect("hub bundle fixture exists");
+        let target = tempfile::tempdir().unwrap();
+        let truncated = target.path().join("truncated.fnr-recovery");
+        fs::write(&truncated, &encoded[..encoded.len() / 2]).unwrap();
+        assert!(import_recovery_bundle(target.path(), &truncated, PASSPHRASE, false).is_err());
+        assert!(!target.path().join("auth-token").exists());
+        assert!(!target.path().join(RECOVERY_MARKER).exists());
     }
 }

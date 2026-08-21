@@ -3,11 +3,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use feanorfs_common::hub_contract::{is_supported_format_version, ManifestWriteOutcome};
 use feanorfs_common::{canonical_manifest_hashes, is_valid_hash};
 
 use super::guards::{ensure_client_format, ensure_migration_access};
 use super::{AppState, FormatQuery, HeadQuery, ManifestQuery};
-use crate::db::ManifestWrite;
 
 pub(super) async fn handle_manifest(
     State(state): State<AppState>,
@@ -49,12 +49,12 @@ pub(super) async fn handle_manifest(
             (StatusCode::INTERNAL_SERVER_ERROR, String::new())
         })?;
     match stored {
-        ManifestWrite::Stored | ManifestWrite::Unchanged => Ok(StatusCode::OK),
-        ManifestWrite::Conflict => Err((
+        ManifestWriteOutcome::Stored | ManifestWriteOutcome::Unchanged => Ok(StatusCode::OK),
+        ManifestWriteOutcome::Conflict => Err((
             StatusCode::BAD_REQUEST,
             "snapshot manifest is immutable".to_string(),
         )),
-        ManifestWrite::Capacity => Err((StatusCode::INSUFFICIENT_STORAGE, String::new())),
+        ManifestWriteOutcome::Capacity => Err((StatusCode::INSUFFICIENT_STORAGE, String::new())),
     }
 }
 
@@ -62,12 +62,19 @@ pub(super) async fn handle_set_format(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<FormatQuery>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, String)> {
     let _publication_guard = state.publication_lock.write().await;
-    ensure_client_format(&state, &query.workspace_id, &headers).await?;
-    ensure_migration_access(&state, &query.workspace_id, &headers).await?;
-    if query.format_version != 3 {
-        return Err(StatusCode::BAD_REQUEST);
+    ensure_client_format(&state, &query.workspace_id, &headers)
+        .await
+        .map_err(|status| (status, String::new()))?;
+    ensure_migration_access(&state, &query.workspace_id, &headers)
+        .await
+        .map_err(|status| (status, String::new()))?;
+    if !is_supported_format_version(query.format_version) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "only format version 3 is accepted".to_string(),
+        ));
     }
     state
         .db
@@ -75,7 +82,7 @@ pub(super) async fn handle_set_format(
         .await
         .map_err(|error| {
             tracing::error!(?error, "failed to set workspace format");
-            StatusCode::INTERNAL_SERVER_ERROR
+            (StatusCode::INTERNAL_SERVER_ERROR, String::new())
         })?;
     Ok(StatusCode::OK)
 }
@@ -84,20 +91,30 @@ pub(super) async fn handle_begin_migration(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HeadQuery>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, String)> {
     let _publication_guard = state.publication_lock.write().await;
-    ensure_client_format(&state, &query.workspace_id, &headers).await?;
+    ensure_client_format(&state, &query.workspace_id, &headers)
+        .await
+        .map_err(|status| (status, String::new()))?;
     let token = headers
         .get("x-feanorfs-migration")
         .and_then(|value| value.to_str().ok())
         .filter(|token| is_valid_hash(token))
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    state
-        .db
-        .begin_migration(&query.workspace_id, token)
-        .await
-        .map_err(|_| StatusCode::LOCKED)?;
-    Ok(StatusCode::OK)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "missing or invalid migration token".to_string(),
+        ))?;
+    match state.db.begin_migration(&query.workspace_id, token).await {
+        Ok(feanorfs_common::hub_contract::MigrationWriteOutcome::Acquired) => Ok(StatusCode::OK),
+        Ok(feanorfs_common::hub_contract::MigrationWriteOutcome::LockedByOther) => Err((
+            StatusCode::LOCKED,
+            "workspace migration is already locked".to_string(),
+        )),
+        Err(error) => {
+            tracing::error!(?error, "failed to begin workspace migration");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, String::new()))
+        }
+    }
 }
 
 pub(super) async fn handle_get_format(

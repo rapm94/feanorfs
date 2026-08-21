@@ -38,8 +38,10 @@ pub async fn init_app_state(
         auth_token,
         publication_lock: Arc::new(tokio::sync::RwLock::new(())),
         protected_requests: Arc::new(tokio::sync::Semaphore::new(app::MAX_PROTECTED_REQUESTS)),
+        head_read_requests: Arc::new(tokio::sync::Semaphore::new(app::MAX_HEAD_READ_REQUESTS)),
         upload_requests: Arc::new(tokio::sync::Semaphore::new(app::MAX_UPLOAD_REQUESTS)),
         manifest_requests: Arc::new(tokio::sync::Semaphore::new(app::MAX_MANIFEST_REQUESTS)),
+        head_waiters: Arc::new(app::head_wait::HeadWaiters::new()),
         pair_relay: app::routes_pair_relay::PairRelayState::default(),
         tunnel_relay: app::routes_tunnel_relay::TunnelRelayState::default(),
     })

@@ -431,3 +431,275 @@ async fn migration_fence_rejects_unfenced_flat_writes() {
         StatusCode::OK
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bounded opaque head-change waiting (CAD-2)
+// ---------------------------------------------------------------------------
+
+fn wait_request(workspace: &str, after: Option<&str>, wait_ms: Option<u64>) -> Request<Body> {
+    let mut query = format!("workspace_id={workspace}");
+    if let Some(after) = after {
+        query.push_str(&format!("&after={after}"));
+    }
+    if let Some(wait_ms) = wait_ms {
+        query.push_str(&format!("&wait_ms={wait_ms}"));
+    }
+    Request::get(format!("/api/head?{query}"))
+        .header("x-feanorfs-format", "3")
+        .body(Body::empty())
+        .expect("build wait request")
+}
+
+fn swap_request(workspace: &str, expected: Option<&str>, new: &str) -> Request<Body> {
+    Request::put("/api/head")
+        .header("content-type", "application/json")
+        .header("x-feanorfs-format", "3")
+        .body(Body::from(
+            serde_json::json!({
+                "workspace_id": workspace,
+                "expected": expected,
+                "new": new,
+            })
+            .to_string(),
+        ))
+        .expect("build swap request")
+}
+
+async fn head_json(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read head body");
+    serde_json::from_slice(&body).expect("parse head body")
+}
+
+#[tokio::test]
+async fn head_wait_returns_immediately_when_head_already_differs() {
+    let state = app_state().await;
+    let head = "c".repeat(64);
+    state
+        .db
+        .upsert_manifest("ws", &head, format!("{head}\n").as_bytes())
+        .await
+        .expect("store manifest");
+    state.db.swap_head("ws", None, &head).await.unwrap();
+    let app = build_router(state);
+    let response = app
+        .clone()
+        .oneshot(wait_request("ws", Some(&"d".repeat(64)), Some(5000)))
+        .await
+        .expect("send wait request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = head_json(response).await;
+    assert_eq!(body["snapshot_id"], head);
+    assert_eq!(body["wait_supported"], true);
+}
+
+#[tokio::test]
+async fn head_wait_wakes_after_durable_cas() {
+    let state = app_state().await;
+    let first = "e".repeat(64);
+    let second = "f".repeat(64);
+    for id in [&first, &second] {
+        state
+            .db
+            .upsert_manifest("ws", id, format!("{id}\n").as_bytes())
+            .await
+            .expect("store manifest");
+    }
+    state.db.swap_head("ws", None, &first).await.unwrap();
+    let app = build_router(state);
+    let wait = app
+        .clone()
+        .oneshot(wait_request("ws", Some(&first), Some(5000)));
+    // Publish after a short delay so the waiter is registered first.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let swap = app
+        .oneshot(swap_request("ws", Some(&first), &second))
+        .await
+        .expect("swap head");
+    assert_eq!(swap.status(), StatusCode::OK);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .expect("waiter must wake")
+        .expect("waiter response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = head_json(response).await;
+    assert_eq!(body["snapshot_id"], second);
+}
+
+#[tokio::test]
+async fn head_wait_does_not_wake_after_rejected_cas() {
+    let state = app_state().await;
+    let first = "11".repeat(32);
+    let second = "22".repeat(32);
+    let third = "33".repeat(32);
+    for id in [&first, &second, &third] {
+        state
+            .db
+            .upsert_manifest("ws", id, format!("{id}\n").as_bytes())
+            .await
+            .expect("store manifest");
+    }
+    state.db.swap_head("ws", None, &first).await.unwrap();
+    let app = build_router(state);
+    let wait = app
+        .clone()
+        .oneshot(wait_request("ws", Some(&first), Some(500)));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // A rejected CAS must never wake the waiter.
+    let rejected = app
+        .clone()
+        .oneshot(swap_request("ws", Some(&"99".repeat(32)), &third))
+        .await
+        .expect("rejected swap");
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    // The accepted swap wakes the waiter with the new head.
+    let accepted = app
+        .oneshot(swap_request("ws", Some(&first), &second))
+        .await
+        .expect("accepted swap");
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .expect("waiter must resolve")
+        .expect("waiter response");
+    let body = head_json(response).await;
+    assert_eq!(body["snapshot_id"], second);
+    assert_eq!(body["wait_supported"], true);
+}
+
+#[tokio::test]
+async fn head_wait_timeout_returns_unchanged_head_without_error() {
+    let state = app_state().await;
+    let head = "44".repeat(32);
+    state
+        .db
+        .upsert_manifest("ws", &head, format!("{head}\n").as_bytes())
+        .await
+        .expect("store manifest");
+    state.db.swap_head("ws", None, &head).await.unwrap();
+    let app = build_router(state);
+    let started = std::time::Instant::now();
+    let response = app
+        .oneshot(wait_request("ws", Some(&head), Some(200)))
+        .await
+        .expect("send wait request");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = head_json(response).await;
+    assert_eq!(body["snapshot_id"], head);
+}
+
+#[tokio::test]
+async fn exhausted_workspace_waiters_return_retryable_status() {
+    let state = app_state().await;
+    let head = "45".repeat(32);
+    state
+        .db
+        .upsert_manifest("ws", &head, format!("{head}\n").as_bytes())
+        .await
+        .expect("store manifest");
+    state.db.swap_head("ws", None, &head).await.unwrap();
+    let app = build_router(state);
+    let mut waiters = Vec::new();
+    for _ in 0..super::super::head_wait::MAX_WORKSPACE_WAITERS {
+        let request = wait_request("ws", Some(&head), Some(5000));
+        let app = app.clone();
+        waiters.push(tokio::spawn(async move { app.oneshot(request).await }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let overflow = app
+        .oneshot(wait_request("ws", Some(&head), Some(5000)))
+        .await
+        .expect("send overflow wait request");
+    assert_eq!(overflow.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    for waiter in waiters {
+        waiter.abort();
+    }
+}
+
+#[tokio::test]
+async fn head_wait_auth_and_format_checks_still_fail_closed() {
+    let state = crate::init_app_state(
+        tempfile::TempDir::new()
+            .expect("temp dir")
+            .path()
+            .to_path_buf(),
+        Some("secret".to_string()),
+    )
+    .await
+    .expect("init app state");
+    let app = build_router(state);
+    let response = app
+        .oneshot(wait_request("ws", Some(&"55".repeat(32)), Some(1000)))
+        .await
+        .expect("send unauthorized wait");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn head_wait_workspace_a_publication_never_wakes_b() {
+    let state = app_state().await;
+    let head_a = "66".repeat(32);
+    let head_b = "77".repeat(32);
+    let next_a = "88".repeat(32);
+    for (workspace, id) in [("a", &head_a), ("b", &head_b), ("a", &next_a)] {
+        state
+            .db
+            .upsert_manifest(workspace, id, format!("{id}\n").as_bytes())
+            .await
+            .expect("store manifest");
+    }
+    state.db.swap_head("a", None, &head_a).await.unwrap();
+    state.db.swap_head("b", None, &head_b).await.unwrap();
+    let app = build_router(state);
+    let wait_b = app
+        .clone()
+        .oneshot(wait_request("b", Some(&head_b), Some(400)));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let swap_a = app
+        .oneshot(swap_request("a", Some(&head_a), &next_a))
+        .await
+        .expect("swap workspace a");
+    assert_eq!(swap_a.status(), StatusCode::OK);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), wait_b)
+        .await
+        .expect("waiter b must resolve by timeout");
+    let response = response.expect("waiter b response");
+    let body = head_json(response).await;
+    assert_eq!(
+        body["snapshot_id"], head_b,
+        "workspace b must not wake for a"
+    );
+}
+
+#[tokio::test]
+async fn head_wait_rejects_malformed_after() {
+    let app = build_router(app_state().await);
+    let response = app
+        .oneshot(wait_request("ws", Some("not-a-hash"), Some(100)))
+        .await
+        .expect("send malformed wait");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn plain_head_get_keeps_the_immediate_shape() {
+    let app = build_router(app_state().await);
+    let response = app
+        .oneshot(
+            Request::get("/api/head?workspace_id=ws")
+                .header("x-feanorfs-format", "3")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send plain get");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = head_json(response).await;
+    // Old clients parse exactly this shape; `wait_supported` stays omitted.
+    assert_eq!(body["snapshot_id"], serde_json::Value::Null);
+    assert!(body.get("wait_supported").is_none());
+}

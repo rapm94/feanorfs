@@ -60,3 +60,16 @@ Content-addressed encrypted object storage. Axum, Rustls, and SQLite transport a
 | Child | Purpose |
 | :--- | :--- |
 | [`src/app/`](src/app/AGENTS.md) | Axum format/migration guards, grouped route handlers, and route tests. |
+
+## Bounded opaque head-change waiting
+
+- `app/head_wait.rs` owns the in-memory waiter registry keyed only by opaque
+  workspace id: global (256) and per-workspace (16) bounds, wait durations
+  capped at 30 s (below the client read-idle timeout), and disconnect cleanup
+  via drop guards. Waiters are notified only after a durable head swap; a
+  rejected CAS never wakes them. Exhausted waiter capacity returns HTTP 503,
+  so clients treat saturation as retryable instead of immediately polling the
+  unchanged head.
+- `GET /api/head` accepts optional `after`/`wait_ms`; plain GETs keep the
+  exact previous shape. No new route, table, or agent metadata exists — the
+  hub remains content-blind and agent-blind.

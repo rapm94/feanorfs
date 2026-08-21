@@ -1,14 +1,13 @@
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt as _, StreamExt as _};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 
+use super::relay_common::{relay, valid_lower_hex, wait_for_peer, ForwardPolicy, PeerWaitPolicy};
 use super::AppState;
 
 const SESSION_HEX_BYTES: usize = 16;
@@ -20,6 +19,26 @@ const MAX_RELAYED_FRAMES: usize = 8;
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Peer wait policy: an offer waits up to SESSION_TTL (15 min) for its join,
+// and each Ping heartbeat must be answered within SOCKET_WRITE_TIMEOUT (5 s).
+const PAIR_PEER_WAIT: PeerWaitPolicy = PeerWaitPolicy {
+    expiry: SESSION_TTL,
+    heartbeat_write_timeout: SOCKET_WRITE_TIMEOUT,
+};
+
+// Forwarding policy: at most MAX_RELAYED_FRAMES (8) PAKE handshake frames
+// total across both directions (heartbeats included), each message at most
+// MAX_FRAME_BYTES (16 KiB), no idle timeout (the relay is additionally bounded
+// by EXCHANGE_TIMEOUT (30 s) at the call site), and writes bounded by
+// SOCKET_WRITE_TIMEOUT (5 s).
+const PAIR_FORWARD: ForwardPolicy = ForwardPolicy {
+    max_frames: Some(MAX_RELAYED_FRAMES),
+    max_bytes: None,
+    max_message_bytes: MAX_FRAME_BYTES,
+    idle_timeout: None,
+    write_timeout: SOCKET_WRITE_TIMEOUT,
+};
 
 #[derive(Clone)]
 pub(crate) struct PairRelayState {
@@ -100,7 +119,7 @@ impl PairRelayState {
             );
         }
 
-        let mut peer = match wait_for_join(socket, joined).await {
+        let mut peer = match wait_for_peer(socket, joined, PAIR_PEER_WAIT).await {
             Some(peer) => peer,
             None => {
                 self.pending.lock().await.remove(&session);
@@ -110,7 +129,7 @@ impl PairRelayState {
 
         let _ = tokio::time::timeout(
             EXCHANGE_TIMEOUT,
-            relay(&mut admitted.socket, &mut peer.socket),
+            relay(&mut admitted.socket, &mut peer.socket, PAIR_FORWARD),
         )
         .await;
     }
@@ -128,93 +147,12 @@ impl PairRelayState {
     }
 }
 
-async fn wait_for_join(
-    socket: &mut WebSocket,
-    mut joined: oneshot::Receiver<AdmittedSocket>,
-) -> Option<AdmittedSocket> {
-    let deadline = tokio::time::sleep(SESSION_TTL);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            peer = &mut joined => return peer.ok(),
-            _ = &mut deadline => return None,
-            message = socket.next() => match message {
-                Some(Ok(Message::Ping(bytes))) => {
-                    tokio::time::timeout(
-                        SOCKET_WRITE_TIMEOUT,
-                        socket.send(Message::Pong(bytes)),
-                    )
-                    .await
-                    .ok()?
-                    .ok()?;
-                }
-                Some(Ok(Message::Pong(_))) => {}
-                _ => return None,
-            }
-        }
-    }
-}
-
-async fn relay(offer: &mut WebSocket, join: &mut WebSocket) {
-    let relayed = AtomicUsize::new(0);
-    let (mut offer_send, mut offer_receive) = offer.split();
-    let (mut join_send, mut join_receive) = join.split();
-    let offer_to_join = async {
-        while let Some(Ok(message)) = offer_receive.next().await {
-            if !claim_frame(&relayed) || !allowed_message(&message) {
-                return;
-            }
-            if !matches!(
-                tokio::time::timeout(SOCKET_WRITE_TIMEOUT, join_send.send(message)).await,
-                Ok(Ok(()))
-            ) {
-                return;
-            }
-        }
-    };
-    let join_to_offer = async {
-        while let Some(Ok(message)) = join_receive.next().await {
-            if !claim_frame(&relayed) || !allowed_message(&message) {
-                return;
-            }
-            if !matches!(
-                tokio::time::timeout(SOCKET_WRITE_TIMEOUT, offer_send.send(message)).await,
-                Ok(Ok(()))
-            ) {
-                return;
-            }
-        }
-    };
-    tokio::select! {
-        () = offer_to_join => {}
-        () = join_to_offer => {}
-    }
-}
-
-fn claim_frame(relayed: &AtomicUsize) -> bool {
-    relayed
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-            (count < MAX_RELAYED_FRAMES).then_some(count + 1)
-        })
-        .is_ok()
-}
-
-fn allowed_message(message: &Message) -> bool {
-    matches!(
-        message,
-        Message::Binary(bytes) if bytes.len() <= MAX_FRAME_BYTES
-    ) || matches!(message, Message::Ping(_) | Message::Pong(_))
-}
-
 fn prune_expired(pending: &mut HashMap<String, PendingOffer>) {
     pending.retain(|_, offer| offer.created_at.elapsed() < SESSION_TTL && !offer.join.is_closed());
 }
 
 fn valid_session_id(session: &str) -> bool {
-    session.len() == SESSION_HEX_LEN
-        && session
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    valid_lower_hex(session, SESSION_HEX_LEN)
 }
 
 #[cfg(test)]

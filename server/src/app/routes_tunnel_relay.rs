@@ -1,14 +1,14 @@
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt as _, StreamExt as _};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 
+use super::relay_common::{relay, valid_lower_hex, wait_for_peer, ForwardPolicy, PeerWaitPolicy};
 use super::AppState;
 
 const ROUTE_HEX_LEN: usize = 64;
@@ -22,6 +22,28 @@ const HOST_OFFER_TTL: Duration = Duration::from_secs(90);
 const TUNNEL_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Peer wait policy: a host offer waits up to HOST_OFFER_TTL (90 s) for a
+// client, and each Ping heartbeat must be answered within SOCKET_WRITE_TIMEOUT
+// (5 s).
+const TUNNEL_PEER_WAIT: PeerWaitPolicy = PeerWaitPolicy {
+    expiry: HOST_OFFER_TTL,
+    heartbeat_write_timeout: SOCKET_WRITE_TIMEOUT,
+};
+
+// Forwarding policy: at most MAX_TUNNEL_BYTES (16 GiB) relayed total across
+// both directions (Binary payload bytes only; heartbeats are free), each
+// message at most MAX_FRAME_BYTES (64 KiB), no frame cap, the tunnel ends
+// after TUNNEL_IDLE_TIMEOUT (5 min) without a relayed message (and is
+// additionally bounded by TUNNEL_LIFETIME (24 h) at the call site), and
+// writes bounded by SOCKET_WRITE_TIMEOUT (5 s).
+const TUNNEL_FORWARD: ForwardPolicy = ForwardPolicy {
+    max_frames: None,
+    max_bytes: Some(MAX_TUNNEL_BYTES),
+    max_message_bytes: MAX_FRAME_BYTES,
+    idle_timeout: Some(TUNNEL_IDLE_TIMEOUT),
+    write_timeout: SOCKET_WRITE_TIMEOUT,
+};
 
 #[derive(Clone)]
 pub(crate) struct TunnelRelayState {
@@ -111,7 +133,7 @@ impl TunnelRelayState {
                 });
         }
 
-        let mut peer = match wait_for_client(socket, joined).await {
+        let mut peer = match wait_for_peer(socket, joined, TUNNEL_PEER_WAIT).await {
             Some(peer) => peer,
             None => {
                 self.remove_pending(&route, id).await;
@@ -124,7 +146,7 @@ impl TunnelRelayState {
         };
         let _ = tokio::time::timeout(
             TUNNEL_LIFETIME,
-            relay(&mut admitted.socket, &mut peer.socket),
+            relay(&mut admitted.socket, &mut peer.socket, TUNNEL_FORWARD),
         )
         .await;
     }
@@ -156,112 +178,6 @@ impl TunnelRelayState {
     }
 }
 
-async fn wait_for_client(
-    socket: &mut WebSocket,
-    mut joined: oneshot::Receiver<AdmittedSocket>,
-) -> Option<AdmittedSocket> {
-    let deadline = tokio::time::sleep(HOST_OFFER_TTL);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            peer = &mut joined => return peer.ok(),
-            _ = &mut deadline => return None,
-            message = socket.next() => match message {
-                Some(Ok(Message::Ping(bytes))) => {
-                    tokio::time::timeout(
-                        SOCKET_WRITE_TIMEOUT,
-                        socket.send(Message::Pong(bytes)),
-                    )
-                    .await
-                    .ok()?
-                    .ok()?;
-                }
-                Some(Ok(Message::Pong(_))) => {}
-                _ => return None,
-            }
-        }
-    }
-}
-
-async fn relay(host: &mut WebSocket, client: &mut WebSocket) {
-    let bytes = AtomicU64::new(0);
-    let activity = Arc::new(Mutex::new(Instant::now()));
-    let (mut host_send, mut host_receive) = host.split();
-    let (mut client_send, mut client_receive) = client.split();
-    let host_activity = Arc::clone(&activity);
-    let host_to_client = async {
-        while let Some(Ok(message)) = host_receive.next().await {
-            let Some(message_bytes) = allowed_message_bytes(&message) else {
-                return;
-            };
-            if !claim_bytes(&bytes, message_bytes) {
-                return;
-            }
-            *host_activity.lock().await = Instant::now();
-            if !matches!(
-                tokio::time::timeout(SOCKET_WRITE_TIMEOUT, client_send.send(message)).await,
-                Ok(Ok(()))
-            ) {
-                return;
-            }
-        }
-    };
-    let client_activity = Arc::clone(&activity);
-    let client_to_host = async {
-        while let Some(Ok(message)) = client_receive.next().await {
-            let Some(message_bytes) = allowed_message_bytes(&message) else {
-                return;
-            };
-            if !claim_bytes(&bytes, message_bytes) {
-                return;
-            }
-            *client_activity.lock().await = Instant::now();
-            if !matches!(
-                tokio::time::timeout(SOCKET_WRITE_TIMEOUT, host_send.send(message)).await,
-                Ok(Ok(()))
-            ) {
-                return;
-            }
-        }
-    };
-    tokio::select! {
-        () = host_to_client => {}
-        () = client_to_host => {}
-        () = wait_for_idle(activity) => {}
-    }
-}
-
-fn allowed_message_bytes(message: &Message) -> Option<u64> {
-    match message {
-        Message::Binary(bytes) if bytes.len() <= MAX_FRAME_BYTES => Some(bytes.len() as u64),
-        Message::Ping(_) | Message::Pong(_) => Some(0),
-        _ => None,
-    }
-}
-
-fn claim_bytes(bytes: &AtomicU64, additional: u64) -> bool {
-    bytes
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current
-                .checked_add(additional)
-                .filter(|next| *next <= MAX_TUNNEL_BYTES)
-        })
-        .is_ok()
-}
-
-async fn wait_for_idle(activity: Arc<Mutex<Instant>>) {
-    loop {
-        let remaining = {
-            let last = *activity.lock().await;
-            TUNNEL_IDLE_TIMEOUT.saturating_sub(last.elapsed())
-        };
-        if remaining.is_zero() {
-            return;
-        }
-        tokio::time::sleep(remaining).await;
-    }
-}
-
 fn prune_expired(pending: &mut HashMap<String, VecDeque<PendingHost>>) {
     pending.retain(|_, hosts| {
         hosts.retain(|host| host.created_at.elapsed() < HOST_OFFER_TTL && !host.client.is_closed());
@@ -270,10 +186,7 @@ fn prune_expired(pending: &mut HashMap<String, VecDeque<PendingHost>>) {
 }
 
 fn valid_route(route: &str) -> bool {
-    route.len() == ROUTE_HEX_LEN
-        && route
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    valid_lower_hex(route, ROUTE_HEX_LEN)
 }
 
 #[cfg(test)]

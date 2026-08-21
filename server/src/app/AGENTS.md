@@ -7,6 +7,7 @@ Own Axum request guards, grouped route handlers, and route-level tests. `../app.
 ## Ownership
 
 - `guards.rs` — client-format and migration-fence admission.
+- `relay_common.rs` — shared WebSocket primitives for the pair/tunnel relay routes: fixed-length lowercase-hex validation, peer-wait heartbeat loop, and policy-parameterized bidirectional forwarding.
 - `routes_legacy.rs` — legacy sync and upload.
 - `routes_objects.rs` — download, workspace listing, and head compare-and-swap.
 - `routes_publication.rs` — manifests, migration start, and format lifecycle.

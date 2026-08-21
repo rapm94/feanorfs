@@ -1,4 +1,6 @@
 mod guards;
+pub(crate) mod head_wait;
+mod relay_common;
 mod routes_legacy;
 mod routes_objects;
 pub(crate) mod routes_pair_relay;
@@ -34,6 +36,7 @@ use routes_publication::{
 use routes_tunnel_relay::{handle_tunnel_relay, TunnelRelayState};
 
 pub(crate) const MAX_PROTECTED_REQUESTS: usize = 64;
+pub(crate) const MAX_HEAD_READ_REQUESTS: usize = 256;
 pub(crate) const MAX_UPLOAD_REQUESTS: usize = 4;
 pub(crate) const MAX_MANIFEST_REQUESTS: usize = 2;
 
@@ -44,8 +47,10 @@ pub struct AppState {
     pub auth_token: Option<String>,
     pub publication_lock: Arc<RwLock<()>>,
     pub(crate) protected_requests: Arc<Semaphore>,
+    pub(crate) head_read_requests: Arc<Semaphore>,
     pub(crate) upload_requests: Arc<Semaphore>,
     pub(crate) manifest_requests: Arc<Semaphore>,
+    pub(crate) head_waiters: Arc<head_wait::HeadWaiters>,
     pub(crate) pair_relay: PairRelayState,
     pub(crate) tunnel_relay: TunnelRelayState,
 }
@@ -64,10 +69,15 @@ struct UploadParams {
     #[serde(default)]
     object: bool,
 }
-
 #[derive(Deserialize)]
 struct HeadQuery {
     workspace_id: String,
+    /// Optional observed head: when present, the handler may wait for this
+    /// opaque head id to change instead of returning immediately.
+    after: Option<String>,
+    /// Optional bounded wait in milliseconds; clamped to
+    /// [`head_wait::MAX_HEAD_WAIT_MS`].
+    wait_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -197,8 +207,13 @@ pub async fn auth_middleware(
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
-    let permit = state
-        .protected_requests
+    let semaphore =
+        if request.method() == axum::http::Method::GET && request.uri().path() == "/api/head" {
+            Arc::clone(&state.head_read_requests)
+        } else {
+            Arc::clone(&state.protected_requests)
+        };
+    let permit = semaphore
         .clone()
         .try_acquire_owned()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;

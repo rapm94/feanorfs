@@ -71,6 +71,54 @@ async fn protected_request_permits_live_until_response_bodies_are_dropped() {
 }
 
 #[tokio::test]
+async fn saturated_head_reads_do_not_block_head_publication() {
+    let router = build_router(app_state().await);
+    let mut responses = Vec::new();
+    for _ in 0..super::super::MAX_HEAD_READ_REQUESTS {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/api/head?workspace_id=ws")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        responses.push(response);
+    }
+    let saturated = router
+        .clone()
+        .oneshot(
+            Request::get("/api/head?workspace_id=ws")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let missing = "a".repeat(64);
+    let publication = router
+        .oneshot(
+            Request::put("/api/head")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "workspace_id": "ws",
+                        "expected": null,
+                        "new": missing,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(publication.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
 async fn manifest_content_length_is_capped_before_body_extraction() {
     let response = build_router(app_state().await)
         .oneshot(
