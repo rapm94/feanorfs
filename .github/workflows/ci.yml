@@ -636,6 +636,9 @@ jobs:
           needs.workflow-lint.result != 'success'
         run: exit 1
       - name: Require pre-release gates
+        # Hosted macOS/Windows desktop smokes (tray, desktop-tray) run for
+        # signal but stay outside the release gate until signed-product
+        # acceptance (F1/F2, AI-1) closes.
         if: >-
           github.event_name != 'pull_request' &&
           (
@@ -646,8 +649,6 @@ jobs:
             needs.docs.result != 'success' ||
             needs.build.result != 'success' ||
             needs.sdk.result != 'success' ||
-            needs.tray.result != 'success' ||
-            needs.desktop-tray.result != 'success' ||
             needs.relay-container.result != 'success'
           )
         run: exit 1

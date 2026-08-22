@@ -63,8 +63,11 @@ fn workspace_root() -> PathBuf {
 }
 
 fn surface(root: &Path, rel: &str) -> String {
-    std::fs::read_to_string(root.join(rel))
-        .unwrap_or_else(|error| panic!("surface {rel} unreadable: {error}"))
+    let text = std::fs::read_to_string(root.join(rel))
+        .unwrap_or_else(|error| panic!("surface {rel} unreadable: {error}"));
+    // Windows checkouts may hand back CRLF; every parser here assumes the
+    // repository-normalized LF form ("\n\n" paragraph boundaries included).
+    text.replace("\r\n", "\n")
 }
 
 fn read_doc(rel: &str) -> String {
