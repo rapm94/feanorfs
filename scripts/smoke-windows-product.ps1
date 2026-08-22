@@ -270,6 +270,7 @@ function Assert-HealthyProduct {
             "e2ee",
             "executable_version",
             "global_config",
+            "live_reconciliation",
             "local_state",
             "private_hub",
             "remote_workspace",
@@ -280,8 +281,13 @@ function Assert-HealthyProduct {
             "workspace_format"
         ) | Sort-Object
         $actualChecks = @($doctor.checks.name) | Sort-Object
+        # Windows emits live_reconciliation even with zero active agents
+        # (informational); update_available is ok/info/warning by design.
         $unexpectedStatuses = @($doctor.checks | Where-Object {
-            $_.status -ne "ok" -and -not ($_.name -eq "update_available" -and $_.status -in @("info", "warning"))
+            $_.status -ne "ok" -and -not (
+                ($_.name -eq "update_available" -and $_.status -in @("info", "warning")) -or
+                ($_.name -eq "live_reconciliation" -and $_.status -eq "info")
+            )
         })
         if (-not $doctor.ok -or (Compare-Object $expectedChecks $actualChecks) -or $unexpectedStatuses.Count -ne 0) {
             Write-Host "Doctor payload: $($doctor | ConvertTo-Json -Depth 5)"
