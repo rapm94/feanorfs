@@ -228,14 +228,16 @@ fi
 ' >/dev/null
 TRAY_STATUS="$ROOT/tray-status.json"
 tray_ready=false
-for _ in {1..20}; do
+# Cold hosted runners start supervisor, watcher, and tray from scratch; two
+# minutes is the observed worst case with a strict terminal assertion.
+for _ in {1..120}; do
   if (cd "$WORKSPACE" && "$FEANORFS" --json tray status) >"$TRAY_STATUS" &&
     jq -e '.mirror_state == "idle" and .watching == true and .paused == false' \
       "$TRAY_STATUS" >/dev/null; then
     tray_ready=true
     break
   fi
-  sleep 0.5
+  sleep 1
 done
 if [[ "$tray_ready" != true ]]; then
   echo "Tray did not reach idle, watching, and unpaused state within the bounded readiness window." >&2

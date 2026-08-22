@@ -1808,10 +1808,25 @@ mod tests {
         let root = fake_cli_dir("bad-secret");
         let script = root.join("fake-feanorfs");
         write_executable_script(&script, "#!/bin/sh\ncat\n");
-        let error = CapturedCommand::new(script.as_os_str().to_owned())
-            .secret_stdin(Zeroizing::new("line\nbreak".to_string()))
-            .capture()
-            .expect_err("invalid secret must fail");
+        // Linux containers can answer exec of a freshly written file with
+        // ETXTBSY; that is transport noise around the setup, not the
+        // contract under test. Only the invalid-secret rejection must hold.
+        let mut attempts = 0;
+        let error = loop {
+            match CapturedCommand::new(script.as_os_str().to_owned())
+                .secret_stdin(Zeroizing::new("line\nbreak".to_string()))
+                .capture()
+            {
+                Err(error @ CapturedError::InvalidSecret) => break error,
+                Err(CapturedError::Spawn(message))
+                    if message.contains("Text file busy") && attempts < 5 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                other => panic!("invalid secret must be rejected without spawning: {other:?}"),
+            }
+        };
         assert_eq!(error, CapturedError::InvalidSecret);
         std::fs::remove_dir_all(root).unwrap();
     }

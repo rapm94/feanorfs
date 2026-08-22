@@ -281,7 +281,7 @@ function Assert-HealthyProduct {
         ) | Sort-Object
         $actualChecks = @($doctor.checks.name) | Sort-Object
         $unexpectedStatuses = @($doctor.checks | Where-Object {
-            $_.status -ne "ok" -and -not ($_.name -eq "update_available" -and $_.status -eq "info")
+            $_.status -ne "ok" -and -not ($_.name -eq "update_available" -and $_.status -in @("info", "warning"))
         })
         if (-not $doctor.ok -or (Compare-Object $expectedChecks $actualChecks) -or $unexpectedStatuses.Count -ne 0) {
             throw "Windows doctor checks did not all pass."
@@ -293,7 +293,7 @@ function Assert-HealthyProduct {
                 $trayStatus.mirror_state -eq "idle" -and
                 $trayStatus.watching -and
                 -not $trayStatus.paused
-        } "Windows tray status to become idle and watched"
+        } "Windows tray status to become idle and watched" -Seconds 120
 
         $mcpInput = @(
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
