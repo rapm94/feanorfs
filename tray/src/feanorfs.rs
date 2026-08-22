@@ -1853,15 +1853,16 @@ mod tests {
                 .capture_with_cancel(Some(&cancel_rx));
             let _ = result_tx.send(result);
         });
-        // Wait for the child to be running, then cancel it.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Wait for the child to be running, then cancel it. Cold CI runners
+        // can take seconds to schedule the script process.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !marker.is_file() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(marker.is_file(), "child must start before cancellation");
         cancel_tx.send(()).unwrap();
         let result = result_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(15))
             .expect("capture must return");
         assert!(matches!(result, Err(CapturedError::Canceled)));
         std::fs::remove_dir_all(root).unwrap();

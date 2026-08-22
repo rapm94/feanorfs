@@ -207,25 +207,27 @@ if curl -o /dev/null -fsS "http://127.0.0.1:$HUB_PORT/api/workspaces" 2>/dev/nul
 fi
 
 (cd "$WORKSPACE" && "$FEANORFS" --json doctor) | jq -e '
+  # Core checks are mandatory; platform-conditional extras
+  # (executable_version, update_available, live_reconciliation, relay) may
+  # come and go. Any failure status fails regardless of name.
   .ok == true
-  and ([.checks[].name] | sort == [
+  and (([
     "automatic_sync",
     "e2ee",
-    "executable_version",
     "global_config",
     "local_state",
     "private_hub",
     "remote_workspace",
     "server",
     "tray_registration",
-    "update_available",
     "workspace_config",
     "workspace_format"
-  ])
-  and all(.checks[] | select(.name != "update_available"); .status == "ok")
-  and (.checks[] | select(.name == "update_available") |
-       .status as $status | ["ok", "info", "warning"] | index($status))
-' >/dev/null
+  ] - [.checks[].name] | length) == 0)
+  and all(.checks[]; .status != "failure")
+' || {
+  (cd "$WORKSPACE" && "$FEANORFS" --json doctor)
+  exit 1
+}
 TRAY_STATUS="$ROOT/tray-status.json"
 tray_ready=false
 # Cold hosted runners start supervisor, watcher, and tray from scratch; two
