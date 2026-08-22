@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/rapm94/feanorfs/compare/v0.9.4...v0.10.0) - 2026-08-22
+
+### Added
+
+- *(release)* carry product changes
+- *(common)* protocol contracts for work coordination, conflict identity, and sealed envelopes
+
+### Fixed
+
+- *(common)* pair hex bytes via as_chunks for the new clippy lint
+- *(common)* refuse legacy XOR degradation when AEAD auth fails on size-checked reads
+
+### Other
+
+- knowledge-base refresh, release-evidence tooling, and CI policy updates
+
 ### Added
 
 - Deterministic `ffwork1` coordination reducer: canonical-id tie handling
