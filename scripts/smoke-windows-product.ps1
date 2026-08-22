@@ -284,6 +284,7 @@ function Assert-HealthyProduct {
             $_.status -ne "ok" -and -not ($_.name -eq "update_available" -and $_.status -in @("info", "warning"))
         })
         if (-not $doctor.ok -or (Compare-Object $expectedChecks $actualChecks) -or $unexpectedStatuses.Count -ne 0) {
+            Write-Host "Doctor payload: $($doctor | ConvertTo-Json -Depth 5)"
             throw "Windows doctor checks did not all pass."
         }
 
