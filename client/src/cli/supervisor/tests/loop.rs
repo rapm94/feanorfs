@@ -7,7 +7,12 @@ fn supervisor_status_uses_the_native_process_start_epoch() {
     let started_at = current_supervisor_started_at();
     let native = process_start_epoch(pid).expect("current process has a native start epoch");
 
-    assert_eq!(started_at, native);
+    // CI hosts slew their clocks (NTP steps up to ~1s); allow that slack
+    // while still catching any wrong-source epoch.
+    assert!(
+        (started_at as i64 - native as i64).abs() <= 2,
+        "recorded start {started_at} diverges from native {native}"
+    );
     assert!(recorded_process_is_alive(Some(pid), started_at));
 }
 
