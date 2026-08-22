@@ -1504,6 +1504,7 @@ dependencies = [
  "serde",
  "serde_json",
  "service-manager",
+ "sha2",
  "spake2",
  "sqlx",
  "tempfile",

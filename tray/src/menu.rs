@@ -399,6 +399,22 @@ pub(crate) fn build_menu(state: &AppState) -> Menu {
         None,
     ));
 
+    // Gated install item: only after a check reported an available update.
+    let advertised = state
+        .last_update
+        .as_ref()
+        .filter(|check| matches!(check.status, crate::feanorfs::UpdateStatus::UpdateAvailable))
+        .map(|check| check.latest_version.clone());
+    if let Some(latest) = advertised {
+        let install_label = format!("Install v{latest}…");
+        let _ = menu.append(&MenuItem::with_id(
+            muda::MenuId::new("install-update"),
+            install_label,
+            actions_enabled && !state.update_inflight,
+            None,
+        ));
+    }
+
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&MenuItem::with_id(
         muda::MenuId::new("quit"),
@@ -430,6 +446,7 @@ pub(crate) enum MenuAction {
     ForgetUnavailable,
     CheckHealth,
     CheckUpdates,
+    InstallUpdate,
     Quit,
 }
 
@@ -469,6 +486,9 @@ pub(crate) fn parse_menu_action(id: &str) -> Option<MenuAction> {
     }
     if id == "update" {
         return Some(MenuAction::CheckUpdates);
+    }
+    if id == "install-update" {
+        return Some(MenuAction::InstallUpdate);
     }
     if id == "quit" {
         return Some(MenuAction::Quit);

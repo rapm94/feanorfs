@@ -48,11 +48,15 @@ enum Commands {
     /// Restore a historical snapshot as a new snapshot.
     Undo { snapshot_id: String },
     /// Check the official stable release without downloading or installing it.
+    /// With --apply, download the verified archive and replace this binary.
     Update {
         /// Respect the per-machine throttle: reuse the last result until the
         /// interval elapses (used by the tray and scheduled checks).
         #[arg(long)]
         periodic: bool,
+        /// Apply the available stable release after verifying its checksum.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -98,7 +102,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Undo { snapshot_id } => {
             cli::history::undo(&current_dir, &snapshot_id, cli.json).await?
         }
-        Commands::Update { periodic } => cli::update::run(cli.json, periodic).await?,
+        Commands::Update { periodic, apply } => {
+            if apply {
+                cli::update::run_apply(cli.json).await?;
+            } else {
+                cli::update::run(cli.json, periodic).await?;
+            }
+        }
     }
 
     Ok(())

@@ -16,7 +16,8 @@ use dialogs::{
     health_report_needs_repair, setup_failure_copy, setup_success_copy, show_first_run_choice,
     show_forget_unavailable_result, show_health_dialog, show_health_unavailable,
     show_pairing_dialog, show_recovery_kit_saved_dialog, show_setup_result_dialog,
-    show_update_dialog, show_update_error, show_workspace_restored_dialog, FirstRunChoice,
+    show_update_dialog, show_update_error, show_update_install_error, show_update_installed,
+    show_workspace_restored_dialog, FirstRunChoice,
 };
 use feanorfs::{workspace_has_config, HealthReport, UpdateCheckResult};
 use feanorfs_common::tray_contract::{
@@ -79,6 +80,7 @@ pub(crate) enum Action {
         report: Result<HealthReport, String>,
     },
     UpdateReady(Result<UpdateCheckResult, String>),
+    ApplyReady(Result<crate::feanorfs::UpdateApplyOutcome, String>),
     MenuClick(String),
     TaskDone {
         error: Option<String>,
@@ -352,6 +354,7 @@ fn main() {
                         show_update_error(error);
                     }
                     Ok(result) => {
+                        st.last_update = Some(result.clone());
                         if show_update_dialog(&result)
                             && open::that(&result.release_url).is_err()
                         {
@@ -360,6 +363,21 @@ fn main() {
                                     .into(),
                             );
                         }
+                    }
+                }
+                apply_ui(&st, &tray, &mut visual);
+            }
+            Action::ApplyReady(result) => {
+                st.update_inflight = false;
+                match result {
+                    Err(error) => {
+                        st.error_message = Some(error.clone());
+                        show_update_install_error(error);
+                    }
+                    Ok(outcome) => {
+                        // The applied build supersedes the advertised one.
+                        st.last_update = None;
+                        show_update_installed(&outcome);
                     }
                 }
                 apply_ui(&st, &tray, &mut visual);

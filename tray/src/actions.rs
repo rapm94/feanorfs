@@ -11,9 +11,9 @@ use crate::dialogs::{
 use crate::feanorfs::{
     agent_land, background_service_managed, background_service_start, background_service_stop,
     check_for_updates, conflicts_keep, conflicts_keep_all, export_recovery_kit,
-    forget_unavailable_workspaces, import_recovery_kit, join_workspace, run_pairing_session,
-    stop_workspace, sync_once, system_health, tray_activate, tray_pause, tray_setup, tray_status,
-    workspace_has_config, PairSessionEvent,
+    forget_unavailable_workspaces, import_recovery_kit, install_update, join_workspace,
+    run_pairing_session, stop_workspace, sync_once, system_health, tray_activate, tray_pause,
+    tray_setup, tray_status, workspace_has_config, PairSessionEvent, UpdateStatus,
 };
 use crate::menu::MenuAction;
 use crate::model::{unavailable_workspace_count, AppState, SetupKind};
@@ -401,6 +401,32 @@ pub(crate) fn handle_menu_action(
             let proxy = proxy.clone();
             std::thread::spawn(move || {
                 let _ = proxy.send_event(Action::UpdateReady(check_for_updates()));
+            });
+        }
+        MenuAction::InstallUpdate => {
+            let Some(expected) = state
+                .last_update
+                .as_ref()
+                .filter(|check| check.status == UpdateStatus::UpdateAvailable)
+                .map(|check| check.latest_version.clone())
+            else {
+                return;
+            };
+            if state.update_inflight
+                || state.setup_inflight
+                || state.stop_inflight
+                || state.switch_inflight
+                || state.pair_inflight
+                || state.recovery_inflight
+            {
+                return;
+            }
+            // Clicking the gated item is the explicit install consent.
+            state.update_inflight = true;
+            state.error_message = Some(format!("Installing FeanorFS {expected}…"));
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                let _ = proxy.send_event(Action::ApplyReady(install_update(&expected)));
             });
         }
         MenuAction::Quit => {

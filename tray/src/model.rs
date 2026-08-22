@@ -54,6 +54,8 @@ pub(crate) struct AppState {
     pub(crate) recovery_inflight: bool,
     pub(crate) health_inflight: bool,
     pub(crate) update_inflight: bool,
+    /// Last completed check; drives the gated Install Update item.
+    pub(crate) last_update: Option<crate::feanorfs::UpdateCheckResult>,
     pub(crate) pair_cancel: Option<std::sync::mpsc::Sender<()>>,
     pub(crate) quit_pending: bool,
     pub(crate) last_menu_revision: Cell<Option<u64>>,
@@ -86,6 +88,7 @@ impl AppState {
             recovery_inflight: false,
             health_inflight: false,
             update_inflight: false,
+            last_update: None,
             pair_cancel: None,
             quit_pending: false,
             last_menu_revision: Cell::new(None),

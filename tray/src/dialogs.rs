@@ -423,6 +423,24 @@ pub(crate) fn show_update_error(error: String) {
     show_error_dialog("Could not check for updates", error);
 }
 
+pub(crate) fn show_update_install_error(error: String) {
+    show_error_dialog("Could not install the update", error);
+}
+
+/// Confirms a completed, checksum-verified self-update.
+pub(crate) fn show_update_installed(outcome: &crate::feanorfs::UpdateApplyOutcome) {
+    activate_for_native_dialog();
+    let message = format!(
+        "FeanorFS {} is installed (previously {}). Supervised services restart on the new build automatically. Quit and reopen the tray if its menu does not refresh.",
+        outcome.applied_version, outcome.previous_version
+    );
+    let dialog = rfd::MessageDialog::new()
+        .set_title("FeanorFS updated")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok);
+    let _ = dialog.show();
+}
+
 /// Shows the update-check dialog. Returns `true` when the user chose to open
 /// the official release page.
 pub(crate) fn show_update_dialog(result: &UpdateCheckResult) -> bool {

@@ -388,7 +388,7 @@ pub enum HealthStatus {
     Failure,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
 pub struct UpdateCheckResult {
     pub status: UpdateStatus,
     pub current_version: String,
@@ -396,12 +396,23 @@ pub struct UpdateCheckResult {
     pub release_url: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateStatus {
     UpToDate,
     UpdateAvailable,
     DevelopmentBuild,
+}
+
+/// JSON mirror of the CLI's `update --apply` result. `applied_version` must
+/// equal the version the check advertised before install was offered.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UpdateApplyOutcome {
+    pub applied_version: String,
+    pub previous_version: String,
+    pub replaced_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
 }
 
 pub fn feanorfs_bin() -> String {
@@ -616,6 +627,46 @@ pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
 
 fn update_args() -> [&'static str; 2] {
     ["--json", "update"]
+}
+
+/// Installs the advertised update by delegating to the CLI's checksum-verified
+/// apply path. `expected_latest` must match the version the last check offered;
+/// any other applied version is refused as a confused-deputy outcome.
+pub fn install_update(expected_latest: &str) -> Result<UpdateApplyOutcome, String> {
+    let out = CapturedCommand::new(feanorfs_bin())
+        .args(["--json", "update", "--apply"])
+        .cwd(home_dir())
+        .stdout_limit(UPDATE_STDOUT_LIMIT)
+        .stderr_limit(DEFAULT_STDERR_LIMIT)
+        .timeout(Duration::from_secs(600))
+        .capture()
+        .map_err(|_| {
+            "The update could not be installed because the FeanorFS command is unavailable. The installed app was not changed."
+                .to_string()
+        })?;
+    if !out.status.success() {
+        let detail = out.stderr.as_str_lossy();
+        let detail = detail
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("unknown error");
+        return Err(format!(
+            "The update could not be installed. The previous FeanorFS remains in place. Detail: {detail}"
+        ));
+    }
+    let outcome: UpdateApplyOutcome = out.decode_json().map_err(|error| {
+        format!(
+            "The installed FeanorFS command returned an unreadable install result ({error}). Check `feanorfs update --apply` output before retrying."
+        )
+    })?;
+    if outcome.applied_version != expected_latest {
+        return Err(format!(
+            "The installer reported version {} but {} was verified. Refusing to treat this as the expected update.",
+            outcome.applied_version, expected_latest
+        ));
+    }
+    Ok(outcome)
 }
 
 fn official_release_result(result: &UpdateCheckResult) -> bool {
