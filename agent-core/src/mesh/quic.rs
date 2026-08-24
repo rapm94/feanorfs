@@ -198,7 +198,7 @@ fn dissociate_udp_peer(socket: &std::net::UdpSocket) {
             };
             #[cfg(not(target_os = "macos"))]
             let unspec: libc::sockaddr = libc::sockaddr {
-                sa_family: libc::AF_UNSPEC,
+                sa_family: libc::AF_UNSPEC as libc::sa_family_t,
                 sa_data: [0; 14],
             };
             libc::connect(
