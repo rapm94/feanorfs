@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/rapm94/feanorfs/compare/v0.11.0...v0.12.0) - 2026-08-24
+
+### Added
+
+- Direct-P2P mesh transport (capability-v2 candidates, Ed25519 machine
+  identity, bounded LAN/direct/UPnP/STUN dials, coordinated QUIC punch with a
+  self-healing authenticated loopback bridge, keepalives and bounded idle
+  timeout) with secret-free doctor/tray projections.
+- Encrypted `ffwork1` work-intent coordination with deterministic reducer,
+  enforcement-mode runner admission, and scope-filtered land guard.
+- Two-AI cross-machine collaboration field run: scoped work proposals and
+  decisions, agent-worktree authorship on both machines, deliberate same-file
+  EditEdit conflict, resolution signal to the losing side; evidence in
+  docs/mesh-field-evidence.md.
+
+### Fixed
+
+- Publication now walks the complete bounded parent-snapshot DAG into every
+  reachability manifest, healing heads whose historical objects other clients
+  could not fetch; one typed missing-blob repair pass re-uploads verified
+  cached ciphertext before exactly one manifest retry.
+- Manual single/bulk conflict resolution holds the workspace sync lock;
+  tray pause is a true quiescence barrier and the watcher rechecks pause
+  under the lock.
+- Hub STUN discovery runs through the punch socket itself, so the reflexive
+  mapping is baked for the exact punch port even while the worker owns it.
+- Authenticated mDNS success replaces stale LAN mesh candidates after
+  DHCP/interface moves; stale tray mesh paths project unreachable past five
+  minutes.
+- Linux reqwest `.local` DNS override gap in the tunneled mesh path; OpenCode
+  MCP installer now emits the current local-server shape.
+
 ## [0.11.0](https://github.com/rapm94/feanorfs/compare/v0.10.1...v0.11.0) - 2026-08-22
 
 ### Added
