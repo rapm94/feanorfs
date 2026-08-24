@@ -201,7 +201,9 @@ fn hex_decode(encoded: &str) -> Result<Vec<u8>> {
     ensure!(encoded.len().is_multiple_of(2), "hex length must be even");
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = hex_nibble(pair[0]).context("invalid mesh identity hex")?;
             let low = hex_nibble(pair[1]).context("invalid mesh identity hex")?;

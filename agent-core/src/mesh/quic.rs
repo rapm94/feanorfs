@@ -100,31 +100,25 @@ pub async fn serve_punch_bridge(
     let probe_socket = tokio::net::UdpSocket::from_std(cloned_socket)
         .context("register QUIC probe socket with the async runtime")?;
     let started = std::time::Instant::now();
-    // First packets from a freshly bound punch port are occasionally lost by
-    // consumer routers; three bounded probes stay well under a second each.
+    // One bounded probe keeps the pre-listen window short: clients start
+    // dialing the moment this returns, so retry sweeps belong to the
+    // hub-service reflexive fallback, not to this critical path.
     let mut reflexive = None;
     if let Ok(server) =
         crate::mesh::stun::resolve_server(crate::mesh::stun::DEFAULT_PRIMARY_SERVER).await
     {
         tracing::info!("STUN resolve took {:?}", started.elapsed());
-        for attempt in 1..=3_u32 {
-            match crate::mesh::stun::query_reflexive_over(&probe_socket, server).await {
-                Ok(address) if !address.ip().is_loopback() && !address.ip().is_unspecified() => {
-                    tracing::info!(
-                        "STUN ok on attempt {attempt} in {:?}: {}",
-                        started.elapsed(),
-                        address
-                    );
-                    reflexive = Some(address);
-                    break;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::info!(
-                        "STUN attempt {attempt} failed after {:?}: {error:#}",
-                        started.elapsed()
-                    );
-                }
+        match crate::mesh::stun::query_reflexive_over(&probe_socket, server).await {
+            Ok(address) if !address.ip().is_loopback() && !address.ip().is_unspecified() => {
+                tracing::info!("STUN ok in {:?}: {}", started.elapsed(), address);
+                reflexive = Some(address);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::info!(
+                    "STUN probe unavailable after {:?}: {error:#}",
+                    started.elapsed()
+                );
             }
         }
     }
