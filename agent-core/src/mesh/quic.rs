@@ -90,6 +90,11 @@ pub async fn serve_punch_bridge(
     upstream: SocketAddr,
 ) -> Result<PunchBridgeHandle> {
     let std_socket = std::net::UdpSocket::bind(bind).context("bind QUIC punch listener")?;
+    // The probe socket registers with the tokio runtime, which requires
+    // non-blocking mode; the flag lives on the shared socket description.
+    std_socket
+        .set_nonblocking(true)
+        .context("set punch socket non-blocking")?;
     let local = std_socket.local_addr()?;
     let cloned_socket = std_socket.try_clone().context("clone QUIC punch socket")?;
     let probe_socket = tokio::net::UdpSocket::from_std(cloned_socket)
@@ -124,6 +129,9 @@ pub async fn serve_punch_bridge(
         }
     }
     drop(probe_socket);
+    // The STUN probe connected the shared socket description to its server;
+    // dissolve that peer filter or quinn inherits a socket welded to Google.
+    dissociate_udp_peer(&std_socket);
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(build_server_config(&cert_pem, &key_pem)?),
@@ -170,6 +178,46 @@ pub async fn serve_punch_bridge(
 pub struct PunchBridgeHandle {
     pub local: SocketAddr,
     pub reflexive: Option<SocketAddr>,
+}
+
+/// Clears a UDP socket's connected peer by connecting to AF_UNSPEC, the
+/// POSIX-dissociation idiom that `std` does not expose.
+fn dissociate_udp_peer(socket: &std::net::UdpSocket) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: `connect` on a valid UDP file descriptor with a zeroed
+        // sockaddr (family = AF_UNSPEC) is the documented peer-reset call;
+        // EINVAL from an unconnected socket is ignored.
+        let rc = unsafe {
+            #[cfg(target_os = "macos")]
+            let unspec: libc::sockaddr = libc::sockaddr {
+                sa_len: 0,
+                sa_family: libc::AF_UNSPEC as libc::sa_family_t,
+                sa_data: [0; 14],
+            };
+            #[cfg(not(target_os = "macos"))]
+            let unspec: libc::sockaddr = libc::sockaddr {
+                sa_family: libc::AF_UNSPEC,
+                sa_data: [0; 14],
+            };
+            libc::connect(
+                socket.as_raw_fd(),
+                &unspec,
+                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            tracing::debug!(
+                "UDP peer dissociation returned {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+    }
 }
 
 async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
