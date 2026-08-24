@@ -22,6 +22,7 @@ pub mod integrator;
 pub mod large_file;
 pub mod local;
 pub mod lock;
+pub mod mesh;
 pub mod messages;
 mod object_gc;
 pub mod objects;

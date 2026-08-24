@@ -23,6 +23,8 @@ pub(super) struct Secrets {
     version: u8,
     pub encryption_password: Option<String>,
     pub server_password: Option<String>,
+    #[serde(default)]
+    pub node_signing_key: Option<String>,
 }
 
 impl std::fmt::Debug for Secrets {
@@ -38,6 +40,10 @@ impl std::fmt::Debug for Secrets {
                 "server_password",
                 &self.server_password.as_ref().map(|_| "<redacted>"),
             )
+            .field(
+                "node_signing_key",
+                &self.node_signing_key.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -48,14 +54,30 @@ impl Secrets {
         server_password: Option<String>,
     ) -> Self {
         Self {
-            version: 1,
+            version: 2,
             encryption_password,
             server_password,
+            node_signing_key: None,
+        }
+    }
+
+    pub(super) fn machine(node_signing_key: String) -> Self {
+        Self {
+            version: 2,
+            encryption_password: None,
+            server_password: None,
+            node_signing_key: Some(node_signing_key),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.encryption_password.is_none() && self.server_password.is_none()
+        self.encryption_password.is_none()
+            && self.server_password.is_none()
+            && self.node_signing_key.is_none()
+    }
+
+    pub(super) const fn version(&self) -> u8 {
+        self.version
     }
 }
 
@@ -84,7 +106,7 @@ pub(super) fn load(content: &str) -> Result<Option<Secrets>> {
     );
     let secrets: Secrets = serde_json::from_str(&encoded)
         .context("decode FeanorFS credentials from the OS credential store")?;
-    if secrets.version != 1 {
+    if !matches!(secrets.version, 1 | 2) {
         anyhow::bail!(
             "unsupported FeanorFS credential version {}",
             secrets.version
@@ -224,6 +246,7 @@ fn redact_and_mark(value: &mut Value, id: &str) -> Result<()> {
         .context("FeanorFS config must be a JSON object")?;
     object.remove("encryption_password");
     object.remove("server_password");
+    object.remove("node_signing_key");
     object.insert("credential_store".into(), Value::String(STORE_OS.into()));
     object.insert("credential_id".into(), Value::String(id.into()));
     Ok(())
@@ -235,27 +258,5 @@ fn write_value(path: &Path, value: &Value) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn redacted_config_contains_only_a_non_secret_reference() {
-        let mut value = serde_json::json!({
-            "server_url": "https://hub.example",
-            "encryption_password": "secret-key",
-            "server_password": "secret-token"
-        });
-        redact_and_mark(&mut value, "fsc1-public-id").unwrap();
-        let object = value.as_object().unwrap();
-        assert!(!object.contains_key("encryption_password"));
-        assert!(!object.contains_key("server_password"));
-        assert_eq!(object["credential_store"], "os");
-        assert_eq!(object["credential_id"], "fsc1-public-id");
-    }
-
-    #[test]
-    fn malformed_markers_fail_closed() {
-        assert!(marker(r#"{"credential_store":"os"}"#).is_err());
-        assert!(marker(r#"{"credential_store":"future","credential_id":"x"}"#).is_err());
-    }
-}
+#[path = "credentials_tests.rs"]
+mod tests;

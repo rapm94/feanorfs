@@ -574,6 +574,7 @@ pub fn invite_from_config(config: &Config) -> Option<WorkspaceInvite> {
         tls_ca_pem: config.tls_ca_pem.clone(),
         hub_local: config.is_local_hub(),
         relay: config.relay.clone(),
+        mesh: config.mesh.clone(),
         ignore_policy: None,
     })
 }
@@ -584,6 +585,7 @@ pub struct HubConnection {
     pub token: Option<String>,
     pub tls_ca_pem: Option<String>,
     pub relay: Option<feanorfs_common::RelayConfig>,
+    pub mesh: Option<feanorfs_common::MeshConfig>,
 }
 
 impl std::fmt::Debug for HubConnection {
@@ -594,6 +596,7 @@ impl std::fmt::Debug for HubConnection {
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("tls_ca_pem_present", &self.tls_ca_pem.is_some())
             .field("relay", &self.relay)
+            .field("mesh", &self.mesh)
             .finish()
     }
 }
@@ -622,6 +625,7 @@ pub async fn initialize_local_mirror(
             token: None,
             tls_ca_pem: None,
             relay: None,
+            mesh: None,
         },
         false,
         true,
@@ -642,6 +646,7 @@ pub async fn initialize_new_mirror(
         token: server_token,
         tls_ca_pem,
         relay,
+        mesh,
     } = hub;
     let hub_local = local_hub || url == LOCAL_HUB_URL;
     let srv_pass = resolve_connection_token(server_token, hub_local);
@@ -663,6 +668,7 @@ pub async fn initialize_new_mirror(
             server_password: srv_pass.clone(),
             tls_ca_pem: tls_ca_pem.clone(),
             relay: relay.clone(),
+            mesh: mesh.clone(),
         };
         save_global_config_secure(&global)?;
     }
@@ -676,6 +682,7 @@ pub async fn initialize_new_mirror(
         format_version: 3,
         hub_local,
         relay: relay.clone(),
+        mesh: mesh.clone(),
     };
     save_config_secure(current_dir, &config)?;
 
@@ -706,6 +713,7 @@ pub async fn initialize_new_mirror(
         tls_ca_pem,
         hub_local,
         relay,
+        mesh,
         ignore_policy: feanorfs_client::join_preflight::read_ignore_policy(current_dir).ok(),
     };
 
@@ -762,6 +770,7 @@ pub async fn link_existing_mirror(
         token: server_token,
         tls_ca_pem,
         relay,
+        mesh,
     } = hub;
     let hub_local = hub_local || url == LOCAL_HUB_URL;
     let srv_pass = resolve_connection_token(server_token, hub_local);
@@ -777,6 +786,7 @@ pub async fn link_existing_mirror(
             server_password: srv_pass.clone(),
             tls_ca_pem: tls_ca_pem.clone(),
             relay: relay.clone(),
+            mesh: mesh.clone(),
         };
         save_global_config_secure(&global)?;
     }
@@ -790,6 +800,7 @@ pub async fn link_existing_mirror(
         format_version: 3,
         hub_local,
         relay,
+        mesh,
     };
     save_config_secure(current_dir, &config)?;
 
@@ -902,6 +913,7 @@ pub async fn join_from_workspace_invite(
             token: invite.server_token,
             tls_ca_pem: invite.tls_ca_pem,
             relay: invite.relay,
+            mesh: invite.mesh,
         },
         invite.hub_local,
         run_initial_sync,

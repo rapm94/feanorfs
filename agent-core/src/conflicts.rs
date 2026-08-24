@@ -333,6 +333,7 @@ pub async fn resolve_conflict(
             "unsafe path: {path}"
         )));
     }
+    let _sync_guard = crate::lock::SyncLock::acquire(ctx.base)?;
     let record = match ctx.db.get_conflict_record(path).await {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -767,6 +768,7 @@ async fn resolve_all_conflicts(ctx: &SyncCtx<'_>, keep: ResolveKeep) -> Result<V
     if !matches!(keep, ResolveKeep::Local | ResolveKeep::Cloud) {
         bail!("bulk conflict resolution supports only local or cloud choices");
     }
+    let _sync_guard = crate::lock::SyncLock::acquire(ctx.base)?;
     let records = ctx.db.list_conflict_records().await?;
     if records.is_empty() {
         return Ok(Vec::new());
@@ -1410,6 +1412,8 @@ mod tests {
     use super::*;
     use crate::api::ApiClient;
     use crate::head::SwapHeadResult;
+    use crate::hub::LocalHub;
+    use crate::local::ClientDb;
     use crate::snapshot::{SnapshotEngine, SnapshotInput};
     use feanorfs_common::{classify_conflict_kind, detect_concurrent_edits, hash_bytes};
 
@@ -1491,6 +1495,35 @@ mod tests {
         assert!(!conflicts_pending(None));
         assert!(!conflicts_pending(Some(&HashSet::new())));
         assert!(conflicts_pending(Some(&HashSet::from(["x".into()]))));
+    }
+
+    #[tokio::test]
+    async fn manual_resolution_refuses_a_held_sync_lock_before_reading_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws");
+        std::fs::create_dir_all(&base).unwrap();
+        let state = crate::workspace_layout::ensure_workspace_state(&base).unwrap();
+        let hub = LocalHub::open(dir.path().join("hub-data"), None)
+            .await
+            .unwrap();
+        let api = ApiClient::local(hub, None);
+        let db = ClientDb::new(state).await.unwrap();
+        let ctx = SyncCtx::new(
+            &api,
+            &db,
+            &base,
+            "test-ws",
+            Some("test-password"),
+            feanorfs_common::LegacyPolicy::Reject,
+        );
+        let _held = crate::lock::SyncLock::acquire(&base).unwrap();
+
+        let single = resolve_conflict(&ctx, "file.txt", ResolveKeep::Cloud, None)
+            .await
+            .unwrap_err();
+        assert!(single.to_string().contains("another sync is running"));
+        let bulk = resolve_all_cloud_conflicts(&ctx).await.unwrap_err();
+        assert!(bulk.to_string().contains("another sync is running"));
     }
 
     #[test]

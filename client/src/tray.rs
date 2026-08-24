@@ -23,6 +23,7 @@ use std::time::Duration;
 
 const AGENT_CACHE_FILE: &str = "tray-agent-cache.json";
 const AGENT_CACHE_TTL: Duration = Duration::from_secs(30);
+const MESH_PATH_TTL_MS: i64 = 5 * 60 * 1_000;
 const WORKER_STATUS_FILE: &str = "worker-status.json";
 const MAX_TRAY_CONFLICT_ENTRIES: usize = 20;
 const MAX_TRAY_AGENT_ENTRIES: usize = 20;
@@ -95,6 +96,7 @@ pub async fn publish_worker_status(
         version: env!("CARGO_PKG_VERSION").to_string(),
         continuous,
         resolution,
+        mesh_reachability: mesh_reachability_projection(),
     };
     let Some(status_path) = worker_status_path(current_dir) else {
         return Ok(());
@@ -112,6 +114,33 @@ pub async fn publish_worker_status(
 
 /// Bounded counts/status projection of the resolution store for the tray.
 /// Metadata only (ids/state/counts); never paths, identities, or bodies.
+fn mesh_reachability_projection() -> Option<String> {
+    let state = feanorfs_agent_core::global_state_root()
+        .ok()
+        .and_then(|root| feanorfs_agent_core::mesh::MeshStateStore::open(&root).ok())
+        .and_then(|store| store.snapshot().ok())?;
+    mesh_reachability_from_state(&state, chrono::Utc::now().timestamp_millis())
+}
+
+fn mesh_reachability_from_state(
+    state: &feanorfs_agent_core::mesh::MeshState,
+    now_ms: i64,
+) -> Option<String> {
+    let path = state.last_path()?;
+    let age = now_ms.checked_sub(path.established_at_ms())?;
+    if !(0..=MESH_PATH_TTL_MS).contains(&age) {
+        return Some("unreachable".to_string());
+    }
+    Some(match path.candidate().transport() {
+        feanorfs_common::MeshTransport::Quic => "punched".to_string(),
+        feanorfs_common::MeshTransport::Tcp => match path.candidate().kind() {
+            feanorfs_common::MeshCandidateKind::Lan => "lan".to_string(),
+            feanorfs_common::MeshCandidateKind::Direct => "direct".to_string(),
+            _ => "direct_mapped".to_string(),
+        },
+    })
+}
+
 fn resolution_health_projection(
     state: feanorfs_agent_core::ResolutionStateFile,
 ) -> feanorfs_common::tray_contract::ResolutionHealth {
@@ -664,6 +693,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").into(),
             continuous: None,
             resolution: None,
+            mesh_reachability: None,
         };
         let path = worker_status_path(root).expect("state dir must exist after publish");
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -679,6 +709,41 @@ mod tests {
         invalidate_worker_status(root);
         assert!(load_worker_status(root).is_none());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_mesh_path_projects_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = feanorfs_agent_core::mesh::MeshStateStore::open(dir.path()).unwrap();
+        let candidate = feanorfs_common::MeshCandidate::new(
+            feanorfs_common::MeshTransport::Tcp,
+            feanorfs_common::MeshCandidateKind::Lan,
+            "192.168.1.16:3031".parse().unwrap(),
+        )
+        .unwrap();
+        store
+            .record_success(
+                feanorfs_agent_core::mesh::MeshPath::new(
+                    feanorfs_common::NodeId::from_public_key([4_u8; 32]),
+                    candidate,
+                    1_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let state = store.snapshot().unwrap();
+        assert_eq!(
+            mesh_reachability_from_state(&state, 1_000),
+            Some("lan".to_string())
+        );
+        assert_eq!(
+            mesh_reachability_from_state(&state, 1_000 + MESH_PATH_TTL_MS + 1),
+            Some("unreachable".to_string())
+        );
+        assert_eq!(
+            mesh_reachability_from_state(&state, 999),
+            Some("unreachable".to_string())
+        );
     }
 
     #[test]
@@ -709,6 +774,7 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").into(),
             continuous: None,
             resolution: None,
+            mesh_reachability: None,
         };
         std::fs::write(&path, serde_json::to_vec(&oversized).unwrap()).unwrap();
         assert!(load_worker_status(root).is_none());
@@ -721,6 +787,7 @@ mod tests {
             version: "0.0.0".into(),
             continuous: None,
             resolution: None,
+            mesh_reachability: None,
         };
         std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
         assert!(load_worker_status(root).is_none());

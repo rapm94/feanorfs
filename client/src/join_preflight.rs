@@ -163,6 +163,7 @@ pub async fn preview_join(workspace: &Path, invite: &WorkspaceInvite) -> Result<
         format_version: 3,
         hub_local: invite.hub_local,
         relay: invite.relay.clone(),
+        mesh: invite.mesh.clone(),
     };
     let api = crate::endpoint::open(&scratch.0, &config).await?;
     let ctx = SyncCtx::from_config(&api, &db, workspace, &config)?;

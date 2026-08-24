@@ -651,6 +651,7 @@ mod tests {
             format_version: 3,
             hub_local: true,
             relay: None,
+            mesh: None,
         };
         let ctx = crate::SyncCtx::from_config(&api, &db, workspace.path(), &config).unwrap();
         let path = "unknown.txt";

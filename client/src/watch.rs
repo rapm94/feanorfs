@@ -1,6 +1,6 @@
 use crate::api::ApiClient;
 use crate::backoff::{BackoffGrowth, BackoffReset, ExponentialBackoff};
-use crate::commands::do_sync;
+use crate::commands::do_sync_guarded;
 use crate::local::ClientDb;
 use crate::tray_state::{clear_watch_pid, is_paused, write_watch_pid};
 use anyhow::Result;
@@ -356,6 +356,17 @@ async fn publish_sync_failure(current_dir: &Path, db: &ClientDb) {
             .await;
 }
 
+fn acquire_watcher_sync_guard(
+    current_dir: &Path,
+) -> Result<Option<feanorfs_agent_core::lock::SyncLock>> {
+    let guard = feanorfs_agent_core::lock::SyncLock::acquire(current_dir)?;
+    if is_paused(current_dir) {
+        Ok(None)
+    } else {
+        Ok(Some(guard))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sync_once(
     api: &ApiClient,
@@ -367,11 +378,15 @@ async fn sync_once(
     announce: bool,
     lazy: bool,
 ) -> Result<()> {
+    let Some(guard) = acquire_watcher_sync_guard(current_dir)? else {
+        return Ok(());
+    };
     tracing::info!("{label}");
     if announce {
         println!("{label}...");
     }
-    let result = do_sync(api, db, current_dir, workspace_id, password, lazy).await?;
+    let result =
+        do_sync_guarded(api, db, current_dir, workspace_id, password, lazy, &guard).await?;
     println!(
         "Sync complete. Uploaded {}, Downloaded {} (lazy: {}), Local Deletes {}, Remote Deletes {}.",
         result.uploads,
@@ -389,15 +404,24 @@ async fn sync_once(
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_event_burst, event_paths_warrant_sync, event_paths_warrant_sync_under,
-        event_warrants_sync, event_warrants_sync_under, wait_for_retry, SyncRetryGate,
-        WATCH_BACKOFF,
+        acquire_watcher_sync_guard, drain_event_burst, event_paths_warrant_sync,
+        event_paths_warrant_sync_under, event_warrants_sync, event_warrants_sync_under,
+        wait_for_retry, SyncRetryGate, WATCH_BACKOFF,
     };
     use notify::event::{AccessKind, AccessMode, ModifyKind};
     use notify::{Event, EventKind};
     use std::path::PathBuf;
     use std::time::Duration;
     use std::time::Instant;
+
+    #[test]
+    fn watcher_rechecks_pause_after_acquiring_sync_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws");
+        std::fs::create_dir_all(&base).unwrap();
+        crate::tray_state::set_paused(&base, true).unwrap();
+        assert!(acquire_watcher_sync_guard(&base).unwrap().is_none());
+    }
 
     #[test]
     fn sync_worthy_for_workspace_file() {

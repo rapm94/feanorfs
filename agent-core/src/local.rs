@@ -4,6 +4,7 @@ mod config;
 mod conflicts;
 mod credential_platform;
 mod credentials;
+mod node_credentials;
 mod private_file;
 mod scan;
 mod walker;
@@ -18,6 +19,10 @@ pub use config::{
     save_config_secure, save_global_config, save_global_config_secure, validate_e2ee_key, Config,
     CredentialProtection, GlobalConfig, LOCAL_HUB_URL,
 };
+pub(crate) use node_credentials::{
+    load_node_signing_key, save_node_signing_key, save_node_signing_key_private,
+};
+pub(crate) use private_file::create_private_dir;
 pub use scan::{
     scan_local_directory, scan_local_directory_with_opts, scan_local_directory_with_policy,
 };

@@ -26,6 +26,7 @@ pub mod agent_contract;
 pub mod hub_contract;
 pub mod integrator_contract;
 pub mod invite;
+pub mod mesh_contract;
 pub mod resolution_contract;
 pub mod sealed_envelope;
 pub mod sync_delta;
@@ -50,6 +51,10 @@ pub use invite::{
     decode_hub_invite, decode_invite, encode_hub_invite, encode_invite, hub_ca_fingerprint,
     hub_mdns_hostname, looks_like_hub_invite, looks_like_invite, HubInvite, RelayConfig,
     WorkspaceInvite, HUB_INVITE_PREFIX, HUB_MDNS_SERVICE, INVITE_PREFIX,
+};
+pub use mesh_contract::{
+    MeshCandidate, MeshCandidateKind, MeshConfig, MeshTransport, NodeId, MAX_MESH_CANDIDATES,
+    MESH_CAPABILITY_VERSION,
 };
 pub use tray_contract::{
     ConflictKeepResult, ConflictShowResult, ContinuousHealth, RecentWorkspaceEntry,

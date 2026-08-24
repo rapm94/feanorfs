@@ -15,7 +15,7 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
-pub(super) fn create_private_dir(path: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {

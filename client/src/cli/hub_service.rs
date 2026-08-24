@@ -3,10 +3,14 @@ use feanorfs_client::{
     load_global_config, save_config_secure, save_global_config_secure, ApiClient, Config,
     GlobalConfig, WorkspaceInvite,
 };
+use feanorfs_common::{
+    MeshCandidate, MeshCandidateKind, MeshConfig, MeshTransport, MAX_MESH_CANDIDATES,
+};
 use feanorfs_server::{
     acquire_hub_runtime, prepare_tls, resolve_or_create_auth_token, run_http_server, ServeOptions,
 };
 use std::io::Write as _;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -289,6 +293,7 @@ pub(crate) async fn configure_relay_for_pairing(
         server_password: previous_global.server_password.clone(),
         tls_ca_pem: previous_global.tls_ca_pem.clone(),
         relay: Some(relay.clone()),
+        mesh: previous_global.mesh.clone(),
     };
     save_hub_relay(&data_dir, &relay).context("save private-hub relay configuration")?;
     if let Err(error) = save_global_config_secure(&updated_global) {
@@ -396,6 +401,7 @@ async fn ensure_private_hub_inner(
         token: Some(token),
         tls_ca_pem: tls.public_ca_pem,
         relay: load_hub_relay(&spec.data_dir)?,
+        mesh: Some(automatic_mesh_config(port).await?),
     };
 
     let status = super::supervisor::supervisor_job_state()?;
@@ -457,6 +463,7 @@ pub(crate) async fn run_supervised(data_dir: PathBuf) -> anyhow::Result<()> {
             None
         }
     };
+    start_punch_bridge(&spec.data_dir, port);
     let server = run_http_server(automatic_options(spec.data_dir, port));
     tokio::pin!(server);
     let Some(relay) = relay else {
@@ -485,6 +492,207 @@ fn automatic_options(data_dir: PathBuf, port: u16) -> ServeOptions {
         mdns: true,
         gc_interval_secs: 60 * 60,
         ..ServeOptions::default()
+    }
+}
+
+fn start_punch_bridge(data_dir: &Path, port: u16) {
+    let read = |name: &str| -> anyhow::Result<String> {
+        Ok(std::fs::read_to_string(data_dir.join("tls").join(name))?)
+    };
+    let (cert, key) = match (read("server-cert.pem"), read("server-key.pem")) {
+        (Ok(cert), Ok(key)) => (cert, key),
+        _ => {
+            tracing::debug!("private-hub TLS material is unavailable; mesh punch disabled");
+            return;
+        }
+    };
+    let identity = match feanorfs_agent_core::mesh::MachineIdentity::load_or_create() {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!("mesh punch disabled; node identity unavailable: {error:#}");
+            return;
+        }
+    };
+    let bind: SocketAddr = ([0, 0, 0, 0], port).into();
+    let upstream: SocketAddr = ([127, 0, 0, 1], port).into();
+    let data_dir = data_dir.to_path_buf();
+    tokio::spawn(async move {
+        match feanorfs_agent_core::mesh::serve_punch_bridge(
+            bind,
+            cert,
+            key,
+            feanorfs_agent_core::mesh::PunchPeer { identity },
+            upstream,
+        )
+        .await
+        {
+            Ok(handle) => {
+                tracing::info!("mesh punch bridge listening on UDP {}", handle.local);
+                if let Some(reflexive) = handle.reflexive {
+                    match persist_reflexive(&data_dir, reflexive).await {
+                        Ok(()) => tracing::info!("mesh punch reflexive address recorded"),
+                        Err(error) => {
+                            tracing::debug!("could not record punch reflexive address: {error:#}")
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::debug!("mesh punch bridge disabled: {error:#}"),
+        }
+    });
+}
+
+const REFLEXIVE_FILE: &str = "mesh-reflexive.json";
+const REFLEXIVE_SCHEMA_VERSION: u32 = 1;
+
+/// Persists the punch socket's STUN-reflexive mapping so capability
+/// generation can advertise it even while the worker holds the port.
+async fn persist_reflexive(data_dir: &Path, address: SocketAddr) -> anyhow::Result<()> {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ReflexiveRecord {
+        #[allow(dead_code)]
+        schema_version: u32,
+        address: SocketAddr,
+    }
+    let content = serde_json::to_vec_pretty(&ReflexiveRecord {
+        schema_version: REFLEXIVE_SCHEMA_VERSION,
+        address,
+    })?;
+    feanorfs_agent_core::fs_util::atomic_write_durable(data_dir, REFLEXIVE_FILE, &content)
+        .await
+        .map_err(|error| anyhow::anyhow!("persist punch reflexive record: {error:#}"))
+}
+
+/// Reads the reflexive mapping the punch-bridge worker discovered through its
+/// own bound socket. Absent, corrupt, loopback, or unspecified records are
+/// ignored — this is a hint file, never authority.
+pub(crate) fn load_reflexive(data_dir: &Path) -> Option<SocketAddr> {
+    #[derive(serde::Deserialize)]
+    struct ReflexiveRecord {
+        #[allow(dead_code)]
+        schema_version: u32,
+        address: SocketAddr,
+    }
+    let content = std::fs::read_to_string(data_dir.join(REFLEXIVE_FILE)).ok()?;
+    let record: ReflexiveRecord = serde_json::from_str(&content).ok()?;
+    let address = record.address;
+    (!address.ip().is_loopback() && !address.ip().is_unspecified()).then_some(address)
+}
+
+async fn automatic_mesh_config(port: u16) -> anyhow::Result<MeshConfig> {
+    let identity = feanorfs_agent_core::mesh::MachineIdentity::load_or_create()?;
+    let addresses = if_addrs::get_if_addrs()?
+        .into_iter()
+        .map(|interface| interface.ip());
+    let mut candidates = interface_candidates(port, addresses);
+    let internal = candidates
+        .iter()
+        .find(|candidate| {
+            candidate.kind() == MeshCandidateKind::Lan && candidate.address().is_ipv4()
+        })
+        .map(|candidate| candidate.address().ip());
+    if let Some(internal) = internal {
+        match feanorfs_agent_core::mesh::map_tcp_port(internal, port).await {
+            Ok(mapped) => candidates.push(mapped),
+            Err(error) => {
+                tracing::debug!("private-hub NAT port mapping unavailable: {error:#}");
+            }
+        }
+    }
+    match feanorfs_agent_core::mesh::discover_reflexive(Some(port)).await {
+        Ok(reflexive) => {
+            if let Ok(candidate) =
+                MeshCandidate::new(MeshTransport::Quic, MeshCandidateKind::Reflexive, reflexive)
+            {
+                candidates.push(candidate);
+            }
+        }
+        Err(error) => {
+            // The punch-bridge worker usually owns the UDP port by now; fall
+            // back to the mapping it discovered through that exact socket.
+            tracing::debug!("private-hub STUN discovery unavailable: {error:#}");
+            let spec = HubServiceSpec::load_default().ok();
+            if let Some(address) = spec.and_then(|spec| load_reflexive(&spec.data_dir)) {
+                if let Ok(candidate) =
+                    MeshCandidate::new(MeshTransport::Quic, MeshCandidateKind::Reflexive, address)
+                {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    MeshConfig::new(identity.node_id(), prioritized_candidates(candidates))
+}
+
+fn interface_candidates(
+    port: u16,
+    addresses: impl IntoIterator<Item = IpAddr>,
+) -> Vec<MeshCandidate> {
+    addresses
+        .into_iter()
+        .filter_map(|address| {
+            MeshCandidate::new(
+                MeshTransport::Tcp,
+                mesh_candidate_kind(address)?,
+                SocketAddr::new(address, port),
+            )
+            .ok()
+        })
+        .collect()
+}
+
+const fn candidate_rank(kind: MeshCandidateKind) -> u8 {
+    match kind {
+        MeshCandidateKind::Direct => 0,
+        MeshCandidateKind::Mapped => 1,
+        _ => 2,
+    }
+}
+
+fn prioritized_candidates(mut candidates: Vec<MeshCandidate>) -> Vec<MeshCandidate> {
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+        .sort_unstable_by_key(|candidate| (candidate_rank(candidate.kind()), candidate.address()));
+    candidates.truncate(MAX_MESH_CANDIDATES);
+    candidates
+}
+
+#[cfg(test)]
+fn mesh_config_for_addresses(
+    node_id: feanorfs_common::NodeId,
+    port: u16,
+    addresses: impl IntoIterator<Item = IpAddr>,
+) -> anyhow::Result<MeshConfig> {
+    MeshConfig::new(
+        node_id,
+        prioritized_candidates(interface_candidates(port, addresses)),
+    )
+}
+
+fn mesh_candidate_kind(address: IpAddr) -> Option<MeshCandidateKind> {
+    match address {
+        IpAddr::V4(address) if address.is_loopback() || address.is_unspecified() => None,
+        IpAddr::V4(address)
+            if address.is_private()
+                || address.is_link_local()
+                || (address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1])) =>
+        {
+            Some(MeshCandidateKind::Lan)
+        }
+        IpAddr::V4(_) => Some(MeshCandidateKind::Direct),
+        IpAddr::V6(address)
+            if address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_unicast_link_local() =>
+        {
+            None
+        }
+        IpAddr::V6(address) if address.segments()[0] & 0xfe00 == 0xfc00 => {
+            Some(MeshCandidateKind::Lan)
+        }
+        IpAddr::V6(_) => Some(MeshCandidateKind::Direct),
     }
 }
 
@@ -720,6 +928,7 @@ mod tests {
             tls_ca_pem: Some("managed-public-ca".into()),
             hub_local: false,
             relay: None,
+            mesh: None,
             ignore_policy: None,
         };
         let portable = portable_invite_for_managed_ca(invite.clone(), "managed-public-ca");
@@ -735,5 +944,82 @@ mod tests {
 
         let unrelated = portable_invite_for_managed_ca(invite.clone(), "different-public-ca");
         assert_eq!(unrelated, invite);
+    }
+
+    #[test]
+    fn automatic_mesh_candidates_are_bounded_and_prioritize_direct_addresses() {
+        let node_id = feanorfs_common::NodeId::from_public_key([7_u8; 32]);
+        let mut addresses = (1_u8..=20)
+            .map(|suffix| IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, suffix)))
+            .collect::<Vec<_>>();
+        addresses.push("2001:4860:4860::8888".parse().unwrap());
+        addresses.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        addresses.push("fe80::1".parse().unwrap());
+
+        let mesh = mesh_config_for_addresses(node_id, 3030, addresses).unwrap();
+
+        assert_eq!(mesh.candidates().len(), MAX_MESH_CANDIDATES);
+        assert!(mesh.candidates().iter().any(|candidate| {
+            candidate.kind() == MeshCandidateKind::Direct
+                && candidate.address() == "[2001:4860:4860::8888]:3030".parse().unwrap()
+        }));
+        assert!(mesh
+            .candidates()
+            .iter()
+            .all(|candidate| !candidate.address().ip().is_loopback()));
+    }
+
+    #[test]
+    fn mapped_candidates_rank_between_direct_and_lan_within_the_cap() {
+        let lan = MeshCandidate::new(
+            MeshTransport::Tcp,
+            MeshCandidateKind::Lan,
+            "10.0.0.1:3030".parse().unwrap(),
+        )
+        .unwrap();
+        let direct = MeshCandidate::new(
+            MeshTransport::Tcp,
+            MeshCandidateKind::Direct,
+            "203.0.113.9:3030".parse().unwrap(),
+        )
+        .unwrap();
+        let mapped = MeshCandidate::new(
+            MeshTransport::Tcp,
+            MeshCandidateKind::Mapped,
+            "198.51.100.4:54321".parse().unwrap(),
+        )
+        .unwrap();
+
+        let ranked = prioritized_candidates(vec![lan, mapped, direct.clone()]);
+
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                MeshCandidateKind::Direct,
+                MeshCandidateKind::Mapped,
+                MeshCandidateKind::Lan
+            ]
+        );
+        assert_eq!(
+            prioritized_candidates(vec![direct; MAX_MESH_CANDIDATES + 3]).len(),
+            1
+        );
+        let many = (0..MAX_MESH_CANDIDATES + 3)
+            .map(|index| {
+                MeshCandidate::new(
+                    MeshTransport::Tcp,
+                    MeshCandidateKind::Lan,
+                    SocketAddr::from((
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, index as u8 + 1)),
+                        3030,
+                    )),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(prioritized_candidates(many).len(), MAX_MESH_CANDIDATES);
     }
 }

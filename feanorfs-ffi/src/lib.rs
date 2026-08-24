@@ -2284,6 +2284,7 @@ mod smoke {
                 format_version: 2,
                 hub_local: true,
                 relay: None,
+                mesh: None,
             },
         )
         .unwrap();

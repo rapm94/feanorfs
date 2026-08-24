@@ -35,6 +35,17 @@ pub fn set_paused(base: &Path, paused: bool) -> std::io::Result<()> {
     }
 }
 
+pub async fn pause_and_wait(base: &Path, wait: std::time::Duration) -> anyhow::Result<()> {
+    set_paused(base, true)?;
+    let guard = feanorfs_agent_core::lock::try_acquire_sync_lock(base, wait)
+        .await
+        .map_err(|error| {
+            error.context("sync is paused, but an in-flight sync did not quiesce before timeout")
+        })?;
+    drop(guard);
+    Ok(())
+}
+
 fn pid_alive(pid: u32) -> bool {
     feanorfs_agent_core::lock::pid_alive(pid)
 }
@@ -88,6 +99,28 @@ pub fn write_watch_pid(base: &Path) {
 pub fn clear_watch_pid(base: &Path) {
     if let Ok(dir) = feanorfs_dir(base) {
         let _ = fs::remove_file(dir.join(WATCH_PID_FILE));
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pause_waits_for_the_in_flight_sync_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws");
+        std::fs::create_dir_all(&base).unwrap();
+        let held = feanorfs_agent_core::lock::SyncLock::acquire(&base).unwrap();
+        let task_base = base.clone();
+        let task = tokio::spawn(async move {
+            pause_and_wait(&task_base, std::time::Duration::from_secs(1)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+        drop(held);
+        task.await.unwrap().unwrap();
+        assert!(is_paused(&base));
     }
 }
 

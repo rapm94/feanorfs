@@ -621,27 +621,7 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
             .snapshot_reachability(&id, upload_manifest)
             .await?;
         if upload_manifest {
-            if let Err(error) = self
-                .ctx
-                .api
-                .upload_manifest(self.ctx.workspace_id(), &id, &hashes)
-                .await
-            {
-                // Only a missing-blob precondition means the upload registry
-                // is stale. Capacity, immutability, authentication, and hub
-                // failures must not trigger a full reachable-object reupload.
-                if crate::api::request_error_status(&error)
-                    == Some(http::StatusCode::PRECONDITION_FAILED)
-                {
-                    if let Ok(state_dir) = self.ctx.state_dir() {
-                        let _ = crate::upload_registry::clear(&state_dir).await;
-                    }
-                }
-                return Err(error);
-            }
-            if let Ok(state_dir) = self.ctx.state_dir() {
-                let _ = crate::upload_registry::record_many(&state_dir, &hashes).await;
-            }
+            self.objects.publish_manifest(&id, &hashes).await?;
         }
         self.objects.cache_manifest(&id, &hashes).await?;
         Ok(id)

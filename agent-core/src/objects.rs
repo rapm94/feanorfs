@@ -267,17 +267,39 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
         id: &str,
         expand_chunked_files: bool,
     ) -> Result<Vec<String>> {
-        let snapshot = self.get_snapshot(id).await?;
         let mut hashes = BTreeSet::new();
-        insert_reachable_hash(&mut hashes, id.to_string())?;
-        let mut pending = vec![TreeStateWork::Enter {
-            id: snapshot.root,
-            prefix: String::new(),
-            depth: 0,
-        }];
+        let mut snapshot_ids = std::collections::HashSet::new();
+        let mut pending_snapshots = vec![id.to_string()];
+        let mut tree_roots = Vec::new();
+        let mut work_items = 0_usize;
+        while let Some(snapshot_id) = pending_snapshots.pop() {
+            if !snapshot_ids.insert(snapshot_id.clone()) {
+                continue;
+            }
+            insert_reachable_hash(&mut hashes, snapshot_id.clone())?;
+            let snapshot = self.get_snapshot(&snapshot_id).await?;
+            work_items = work_items
+                .checked_add(snapshot.parents.len().saturating_add(1))
+                .context("reachability snapshot work counter overflow")?;
+            if work_items > MAX_TREE_WORK_ITEMS {
+                bail!("snapshot reachability exceeds traversal work limit");
+            }
+            tree_roots.push(snapshot.root);
+            pending_snapshots.extend(snapshot.parents.into_iter().rev());
+        }
+
+        let mut pending = tree_roots
+            .into_iter()
+            .rev()
+            .map(|id| TreeStateWork::Enter {
+                id,
+                prefix: String::new(),
+                depth: 0,
+            })
+            .collect::<Vec<_>>();
         let mut active = std::collections::HashSet::new();
         let mut objects = std::collections::HashSet::new();
-        let mut work_items = 0_usize;
+        let mut expanded = std::collections::HashSet::new();
         let mut path_bytes = 0_usize;
         while let Some(work) = pending.pop() {
             match work {
@@ -289,9 +311,13 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
                     prefix,
                     depth,
                 } => {
-                    if depth > MAX_TREE_DEPTH || !active.insert(tree_id.clone()) {
+                    if depth > MAX_TREE_DEPTH || active.contains(&tree_id) {
                         bail!("cycle or excessive depth in reachable encrypted tree");
                     }
+                    if !expanded.insert((tree_id.clone(), prefix.clone())) {
+                        continue;
+                    }
+                    active.insert(tree_id.clone());
                     if objects.insert(tree_id.clone()) && objects.len() > MAX_TREE_OBJECTS {
                         bail!("reachable encrypted tree exceeds distinct-object limit");
                     }
@@ -381,6 +407,43 @@ impl<'ctx, 'a> ObjectStore<'ctx, 'a> {
             }
         }
         Ok(hashes.into_iter().collect())
+    }
+
+    pub(crate) async fn publish_manifest(&self, id: &str, hashes: &[String]) -> Result<()> {
+        let first = self
+            .ctx
+            .api
+            .upload_manifest(self.ctx.workspace_id(), id, hashes)
+            .await;
+        if let Err(error) = first {
+            if crate::api::api_failure_kind(&error)
+                != Some(crate::api::ApiFailureKind::ManifestReferencesMissingBlob)
+            {
+                return Err(error);
+            }
+
+            let state_dir = self.ctx.state_dir()?;
+            crate::upload_registry::clear(&state_dir).await?;
+            for hash in hashes {
+                if let Some(ciphertext) =
+                    cached_object(self.ctx, hash, MAX_ENCRYPTED_OBJECT_BYTES).await?
+                {
+                    self.ctx
+                        .api
+                        .upload_object(self.ctx.workspace_id(), hash, ciphertext)
+                        .await?;
+                }
+            }
+            self.ctx
+                .api
+                .upload_manifest(self.ctx.workspace_id(), id, hashes)
+                .await?;
+        }
+
+        if let Ok(state_dir) = self.ctx.state_dir() {
+            let _ = crate::upload_registry::record_many(&state_dir, hashes).await;
+        }
+        Ok(())
     }
 
     pub(crate) async fn cache_manifest(&self, id: &str, hashes: &[String]) -> Result<()> {
@@ -765,5 +828,62 @@ mod tests {
         .unwrap();
         let chunk0_hash = feanorfs_common::hash_bytes(&sealed0);
         assert!(hashes.contains(&chunk0_hash));
+    }
+
+    #[tokio::test]
+    async fn reachability_includes_parent_snapshots_and_repairs_cached_missing_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("ws");
+        std::fs::create_dir_all(&base).unwrap();
+        let state = crate::workspace_layout::ensure_workspace_state(&base).unwrap();
+        let hub_data = dir.path().join("hub-data");
+        let hub = LocalHub::open(hub_data.clone(), None).await.unwrap();
+        let api = ApiClient::local(hub, None);
+        let db = ClientDb::new(state).await.unwrap();
+        let ctx = SyncCtx::new(
+            &api,
+            &db,
+            &base,
+            "test-ws",
+            Some(TEST_PASSWORD),
+            feanorfs_common::LegacyPolicy::Reject,
+        );
+        let objects = ObjectStore::new(&ctx);
+        let bundle = feanorfs_common::flat_to_tree_with_conflicts(&HashMap::new(), &[]).unwrap();
+        let parent_root = objects.put_bundle(&bundle).await.unwrap();
+        let parent_id = objects
+            .put_snapshot(&Snapshot {
+                root: parent_root.clone(),
+                parents: Vec::new(),
+                author: "parent".into(),
+                created_at_ms: 1,
+                message: None,
+            })
+            .await
+            .unwrap();
+        let child_id = objects
+            .put_snapshot(&Snapshot {
+                root: parent_root.clone(),
+                parents: vec![parent_id.clone()],
+                author: "child".into(),
+                created_at_ms: 2,
+                message: None,
+            })
+            .await
+            .unwrap();
+
+        let hashes = objects
+            .snapshot_reachability(&child_id, true)
+            .await
+            .unwrap();
+        assert!(hashes.contains(&child_id));
+        assert!(hashes.contains(&parent_id));
+        assert!(hashes.contains(&parent_root));
+
+        tokio::fs::remove_file(hub_data.join("blobs").join(&parent_id))
+            .await
+            .unwrap();
+        objects.publish_manifest(&child_id, &hashes).await.unwrap();
+        assert!(hub_data.join("blobs").join(parent_id).is_file());
     }
 }

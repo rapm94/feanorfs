@@ -1936,6 +1936,7 @@ mod tests {
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         };
         feanorfs_client::save_config(base.path(), &config).unwrap();
         let worktree = feanorfs_agent_core::agent_dir(base.path(), "worker").unwrap();

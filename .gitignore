@@ -13,3 +13,6 @@
 /examples/zig-agent/zig-out
 /examples/zig-agent/.zig-cache
 /.omo/run-continuation/
+
+# Local opencode tooling state
+.oh-my-opencode-*.json

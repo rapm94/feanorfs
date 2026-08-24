@@ -66,6 +66,11 @@ pub struct WorkerStatusSnapshot {
     /// CLI (`feanorfs agent resolution …`); the tray never resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<ResolutionHealth>,
+    /// Last observed mesh path class for this workspace:
+    /// `lan` | `direct` | `direct_mapped` | `punched` | `unreachable`.
+    /// Additive, secret-free; derived from local attempt state only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_reachability: Option<String>,
 }
 
 /// Bounded, secret-free resolution counts/status projection for the tray:
@@ -364,6 +369,7 @@ pub mod fixtures {
             version: env!("CARGO_PKG_VERSION").into(),
             continuous: None,
             resolution: None,
+            mesh_reachability: Some("lan".into()),
         }
     }
 

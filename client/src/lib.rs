@@ -101,7 +101,8 @@ pub use recovery::{export_recovery_kit, open_recovery_kit};
 pub use tray::{build_conflict_show, do_tray_status, invalidate_agent_cache};
 pub use tray::{do_tray_status_with, invalidate_worker_status, publish_worker_status};
 pub use tray_state::{
-    clear_watch_pid, is_paused, is_syncing, is_watching, set_paused, write_watch_pid,
+    clear_watch_pid, is_paused, is_syncing, is_watching, pause_and_wait, set_paused,
+    write_watch_pid,
 };
 
 pub use commands::do_cat as cat;

@@ -86,6 +86,7 @@ async fn opaque_relay_preserves_inner_tls_ca_and_bearer_auth() {
         format_version: 3,
         hub_local: false,
         relay: Some(relay_config.clone()),
+        mesh: None,
     };
     let trusted = ApiClient::from_config(workspace.path(), &config)
         .await

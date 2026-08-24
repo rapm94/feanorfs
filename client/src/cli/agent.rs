@@ -235,6 +235,12 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 output_json(&result)?;
             } else {
                 println!("Refreshed: {:?}", result.refreshed);
+                if !result.deferred.is_empty() {
+                    println!("Deferred overlapping paths: {:?}", result.deferred);
+                    println!(
+                        "Reconcile those agent-local edits manually, or use `agent refresh {name} --replace` only to discard them in favor of the shared head."
+                    );
+                }
             }
         }
         AgentAction::Clean { name } => {

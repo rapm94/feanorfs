@@ -2352,6 +2352,7 @@ async fn local_hub_in_process_sync() {
         format_version: 2,
         hub_local: true,
         relay: None,
+        mesh: None,
     };
     save_config(base, &config).unwrap();
     LocalHub::open(config.hub_data_dir(base).unwrap(), None)

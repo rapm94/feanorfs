@@ -73,6 +73,7 @@ fn workspace_credentials_are_private() {
         format_version: 3,
         hub_local: false,
         relay: None,
+        mesh: None,
     };
 
     crate::local::save_config(workspace.path(), &config).unwrap();
@@ -133,6 +134,7 @@ fn config_debug_redacts_credentials_and_capabilities() {
             url: "wss://relay.example".into(),
             route: "secret-relay-route".into(),
         }),
+        mesh: None,
     };
     let rendered = format!("{config:?}");
     for secret in [

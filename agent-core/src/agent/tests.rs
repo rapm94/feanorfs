@@ -71,6 +71,7 @@ async fn configured_runner_blocks_agent_clean_and_spawn_replace_before_mutation(
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         },
     )
     .unwrap();
@@ -143,6 +144,7 @@ async fn agent_runtime_stays_under_its_owner_and_clean_removes_it() {
         format_version: 3,
         hub_local: false,
         relay: None,
+        mesh: None,
     };
     let ctx = crate::ctx::SyncCtx::from_config_with_state_dir(
         &api,

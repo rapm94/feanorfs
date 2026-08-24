@@ -350,12 +350,14 @@ async fn ensure_owned_private_hub_for_resume(
     }
     config.server_password = hub.token.clone();
     config.tls_ca_pem = hub.tls_ca_pem.clone();
+    config.mesh = hub.mesh.clone();
     save_config_secure(work_dir, &config)?;
     save_global_config_secure(&GlobalConfig {
         server_url: config.server_url,
         server_password: hub.token,
         tls_ca_pem: hub.tls_ca_pem,
         relay: config.relay,
+        mesh: config.mesh,
     })?;
     Ok(upgraded_transport)
 }
@@ -387,6 +389,7 @@ fn config_with_refreshed_hub(current: &Config, invite: HubInvite) -> anyhow::Res
     refreshed.server_password = invite.server_token;
     refreshed.tls_ca_pem = invite.tls_ca_pem;
     refreshed.relay = invite.relay;
+    refreshed.mesh = invite.mesh;
     refreshed.hub_local = false;
     Ok(refreshed)
 }
@@ -402,6 +405,7 @@ async fn refresh_hub_trust(work_dir: &Path, invite: HubInvite) -> anyhow::Result
         server_password: refreshed.server_password.clone(),
         tls_ca_pem: refreshed.tls_ca_pem.clone(),
         relay: refreshed.relay.clone(),
+        mesh: refreshed.mesh.clone(),
     }) {
         eprintln!("Warning: could not update the default hub connection: {error}");
     }
@@ -595,6 +599,7 @@ pub async fn run_start(current_dir: &Path, mut opts: StartOptions) -> anyhow::Re
                 token: invite.server_token,
                 tls_ca_pem: invite.tls_ca_pem,
                 relay: invite.relay,
+                mesh: invite.mesh,
             },
             true,
             false,
@@ -644,6 +649,7 @@ pub async fn run_start(current_dir: &Path, mut opts: StartOptions) -> anyhow::Re
                 token,
                 tls_ca_pem: None,
                 relay: None,
+                mesh: None,
             },
             true,
             false,
@@ -667,6 +673,7 @@ pub async fn run_start(current_dir: &Path, mut opts: StartOptions) -> anyhow::Re
                 token: opts.server_token.clone(),
                 tls_ca_pem: None,
                 relay: None,
+                mesh: None,
             },
             false,
             false,
@@ -698,6 +705,7 @@ pub async fn run_start(current_dir: &Path, mut opts: StartOptions) -> anyhow::Re
                 token,
                 tls_ca_pem: None,
                 relay: None,
+                mesh: None,
             },
             true,
             false,
@@ -718,6 +726,7 @@ pub async fn run_start(current_dir: &Path, mut opts: StartOptions) -> anyhow::Re
                 token,
                 tls_ca_pem: global.tls_ca_pem,
                 relay: global.relay,
+                mesh: global.mesh,
             },
             false,
             false,
@@ -793,6 +802,7 @@ mod tests {
             server_token: Some("token".into()),
             tls_ca_pem: Some("public-ca".into()),
             relay: None,
+            mesh: None,
         };
         let encoded = feanorfs_common::encode_hub_invite(&invite).unwrap();
         assert!(matches!(
@@ -934,6 +944,7 @@ mod tests {
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         };
         let refreshed = config_with_refreshed_hub(
             &current,
@@ -942,6 +953,7 @@ mod tests {
                 server_token: Some("new-token".into()),
                 tls_ca_pem: Some("new-public-ca".into()),
                 relay: None,
+                mesh: None,
             },
         )
         .unwrap();
@@ -965,6 +977,7 @@ mod tests {
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         };
 
         assert!(config_with_refreshed_hub(
@@ -974,6 +987,7 @@ mod tests {
                 server_token: Some("new-token".into()),
                 tls_ca_pem: None,
                 relay: None,
+                mesh: None,
             },
         )
         .is_err());
@@ -984,6 +998,7 @@ mod tests {
                 server_token: None,
                 tls_ca_pem: None,
                 relay: None,
+                mesh: None,
             },
         )
         .is_err());
@@ -1038,6 +1053,7 @@ mod tests {
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         };
         authenticate_refreshed_hub(&refreshed).await.unwrap();
 

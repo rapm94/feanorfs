@@ -1,8 +1,8 @@
 use clap::Subcommand;
 use feanorfs_client::{
     do_tray_status_with, forget_unavailable_workspaces, invalidate_worker_status,
-    list_recent_workspaces, load_config, register_workspace, set_active_workspace, set_paused,
-    try_list_recent_workspaces,
+    list_recent_workspaces, load_config, pause_and_wait, register_workspace, set_active_workspace,
+    set_paused, try_list_recent_workspaces,
 };
 use feanorfs_common::{TrayOverviewResult, TrayPauseResult};
 use std::io::BufRead;
@@ -93,7 +93,7 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
         }
         TrayAction::Pause => {
             load_config(current_dir)?;
-            set_paused(current_dir, true)?;
+            pause_and_wait(current_dir, std::time::Duration::from_secs(5)).await?;
             invalidate_worker_status(current_dir);
             if json {
                 output_json(&TrayPauseResult { paused: true })?;

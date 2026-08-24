@@ -27,6 +27,8 @@ pub struct Config {
     pub hub_local: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<feanorfs_common::RelayConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<feanorfs_common::MeshConfig>,
 }
 
 impl std::fmt::Debug for Config {
@@ -47,6 +49,7 @@ impl std::fmt::Debug for Config {
             .field("format_version", &self.format_version)
             .field("hub_local", &self.hub_local)
             .field("relay", &self.relay)
+            .field("mesh", &self.mesh)
             .finish()
     }
 }
@@ -88,6 +91,8 @@ pub struct GlobalConfig {
     pub tls_ca_pem: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<feanorfs_common::RelayConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<feanorfs_common::MeshConfig>,
 }
 
 pub fn validate_e2ee_key(key: &str, format_version: u32) -> Result<()> {

@@ -416,12 +416,7 @@ async fn write_message_snapshot(
         })
         .await?;
     let hashes = engine.objects.snapshot_reachability(&id, true).await?;
-    ctx.api
-        .upload_manifest(ctx.workspace_id(), &id, &hashes)
-        .await?;
-    if let Ok(state_dir) = ctx.state_dir() {
-        let _ = crate::upload_registry::record_many(&state_dir, &hashes).await;
-    }
+    engine.objects.publish_manifest(&id, &hashes).await?;
     engine.objects.cache_manifest(&id, &hashes).await?;
     Ok(id)
 }

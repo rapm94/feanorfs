@@ -7,6 +7,7 @@ use feanorfs_client::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use super::serve::{run_serve, ServeCli};
@@ -627,6 +628,7 @@ async fn run_setup(
             token: final_token,
             tls_ca_pem: None,
             relay: None,
+            mesh: None,
         },
         true,
         false,
@@ -656,6 +658,7 @@ async fn run_attach(
             token: server_token,
             tls_ca_pem: None,
             relay: None,
+            mesh: None,
         },
         false,
         false,
@@ -685,6 +688,7 @@ async fn run_connect(url: Option<String>, token: Option<String>, lan: bool) -> a
         server_password: final_token.clone(),
         tls_ca_pem: None,
         relay: None,
+        mesh: None,
     };
     save_global_config_secure(&global)?;
     println!("Connected to FeanorFS server at {server_url}");
@@ -895,7 +899,108 @@ fn doctor_label(name: &str) -> &str {
         "executable_version" => "Executable version",
         "update_available" => "Release awareness",
         "live_reconciliation" => "Live agent reconciliation",
+        "ipv6_reachable" => "IPv6 reachability",
+        "upnp_mapping" => "NAT port mapping",
+        "udp_punch_capable" => "UDP hole punch",
         _ => name,
+    }
+}
+
+async fn run_mesh_checks(result: &mut DoctorResult) {
+    let has_global_ipv6 = if_addrs::get_if_addrs().is_ok_and(|interfaces| {
+        interfaces.iter().any(|interface| {
+            matches!(
+                interface.ip(),
+                IpAddr::V6(address)
+                    if !address.is_loopback()
+                        && !address.is_unspecified()
+                        && !address.is_unicast_link_local()
+                        && address.segments()[0] & 0xfe00 != 0xfc00
+            )
+        })
+    });
+    if has_global_ipv6 {
+        result.add(
+            "ipv6_reachable",
+            DoctorCheckStatus::Ok,
+            "a global IPv6 address is available for direct candidates",
+            None,
+        );
+    } else {
+        result.add(
+            "ipv6_reachable",
+            DoctorCheckStatus::Info,
+            "no global IPv6 address; direct IPv6 mesh candidates are unavailable",
+            None,
+        );
+    }
+
+    let lan = if_addrs::get_if_addrs().ok().and_then(|interfaces| {
+        interfaces
+            .iter()
+            .find_map(|interface| match interface.ip() {
+                IpAddr::V4(address)
+                    if !address.is_loopback()
+                        && !address.is_unspecified()
+                        && address.is_private() =>
+                {
+                    Some(address)
+                }
+                _ => None,
+            })
+    });
+    match lan {
+        Some(lan) => {
+            let probe_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.ok();
+            let mapped = match probe_listener
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+            {
+                Some(Ok(probe)) => {
+                    feanorfs_agent_core::mesh::map_tcp_port(IpAddr::V4(lan), probe.port())
+                        .await
+                        .is_ok()
+                }
+                _ => false,
+            };
+            drop(probe_listener);
+            if mapped {
+                result.add(
+                    "upnp_mapping",
+                    DoctorCheckStatus::Ok,
+                    "the local gateway grants NAT port mappings",
+                    None,
+                );
+            } else {
+                result.add(
+                    "upnp_mapping",
+                    DoctorCheckStatus::Info,
+                    "the gateway does not grant UPnP/NAT-PMP mappings; punched paths still work when available",
+                    None,
+                );
+            }
+        }
+        None => result.add(
+            "upnp_mapping",
+            DoctorCheckStatus::Info,
+            "no private LAN interface is available for a NAT mapping probe",
+            None,
+        ),
+    }
+
+    match feanorfs_agent_core::mesh::discover_reflexive(None).await {
+        Ok(_) => result.add(
+            "udp_punch_capable",
+            DoctorCheckStatus::Ok,
+            "UDP traffic reaches the public internet; coordinated hole punching is possible",
+            None,
+        ),
+        Err(_) => result.add(
+            "udp_punch_capable",
+            DoctorCheckStatus::Info,
+            "STUN discovery failed; UDP hole punching is unavailable on this network",
+            None,
+        ),
     }
 }
 
@@ -1205,6 +1310,7 @@ async fn run_doctor(current_dir: &Path, json: bool) -> anyhow::Result<()> {
 
     let mut result = DoctorResult::new();
     check_release_awareness(&mut result);
+    run_mesh_checks(&mut result).await;
     if global_config_is_present() {
         match load_global_config() {
             Ok(global) => result.add(

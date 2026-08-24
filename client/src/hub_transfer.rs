@@ -487,6 +487,7 @@ mod tests {
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         };
         let ctx = SyncCtx::from_config(&source_api, &db, source_root.path(), &config).unwrap();
         let objects = ObjectStore::new(&ctx);
@@ -671,6 +672,7 @@ mod tests {
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         };
         let source_ctx =
             SyncCtx::from_config(&source_api, &db, source_root.path(), &config).unwrap();
@@ -786,6 +788,7 @@ mod tests {
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         };
         let ctx = SyncCtx::from_config(&api, &db, workspace.path(), &config).unwrap();
         for (path, size) in [

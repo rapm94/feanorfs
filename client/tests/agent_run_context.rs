@@ -40,6 +40,7 @@ async fn nested_agent_signal_commands_use_the_shared_workspace_root() {
         format_version: 3,
         hub_local: true,
         relay: None,
+        mesh: None,
     };
     save_config(&workspace, &config).unwrap();
     let db = ClientDb::new(ensure_workspace_state(&workspace).unwrap())
@@ -163,6 +164,7 @@ async fn setup_worker_workspace(workspace: &Path, workspace_id: &str) {
         format_version: 3,
         hub_local: true,
         relay: None,
+        mesh: None,
     };
     save_config(workspace, &config).unwrap();
     let db = ClientDb::new(ensure_workspace_state(workspace).unwrap())

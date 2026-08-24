@@ -369,6 +369,7 @@ mod tests {
                 format_version: 3,
                 hub_local: false,
                 relay: None,
+                mesh: None,
             },
         )
         .unwrap();

@@ -27,6 +27,7 @@ pub fn write_test_config(workspace: &Path, server_url: &str) {
         format_version: 2,
         hub_local: false,
         relay: None,
+        mesh: None,
     };
     let json = serde_json::to_string_pretty(&cfg).unwrap();
     std::fs::write(state.join("config.json"), json).unwrap();

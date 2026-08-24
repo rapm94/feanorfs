@@ -167,6 +167,7 @@ pub async fn run_serve(mut args: ServeCli, json: bool) -> anyhow::Result<()> {
         server_token: opts.token.clone(),
         tls_ca_pem: tls.and_then(|identity| identity.public_ca_pem),
         relay: None,
+        mesh: None,
     };
     let encoded = encode_hub_invite(&hub_invite)?;
 

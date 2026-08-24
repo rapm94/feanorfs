@@ -654,11 +654,12 @@ fn check_mcp_registered(paths: &HostPaths) -> std::result::Result<bool, String> 
         return Ok(false);
     };
 
-    let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) else {
+    let cmd = entry_command(entry).map(str::to_owned);
+    let Some(cmd) = cmd else {
         return Err("feanorfs MCP entry is missing 'command' field".to_string());
     };
 
-    if is_feanorfs_command(cmd) {
+    if is_feanorfs_command(&cmd) {
         Ok(true)
     } else {
         Err(format!(
@@ -724,10 +725,13 @@ fn update_mcp_config(paths: &HostPaths, exe_path: &Path, force: bool) -> Result<
     reject_foreign_entry(map, config_path, force)?;
 
     let new_entry = if uses_opencode_entry {
+        // opencode validates `mcp.<name>` as {type:"local"|"remote", enabled,
+        // command:[argv..]}; the legacy {type:"stdio", command:<str>, args}
+        // shape fails its schema check and bricks the whole config.
         serde_json::json!({
-            "type": "stdio",
-            "command": exe_str,
-            "args": ["mcp"]
+            "type": "local",
+            "enabled": true,
+            "command": [exe_str, "mcp"]
         })
     } else {
         serde_json::json!({ "command": exe_str, "args": ["mcp"] })
@@ -833,6 +837,14 @@ fn is_feanorfs_command(command: &str) -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("feanorfs"))
 }
 
+fn entry_command(entry: &serde_json::Value) -> Option<&str> {
+    match entry.get("command") {
+        Some(serde_json::Value::String(text)) => Some(text),
+        Some(serde_json::Value::Array(items)) => items.first().and_then(|item| item.as_str()),
+        _ => None,
+    }
+}
+
 fn reject_foreign_entry(
     map: &serde_json::Map<String, serde_json::Value>,
     config_path: &Path,
@@ -841,10 +853,7 @@ fn reject_foreign_entry(
     let Some(existing) = map.get("feanorfs") else {
         return Ok(());
     };
-    let existing_command = existing
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    let existing_command = entry_command(existing).unwrap_or("");
     if !is_feanorfs_command(existing_command) && !force {
         bail!(
             "existing 'feanorfs' entry in {} points to '{}'; use --force to overwrite",
@@ -862,10 +871,7 @@ fn remove_owned_entry(
     let Some(entry) = map.get("feanorfs") else {
         return Ok(false);
     };
-    let command = entry
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    let command = entry_command(entry).unwrap_or("");
     if !is_feanorfs_command(command) {
         bail!(
             "existing 'feanorfs' entry in {} points to '{}'; refusing to remove it",

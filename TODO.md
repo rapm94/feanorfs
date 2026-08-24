@@ -109,3 +109,37 @@ Done when the verification matrix in `prd-continuous-agent-development.md`
 passes on installed products with no lost updates, automatic merge, unbounded
 loop, plaintext regression, Git dependency, or false exactly-once execution
 claim.
+
+### AI-7. Mesh transport field hardening
+
+P0–P3 shipped (see `docs/mesh-transport.md`); remaining before calling the
+direct path production-default on real networks:
+
+- [ ] Renew or release UPnP/PCP mappings on hub stop and supervisor shutdown;
+  leases currently expire naturally after 30 minutes.
+- [ ] Restrict punch admission to workspace members once membership is
+  queryable without new hub endpoints; any signed identity is accepted today
+  (bridged traffic still terminates at the token-authenticated hub).
+- [x] Add last-path TTL to `mesh-state.json` projection so stale punched paths
+  re-probe instead of pinning; QUIC keepalives shipped during the field test,
+  and the tray now projects `unreachable` past the five-minute freshness bound.
+- [x] Authenticated mDNS success now refreshes stale LAN candidates in config
+  (live two-machine subnet-move evidence in `docs/mesh-field-evidence.md`);
+- [ ] Two-machine cross-NAT punch soak with typed outcome stats from
+  `mesh-state.json`; single-machine loopback evidence exists in
+  `client/tests/mesh_evidence.rs`.
+
+Done when a two-machine cross-NAT transfer completes over the punched path
+with recorded stats, no relay configured, and no secret-bearing surface added.
+
+### AI-8. Repair missing reachable historical objects
+
+- [x] Reproduce the two-machine post-conflict history failure where a current
+  head reaches snapshot `c2274d42…` locally but another client receives HTTP
+  404 from the hub for that object.
+- [x] Make publication validate or repair the complete reachable object closure
+  before accepting its manifest/head, without weakening opaque hub storage.
+
+Done: publication walks the bounded parent DAG and one typed missing-blob
+repair re-uploads hash-verified cached ciphertext; live two-machine evidence in
+`docs/mesh-field-evidence.md` ("Fixes shipped after the field test").

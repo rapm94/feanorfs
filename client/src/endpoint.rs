@@ -1,15 +1,22 @@
 use anyhow::Context as _;
+use feanorfs_agent_core::mesh::{
+    DirectPeerDialer, MeshFailureKind, MeshPath, MeshStateStore, PeerDialTarget, PeerDialer as _,
+};
 use feanorfs_agent_core::ApiClient;
-use feanorfs_common::{hub_ca_fingerprint, hub_mdns_hostname, HUB_MDNS_SERVICE};
+use feanorfs_common::{
+    hub_ca_fingerprint, hub_mdns_hostname, MeshCandidate, MeshCandidateKind, MeshConfig,
+    MeshTransport, HUB_MDNS_SERVICE, MAX_MESH_CANDIDATES,
+};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::local::{load_global_config, save_config, save_global_config, Config};
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(900);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const MESH_DIRECT_DIAL_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 struct StableEndpoint {
     url: String,
@@ -21,6 +28,13 @@ struct StableEndpoint {
 pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<ApiClient> {
     if config.is_local_hub() {
         return ApiClient::from_config(workspace, config).await;
+    }
+
+    // Capability candidates are raced before anything else, including the
+    // CA-bound stable-name gate: only an authenticated TLS probe wins, and
+    // slower discovery or DNS must not preempt a signed direct candidate.
+    if let Some(client) = try_mesh_direct(config).await {
+        return Ok(client);
     }
 
     let Some(stable) = stable_endpoint(config) else {
@@ -62,6 +76,11 @@ pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<Ap
         return Ok(direct);
     }
 
+    if let Some(client) = try_mesh_quic(config, &stable).await {
+        persist_stable_url(workspace, config, &stable.url);
+        return Ok(client);
+    }
+
     let fingerprint = stable.fingerprint.clone();
     let hostname = stable.hostname.clone();
     let port = stable.port;
@@ -79,7 +98,7 @@ pub(crate) async fn open(workspace: &Path, config: &Config) -> anyhow::Result<Ap
             &addresses,
         )?;
         if probe(&resolved).await {
-            persist_stable_url(workspace, config, &stable.url);
+            persist_authenticated_mdns(workspace, config, &stable.url, &addresses);
             return Ok(resolved);
         }
     }
@@ -125,6 +144,133 @@ async fn probe(client: &ApiClient) -> bool {
     tokio::time::timeout(PROBE_TIMEOUT, client.get_workspaces())
         .await
         .is_ok_and(|result| result.is_ok())
+}
+
+fn mesh_state_store() -> Option<MeshStateStore> {
+    let root = feanorfs_agent_core::global_state_root().ok()?;
+    MeshStateStore::open(&root).ok()
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+async fn try_mesh_direct(config: &Config) -> Option<ApiClient> {
+    let mesh = config.mesh.clone()?;
+    let node_id = mesh.node_id();
+    let target = PeerDialTarget {
+        server_url: config.server_url.clone(),
+        server_password: config.server_password.clone(),
+        tls_ca_pem: config.tls_ca_pem.clone(),
+        mesh,
+    };
+    let store = mesh_state_store();
+    let started = Instant::now();
+    match DirectPeerDialer::default().dial(target).await {
+        Ok(outcome) => {
+            if let Some(store) = store {
+                let candidate = outcome.candidate().clone();
+                if let Ok(path) = MeshPath::new(node_id, candidate, now_ms()) {
+                    let _ = store.record_success(path);
+                }
+            }
+            Some(outcome.into_client())
+        }
+        Err(_) => {
+            if let Some(store) = store {
+                let kind = if started.elapsed() >= MESH_DIRECT_DIAL_TIMEOUT {
+                    MeshFailureKind::Timeout
+                } else {
+                    MeshFailureKind::Unreachable
+                };
+                let _ = store.record_failure(MeshTransport::Tcp, kind, now_ms());
+            }
+            None
+        }
+    }
+}
+
+const MESH_QUIC_CANDIDATE_BUDGET: usize = 4;
+
+async fn try_mesh_quic(config: &Config, stable: &StableEndpoint) -> Option<ApiClient> {
+    let mesh = config.mesh.as_ref()?;
+    let ca_pem = config.tls_ca_pem.as_deref()?;
+    let identity = feanorfs_agent_core::mesh::MachineIdentity::load_or_create().ok()?;
+    let quic_candidates = mesh
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.transport() == MeshTransport::Quic)
+        .take(MESH_QUIC_CANDIDATE_BUDGET)
+        .cloned()
+        .collect::<Vec<_>>();
+    if quic_candidates.is_empty() {
+        return None;
+    }
+
+    let store = mesh_state_store();
+    let configured_port = reqwest::Url::parse(&config.server_url)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .unwrap_or(443);
+    for candidate in quic_candidates {
+        // URL host must be the candidate IP: hub leaves SAN-cover their
+        // interface addresses, and Linux reqwest does not honor DNS
+        // overrides for `.local` names (macOS does). The CA pin still
+        // verifies the certificate for this exact IP.
+        let ip_host = candidate.address().ip().to_string();
+        let url = format!("https://{ip_host}:{configured_port}");
+        match feanorfs_agent_core::mesh::dial_punch_bridge(
+            candidate.address(),
+            ca_pem,
+            &stable.hostname,
+            feanorfs_agent_core::mesh::PunchPeer {
+                identity: identity.clone(),
+            },
+        )
+        .await
+        {
+            Ok(bridge) => {
+                let client = ApiClient::new_with_tls_resolved(
+                    &url,
+                    config.server_password.as_deref(),
+                    Some(ca_pem),
+                    &ip_host,
+                    &[bridge],
+                )
+                .ok();
+                if let Some(client) = client {
+                    if probe(&client).await {
+                        if let Some(store) = store.as_ref() {
+                            if let Ok(path) = MeshPath::new(mesh.node_id(), candidate, now_ms()) {
+                                let _ = store.record_success(path);
+                            }
+                        }
+                        return Some(client);
+                    }
+                    if let Some(store) = store.as_ref() {
+                        let _ = store.record_failure(
+                            MeshTransport::Quic,
+                            MeshFailureKind::Authentication,
+                            now_ms(),
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                if let Some(store) = store.as_ref() {
+                    let _ = store.record_failure(
+                        MeshTransport::Quic,
+                        MeshFailureKind::Unreachable,
+                        now_ms(),
+                    );
+                }
+            }
+        }
+    }
+    None
 }
 
 fn stable_endpoint(config: &Config) -> Option<StableEndpoint> {
@@ -312,11 +458,36 @@ fn service_identity_matches(info: &mdns_sd::ResolvedService, hostname: &str) -> 
 }
 
 fn persist_stable_url(workspace: &Path, config: &Config, url: &str) {
-    if config.server_url == url {
-        return;
-    }
+    persist_connection_update(workspace, config, url, None);
+}
+
+fn persist_authenticated_mdns(
+    workspace: &Path,
+    config: &Config,
+    url: &str,
+    addresses: &[SocketAddr],
+) {
+    let refreshed = config
+        .mesh
+        .as_ref()
+        .and_then(|mesh| refresh_lan_candidates(mesh, addresses).ok());
+    persist_connection_update(workspace, config, url, refreshed);
+}
+
+fn persist_connection_update(
+    workspace: &Path,
+    config: &Config,
+    url: &str,
+    refreshed_mesh: Option<MeshConfig>,
+) {
     let mut updated = config.clone();
     updated.server_url = url.to_string();
+    if let Some(mesh) = refreshed_mesh {
+        updated.mesh = Some(mesh);
+    }
+    if updated.server_url == config.server_url && updated.mesh == config.mesh {
+        return;
+    }
     if let Err(error) = save_config(workspace, &updated) {
         tracing::warn!("could not persist stable private-hub endpoint: {error}");
         return;
@@ -324,11 +495,45 @@ fn persist_stable_url(workspace: &Path, config: &Config, url: &str) {
     if let Ok(mut global) = load_global_config() {
         if global.server_url == config.server_url && global.tls_ca_pem == config.tls_ca_pem {
             global.server_url = url.to_string();
+            if global.mesh == config.mesh {
+                global.mesh = updated.mesh.clone();
+            }
             if let Err(error) = save_global_config(&global) {
                 tracing::warn!("could not persist stable global hub endpoint: {error}");
             }
         }
     }
+}
+
+fn refresh_lan_candidates(
+    mesh: &MeshConfig,
+    addresses: &[SocketAddr],
+) -> anyhow::Result<MeshConfig> {
+    let mut candidates = mesh
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.kind() != MeshCandidateKind::Lan)
+        .cloned()
+        .collect::<Vec<_>>();
+    for address in addresses {
+        if let Ok(candidate) =
+            MeshCandidate::new(MeshTransport::Tcp, MeshCandidateKind::Lan, *address)
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.sort_unstable_by_key(|candidate| {
+        let rank = match candidate.kind() {
+            MeshCandidateKind::Direct => 0,
+            MeshCandidateKind::Mapped => 1,
+            _ => 2,
+        };
+        (rank, candidate.address())
+    });
+    candidates.truncate(MAX_MESH_CANDIDATES);
+    MeshConfig::new(mesh.node_id(), candidates)
 }
 
 #[cfg(test)]
@@ -345,6 +550,7 @@ mod tests {
             format_version: 3,
             hub_local: false,
             relay: None,
+            mesh: None,
         }
     }
 
@@ -411,5 +617,40 @@ mod tests {
             &info,
             "feanorfs-ffffffffffffffff.local"
         ));
+    }
+
+    #[test]
+    fn authenticated_discovery_replaces_only_stale_lan_candidates() {
+        let node = feanorfs_common::NodeId::from_public_key([9_u8; 32]);
+        let stale = MeshCandidate::new(
+            MeshTransport::Tcp,
+            MeshCandidateKind::Lan,
+            "192.168.50.30:3031".parse().unwrap(),
+        )
+        .unwrap();
+        let mapped = MeshCandidate::new(
+            MeshTransport::Tcp,
+            MeshCandidateKind::Mapped,
+            "198.51.100.30:3031".parse().unwrap(),
+        )
+        .unwrap();
+        let reflexive = MeshCandidate::new(
+            MeshTransport::Quic,
+            MeshCandidateKind::Reflexive,
+            "203.0.113.30:3031".parse().unwrap(),
+        )
+        .unwrap();
+        let mesh =
+            MeshConfig::new(node, vec![stale.clone(), mapped.clone(), reflexive.clone()]).unwrap();
+        let current: SocketAddr = "192.168.1.16:3031".parse().unwrap();
+
+        let refreshed = refresh_lan_candidates(&mesh, &[current, current]).unwrap();
+        assert!(!refreshed.candidates().contains(&stale));
+        assert!(refreshed.candidates().contains(&mapped));
+        assert!(refreshed.candidates().contains(&reflexive));
+        assert!(refreshed.candidates().iter().any(|candidate| {
+            candidate.kind() == MeshCandidateKind::Lan && candidate.address() == current
+        }));
+        assert!(refreshed.candidates().len() <= MAX_MESH_CANDIDATES);
     }
 }

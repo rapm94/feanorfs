@@ -1143,6 +1143,7 @@ async fn join_nonempty_folder_unions_without_silent_overwrite() {
         format_version: 2,
         hub_local: false,
         relay: None,
+        mesh: None,
     };
     save_config(join_base, &config).unwrap();
     let db = feanorfs_client::ClientDb::new(state_path(join_base))
@@ -1230,6 +1231,7 @@ async fn join_preflight_classifies_nonempty_folder_without_mutating_it() {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            mesh: None,
             ignore_policy: Some("remote-cache/\n".into()),
         },
     )

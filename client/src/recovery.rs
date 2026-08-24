@@ -256,6 +256,7 @@ mod tests {
                 url: "https://relay.example".into(),
                 route: "opaque-secret-route".into(),
             }),
+            mesh: None,
             ignore_policy: Some("target/\n".into()),
         }
     }

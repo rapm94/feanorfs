@@ -179,6 +179,7 @@ pub async fn spawn_agent(
             format_version: 1,
             hub_local: false,
             relay: None,
+            mesh: None,
         }
     };
 

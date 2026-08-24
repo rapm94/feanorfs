@@ -943,6 +943,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            mesh: None,
             ignore_policy: None,
         };
         assert!(ensure_internet_hub(&invite("https://sync.example")).is_ok());
@@ -1032,6 +1033,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            mesh: None,
             ignore_policy: Some("target/\n".into()),
         };
         let encoded = feanorfs_client::encode_invite(&invite).unwrap();
@@ -1094,6 +1096,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            mesh: None,
             ignore_policy: None,
         };
         let encoded = feanorfs_client::encode_invite(&invite).unwrap();
@@ -1148,6 +1151,7 @@ mod tests {
                 tls_ca_pem: None,
                 hub_local: false,
                 relay: None,
+                mesh: None,
                 ignore_policy: None,
             };
             host_exchange(
@@ -1199,6 +1203,7 @@ mod tests {
             tls_ca_pem: None,
             hub_local: false,
             relay: None,
+            mesh: None,
             ignore_policy: None,
         };
         let encoded =

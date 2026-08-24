@@ -39,6 +39,7 @@ async fn cli_json_human_and_mcp_signal_adapters_roundtrip() {
         format_version: 3,
         hub_local: true,
         relay: None,
+        mesh: None,
     };
     save_config(&workspace, &config).unwrap();
     let db = ClientDb::new(ensure_workspace_state(&workspace).unwrap())

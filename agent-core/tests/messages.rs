@@ -38,6 +38,7 @@ fn config(workspace_id: &str, key: &str) -> Config {
         format_version: 3,
         hub_local: true,
         relay: None,
+        mesh: None,
     }
 }
 

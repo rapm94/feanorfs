@@ -65,6 +65,23 @@ base64 = "0.22.1"
 reflink = "0.1"
 unicode-normalization = "0.1"
 diffy = "0.5"
+ed25519-dalek = { version = "2.2", features = ["zeroize"] }
+# NAT traversal: UPnP IGD + NAT-PMP/PCP gateway port mapping for direct mesh candidates.
+igd-next = "0.17"
+# Coordinated UDP hole punch transport over QUIC. One Rustls provider stays
+# process-wide: select quinn's aws-lc-rs integration to match the rest of the
+# workspace and keep rustls auto-detection unambiguous.
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "std",
+    "tls12",
+    "aws_lc_rs",
+] }
 urlencoding = "2"
 tower = "0.5"
 http = "1"
