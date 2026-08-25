@@ -99,7 +99,7 @@ fn decode_signing_key(encoded: &str) -> Result<[u8; 32]> {
         "mesh machine identity must be 256-bit lowercase hex"
     );
     let mut key = [0_u8; 32];
-    for (slot, pair) in key.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
+    for (slot, pair) in key.iter_mut().zip(encoded.as_bytes().as_chunks::<2>().0) {
         let high = hex_nibble(pair[0]).context("invalid mesh identity hex")?;
         let low = hex_nibble(pair[1]).context("invalid mesh identity hex")?;
         *slot = (high << 4) | low;
