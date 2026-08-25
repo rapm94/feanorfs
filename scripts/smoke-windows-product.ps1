@@ -270,12 +270,15 @@ function Assert-HealthyProduct {
             "e2ee",
             "executable_version",
             "global_config",
+            "ipv6_reachable",
             "live_reconciliation",
             "local_state",
             "private_hub",
             "remote_workspace",
             "server",
             "tray_registration",
+            "udp_punch_capable",
+            "upnp_mapping",
             "update_available",
             "workspace_config",
             "workspace_format"
@@ -286,7 +289,8 @@ function Assert-HealthyProduct {
         $unexpectedStatuses = @($doctor.checks | Where-Object {
             $_.status -ne "ok" -and -not (
                 ($_.name -eq "update_available" -and $_.status -in @("info", "warning")) -or
-                ($_.name -eq "live_reconciliation" -and $_.status -eq "info")
+                ($_.name -eq "live_reconciliation" -and $_.status -eq "info") -or
+                ($_.name -in @("ipv6_reachable", "upnp_mapping", "udp_punch_capable") -and $_.status -eq "info")
             )
         })
         if (-not $doctor.ok -or (Compare-Object $expectedChecks $actualChecks) -or $unexpectedStatuses.Count -ne 0) {
@@ -311,7 +315,7 @@ function Assert-HealthyProduct {
             throw "Windows MCP smoke returned an unexpected response count."
         }
         $syncStatus = $mcpResponses | Where-Object id -eq 2
-        if ($syncStatus.result.mirror_state -ne "idle" -or $syncStatus.result.local_file_count -ne 1 -or @($syncStatus.result.upload_required).Count -ne 0 -or @($syncStatus.result.download_required).Count -ne 0) {
+        if ($syncStatus.result.structuredContent.mirror_state -ne "idle" -or $syncStatus.result.structuredContent.local_file_count -ne 1 -or @($syncStatus.result.structuredContent.upload_required).Count -ne 0 -or @($syncStatus.result.structuredContent.download_required).Count -ne 0) {
             throw "Windows MCP sync status is not idle."
         }
     }

@@ -258,7 +258,7 @@ MCP_OUT="$ROOT/mcp.jsonl"
     "$FEANORFS" mcp >"$MCP_OUT"
 )
 jq -s -e \
-  'length == 3 and .[0].result.serverInfo.name == "feanorfs" and (.[1].result.tools | length) == 37 and .[2].result.mirror_state == "idle"' \
+  'length == 3 and .[0].result.serverInfo.name == "feanorfs" and (.[1].result.tools | length) == 37 and .[2].result.structuredContent.mirror_state == "idle"' \
   "$MCP_OUT" >/dev/null
 
 echo "Smoke: encrypted workspace recovery"
