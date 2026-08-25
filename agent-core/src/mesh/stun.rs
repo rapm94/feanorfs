@@ -2,8 +2,9 @@ use anyhow::{ensure, Context as _, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
-const BINDING_REQUEST: u16 = 0x0001;
+pub(crate) const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+pub(crate) const BINDING_REQUEST: u16 = 0x0001;
+pub(crate) const DEFAULT_PRIMARY_PORT: u16 = 19302;
 const BINDING_SUCCESS: u16 = 0x0101;
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
@@ -92,7 +93,7 @@ fn to_socket_addrs_vec(server: &str) -> std::io::Result<Vec<SocketAddr>> {
     server.to_socket_addrs().map(|iter| iter.collect())
 }
 
-fn parse_reflexive_address(response: &[u8]) -> Result<SocketAddr> {
+pub(crate) fn parse_reflexive_address(response: &[u8]) -> Result<SocketAddr> {
     ensure!(
         u16::from_be_bytes([response[0], response[1]]) == BINDING_SUCCESS,
         "STUN server rejected the binding request"

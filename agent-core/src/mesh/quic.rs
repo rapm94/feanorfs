@@ -2,7 +2,7 @@ use crate::mesh::identity::MachineIdentity;
 use anyhow::{ensure, Context as _, Result};
 use feanorfs_common::NodeId;
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
@@ -90,42 +90,24 @@ pub async fn serve_punch_bridge(
     upstream: SocketAddr,
 ) -> Result<PunchBridgeHandle> {
     let std_socket = std::net::UdpSocket::bind(bind).context("bind QUIC punch listener")?;
-    // The probe socket registers with the tokio runtime, which requires
-    // non-blocking mode; the flag lives on the shared socket description.
+    let local = std_socket.local_addr()?;
+    let started = std::time::Instant::now();
+    // One bounded blocking probe keeps the pre-listen window short and stays
+    // entirely in std-land (no runtime registration, no shared non-blocking
+    // flags): clients start dialing the moment this returns, so retry sweeps
+    // belong to the hub-service reflexive fallback, not this critical path.
+    let reflexive = probe_reflexive(&std_socket);
+    tracing::info!(
+        "STUN probe finished in {:?}: {}",
+        started.elapsed(),
+        reflexive.map_or_else(|| "unavailable".to_string(), |address| address.to_string())
+    );
+    // The probe connected the socket to its server; dissolve that peer filter
+    // or quinn inherits a socket welded to one destination.
+    dissociate_udp_peer(&std_socket);
     std_socket
         .set_nonblocking(true)
         .context("set punch socket non-blocking")?;
-    let local = std_socket.local_addr()?;
-    let cloned_socket = std_socket.try_clone().context("clone QUIC punch socket")?;
-    let probe_socket = tokio::net::UdpSocket::from_std(cloned_socket)
-        .context("register QUIC probe socket with the async runtime")?;
-    let started = std::time::Instant::now();
-    // One bounded probe keeps the pre-listen window short: clients start
-    // dialing the moment this returns, so retry sweeps belong to the
-    // hub-service reflexive fallback, not to this critical path.
-    let mut reflexive = None;
-    if let Ok(server) =
-        crate::mesh::stun::resolve_server(crate::mesh::stun::DEFAULT_PRIMARY_SERVER).await
-    {
-        tracing::info!("STUN resolve took {:?}", started.elapsed());
-        match crate::mesh::stun::query_reflexive_over(&probe_socket, server).await {
-            Ok(address) if !address.ip().is_loopback() && !address.ip().is_unspecified() => {
-                tracing::info!("STUN ok in {:?}: {}", started.elapsed(), address);
-                reflexive = Some(address);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::info!(
-                    "STUN probe unavailable after {:?}: {error:#}",
-                    started.elapsed()
-                );
-            }
-        }
-    }
-    drop(probe_socket);
-    // The STUN probe connected the shared socket description to its server;
-    // dissolve that peer filter or quinn inherits a socket welded to Google.
-    dissociate_udp_peer(&std_socket);
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(build_server_config(&cert_pem, &key_pem)?),
@@ -212,6 +194,41 @@ fn dissociate_udp_peer(socket: &std::net::UdpSocket) {
     {
         let _ = socket;
     }
+}
+
+/// One blocking STUN binding request through `socket` with a hard read
+/// deadline. Runs before the socket becomes non-blocking quinn property, so
+/// it uses plain std I/O and never touches the async runtime.
+fn probe_reflexive(socket: &std::net::UdpSocket) -> Option<SocketAddr> {
+    (|| -> anyhow::Result<SocketAddr> {
+        let target: SocketAddr = (
+            crate::mesh::stun::DEFAULT_PRIMARY_SERVER,
+            crate::mesh::stun::DEFAULT_PRIMARY_PORT,
+        )
+            .to_socket_addrs()
+            .context("resolve STUN server")?
+            .find(|address| address.is_ipv4())
+            .context("STUN server has no IPv4 address")?;
+        socket.connect(target).context("connect STUN server")?;
+        let mut request = [0_u8; 20];
+        request[..2].copy_from_slice(&crate::mesh::stun::BINDING_REQUEST.to_be_bytes());
+        request[2..4].copy_from_slice(&12_u16.to_be_bytes());
+        request[4..8].copy_from_slice(&crate::mesh::stun::MAGIC_COOKIE);
+        getrandom::fill(&mut request[8..])?;
+        socket.send(&request)?;
+        socket.set_read_timeout(Some(Duration::from_millis(750)))?;
+        let mut response = vec![0_u8; 548];
+        let received = socket.recv(&mut response)?;
+        response.truncate(received);
+        let address = crate::mesh::stun::parse_reflexive_address(&response)?;
+        ensure!(
+            !address.ip().is_loopback() && !address.ip().is_unspecified(),
+            "reflexive address is not remotely reachable"
+        );
+        Ok(address)
+    })()
+    .map_err(|error| tracing::info!("punch-socket STUN probe failed: {error:#}"))
+    .ok()
 }
 
 async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
