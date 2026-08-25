@@ -93,18 +93,15 @@ pub async fn serve_punch_bridge(
     let local = std_socket.local_addr()?;
     let started = std::time::Instant::now();
     // One bounded blocking probe keeps the pre-listen window short and stays
-    // entirely in std-land (no runtime registration, no shared non-blocking
-    // flags): clients start dialing the moment this returns, so retry sweeps
-    // belong to the hub-service reflexive fallback, not this critical path.
+    // entirely in std-land. send_to/recv_from deliberately avoid connect():
+    // an AF_UNSPEC dissociation afterwards leaves Linux UDP sockets unable to
+    // serve quinn, while a lingering connect() would weld quinn to one peer.
     let reflexive = probe_reflexive(&std_socket);
     tracing::info!(
         "STUN probe finished in {:?}: {}",
         started.elapsed(),
         reflexive.map_or_else(|| "unavailable".to_string(), |address| address.to_string())
     );
-    // The probe connected the socket to its server; dissolve that peer filter
-    // or quinn inherits a socket welded to one destination.
-    dissociate_udp_peer(&std_socket);
     std_socket
         .set_nonblocking(true)
         .context("set punch socket non-blocking")?;
@@ -115,6 +112,7 @@ pub async fn serve_punch_bridge(
         Arc::new(quinn::TokioRuntime),
     )
     .context("start QUIC punch endpoint")?;
+    eprintln!("DBG endpoint-live");
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let connection = match incoming.await {
@@ -156,49 +154,9 @@ pub struct PunchBridgeHandle {
     pub reflexive: Option<SocketAddr>,
 }
 
-/// Clears a UDP socket's connected peer by connecting to AF_UNSPEC, the
-/// POSIX-dissociation idiom that `std` does not expose.
-fn dissociate_udp_peer(socket: &std::net::UdpSocket) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd as _;
-        // SAFETY: `connect` on a valid UDP file descriptor with a zeroed
-        // sockaddr (family = AF_UNSPEC) is the documented peer-reset call;
-        // EINVAL from an unconnected socket is ignored.
-        let rc = unsafe {
-            #[cfg(target_os = "macos")]
-            let unspec: libc::sockaddr = libc::sockaddr {
-                sa_len: 0,
-                sa_family: libc::AF_UNSPEC as libc::sa_family_t,
-                sa_data: [0; 14],
-            };
-            #[cfg(not(target_os = "macos"))]
-            let unspec: libc::sockaddr = libc::sockaddr {
-                sa_family: libc::AF_UNSPEC as libc::sa_family_t,
-                sa_data: [0; 14],
-            };
-            libc::connect(
-                socket.as_raw_fd(),
-                &unspec,
-                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            tracing::debug!(
-                "UDP peer dissociation returned {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = socket;
-    }
-}
-
 /// One blocking STUN binding request through `socket` with a hard read
-/// deadline. Runs before the socket becomes non-blocking quinn property, so
-/// it uses plain std I/O and never touches the async runtime.
+/// deadline. Uses send_to/recv_from so the socket never gains a connected
+/// peer; quinn inherits it untouched apart from non-blocking mode.
 fn probe_reflexive(socket: &std::net::UdpSocket) -> Option<SocketAddr> {
     (|| -> anyhow::Result<SocketAddr> {
         let target: SocketAddr = (
@@ -209,17 +167,19 @@ fn probe_reflexive(socket: &std::net::UdpSocket) -> Option<SocketAddr> {
             .context("resolve STUN server")?
             .find(|address| address.is_ipv4())
             .context("STUN server has no IPv4 address")?;
-        socket.connect(target).context("connect STUN server")?;
         let mut request = [0_u8; 20];
         request[..2].copy_from_slice(&crate::mesh::stun::BINDING_REQUEST.to_be_bytes());
         request[2..4].copy_from_slice(&12_u16.to_be_bytes());
         request[4..8].copy_from_slice(&crate::mesh::stun::MAGIC_COOKIE);
         getrandom::fill(&mut request[8..])?;
-        socket.send(&request)?;
+        socket.send_to(&request, target)?;
         socket.set_read_timeout(Some(Duration::from_millis(750)))?;
         let mut response = vec![0_u8; 548];
-        let received = socket.recv(&mut response)?;
-        response.truncate(received);
+        let (_, responder) = socket.recv_from(&mut response)?;
+        ensure!(
+            responder == target,
+            "STUN reply came from an unexpected source"
+        );
         let address = crate::mesh::stun::parse_reflexive_address(&response)?;
         ensure!(
             !address.ip().is_loopback() && !address.ip().is_unspecified(),
