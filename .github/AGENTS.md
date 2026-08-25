@@ -98,7 +98,7 @@ contributor templates.
   `unpinned-images` container-matrix diagnostic requires a cargo-dist
   regeneration decision; inputs remain bounded until then.
 - cargo-dist generates attested CLI archives only and publishes them together with the exact validated custom product set; it must not generate shell/PowerShell installers that look like the tray-inclusive desktop product. Public installer routing belongs to `scripts/install.sh`, the signed macOS package/DMG, verified Linux native packages/full bundle, and the Authenticode Windows setup EXE.
-- Relay image publication builds amd64 and arm64 `feanorfs` binaries inside the pinned Bookworm Rust environment on matching native runners, assembles each through `Dockerfile.relay-binary` with the same Bookworm runtime ABI, attests each architecture, records each Buildx digest in an immutable workflow artifact, then merges those digests without resolving architecture tags. Never restore QEMU workspace compilation or copy a newer host-glibc binary into the runtime image.
+- Relay image publication waits boundedly for the exact successful cargo-dist release before invoking `release-evidence.sh`, then builds amd64 and arm64 `feanorfs` binaries inside the pinned Bookworm Rust environment on matching native runners, assembles each through `Dockerfile.relay-binary` with the same Bookworm runtime ABI, attests each architecture, records each Buildx digest in an immutable workflow artifact, and merges those digests without resolving architecture tags. Never require release evidence before publication, restore QEMU workspace compilation, or copy a newer host-glibc binary into the runtime image.
 
 ## Work Guidance
 

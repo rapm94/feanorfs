@@ -89,4 +89,11 @@ for workflow in \
     fi
 done
 
+relay=.github/workflows/relay-image.yml
+release_ready_line="$(grep -nF 'if [ "$ready" != true ]; then' "$relay" | cut -d: -f1)"
+release_evidence_line="$(grep -nF 'evidence="$(scripts/release-evidence.sh "$RELEASE_TAG" "$EXPECTED_SHA")"' "$relay" | cut -d: -f1)"
+test -n "$release_ready_line" && test -n "$release_evidence_line" && \
+    test "$release_evidence_line" -gt "$release_ready_line" || \
+    fail "$relay must invoke release-evidence only after the bounded cargo-dist publication wait"
+
 printf '%s\n' 'Deterministic atomic release publication policy passed.'
