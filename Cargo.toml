@@ -50,7 +50,7 @@ dtor = "1"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-mdns-sd = "0.20.2"
+mdns-sd = "0.21.0"
 dns-sd-native = "0.1.1"
 zbus = "5"
 getrandom = "0.4"
