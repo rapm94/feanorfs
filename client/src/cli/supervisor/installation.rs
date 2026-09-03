@@ -16,6 +16,12 @@ use crate::cli::util::{record_service_identity, service_identity_matches};
 
 use super::*;
 
+/// Native service managers may throttle a job that just failed. In
+/// particular, launchd can keep a repaired job in its penalty box longer than
+/// the five seconds allowed for ordinary supervisor-owned child startup.
+/// Keep this wait bounded, but give the OS-level job its own recovery budget.
+const SUPERVISOR_JOB_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn marker_path() -> anyhow::Result<PathBuf> {
     Ok(feanorfs_agent_core::global_state_root()?.join(MARKER_FILE))
 }
@@ -274,7 +280,7 @@ pub(crate) fn supervisor_job_running() -> anyhow::Result<bool> {
 }
 
 fn wait_for_job_running() -> anyhow::Result<()> {
-    let deadline = Instant::now() + READY_TIMEOUT;
+    let deadline = Instant::now() + SUPERVISOR_JOB_READY_TIMEOUT;
     while Instant::now() < deadline {
         if supervisor_job_state()? == ServiceState::Running {
             return Ok(());
@@ -282,6 +288,18 @@ fn wait_for_job_running() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(200));
     }
     anyhow::bail!(
-        "the FeanorFS background job did not reach the running state within 5 seconds; check `feanorfs doctor` and retry"
+        "the FeanorFS background job did not reach the running state within {} seconds; check `feanorfs doctor` and retry",
+        SUPERVISOR_JOB_READY_TIMEOUT.as_secs()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_job_recovery_budget_exceeds_child_startup_budget() {
+        assert!(SUPERVISOR_JOB_READY_TIMEOUT > READY_TIMEOUT);
+        assert!(SUPERVISOR_JOB_READY_TIMEOUT <= Duration::from_secs(30));
+    }
 }

@@ -25,6 +25,10 @@ pub struct ApiClient {
     backend: Backend,
     server_password: Option<String>,
     migration_token: Option<String>,
+    /// Shared across every nested file/chunk upload path for this endpoint.
+    /// The hub admits four upload bodies; waiting here prevents locally
+    /// generated concurrency from being misclassified as a remote outage.
+    upload_requests: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -53,6 +57,7 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// stops answering (blackholed network, paused hub process) fails within the
 /// bound instead of wedging sync, the watcher, and CLI commands forever.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_IN_FLIGHT_UPLOAD_REQUESTS: usize = 4;
 
 #[derive(Debug)]
 struct RequestStatusError {
@@ -276,6 +281,7 @@ impl ApiClient {
             },
             server_password: server_password.map(str::to_string),
             migration_token: None,
+            upload_requests: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_UPLOAD_REQUESTS)),
         }
     }
 
@@ -321,6 +327,7 @@ impl ApiClient {
             },
             server_password: server_password.map(str::to_string),
             migration_token: None,
+            upload_requests: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_UPLOAD_REQUESTS)),
         })
     }
 
@@ -367,6 +374,7 @@ impl ApiClient {
             },
             server_password: server_password.map(str::to_string),
             migration_token: None,
+            upload_requests: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_UPLOAD_REQUESTS)),
         })
     }
 
@@ -375,6 +383,7 @@ impl ApiClient {
             backend: Backend::Local(hub),
             server_password,
             migration_token: None,
+            upload_requests: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_UPLOAD_REQUESTS)),
         }
     }
 
@@ -516,6 +525,16 @@ impl ApiClient {
     }
 
     async fn post_bytes(&self, path: &str, query: &str, body: Vec<u8>) -> Result<()> {
+        let _upload_permit = if path == "/api/upload" {
+            Some(
+                Arc::clone(&self.upload_requests)
+                    .acquire_owned()
+                    .await
+                    .context("wait for bounded upload capacity")?,
+            )
+        } else {
+            None
+        };
         let (status, bytes) = self
             .raw_request(http::Method::POST, path, query, body, None)
             .await?;
@@ -981,9 +1000,25 @@ fn check_server_version(advertised: &str) -> Result<()> {
 mod version_tests {
     use super::{
         api_failure_kind, check_server_version, is_retryable_transport_error, request_status_error,
-        ApiClient, ApiFailureKind,
+        ApiClient, ApiFailureKind, MAX_IN_FLIGHT_UPLOAD_REQUESTS,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    #[derive(Clone, Default)]
+    struct UploadProbe {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    struct ActiveUpload(Arc<AtomicUsize>);
+
+    impl Drop for ActiveUpload {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     async fn serve(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -992,6 +1027,42 @@ mod version_tests {
             axum::serve(listener, router).await.unwrap();
         });
         (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn nested_uploads_share_the_hub_admission_bound() {
+        async fn upload(
+            axum::extract::State(probe): axum::extract::State<UploadProbe>,
+        ) -> http::StatusCode {
+            let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+            probe.peak.fetch_max(active, Ordering::SeqCst);
+            let _active = ActiveUpload(Arc::clone(&probe.active));
+            if active > MAX_IN_FLIGHT_UPLOAD_REQUESTS {
+                return http::StatusCode::SERVICE_UNAVAILABLE;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            http::StatusCode::OK
+        }
+
+        let probe = UploadProbe::default();
+        let router = axum::Router::new()
+            .route("/api/upload", axum::routing::post(upload))
+            .with_state(probe.clone());
+        let (url, task) = serve(router).await;
+        let client = ApiClient::new(&url, None);
+        let hash = "a".repeat(64);
+        let uploads = (0..16).map(|_| client.upload_object("workspace", &hash, vec![1]));
+        let results = futures_util::future::join_all(uploads).await;
+        task.abort();
+
+        for result in results {
+            result.unwrap();
+        }
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            probe.peak.load(Ordering::SeqCst),
+            MAX_IN_FLIGHT_UPLOAD_REQUESTS
+        );
     }
 
     #[test]
