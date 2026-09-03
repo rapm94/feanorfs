@@ -20,7 +20,7 @@ path = "src/main.rs"
 feanorfs-common = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tao = "0.35.3"
+tao = "0.37.0"
 tray-icon = { version = "0.24.1", default-features = false }
 muda = { version = "0.19.3", default-features = false }
 open = "5.4.0"
