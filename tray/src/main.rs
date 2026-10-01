@@ -68,6 +68,15 @@ fn runner_test_launch(_: Option<&std::ffi::OsStr>, _: Option<&std::ffi::OsStr>) 
 
 #[derive(Clone)]
 pub(crate) enum Action {
+    ResolutionReady {
+        generation: u64,
+        workspace: PathBuf,
+        review: Result<Option<Box<crate::feanorfs::ResolutionReview>>, String>,
+    },
+    ResolutionDone {
+        generation: u64,
+        result: Result<String, String>,
+    },
     Refresh,
     FirstRun,
     StatusReady {
@@ -323,6 +332,32 @@ fn main() {
                     request_status_fetch(&mut st, &proxy);
                 }
             }
+            Action::ResolutionReady { generation, workspace, review } => {
+                if generation != st.task_generation || st.workspace.as_ref() != Some(&workspace) { return; }
+                match review {
+                    Ok(Some(review)) => {
+                        if let Some(decision) = dialogs::prompt_resolution(&review) {
+                            let proxy = proxy.clone();
+                            std::thread::spawn(move || {
+                                let result = feanorfs::submit_resolution_review(&workspace, &review, decision);
+                                let _ = proxy.send_event(Action::ResolutionDone { generation, result });
+                            });
+                        } else { st.resolution_inflight = false; }
+                    }
+                    other => {
+                        st.resolution_inflight = false;
+                        dialogs::show_resolution_outcome(&other.map(|_| "No resolution is currently waiting for your answer or publication.".into()));
+                    }
+                }
+                apply_ui(&st, &tray, &mut visual);
+            }
+            Action::ResolutionDone { generation, result } => {
+                if generation != st.task_generation { return; }
+                st.resolution_inflight = false;
+                dialogs::show_resolution_outcome(&result);
+                request_status_fetch(&mut st, &proxy);
+                apply_ui(&st, &tray, &mut visual);
+            }
             Action::HealthReady { workspace, report } => {
                 st.health_inflight = false;
                 if st.workspace.as_ref() != Some(&workspace) {
@@ -393,6 +428,7 @@ fn main() {
                             | MenuAction::ExportRecovery
                             | MenuAction::ImportRecovery
                             | MenuAction::CheckHealth
+                            | MenuAction::ReviewResolutions
                             | MenuAction::CheckUpdates
                             | MenuAction::TogglePause
                             | MenuAction::ForgetUnavailable

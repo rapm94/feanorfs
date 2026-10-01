@@ -238,6 +238,19 @@ pub struct PersistedResolutionJob {
     /// answer must reference the exact generation.
     #[serde(default)]
     pub question_generation: u32,
+    /// Exact locally accepted answer, retained for publication retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_answer: Option<HumanResolutionAnswer>,
+    /// Signal publication receipt; this is not a peer read acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_message_id: Option<String>,
+}
+
+impl PersistedResolutionJob {
+    fn evictable(&self) -> bool {
+        self.assignment_state.is_terminal()
+            && (self.human_answer.is_none() || self.answer_message_id.is_some())
+    }
 }
 
 /// Durable resolution state file (schema-versioned, advisory lock, atomic
@@ -258,8 +271,8 @@ impl ResolutionStateFile {
 
     /// Evicts only TERMINAL records (oldest first) so the store stays
     /// bounded without ever dropping an in-flight, uncertain, or working
-    /// assignment. `Active` and `PublicationUncertain` records are never
-    /// evicted; the non-terminal count is bounded by prepare instead.
+    /// assignment or unsent human answer. Admission refuses when retained
+    /// records already fill the bound.
     fn trim(&mut self) {
         if self.jobs.len() <= RESOLUTION_MAX_JOBS {
             return;
@@ -267,7 +280,7 @@ impl ResolutionStateFile {
         let mut terminal: Vec<PersistedResolutionJob> = self
             .jobs
             .iter()
-            .filter(|record| record.assignment_state.is_terminal())
+            .filter(|record| record.evictable())
             .cloned()
             .collect();
         terminal.sort_by_key(|record| record.created_at_ms);
@@ -278,7 +291,7 @@ impl ResolutionStateFile {
         let mut kept: Vec<PersistedResolutionJob> = self
             .jobs
             .iter()
-            .filter(|record| !record.assignment_state.is_terminal())
+            .filter(|record| !record.evictable())
             .cloned()
             .collect();
         kept.extend(terminal);
@@ -327,6 +340,23 @@ impl ResolutionStore {
                         format!("corrupt resolution result record {}", record.job.job_id)
                     })?;
                 }
+                if let Some(answer) = &record.human_answer {
+                    validate_human_resolution_answer(answer)?;
+                    ensure!(
+                        answer.job_id == record.job.job_id
+                            && answer.assignment_id == record.job.assignment_id
+                            && answer.attempt == record.job.attempt
+                            && answer.conflict_fingerprint == record.job.conflict_fingerprint
+                            && answer.question_generation == record.question_generation,
+                        "stored human answer does not match its resolution job"
+                    );
+                }
+                if let Some(message_id) = &record.answer_message_id {
+                    ensure!(
+                        record.human_answer.is_some() && feanorfs_common::is_valid_hash(message_id),
+                        "invalid human answer publication receipt"
+                    );
+                }
             }
             Ok(state.clone())
         })
@@ -345,6 +375,10 @@ impl ResolutionStore {
             f(state)?;
             state.schema_version = RESOLUTION_STORE_SCHEMA_VERSION;
             state.trim();
+            ensure!(
+                state.jobs.len() <= RESOLUTION_MAX_JOBS,
+                "resolution store is full; publish pending answers or finish active jobs first"
+            );
             Ok(())
         })?;
         self.load()
@@ -586,6 +620,8 @@ pub(crate) async fn prepare_resolution_job_guarded(
         verified_at_ms: None,
         result: None,
         question_generation: 0,
+        human_answer: None,
+        answer_message_id: None,
     };
     let store = ResolutionStore::open(ctx.base)?;
     store.update(|state| {
@@ -612,7 +648,7 @@ pub(crate) async fn prepare_resolution_job_guarded(
         let non_terminal = state
             .jobs
             .iter()
-            .filter(|existing| !existing.assignment_state.is_terminal())
+            .filter(|existing| !existing.evictable())
             .count();
         if non_terminal >= RESOLUTION_MAX_JOBS {
             return Err(anyhow::Error::new(
@@ -961,7 +997,10 @@ fn inline_verify_candidate(
         policy_id: Some(RESOLUTION_VERIFICATION_POLICY_ID.to_string()),
         policy_version: 1,
         tool_ref: None,
-        input_hashes: vec![job.job_id.clone(), job.conflict_fingerprint.clone()],
+        input_hashes: vec![
+            feanorfs_common::hash_bytes(job.job_id.as_bytes()),
+            job.conflict_fingerprint.clone(),
+        ],
         output_hash: Some(observed_hash),
         checks,
     };
@@ -996,7 +1035,10 @@ fn inline_verify_no_candidate(
         policy_id: Some(RESOLUTION_VERIFICATION_POLICY_ID.to_string()),
         policy_version: 1,
         tool_ref: None,
-        input_hashes: vec![job.job_id.clone(), job.conflict_fingerprint.clone()],
+        input_hashes: vec![
+            feanorfs_common::hash_bytes(job.job_id.as_bytes()),
+            job.conflict_fingerprint.clone(),
+        ],
         output_hash: None,
         checks: vec![VerificationCheck {
             name: "no_candidate_required".to_string(),
@@ -1151,16 +1193,10 @@ async fn publish_once(ctx: &SyncCtx<'_>, job_id: &str) -> Result<String> {
             detail: "workspace head disappeared during guarded publication".to_string(),
         }));
     };
-    if head != job.job.current_snapshot {
-        return Err(anyhow::Error::new(StalePublication {
-            kind: ResolutionStaleKind::HeadChanged,
-            detail: format!(
-                "workspace head changed since preparation (expected {}, found {head})",
-                job.job.current_snapshot
-            ),
-        }));
-    }
     let engine = SnapshotEngine::new(ctx);
+    engine
+        .validate_resolution_head(&job.job.conflict, &head)
+        .await?;
     let snapshot = engine.load_snapshot(&head).await?;
     let state = engine.objects.get_tree_state(&snapshot.root).await?;
     let Some(conflict) = state
@@ -1183,8 +1219,8 @@ async fn publish_once(ctx: &SyncCtx<'_>, job_id: &str) -> Result<String> {
     };
     let recomputed = conflict_identity_from_edit(
         ctx.workspace_id(),
-        &head,
-        &head,
+        &job.job.conflict.current_snapshot,
+        &job.job.conflict.about_snapshot,
         &snapshot.root,
         conflict,
         feanorfs_common::ConflictKind::EditEdit,
@@ -1728,6 +1764,7 @@ pub async fn materialize_resolution_legs(
         .join("jobs")
         .join(&job.job.job_id);
     tokio::fs::create_dir_all(&job_dir).await?;
+    let read_root = crate::workspace_read::WorkspaceReadRoot::open(&state_root)?;
     let mut materialized = Vec::new();
     for (role, leg) in legs {
         if leg.deleted || !leg.present {
@@ -1748,13 +1785,27 @@ pub async fn materialize_resolution_legs(
                 leg.size
             );
         }
-        let file = open_create_new_no_follow(&destination).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                anyhow::anyhow!("resolution leg {:?} already materialized", role)
-            } else {
-                anyhow::Error::new(error)
+        let file = match open_create_new_no_follow(&destination) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let relative = format!(
+                    "orchestrator/resolution/jobs/{}/leg-{}.bin",
+                    job.job.job_id,
+                    role.as_str()
+                );
+                let (existing, _) = read_root
+                    .read_regular_stable(&relative, plaintext.len() as u64)
+                    .await?;
+                ensure!(
+                    existing == plaintext,
+                    "preserved resolution leg {:?} was modified; refusing to replace it",
+                    role
+                );
+                materialized.push((role, destination));
+                continue;
             }
-        })?;
+            Err(error) => return Err(error.into()),
+        };
         {
             use tokio::io::AsyncWriteExt as _;
             let mut file = tokio::fs::File::from_std(file);
@@ -1892,6 +1943,7 @@ pub async fn answer_resolution(
                     ResolutionAssignmentState::Deferred,
                 )?;
                 record.assignment_state = ResolutionAssignmentState::Deferred;
+                record.human_answer = Some(answer.clone());
                 Ok(())
             })?;
         }
@@ -1903,6 +1955,7 @@ pub async fn answer_resolution(
                     ResolutionAssignmentState::KeepUnresolved,
                 )?;
                 record.assignment_state = ResolutionAssignmentState::KeepUnresolved;
+                record.human_answer = Some(answer.clone());
                 Ok(())
             })?;
         }
@@ -1938,6 +1991,7 @@ pub async fn answer_resolution(
             let mut record = job;
             record.verified_at_ms = Some(now_ms());
             record.result = Some(result.clone());
+            record.human_answer = Some(answer.clone());
             let store = ResolutionStore::open(ctx.base)?;
             store.update(|state| {
                 let existing = ResolutionStore::find_mut(state, &answer.job_id)?;
@@ -1951,6 +2005,41 @@ pub async fn answer_resolution(
         }
     }
     Ok(answer)
+}
+
+/// Publishes the exact saved answer. A failed or uncertain send leaves it
+/// retryable; duplicate signals reduce to the same answer. A receipt avoids
+/// another send after confirmed publication, but does not claim peer receipt.
+pub async fn publish_saved_human_answer(
+    ctx: &SyncCtx<'_>,
+    job_id: &str,
+    question_generation: Option<u32>,
+) -> Result<String> {
+    let store = ResolutionStore::open(ctx.base)?;
+    let record = store.load_job(job_id)?;
+    let answer = record
+        .human_answer
+        .context("no saved human answer; record an answer first")?;
+    if let Some(generation) = question_generation {
+        ensure!(
+            generation == answer.question_generation,
+            "saved answer belongs to a different question generation"
+        );
+    }
+    if let Some(message_id) = record.answer_message_id {
+        return Ok(message_id);
+    }
+    let message_id = crate::resolution_protocol::send_human_answer(ctx, &answer).await?;
+    store.update(|state| {
+        let record = ResolutionStore::find_mut(state, job_id)?;
+        ensure!(
+            record.human_answer.as_ref() == Some(&answer),
+            "saved human answer changed during publication"
+        );
+        record.answer_message_id = Some(message_id.clone());
+        Ok(())
+    })?;
+    Ok(message_id)
 }
 
 /// Records the terminal `Deferred` state for one assignment without any
@@ -3335,7 +3424,10 @@ mod tests {
         assert_eq!(evidence.policy_version, 1);
         assert_eq!(
             evidence.input_hashes,
-            vec![job.job_id.clone(), job.conflict_fingerprint.clone()]
+            vec![
+                feanorfs_common::hash_bytes(job.job_id.as_bytes()),
+                job.conflict_fingerprint.clone()
+            ]
         );
         assert_eq!(
             evidence.output_hash.as_deref(),
@@ -3689,9 +3781,17 @@ mod tests {
         uncertain.assignment_state = ResolutionAssignmentState::PublicationUncertain;
         uncertain.created_at_ms = 1000;
 
+        let mut pending = base.clone();
+        pending.job.job_id = "e".repeat(32);
+        pending.assignment_state = ResolutionAssignmentState::Deferred;
+        pending.question_generation = 1;
+        pending.human_answer = Some(answer_for(&pending.job, 1, HumanResolutionOption::Defer));
+        pending.created_at_ms = 0;
+
         store
             .update(|state| {
                 state.jobs.push(uncertain);
+                state.jobs.push(pending);
                 state.jobs.append(&mut terminal);
                 Ok(())
             })
@@ -3699,6 +3799,10 @@ mod tests {
 
         let trimmed = store.load().unwrap();
         assert_eq!(trimmed.jobs.len(), RESOLUTION_MAX_JOBS);
+        assert!(trimmed
+            .jobs
+            .iter()
+            .any(|record| record.created_at_ms == 0 && record.human_answer.is_some()));
         // Both non-terminal records survive.
         assert!(trimmed.jobs.iter().any(|record| {
             record.assignment_state == ResolutionAssignmentState::PublicationUncertain

@@ -568,9 +568,12 @@ pub async fn probe_agent_state(
     let ctx = SyncCtx::from_config(api, db, base, &config)?;
     let snapshots = SnapshotEngine::new(&ctx);
     let current_head = api.get_head(ctx.workspace_id()).await?;
-    let head_tree = match current_head.as_deref() {
-        Some(id) => Some(snapshots.load_snapshot(id).await?.root),
-        None => None,
+    let (head_tree, published_conflicts) = match current_head.as_deref() {
+        Some(id) => (
+            Some(snapshots.load_snapshot(id).await?.root),
+            snapshots.load_state(id).await?.conflicts.len(),
+        ),
+        None => (None, 0),
     };
     let agent_base = snapshots.read_agent_base(name).await.ok();
     let base_tree = match agent_base.as_deref() {
@@ -584,7 +587,7 @@ pub async fn probe_agent_state(
         head_tree,
         agent_base,
         local_changes: diff.our_changes.len(),
-        conflicts: diff.conflicts.len(),
+        conflicts: diff.conflicts.len().max(published_conflicts),
     })
 }
 /// Bounded, secret-free aggregation of live controller status files.

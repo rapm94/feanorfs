@@ -1127,6 +1127,34 @@ impl ControllerCore {
         self.publish_status();
     }
 
+    /// Only an authenticated, conflict-free state clears a conflict pause.
+    /// Other attention reasons still require their own explicit repair.
+    async fn resume_after_resolution(&mut self) {
+        if self
+            .attention
+            .as_ref()
+            .is_none_or(|attention| attention.reason != "pending_conflicts")
+        {
+            return;
+        }
+        match self.probe_authoritative_state().await {
+            Ok(probe) if probe.current_head.is_some() && probe.conflicts == 0 => {
+                self.attention = None;
+                self.apply_probe(probe);
+                // Refresh before any land: the resolved version must reach
+                // the agent before queued local work can publish again.
+                self.do_refresh().await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "could not verify conflict resolution; retaining pause"
+                );
+            }
+        }
+    }
+
     /// One bounded attempt to reconcile remaining local work.
     ///
     /// `deactivate` marks the controller stopped (final outcome); runner
@@ -1607,7 +1635,12 @@ async fn prepare_controller(
     let (fs_tx, fs_rx) = mpsc::channel::<()>(EVENT_CHANNEL_BOUND);
     let burst_dirty = Arc::new(AtomicBool::new(false));
     let burst_dirty_watch = Arc::clone(&burst_dirty);
-    let watched_dir = feanorfs_agent_core::agent_dir(&base, &agent)?;
+    // Native events use the canonical path (e.g. /private/var on macOS).
+    // Match that spelling once, otherwise stripping a /var root fails and
+    // the private .feanorfs ancestor makes every real edit look ignored.
+    let watched_dir = feanorfs_agent_core::agent_dir(&base, &agent)?
+        .canonicalize()
+        .context("canonicalize agent worktree for watching")?;
     let event_root = watched_dir.clone();
     let mut watcher =
         notify::recommended_watcher(move |result: std::result::Result<notify::Event, _>| {
@@ -1736,6 +1769,7 @@ async fn run_controller_loop(
         tokio::select! {
             Some(()) = fs_rx.recv() => {
                 capture_event_burst(&mut core, &mut fs_rx, &burst_dirty, true).await;
+                core.resume_after_resolution().await;
             }
             observation = core.observer.observe(HEAD_WAIT_WINDOW) => {
                 match observation {
@@ -1794,6 +1828,7 @@ async fn run_controller_loop(
                     }
                     Err(error) => core.classify_operation_error(&error),
                 }
+                core.resume_after_resolution().await;
             }
             _ = shutdown.changed() => break,
             Some(Control::FlushFinal(tx)) = control_rx.recv() => {
@@ -1871,7 +1906,10 @@ async fn capture_event_burst(
     dirty
 }
 
-/// Drains a burst only after a full quiet period since its final event.
+const MAX_EVENT_BURST: Duration = Duration::from_secs(10);
+
+/// Drains until a full quiet period or the maximum burst deadline.
+/// Returning at the cap still marks local work dirty; later events stay queued.
 /// Returns whether at least one event was consumed, including the event that
 /// selected the caller's branch.
 async fn drain_event_burst(
@@ -1887,8 +1925,13 @@ async fn drain_event_burst(
             }
         }
     }
+    let deadline = tokio::time::Instant::now() + MAX_EVENT_BURST;
     loop {
-        match tokio::time::timeout(delay, rx.recv()).await {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return consumed;
+        }
+        match tokio::time::timeout_at(deadline.min(now + delay), rx.recv()).await {
             Ok(Some(())) => consumed = true,
             Ok(None) | Err(_) => return consumed,
         }
@@ -1898,6 +1941,27 @@ async fn drain_event_burst(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_events_cannot_starve_debounce_deadline() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(()).await.unwrap();
+        let sender = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(11),
+            drain_event_burst(&mut rx, Duration::from_millis(500), false),
+        )
+        .await;
+        sender.abort();
+        assert!(result.expect("continuous writes must not starve control/shutdown"));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn drain_reports_events_and_waits_for_the_final_quiet_period() {

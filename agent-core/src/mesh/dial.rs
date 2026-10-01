@@ -66,6 +66,13 @@ impl DirectPeerDialer {
 
     async fn dial_target(&self, target: PeerDialTarget) -> Result<DirectDialOutcome> {
         let url = reqwest::Url::parse(&target.server_url).context("parse mesh hub URL")?;
+        let test_loopback = cfg!(test) && match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+        anyhow::ensure!(url.scheme() == "https" || (url.scheme() == "http" && test_loopback), "mesh dial targets require HTTPS");
         let hostname = url
             .host_str()
             .context("mesh hub URL has no hostname")?

@@ -206,6 +206,16 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+pub(super) async fn wait_for_poll_or_shutdown(
+    shutdown: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown => true,
+        _ = tokio::time::sleep(POLL_INTERVAL) => false,
+    }
+}
+
 /// Atomically claims the single-supervisor instance lock. The lock file is
 /// never removed, so ownership transfers safely on crash; `fs2` releases it
 /// automatically when the owning process exits.
@@ -337,6 +347,7 @@ pub(super) struct PendingOrphanCleanup {
     /// never turn that stale record into a speculative PID signal: the old
     /// Job handle closing is the only supported cleanup operation.
     pub(super) job_owned: bool,
+    pub(super) previous_supervisor_pid: Option<u32>,
     pub(super) expected_executable: PathBuf,
     pub(super) expected_command: String,
     pub(super) grace: Duration,
@@ -433,6 +444,7 @@ pub(super) fn pending_orphan_cleanup_with_state(
         recorded_state,
         process_start_id,
         executable_identity: process_tree::executable_identity_for_path(program),
+        previous_supervisor_pid: None,
         job_owned: matches!(
             identity,
             OrphanIdentity::Worker {
@@ -558,12 +570,17 @@ pub(super) fn retry_one_pending_orphan_cleanup(cleanup: &mut PendingOrphanCleanu
     if cleanup.ticket.is_complete() {
         return;
     }
-    // A previous Windows supervisor's Job handle is not serializable and
-    // cannot be reopened by this process.  Even a null/dead root PID gives no
-    // proof that descendants are gone; retain the ownership record forever
-    // (and therefore withhold the runner ACK) until the original kernel Job
-    // boundary has removed it.
     if cleanup.job_owned {
+        // Only the predecessor owned the non-inheritable kill-on-close Job
+        // handle. Its death closes that handle and kills every descendant.
+        // Retire the record, never guess-kill a possibly reused child PID.
+        // Missing/live predecessor evidence remains fail-closed.
+        #[cfg(any(target_os = "windows", test))]
+        if cleanup.previous_supervisor_pid.is_some_and(|pid| {
+            pid != std::process::id() && !feanorfs_agent_core::lock::pid_alive(pid)
+        }) {
+            cleanup.ticket.complete();
+        }
         return;
     }
     if cleanup.pid.is_none() && matches!(cleanup.spec.kind, ChildKind::Tray) {
@@ -719,6 +736,7 @@ async fn reap_orphaned_children() -> BTreeMap<String, PendingOrphanCleanup> {
             executable_identity,
             &identity,
         );
+        cleanup.previous_supervisor_pid = status.pid;
         retry_one_pending_orphan_cleanup(&mut cleanup);
         // A runner needs a final state checkpoint even when its direct worker
         // was already gone. Other completed components need no map entry.
@@ -814,8 +832,16 @@ pub(crate) async fn run_supervisor() -> anyhow::Result<()> {
     let mut last_port_mtime = hub_config_mtime("listen-port");
     let mut reconcile_generation = 0_u64;
     let mut last_registry_digest = None::<String>;
+    // Retain signal registration across all retries, including failed reads.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = std::future::ready(()) => {}
+        }
         // A transient registry problem (lock contention, corrupt file) must
         // never kill the whole supervisor: keep the current children and
         // retry next poll. Exiting here would orphan every child process.
@@ -825,7 +851,9 @@ pub(crate) async fn run_supervisor() -> anyhow::Result<()> {
                 tracing::error!(
                     "supervisor registry unreadable; keeping current children: {error:#}"
                 );
-                tokio::time::sleep(POLL_INTERVAL).await;
+                if wait_for_poll_or_shutdown(shutdown.as_mut()).await {
+                    break;
+                }
                 continue;
             }
         };
@@ -842,7 +870,9 @@ pub(crate) async fn run_supervisor() -> anyhow::Result<()> {
                 tracing::error!(
                     "building desired supervisor specs failed; keeping current children: {error:#}"
                 );
-                tokio::time::sleep(POLL_INTERVAL).await;
+                if wait_for_poll_or_shutdown(shutdown.as_mut()).await {
+                    break;
+                }
                 continue;
             }
         };
@@ -854,7 +884,9 @@ pub(crate) async fn run_supervisor() -> anyhow::Result<()> {
             Ok(changed) => changed,
             Err(error) => {
                 tracing::error!("supervisor reconcile failed; retrying: {error:#}");
-                tokio::time::sleep(POLL_INTERVAL).await;
+                if wait_for_poll_or_shutdown(shutdown.as_mut()).await {
+                    break;
+                }
                 continue;
             }
         };
@@ -902,9 +934,8 @@ pub(crate) async fn run_supervisor() -> anyhow::Result<()> {
             }
         }
 
-        tokio::select! {
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
-            _ = shutdown_signal() => break,
+        if wait_for_poll_or_shutdown(shutdown.as_mut()).await {
+            break;
         }
     }
 

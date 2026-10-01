@@ -96,8 +96,14 @@ pub struct ProtocolEntry {
     pub question_generation: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ResolutionResult>,
+    /// Canonical result id, independent of subsequent answer observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<HumanResolutionAnswer>,
+    /// Canonical answer id, independent of subsequent result observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoke_reason: Option<ResolutionRevokeReason>,
     /// Message id of the last profile applied for this fingerprint.
@@ -204,6 +210,27 @@ fn validate_protocol_state(state: &ResolutionProtocolState) -> Result<()> {
         state.applied.len() <= RESOLUTION_PROTOCOL_MAX_APPLIED,
         "resolution protocol applied-ids exceed their bound"
     );
+    ensure!(
+        state.pending.len() <= RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS,
+        "resolution protocol pending fingerprints exceed their bound"
+    );
+    for (fingerprint, pending) in &state.pending {
+        ensure!(
+            feanorfs_common::is_valid_hash(fingerprint),
+            "resolution protocol pending fingerprint is invalid"
+        );
+        ensure!(
+            pending.len() <= RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT,
+            "resolution protocol pending profiles exceed their bound"
+        );
+        for (message, profile) in pending {
+            ensure!(
+                feanorfs_common::is_valid_hash(&message.message_id),
+                "resolution protocol pending message id is invalid"
+            );
+            feanorfs_common::validate_resolution_profile(profile)?;
+        }
+    }
     for (fingerprint, entry) in &state.entries {
         ensure!(
             entry.conflict_fingerprint == *fingerprint
@@ -243,30 +270,6 @@ fn validate_protocol_state(state: &ResolutionProtocolState) -> Result<()> {
                     && result.conflict_fingerprint == entry.conflict_fingerprint,
                 "resolution protocol result binding mismatch"
             );
-        }
-        ensure!(
-            state.pending.len() <= RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS,
-            "resolution protocol pending fingerprints exceed their bound"
-        );
-        for (fingerprint, pending) in &state.pending {
-            ensure!(
-                feanorfs_common::is_valid_hash(fingerprint),
-                "resolution protocol pending fingerprint is invalid"
-            );
-            ensure!(
-                pending.len() <= RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT,
-                "resolution protocol pending profiles exceed their bound"
-            );
-            for (message, profile) in pending {
-                ensure!(
-                    feanorfs_common::is_valid_hash(&message.message_id),
-                    "resolution protocol pending message id is invalid"
-                );
-                ensure!(
-                    feanorfs_common::validate_resolution_profile(profile).is_ok(),
-                    "resolution protocol pending profile is invalid"
-                );
-            }
         }
         if let Some(answer) = &entry.answer {
             validate_human_resolution_answer(answer)?;
@@ -348,7 +351,9 @@ fn apply_profile_to_entry(
                 state: ProtocolAssignmentState::Assigned,
                 question_generation: question_generation.unwrap_or(0),
                 result: None,
+                result_message_id: None,
                 answer: None,
+                answer_message_id: None,
                 revoke_reason: None,
                 observed_message_id: message_id.to_string(),
             };
@@ -366,22 +371,31 @@ fn apply_profile_to_entry(
             if matches!(entry.state, ProtocolAssignmentState::Revoked) {
                 return Ok(ApplyOutcome::Applied(None));
             }
-            // Deterministic first-wins: an already-observed result keeps the
-            // smaller observed message id; equal content is idempotent.
-            if let Some(existing) = &entry.result {
-                if existing == result {
-                    return Ok(ApplyOutcome::Applied(None));
-                }
-                ensure!(
-                    message_id < entry.observed_message_id.as_str(),
-                    "ffres1 result supersedes an already-observed result with a \
-                     non-canonical message id"
-                );
+            // Select by this profile's id, not an intervening answer's id.
+            // Equal content still updates the winning id when it is smaller.
+            if entry.result.is_some()
+                && message_id >= entry.result_message_id.as_deref()
+                    .unwrap_or(&entry.observed_message_id)
+            {
+                return Ok(ApplyOutcome::Applied(None));
             }
-            entry.state = ProtocolAssignmentState::ResultReceived;
             entry.question_generation = result.question_generation;
             entry.result = Some(result.clone());
-            entry.observed_message_id = message_id.to_string();
+            entry.result_message_id = Some(message_id.to_string());
+            if entry.answer.as_ref().is_some_and(|answer| {
+                answer.question_generation != result.question_generation
+            }) {
+                entry.answer = None;
+                entry.answer_message_id = None;
+            }
+            if entry.answer.is_some() {
+                entry.state = ProtocolAssignmentState::HumanAnswered;
+                entry.observed_message_id = entry.answer_message_id.clone()
+                    .unwrap_or_else(|| entry.observed_message_id.clone());
+            } else {
+                entry.state = ProtocolAssignmentState::ResultReceived;
+                entry.observed_message_id = message_id.to_string();
+            }
             Ok(ApplyOutcome::Applied(None))
         }
         ResolutionProfile::Revoke(profile) => {
@@ -412,18 +426,15 @@ fn apply_profile_to_entry(
             if matches!(entry.state, ProtocolAssignmentState::Revoked) {
                 return Ok(ApplyOutcome::Applied(None));
             }
-            if let Some(existing) = &entry.answer {
-                if existing == answer {
-                    return Ok(ApplyOutcome::Applied(None));
-                }
-                ensure!(
-                    message_id < entry.observed_message_id.as_str(),
-                    "ffres1 human answer supersedes an already-observed answer with a \
-                     non-canonical message id"
-                );
+            if entry.answer.is_some()
+                && message_id >= entry.answer_message_id.as_deref()
+                    .unwrap_or(&entry.observed_message_id)
+            {
+                return Ok(ApplyOutcome::Applied(None));
             }
             entry.state = ProtocolAssignmentState::HumanAnswered;
             entry.answer = Some(answer.clone());
+            entry.answer_message_id = Some(message_id.to_string());
             entry.observed_message_id = message_id.to_string();
             Ok(ApplyOutcome::Applied(None))
         }
@@ -467,6 +478,30 @@ fn drain_pending(
     Ok(())
 }
 
+/// Keeps existing pending evidence on exhaustion; never creates an empty
+/// fingerprint slot or exceeds a persistence bound.
+fn hold_pending(
+    state: &mut ResolutionProtocolState,
+    fingerprint: &str,
+    message: &AgentMessage,
+    profile: ResolutionProfile,
+) {
+    let pending = state.pending.get(fingerprint);
+    if pending.is_some_and(|held| held.iter().any(|(m, _)| m.message_id == message.message_id)) {
+        return;
+    }
+    if pending.is_some_and(|held| held.len() >= RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT)
+        || (pending.is_none()
+            && state.pending.len() >= RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS)
+    {
+        state.incomplete = true;
+        return;
+    }
+    let pending = state.pending.entry(fingerprint.to_string()).or_default();
+    pending.push((message.clone(), profile));
+    pending.sort_by(|left, right| left.0.message_id.cmp(&right.0.message_id));
+}
+
 /// Applies one bounded batch of observed `ffmsg1` messages (already sorted
 /// by canonical message id) to the projection. Pure and deterministic;
 /// returns the jobs an assignment profile must import durably.
@@ -504,23 +539,7 @@ fn apply_protocol_batch(
                     drain_pending(state, &fingerprint, &mut imports)?;
                 }
                 ApplyOutcome::HoldForLater => {
-                    let fingerprint_count = state.pending.len();
-                    let has_fingerprint = state.pending.contains_key(&fingerprint);
-                    let pending = state.pending.entry(fingerprint.clone()).or_default();
-                    if pending
-                        .iter()
-                        .any(|(held, _)| held.message_id == message.message_id)
-                    {
-                        continue;
-                    }
-                    if pending.len() >= RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT
-                        || (fingerprint_count >= RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS
-                            && !has_fingerprint)
-                    {
-                        state.incomplete = true;
-                    }
-                    pending.push((message.clone(), profile.clone()));
-                    pending.sort_by(|left, right| left.0.message_id.cmp(&right.0.message_id));
+                    hold_pending(state, &fingerprint, message, profile);
                 }
             },
             None => {
@@ -532,23 +551,7 @@ fn apply_protocol_batch(
                     if state.applied.binary_search(&message.message_id).is_ok() {
                         continue;
                     }
-                    let fingerprint_count = state.pending.len();
-                    let has_fingerprint = state.pending.contains_key(&fingerprint);
-                    let pending = state.pending.entry(fingerprint.clone()).or_default();
-                    if pending
-                        .iter()
-                        .any(|(held, _)| held.message_id == message.message_id)
-                    {
-                        continue;
-                    }
-                    if pending.len() >= RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT
-                        || (fingerprint_count >= RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS
-                            && !has_fingerprint)
-                    {
-                        state.incomplete = true;
-                    }
-                    pending.push((message.clone(), profile.clone()));
-                    pending.sort_by(|left, right| left.0.message_id.cmp(&right.0.message_id));
+                    hold_pending(state, &fingerprint, message, profile);
                     continue;
                 }
                 // First observation must be an assignment (nothing else can
@@ -585,7 +588,9 @@ fn apply_protocol_batch(
                             state: ProtocolAssignmentState::Assigned,
                             question_generation: profile.question_generation.unwrap_or(0),
                             result: None,
+                            result_message_id: None,
                             answer: None,
+                            answer_message_id: None,
                             revoke_reason: None,
                             observed_message_id: message_id.clone(),
                         };
@@ -678,6 +683,8 @@ async fn import_resolution_job(ctx: &SyncCtx<'_>, job: &ResolutionJob) -> Result
             verified_at_ms: None,
             result: None,
             question_generation: 0,
+            human_answer: None,
+            answer_message_id: None,
         };
         state.jobs.push(state_record);
         Ok(())
@@ -1067,7 +1074,9 @@ mod tests {
                     state: ProtocolAssignmentState::Assigned,
                     question_generation: 0,
                     result: None,
+                    result_message_id: None,
                     answer: None,
+                    answer_message_id: None,
                     revoke_reason: None,
                     observed_message_id: hex('a'),
                 },
@@ -1085,6 +1094,74 @@ mod tests {
         assert_eq!(state.entries.len(), RESOLUTION_PROTOCOL_MAX_ENTRIES);
         assert!(!state.entries.contains_key(&revoked_key));
         assert!(state.entries.contains_key(&job.conflict_fingerprint));
+    }
+
+    #[test]
+    fn pending_bounds_hold_without_entries_and_remain_writable() {
+        let mut state = ResolutionProtocolState::fresh();
+        let job = unique_job(0);
+        for index in 0..=RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT {
+            let mut incoming = message('b', &result_body(&job, 0), &job.owner);
+            incoming.message_id = format!("{index:064x}");
+            apply_protocol_batch(&mut state, &[incoming]).unwrap();
+        }
+        assert!(state.entries.is_empty());
+        assert!(state.incomplete);
+        assert_eq!(state.pending[&job.conflict_fingerprint].len(), RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT);
+        assert_eq!(state.pending[&job.conflict_fingerprint][0].0.message_id, format!("{:064x}", 0));
+        for _ in 1..=RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS {
+            let job = unique_job(0);
+            apply_protocol_batch(&mut state, &[message('c', &result_body(&job, 0), &job.owner)]).unwrap();
+        }
+        assert_eq!(state.pending.len(), RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS);
+        validate_protocol_state(&state).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResolutionProtocolStore::open(dir.path()).unwrap();
+        store.update(|stored| { *stored = state.clone(); Ok(()) }).unwrap();
+        assert_eq!(store.load().unwrap(), state);
+        let mut corrupt = state.clone();
+        let held = corrupt.pending[&job.conflict_fingerprint][0].clone();
+        corrupt.pending.get_mut(&job.conflict_fingerprint).unwrap().push(held);
+        assert!(validate_protocol_state(&corrupt).is_err());
+        let mut corrupt = state;
+        corrupt.pending.insert("f".repeat(64), vec![]);
+        assert!(validate_protocol_state(&corrupt).is_err());
+    }
+
+    #[test]
+    fn competing_results_and_answers_converge_across_single_deliveries() {
+        let job = unique_job(0);
+        let assignment = message('a', &assignment_body(&job), "preparer");
+        let first_result = message('b', &result_body(&job, 0), &job.owner);
+        let mut other_result = parse_resolution_profile(&first_result.body).unwrap();
+        if let ResolutionProfile::Result(result) = &mut other_result {
+            result.diagnostics.push("alternative".into());
+        }
+        let other_result = message('e', &encode_resolution_profile(&other_result).unwrap(), &job.owner);
+        let first_answer = message('c', &answer_body(&job, 0), "human");
+        let mut other_answer = parse_resolution_profile(&first_answer.body).unwrap();
+        if let ResolutionProfile::HumanAnswer(answer) = &mut other_answer {
+            answer.chosen_option = HumanResolutionOption::KeepUnresolved;
+        }
+        let other_answer = message('d', &encode_resolution_profile(&other_answer).unwrap(), "human");
+        let signals = [first_result, first_answer, other_answer, other_result];
+        let mut expected = ResolutionProtocolState::fresh();
+        apply_protocol_batch(&mut expected, &[assignment.clone()]).unwrap();
+        apply_protocol_batch(&mut expected, &signals).unwrap();
+        for order in [[3, 2, 1, 0], [1, 3, 0, 2], [0, 3, 2, 1]] {
+            let mut state = ResolutionProtocolState::fresh();
+            apply_protocol_batch(&mut state, &[assignment.clone()]).unwrap();
+            for index in order {
+                apply_protocol_batch(&mut state, std::slice::from_ref(&signals[index])).unwrap();
+            }
+            assert_eq!(state, expected);
+            let dir = tempfile::tempdir().unwrap();
+            let store = ResolutionProtocolStore::open(dir.path()).unwrap();
+            store.update(|stored| { *stored = state; Ok(()) }).unwrap();
+            let stored = store.load().unwrap();
+            assert_eq!(stored, expected);
+            assert_eq!(entry_status(&stored.entries[&job.conflict_fingerprint]).state, ProtocolAssignmentState::HumanAnswered);
+        }
     }
 
     #[test]

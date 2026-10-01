@@ -864,9 +864,8 @@ pub(crate) fn ensure_workspace_state_in(workspace: &Path, root: &Path) -> Result
     }
     maintain_workspace(workspace, &state)?;
     revalidate_workspace_identity(workspace, identity.as_ref())?;
-    // Removing the migration lock mutates the workspaces directory. Publish
-    // the index afterward so its freshness stamp represents the final slot
-    // layout rather than becoming stale as `ensure` returns.
+    // Publish the index after slot maintenance. The migration lock inode
+    // persists; dropping the guard only releases its kernel ownership.
     drop(_guard);
     if let Some((identity, canonical)) = index_record {
         crate::workspace_state_registry::upsert_index_entry(
@@ -1214,47 +1213,25 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-struct MigrationLock(PathBuf);
+struct MigrationLock {
+    _file: fs::File,
+}
 
 impl MigrationLock {
     fn acquire(path: &Path) -> Result<Self> {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            match options.open(path) {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id())?;
-                    return Ok(Self(path.to_path_buf()));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::read_to_string(path)
-                        .ok()
-                        .and_then(|pid| pid.trim().parse::<u32>().ok())
-                        .is_none_or(|pid| !crate::lock::pid_alive(pid));
-                    if stale {
-                        let _ = fs::remove_file(path);
-                        continue;
-                    }
+            match crate::lock::try_acquire_lock_file(path, "workspace state migration") {
+                Ok(file) => return Ok(Self { _file: file }),
+                Err(error) if crate::lock::is_lock_contention(&error) => {
                     if std::time::Instant::now() >= deadline {
                         bail!("workspace state migration is already running");
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
-    }
-}
-
-impl Drop for MigrationLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
     }
 }
 

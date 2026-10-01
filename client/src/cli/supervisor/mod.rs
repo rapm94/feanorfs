@@ -107,8 +107,8 @@ pub(crate) use migration::migrate_legacy_jobs;
 pub(crate) use r#loop::run_supervisor;
 pub(crate) use registry::{
     add_runner, add_workspace, is_registered, is_runner_registered, registered_workspaces,
-    remove_runner_from_registry, remove_workspace_from_registry, runner_stop_authority_exists,
-    start_workspace_in_registry, stop_workspace_in_registry,
+    remove_runner_from_registry, remove_workspace_from_registry, restore_suspended_workspace,
+    runner_stop_authority_exists, start_workspace_in_registry, stop_workspace_in_registry,
 };
 #[cfg(test)]
 pub(crate) use status::ChildStatus;

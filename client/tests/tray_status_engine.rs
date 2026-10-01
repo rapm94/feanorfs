@@ -27,6 +27,64 @@ const LARGE_WORKSPACE_FILES: usize = 1000;
 const SENTINEL_DIR_FILES: usize = 2000;
 const SENTINEL_ROOT_FILES: usize = 100;
 
+#[tokio::test]
+async fn tray_preserves_worker_activity_and_old_snapshots_remain_readable() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    make_v3(&client);
+    let root = client.workspace.path();
+    publish_worker_status(root, &MirrorState::Idle, &client.db)
+        .await
+        .unwrap();
+    let path = support::state_path(root).join("worker-status.json");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    snapshot["continuous"] = serde_json::json!({
+        "agents_live": 2, "agents_attention": 1, "agents_offline": 3
+    });
+    snapshot["resolution"] = serde_json::json!({
+        "active": 0, "submitted": 2, "completed": 0,
+        "revoked": 0, "requires_human": 1
+    });
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let status = do_tray_status(root).await.unwrap();
+    assert_eq!(status.continuous.unwrap().agents_live, 2);
+    assert_eq!(status.resolution.unwrap().requires_human, 1);
+    assert_eq!(status.reported_at_ms, snapshot["published_at_ms"].as_i64());
+    assert_eq!(
+        feanorfs_common::tray_contract::activity_commands(status.continuous, status.resolution),
+        ["feanorfs agent status", "feanorfs agent resolution review"]
+    );
+    assert_eq!(
+        status.activity_lines(),
+        vec![
+            "Agents last reported: 2 running · 1 need attention · 3 offline",
+            "Resolutions last reported: 1 need your answer",
+        ]
+    );
+    let public = feanorfs_client::do_status(
+        &server.api,
+        &client.db,
+        root,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    assert_eq!(public.reported_at_ms, status.reported_at_ms);
+    assert_eq!(public.continuous, status.continuous);
+    assert_eq!(public.resolution, status.resolution);
+
+    // Absence is unknown, not a claim that no agents or questions exist.
+    snapshot.as_object_mut().unwrap().remove("continuous");
+    snapshot.as_object_mut().unwrap().remove("resolution");
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let old = do_tray_status(root).await.unwrap();
+    assert!(old.continuous.is_none());
+    assert!(old.resolution.is_none());
+    assert!(old.activity_lines().is_empty());
+}
+
 fn make_v3(client: &support::TestClient) -> feanorfs_client::Config {
     let mut config = load_config(client.workspace.path()).unwrap();
     config.format_version = 3;

@@ -32,7 +32,10 @@ async fn same_process_sync_lock_is_exclusive_until_the_owner_drops() {
     let second = feanorfs_client::lock::SyncLock::acquire(base).unwrap();
     assert!(state_path(base).join("sync.lock").exists());
     drop(second);
-    assert!(!state_path(base).join("sync.lock").exists());
+    // Stable lock inode prevents split ownership among already-open contenders.
+    assert!(state_path(base).join("sync.lock").exists());
+    let released = feanorfs_client::lock::SyncLock::acquire(base).unwrap();
+    drop(released);
 
     let first_land = feanorfs_client::lock::LandLock::acquire(base).unwrap();
     let land_contention = match feanorfs_client::lock::LandLock::acquire(base) {
@@ -2106,6 +2109,234 @@ async fn migrate_rekeys_an_existing_format_v3_workspace() {
         read_workspace_file(verifier.workspace.path(), "v3-secret.txt").await,
         b"stronger key after v3"
     );
+}
+
+#[tokio::test]
+async fn plain_migrate_preserves_interrupted_v3_rekey_journal() {
+    use feanorfs_client::{load_config, migrate_workspace};
+
+    let server = spawn_test_server().await;
+    let source = spawn_test_client_with_server(&server).await;
+    let base = source.workspace.path();
+    write_workspace_file(base, "resume-v3.txt", b"preserve rekey recovery").await;
+    do_push_only(
+        &server.api,
+        &source.db,
+        base,
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    migrate_workspace(base, false).await.unwrap();
+    let state = state_path(base);
+    tokio::fs::write(state.join("migration-failpoint"), b"after_reseal_upload")
+        .await
+        .unwrap();
+    assert!(migrate_workspace(base, true).await.is_err());
+    let journal_path = state.join("migration-v3.json");
+    let before = tokio::fs::read(&journal_path).await.unwrap();
+    let config_before = load_config(base).unwrap();
+    let error = migrate_workspace(base, false).await.unwrap_err();
+    assert!(error.to_string().contains("migrate --rekey"));
+    assert_eq!(tokio::fs::read(&journal_path).await.unwrap(), before);
+    assert_eq!(
+        load_config(base).unwrap().encryption_password,
+        config_before.encryption_password
+    );
+    assert_eq!(
+        read_workspace_file(base, "resume-v3.txt").await,
+        b"preserve rekey recovery"
+    );
+    tokio::fs::remove_file(state.join("migration-failpoint"))
+        .await
+        .unwrap();
+    migrate_workspace(base, true).await.unwrap();
+    assert!(!journal_path.exists());
+    let finalized_key = load_config(base).unwrap().encryption_password;
+    assert_ne!(finalized_key, config_before.encryption_password);
+
+    // Simulate a crash after final config commit but before journal unlink.
+    let mut finalized_journal: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    finalized_journal["phase"] = serde_json::json!("stamped");
+    for rekey in [false, true] {
+        tokio::fs::write(
+            &journal_path,
+            serde_json::to_vec(&finalized_journal).unwrap(),
+        )
+        .await
+        .unwrap();
+        migrate_workspace(base, rekey).await.unwrap();
+        assert!(!journal_path.exists());
+        assert_eq!(
+            load_config(base).unwrap().encryption_password,
+            finalized_key
+        );
+    }
+}
+
+#[tokio::test]
+async fn rekey_resume_reuses_candidate_after_uncertain_publication() {
+    check_rekey_resume_after_publication(false).await;
+}
+
+#[tokio::test]
+async fn rekey_resume_preserves_local_edits_through_next_sync() {
+    check_rekey_resume_after_publication(true).await;
+}
+
+async fn check_rekey_resume_after_publication(edit_during_interruption: bool) {
+    use feanorfs_client::{load_config, migrate_workspace};
+
+    for format_v3 in [false, true] {
+        let server = spawn_test_server().await;
+        let source = spawn_test_client_with_server(&server).await;
+        let base = source.workspace.path();
+        write_workspace_file(base, "published.txt", b"one durable candidate").await;
+        do_push_only(
+            &server.api,
+            &source.db,
+            base,
+            WORKSPACE_ID,
+            Some(TEST_PASSWORD),
+        )
+        .await
+        .unwrap();
+        if format_v3 {
+            migrate_workspace(base, false).await.unwrap();
+        }
+        let failpoint = state_path(base).join("migration-failpoint");
+        tokio::fs::write(&failpoint, b"after_head_publish")
+            .await
+            .unwrap();
+        let error = migrate_workspace(base, true).await.unwrap_err();
+        assert!(error.to_string().contains("after_head_publish"));
+        let journal_path = state_path(base).join("migration-v3.json");
+        let journal: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&journal_path).await.unwrap()).unwrap();
+        assert_eq!(journal["phase"], "resealed");
+        let candidate = journal["publication"]["candidate_id"].as_str().unwrap();
+        assert_eq!(
+            server.api.get_head(WORKSPACE_ID).await.unwrap().as_deref(),
+            Some(candidate)
+        );
+        assert_eq!(
+            load_config(base).unwrap().encryption_password.as_deref(),
+            Some(TEST_PASSWORD)
+        );
+        if edit_during_interruption {
+            write_workspace_file(base, "published.txt", b"local edit during interruption").await;
+        }
+        tokio::fs::remove_file(failpoint).await.unwrap();
+        migrate_workspace(base, true).await.unwrap();
+        assert_eq!(
+            server.api.get_head(WORKSPACE_ID).await.unwrap().as_deref(),
+            Some(candidate)
+        );
+        assert!(!journal_path.exists());
+        let config = load_config(base).unwrap();
+        assert_eq!(
+            config.encryption_password.as_deref(),
+            journal["target_key"].as_str()
+        );
+        if edit_during_interruption {
+            assert_eq!(
+                read_workspace_file(base, "published.txt").await,
+                b"local edit during interruption"
+            );
+            do_sync(
+                &server.api,
+                &source.db,
+                base,
+                WORKSPACE_ID,
+                config.encryption_password.as_deref(),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                read_workspace_file(base, "published.txt").await,
+                b"local edit during interruption"
+            );
+            assert_eq!(
+                source.db.list_pending_conflict_paths().await.unwrap(),
+                vec!["published.txt".to_string()]
+            );
+        }
+        let verifier = spawn_test_client_with_server(&server).await;
+        let mut verifier_config = load_config(verifier.workspace.path()).unwrap();
+        verifier_config.format_version = 3;
+        verifier_config.encryption_password = config.encryption_password;
+        feanorfs_client::save_config(verifier.workspace.path(), &verifier_config).unwrap();
+        do_pull_only(
+            &server.api,
+            &verifier.db,
+            verifier.workspace.path(),
+            WORKSPACE_ID,
+            verifier_config.encryption_password.as_deref(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_workspace_file(verifier.workspace.path(), "published.txt").await,
+            b"one durable candidate"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stamped_rekey_resume_does_not_reacquire_released_fence() {
+    use feanorfs_client::migrate_workspace;
+
+    for format_v3 in [false, true] {
+        let server = spawn_test_server().await;
+        let source = spawn_test_client_with_server(&server).await;
+        let base = source.workspace.path();
+        write_workspace_file(base, "stamp.txt", b"keep cutover resumable").await;
+        do_push_only(
+            &server.api,
+            &source.db,
+            base,
+            WORKSPACE_ID,
+            Some(TEST_PASSWORD),
+        )
+        .await
+        .unwrap();
+        if format_v3 {
+            migrate_workspace(base, false).await.unwrap();
+        }
+        let failpoint = state_path(base).join("migration-failpoint");
+        tokio::fs::write(&failpoint, b"after_format_stamp")
+            .await
+            .unwrap();
+        let error = migrate_workspace(base, true).await.unwrap_err();
+        assert!(error.to_string().contains("after_format_stamp"));
+        let journal: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(state_path(base).join("migration-v3.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(journal["phase"], "stamped");
+        assert_eq!(
+            feanorfs_client::load_config(base)
+                .unwrap()
+                .encryption_password
+                .as_deref(),
+            Some(TEST_PASSWORD)
+        );
+        tokio::fs::remove_file(failpoint).await.unwrap();
+        migrate_workspace(base, true).await.unwrap();
+        // No migration token: an orphaned reacquired fence would reject this.
+        let bytes = b"post-stamp object".to_vec();
+        let hash = feanorfs_common::hash_bytes(&bytes);
+        server
+            .api
+            .upload_object(WORKSPACE_ID, &hash, bytes)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]

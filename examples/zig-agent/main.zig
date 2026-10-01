@@ -38,15 +38,19 @@ pub fn main() !void {
     }
     defer c.ffs_string_free(agent_dir);
 
-    const agent_task = try std.fmt.allocPrint(
+    const agent_task = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "{s}/task.txt",
         .{std.mem.span(agent_dir)},
+        0,
     );
     defer std.heap.page_allocator.free(agent_task);
     const fp = c.fopen(agent_task.ptr, "w") orelse return error.WriteFailed;
-    defer _ = c.fclose(fp);
-    _ = c.fputs("zig edit\n", fp);
+    const write_failed = c.fputs("zig edit\n", fp) == c.EOF;
+    // fclose flushes buffered output. Always close, even after a write error,
+    // and never publish the agent workspace unless both operations succeeded.
+    const close_failed = c.fclose(fp) == c.EOF;
+    if (write_failed or close_failed) return error.WriteFailed;
 
     const land = c.ffs_agent_land(root.ptr, name.ptr, 0, 0);
     if (land == null) {

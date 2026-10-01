@@ -463,6 +463,20 @@ pub(crate) fn stop_workspace_in_registry(workspace: &Path) -> anyhow::Result<()>
     })
 }
 
+/// Compensates a start suspension even when configuration is now unreadable.
+/// Only restores an existing stopped entry; never invents registration.
+pub(crate) fn restore_suspended_workspace(workspace: &Path) -> anyhow::Result<()> {
+    let canonical = canonical_workspace_path(workspace)?;
+    update_registry(|store| {
+        if let Some(index) = store.stopped.iter().position(|path| path == &canonical) {
+            store.stopped.remove(index);
+            if !store.workspaces.iter().any(|path| path == &canonical) {
+                store.workspaces.push(canonical);
+            }
+        }
+    })
+}
+
 pub(crate) fn start_workspace_in_registry(workspace: &Path) -> anyhow::Result<()> {
     let canonical = ensure_workspace_configured(workspace)?;
     update_registry(|store| {

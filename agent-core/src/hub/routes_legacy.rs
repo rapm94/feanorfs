@@ -97,7 +97,6 @@ impl LocalHub {
                 parse_required_param::<u32>(params, "mode")?,
             ))
         };
-        let blob_path = self.db.blob_path(hash);
         let is_new = !self.db.blob_exists(hash);
         if is_new {
             self.db.store_blob(hash, body).map_err(status_err)?;
@@ -116,25 +115,9 @@ impl LocalHub {
             .upsert_file(workspace_id, path, hash, size, mtime, mode, false)
         {
             Ok(()) => Ok(response(StatusCode::OK, Body::empty())),
-            Err(error) => {
-                if is_new {
-                    // When the blob write committed but directory-sync
-                    // durability is uncertain, the blob may or may not exist
-                    // after the failed upsert; retain it only when the
-                    // workspace now references it.
-                    let is_referenced = crate::durable::commit_durability_is_uncertain(&error)
-                        && self
-                            .db
-                            .get_files(workspace_id)
-                            .map_err(status_err)?
-                            .iter()
-                            .any(|(_, file)| file.hash == hash);
-                    if !is_referenced {
-                        let _ = std::fs::remove_file(blob_path);
-                    }
-                }
-                Err(status_err(error))
-            }
+            // Immutable CAS objects may already be shared by another publication.
+            // Metadata failure never authorizes deletion; retention/GC owns it.
+            Err(error) => Err(status_err(error)),
         }
     }
 }

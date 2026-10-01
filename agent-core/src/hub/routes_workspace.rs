@@ -58,9 +58,6 @@ impl LocalHub {
                     "missing or invalid migration token".into(),
                 )
             })?;
-        if self.db.get_format(workspace_id).map_err(status_err)? >= 3 {
-            return Ok(response(StatusCode::OK, Body::empty()));
-        }
         match self.db.begin_migration(workspace_id, token) {
             Ok(MigrationWriteOutcome::Acquired) => Ok(response(StatusCode::OK, Body::empty())),
             Ok(MigrationWriteOutcome::LockedByOther) => Err((

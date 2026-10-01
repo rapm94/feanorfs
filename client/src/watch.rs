@@ -118,6 +118,7 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
 
     let mut consecutive_errors = 0u32;
     let mut retry = SyncRetryGate::new();
+    let mut dirty = true;
     // Reusable bounded head observer: a healthy hub wakes the watcher as soon
     // as the opaque head changes; the periodic window remains the recovery
     // backstop for unsupported hubs and transient transport failures.
@@ -137,9 +138,11 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
         )
         .await
         {
-            Ok(()) => {
+            Ok(applied) => {
+                dirty = !applied;
                 retry.noted_success();
-                acknowledge_current_head(&mut head_observer, api, workspace_id).await;
+                // Never acknowledge a freshly read post-sync head: it may
+                // contain changes published after this pass completed.
             }
             Err(e) => {
                 consecutive_errors = consecutive_errors.saturating_add(1);
@@ -160,11 +163,15 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
     // watcher — it kept refreshing `watch.pid` every poll so the tray still
     // reported "watching", but no sync ever ran again.
     loop {
+        let paused = is_paused(current_dir);
+        dirty |= paused;
+        let previous_head = head_observer.known().map(str::to_owned);
         tokio::select! {
             maybe = rx.recv() => {
                 if maybe.is_none() {
                     break;
                 }
+                dirty = true;
                 drain_event_burst(&mut rx, DEBOUNCE_INTERVAL).await;
 
                 if !retry.ready() {
@@ -186,10 +193,10 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(applied) => {
+                        dirty = !applied;
                         consecutive_errors = 0;
                         retry.noted_success();
-                        acknowledge_current_head(&mut head_observer, api, workspace_id).await;
                     }
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
@@ -200,14 +207,19 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                     }
                 }
             }
-            observation = head_observer.observe(IDLE_POLL_INTERVAL) => {
+            observation = head_observer.observe(IDLE_POLL_INTERVAL), if !paused => {
                 // Refresh the pid file so `is_watching` doesn't treat a
                 // long-running watcher as stale (24h age cutoff).
                 write_watch_pid(current_dir);
-                if !retry.ready() {
+                if is_paused(current_dir) {
+                    // observe() advances known internally. Undo that advance
+                    // when pause prevents applying the observed publication.
+                    head_observer.acknowledge(previous_head);
+                    dirty = true;
                     continue;
                 }
-                if is_paused(current_dir) {
+                if !retry.ready() {
+                    dirty = true;
                     continue;
                 }
                 // Skip only when a wait-supported hub authoritatively
@@ -217,7 +229,7 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                     observation.as_ref(),
                     Ok(observed) if !observed.changed && !observed.unsupported
                 );
-                if unchanged_on_supported_hub {
+                if unchanged_on_supported_hub && !dirty {
                     continue;
                 }
                 let label = if observation
@@ -232,10 +244,10 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                 match sync_once(api, db, current_dir, workspace_id, password, label, true, lazy)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(applied) => {
+                        dirty = !applied;
                         consecutive_errors = 0;
                         retry.noted_success();
-                        acknowledge_current_head(&mut head_observer, api, workspace_id).await;
                     }
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
@@ -245,9 +257,16 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                     }
                 }
             }
+            // Pause markers live outside the watched worktree. Poll only
+            // pending work so resume converges even without another FS/head event.
+            _ = tokio::time::sleep(DEBOUNCE_INTERVAL), if dirty && retry.ready() => {
+                if !is_paused(current_dir) {
+                    retry.postpone(Duration::ZERO);
+                }
+            }
             _ = wait_for_retry(retry.deadline()) => {
                 if is_paused(current_dir) {
-                    retry.postpone(IDLE_POLL_INTERVAL);
+                    retry.postpone(DEBOUNCE_INTERVAL);
                     continue;
                 }
                 match sync_once(
@@ -262,10 +281,10 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(applied) => {
+                        dirty = !applied;
                         consecutive_errors = 0;
                         retry.noted_success();
-                        acknowledge_current_head(&mut head_observer, api, workspace_id).await;
                     }
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
@@ -280,18 +299,6 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Marks the current head as observed after a successful sync so the
-/// watcher's own publication never re-triggers a redundant pass.
-async fn acknowledge_current_head(
-    observer: &mut feanorfs_agent_core::HeadObserver<'_>,
-    api: &ApiClient,
-    workspace_id: &str,
-) {
-    if let Ok(head) = api.get_head(workspace_id).await {
-        observer.acknowledge(head);
-    }
 }
 
 /// Gates sync attempts after failures with a real wait, so a transient error
@@ -377,9 +384,9 @@ async fn sync_once(
     label: &str,
     announce: bool,
     lazy: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(guard) = acquire_watcher_sync_guard(current_dir)? else {
-        return Ok(());
+        return Ok(false);
     };
     tracing::info!("{label}");
     if announce {
@@ -398,7 +405,7 @@ async fn sync_once(
     // Publish the bounded secret-free tray status snapshot so routine tray
     // refreshes never scan the project or take the sync lock.
     let _ = crate::tray::publish_worker_status(current_dir, &result.mirror_state, db).await;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

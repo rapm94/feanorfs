@@ -1,5 +1,21 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn shutdown_interrupts_registry_retry_delay() {
+    let shutdown = async { tokio::time::sleep(Duration::from_millis(10)).await };
+    tokio::pin!(shutdown);
+    assert!(tokio::time::timeout(
+        Duration::from_millis(50),
+        super::super::r#loop::wait_for_poll_or_shutdown(shutdown.as_mut()),
+    )
+    .await
+    .expect("shutdown must interrupt the retry delay"));
+    // An already-ready signal wins even when the poll would also be ready.
+    let ready = std::future::ready(());
+    tokio::pin!(ready);
+    assert!(super::super::r#loop::wait_for_poll_or_shutdown(ready.as_mut()).await);
+}
+
 #[cfg(unix)]
 #[test]
 fn supervisor_status_uses_the_native_process_start_epoch() {
@@ -74,6 +90,19 @@ fn null_pid_orphan_cleanup_is_fail_closed_for_non_stopped_states() {
     );
     retry_one_pending_orphan_cleanup(&mut job_owned);
     assert!(!job_owned.ticket.is_complete());
+    job_owned.previous_supervisor_pid = Some(std::process::id());
+    retry_one_pending_orphan_cleanup(&mut job_owned);
+    assert!(
+        !job_owned.ticket.is_complete(),
+        "live predecessor is not proof of job teardown"
+    );
+    job_owned.previous_supervisor_pid = Some(i32::MAX as u32);
+    assert!(!feanorfs_agent_core::lock::pid_alive(i32::MAX as u32));
+    retry_one_pending_orphan_cleanup(&mut job_owned);
+    assert!(
+        job_owned.ticket.is_complete(),
+        "dead predecessor closed its kill-on-close job"
+    );
 }
 
 #[test]

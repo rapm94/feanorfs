@@ -75,6 +75,15 @@ pub async fn run(current_dir: &Path, action: TrayAction, json: bool) -> anyhow::
                         result.agents.working, result.agents.need_attention
                     );
                 }
+                for line in result.activity_lines() {
+                    println!("{line}");
+                }
+                for command in feanorfs_common::tray_contract::activity_commands(
+                    result.continuous,
+                    result.resolution,
+                ) {
+                    println!("Next: {command}");
+                }
             }
         }
         TrayAction::Overview => {

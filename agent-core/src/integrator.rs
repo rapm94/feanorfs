@@ -3093,6 +3093,8 @@ mod tests {
                     verified_at_ms: None,
                     result: None,
                     question_generation: 0,
+                    human_answer: None,
+                    answer_message_id: None,
                 });
                 Ok(())
             })

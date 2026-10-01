@@ -20,6 +20,128 @@ pub(crate) const FIRST_RUN_LATER: &str = "Not Now";
 pub(crate) const HEALTH_REPAIR: &str = "Repair Mirroring";
 pub(crate) const HEALTH_CLOSE: &str = "Close";
 pub(crate) const UPDATE_OPEN: &str = "Open Release Page";
+
+pub(crate) fn prompt_resolution(
+    review: &crate::feanorfs::ResolutionReview,
+) -> Option<crate::feanorfs::ResolutionDecision> {
+    use crate::feanorfs::ResolutionDecision;
+    use feanorfs_common::{HumanResolutionOption as OptionKind, ResolutionOutcome};
+    let result = review.result.as_ref()?;
+    activate_for_native_dialog();
+    if review.human_answer.is_some() && review.answer_message_id.is_none() {
+        let choice = rfd::MessageDialog::new()
+            .set_title("Send saved answer?")
+            .set_description("Your answer is saved locally. Its publication has not been confirmed. Retry sending the same answer to the shared workspace.")
+            .set_buttons(rfd::MessageButtons::OkCancelCustom("Send Saved Answer".into(), "Cancel".into()))
+            .show();
+        return matches!(choice, rfd::MessageDialogResult::Custom(ref value) if value == "Send Saved Answer")
+            .then_some(ResolutionDecision::PublishAnswer);
+    }
+    let initial = rfd::MessageDialog::new()
+        .set_title("Review resolution")
+        .set_description(format!(
+            "{}\n\n{}",
+            review.job.conflict.path,
+            result
+                .question
+                .as_deref()
+                .unwrap_or("A resolver result is awaiting publication.")
+        ))
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            "Continue…".into(),
+            "Open Preserved Versions…".into(),
+            "Cancel".into(),
+        ))
+        .show();
+    match initial {
+        rfd::MessageDialogResult::Custom(value) if value == "Open Preserved Versions…" => {
+            return Some(ResolutionDecision::Inspect)
+        }
+        rfd::MessageDialogResult::Custom(value) if value == "Continue…" => {}
+        _ => return None,
+    }
+    if matches!(
+        result.outcome,
+        ResolutionOutcome::CandidateReady | ResolutionOutcome::NoChangeRequired
+    ) {
+        let choice = rfd::MessageDialog::new()
+            .set_title("Publish this resolution?")
+            .set_description(format!("{}\n\nThe engine will recheck the exact conflict and candidate before publishing. A replacement may overwrite or delete this path.\n\nResolver reports: {}", review.job.conflict.path, result.verification.summary))
+            .set_buttons(rfd::MessageButtons::OkCancelCustom("Publish Resolution".into(), "Cancel".into()))
+            .show();
+        return matches!(choice, rfd::MessageDialogResult::Custom(ref value) if value == "Publish Resolution")
+            .then_some(ResolutionDecision::Apply);
+    }
+    if result.outcome != ResolutionOutcome::RequiresHuman {
+        return None;
+    }
+    let description = format!("{}\n\n{}\n\nBoth conflict versions remain preserved until a resolution is explicitly published.", review.job.conflict.path, result.question.as_deref()?);
+    if result.safe_options.contains(&OptionKind::SubmitCandidate) {
+        let choice = rfd::MessageDialog::new()
+            .set_title("Resolution needs your answer")
+            .set_description(&description)
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                "Choose Replacement File…".into(),
+                "Leave Unresolved…".into(),
+                "Cancel".into(),
+            ))
+            .show();
+        match choice {
+            rfd::MessageDialogResult::Custom(value) if value == "Choose Replacement File…" => {
+                let file = rfd::FileDialog::new()
+                    .set_title("Choose the reconciled replacement file")
+                    .pick_file()?;
+                return Some(ResolutionDecision::Answer(
+                    OptionKind::SubmitCandidate,
+                    Some(file),
+                ));
+            }
+            rfd::MessageDialogResult::Custom(value) if value == "Leave Unresolved…" => {}
+            _ => return None,
+        }
+    }
+    let defer = result.safe_options.contains(&OptionKind::Defer);
+    let keep = result.safe_options.contains(&OptionKind::KeepUnresolved);
+    let choice = rfd::MessageDialog::new()
+        .set_title("Keep the conflict preserved")
+        .set_description(description)
+        .set_buttons(if defer && keep {
+            rfd::MessageButtons::YesNoCancelCustom(
+                "Defer".into(),
+                "Keep Unresolved".into(),
+                "Cancel".into(),
+            )
+        } else {
+            rfd::MessageButtons::OkCancelCustom(
+                if defer { "Defer" } else { "Keep Unresolved" }.into(),
+                "Cancel".into(),
+            )
+        })
+        .show();
+    match choice {
+        rfd::MessageDialogResult::Custom(value) if value == "Defer" && defer => {
+            Some(ResolutionDecision::Answer(OptionKind::Defer, None))
+        }
+        rfd::MessageDialogResult::Custom(value) if value == "Keep Unresolved" && keep => {
+            Some(ResolutionDecision::Answer(OptionKind::KeepUnresolved, None))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn show_resolution_outcome(result: &Result<String, String>) {
+    rfd::MessageDialog::new()
+        .set_title("Conflict resolution")
+        .set_description(match result {
+            Ok(message) | Err(message) => message,
+        })
+        .set_level(if result.is_ok() {
+            rfd::MessageLevel::Info
+        } else {
+            rfd::MessageLevel::Error
+        })
+        .show();
+}
 pub(crate) const UPDATE_LATER: &str = "Later";
 
 #[cfg(target_os = "macos")]

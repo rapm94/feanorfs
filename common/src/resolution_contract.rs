@@ -268,8 +268,8 @@ fn validate_leg(leg: &ConflictLegDescriptor, label: &str) -> Result<()> {
     );
     if !leg.present {
         ensure!(
-            !leg.deleted && leg.hash.is_empty() && leg.size == 0,
-            "{label} leg is absent but carries deletion/hash/size content"
+            !leg.deleted && leg.hash.is_empty() && leg.size == 0 && leg.mode == 0,
+            "{label} leg is absent but carries deletion/hash/size/mode content"
         );
         return Ok(());
     }
@@ -813,6 +813,7 @@ fn validate_sorted_unique_hashes(values: &[String], limit: usize, label: &str) -
 /// # Errors
 /// Returns an error for any out-of-bounds or internally inconsistent field.
 pub fn validate_resolution_result(result: &ResolutionResult) -> Result<()> {
+    crate::integrator_contract::validate_verification_evidence(&result.verification)?;
     ensure!(
         result.schema_version == RESOLUTION_SCHEMA_VERSION,
         "unsupported resolution result schema {} (expected {RESOLUTION_SCHEMA_VERSION})",
@@ -976,6 +977,13 @@ pub struct HumanResolutionAnswer {
 /// # Errors
 /// Returns an error for any out-of-bounds or internally inconsistent field.
 pub fn validate_human_resolution_answer(answer: &HumanResolutionAnswer) -> Result<()> {
+    if let Some(verification) = &answer.verification {
+        crate::integrator_contract::validate_verification_evidence(verification)?;
+        ensure!(
+            verification.summary.len() <= RESOLUTION_MAX_VERIFICATION_SUMMARY_BYTES,
+            "human answer verification summary exceeds its byte bound"
+        );
+    }
     ensure!(
         answer.schema_version == RESOLUTION_SCHEMA_VERSION,
         "unsupported human answer schema {} (expected {RESOLUTION_SCHEMA_VERSION})",
@@ -1232,7 +1240,7 @@ pub fn encode_resolution_profile(profile: &ResolutionProfile) -> Result<String> 
     validate_resolution_profile(profile)?;
     let bytes = serde_json::to_vec(profile).context("serialize ffres1 profile")?;
     ensure!(
-        bytes.len() <= RESOLUTION_MAX_PROFILE_BYTES,
+        bytes.len() < RESOLUTION_MAX_PROFILE_BYTES - RESOLUTION_JOB_DISCRIMINATOR.len(),
         "ffres1 profile exceeds the signal body bound"
     );
     let mut body = String::with_capacity(RESOLUTION_JOB_DISCRIMINATOR.len() + 1 + bytes.len());
@@ -1249,12 +1257,12 @@ pub fn encode_resolution_profile(profile: &ResolutionProfile) -> Result<String> 
 /// unknown versions, malformed JSON, or profiles failing validation.
 #[must_use]
 pub fn parse_resolution_profile(body: &str) -> Option<ResolutionProfile> {
+    if body.len() > RESOLUTION_MAX_PROFILE_BYTES {
+        return None;
+    }
     let json = body
         .strip_prefix(RESOLUTION_JOB_DISCRIMINATOR)?
         .strip_prefix(':')?;
-    if json.len() > RESOLUTION_MAX_PROFILE_BYTES {
-        return None;
-    }
     let profile: ResolutionProfile = serde_json::from_str(json).ok()?;
     if validate_resolution_profile(&profile).is_err() {
         return None;
@@ -1549,6 +1557,73 @@ pub mod resolution_fixtures {
 mod tests {
     use super::resolution_fixtures as fixtures;
     use super::*;
+
+    #[test]
+    fn absent_leg_rejects_executable_mode() {
+        let mut identity = fixtures::absent_base();
+        validate_conflict_identity(&identity).unwrap();
+        identity.base.mode = crate::EXECUTABLE_MODE;
+        assert!(validate_conflict_identity(&identity).is_err());
+    }
+
+    #[test]
+    fn result_and_human_answer_validate_evidence() {
+        use crate::integrator_contract::{VerificationCheck, VERIFICATION_MAX_CHECKS, VERIFICATION_MAX_INPUT_HASHES};
+        let mut result = fixtures::result();
+        result.verification.checks = vec![VerificationCheck {
+            name: "check".to_string(), passed: true, detail: None,
+        }; VERIFICATION_MAX_CHECKS];
+        result.verification.input_hashes = vec!["a".repeat(64); VERIFICATION_MAX_INPUT_HASHES];
+        let mut answer = HumanResolutionAnswer {
+            schema_version: RESOLUTION_SCHEMA_VERSION,
+            job_id: result.job_id.clone(), assignment_id: result.assignment_id.clone(),
+            attempt: result.attempt, conflict_fingerprint: result.conflict_fingerprint.clone(),
+            question_generation: 0, chosen_option: HumanResolutionOption::SubmitCandidate,
+            candidate: result.candidate.clone(), verification: Some(result.verification.clone()),
+        };
+        validate_resolution_result(&result).unwrap();
+        validate_human_resolution_answer(&answer).unwrap();
+        for bad in [
+            crate::VerificationSummary { checks: vec![result.verification.checks[0].clone(); VERIFICATION_MAX_CHECKS + 1], ..result.verification.clone() },
+            crate::VerificationSummary { input_hashes: vec!["a".repeat(64); VERIFICATION_MAX_INPUT_HASHES + 1], ..result.verification.clone() },
+            crate::VerificationSummary { input_hashes: vec!["a".repeat(32)], ..result.verification.clone() },
+            crate::VerificationSummary { output_hash: Some("A".repeat(64)), ..result.verification.clone() },
+        ] {
+            result.verification = bad.clone();
+            answer.verification = Some(bad);
+            assert!(validate_resolution_result(&result).is_err());
+            assert!(validate_human_resolution_answer(&answer).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_bound_includes_discriminator() {
+        let mut result = fixtures::result();
+        // JSON escaping permits a large body while individual evidence
+        // strings remain within their decoded byte bounds.
+        result.verification.checks = vec![crate::integrator_contract::VerificationCheck {
+            name: "check".into(), passed: true, detail: Some("\n".repeat(512)),
+        }; 6];
+        let initial = encode_resolution_profile(&ResolutionProfile::Result(result.clone())).unwrap().len();
+        let remaining = RESOLUTION_MAX_PROFILE_BYTES - initial;
+        result.diagnostics = vec![String::new(); remaining.div_ceil(RESOLUTION_DIAGNOSTIC_BYTES)];
+        let overhead = encode_resolution_profile(&ResolutionProfile::Result(result.clone())).unwrap().len();
+        let mut padding = RESOLUTION_MAX_PROFILE_BYTES - overhead;
+        for diagnostic in &mut result.diagnostics {
+            let take = padding.min(RESOLUTION_DIAGNOSTIC_BYTES);
+            *diagnostic = "x".repeat(take);
+            padding -= take;
+        }
+        assert_eq!(padding, 0);
+        let body = encode_resolution_profile(&ResolutionProfile::Result(result.clone())).unwrap();
+        assert_eq!(body.len(), RESOLUTION_MAX_PROFILE_BYTES);
+        assert!(parse_resolution_profile(&body).is_some());
+        result.diagnostics.last_mut().unwrap().push('x');
+        let oversized = format!("{RESOLUTION_JOB_DISCRIMINATOR}:{}", serde_json::to_string(&ResolutionProfile::Result(result.clone())).unwrap());
+        assert_eq!(oversized.len(), RESOLUTION_MAX_PROFILE_BYTES + 1);
+        assert!(encode_resolution_profile(&ResolutionProfile::Result(result)).is_err());
+        assert!(parse_resolution_profile(&oversized).is_none());
+    }
 
     #[test]
     fn golden_fingerprints_are_frozen() {

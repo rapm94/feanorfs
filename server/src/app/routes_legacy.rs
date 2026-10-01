@@ -75,7 +75,7 @@ pub(super) async fn handle_upload(
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             if !retired {
-                tracing::warn!(path = %params.path, "rejected new unsafe tombstone path");
+                tracing::warn!("rejected new unsafe tombstone path");
                 return Err(StatusCode::BAD_REQUEST);
             }
             return Ok(StatusCode::OK);
@@ -98,21 +98,16 @@ pub(super) async fn handle_upload(
         return Ok(StatusCode::OK);
     }
     if !safe_path {
-        tracing::warn!(path = %params.path, "rejected upload with unsafe path");
+        tracing::warn!("rejected upload with unsafe path");
         return Err(StatusCode::BAD_REQUEST);
     }
     if !is_valid_hash(&params.hash) {
-        tracing::warn!(hash = %params.hash, "rejected upload with invalid hash");
+        tracing::warn!("rejected upload with invalid hash");
         return Err(StatusCode::BAD_REQUEST);
     }
     let computed_hash = hash_bytes(&body);
     if computed_hash != params.hash {
-        tracing::warn!(
-            path = %params.path,
-            expected = %params.hash,
-            computed = %computed_hash,
-            "upload hash mismatch"
-        );
+        tracing::warn!("upload hash mismatch");
         return Err(StatusCode::BAD_REQUEST);
     }
     let blob_path = state.storage_dir.join("blobs").join(&params.hash);

@@ -230,6 +230,110 @@ async fn directory_to_file_replacement_reports_leaf_deletes_and_file_add() {
     );
 }
 
+#[tokio::test]
+async fn rekey_cannot_replace_a_head_newer_than_its_source_view() {
+    let hub_data = tempfile::tempdir().unwrap();
+    let client = tempfile::tempdir().unwrap();
+    let hub = LocalHub::open(hub_data.path().to_path_buf(), None)
+        .await
+        .unwrap();
+    let api = ApiClient::local(hub, None);
+    let state = ensure_workspace_state(client.path()).unwrap();
+    let db = ClientDb::new(&state).await.unwrap();
+    let ctx = SyncCtx::new(
+        &api,
+        &db,
+        client.path(),
+        "workspace",
+        Some("old-key"),
+        LegacyPolicy::Reject,
+    );
+    let engine = SnapshotEngine::new(&ctx);
+    let source = engine
+        .publish_server_view(&HashMap::new(), "source")
+        .await
+        .unwrap();
+    upload_blob(&api, b"new peer bytes").await;
+    let peer_files = HashMap::from([(
+        "peer.txt".into(),
+        FileState {
+            path: "peer.txt".into(),
+            hash: hash_bytes(b"new peer bytes"),
+            size: 14,
+            mtime: 1,
+            deleted: false,
+            mode: 0,
+        },
+    )]);
+    let newer = engine
+        .publish_server_view(&peer_files, "peer")
+        .await
+        .unwrap();
+    assert_ne!(source, newer);
+    let target_ctx = SyncCtx::new(
+        &api,
+        &db,
+        client.path(),
+        "workspace",
+        Some("new-key"),
+        LegacyPolicy::Reject,
+    );
+    let target = SnapshotEngine::new(&target_ctx);
+    assert!(target
+        .publish_rekeyed_view(Some(&source), &HashMap::new(), "rekey")
+        .await
+        .is_err());
+    assert_eq!(api.get_head("workspace").await.unwrap(), Some(newer));
+}
+
+#[tokio::test]
+async fn rekey_retry_after_swapped_head_completes_idempotently() {
+    let hub_data = tempfile::tempdir().unwrap();
+    let client = tempfile::tempdir().unwrap();
+    let hub = LocalHub::open(hub_data.path().to_path_buf(), None)
+        .await
+        .unwrap();
+    let api = ApiClient::local(hub, None);
+    let state = ensure_workspace_state(client.path()).unwrap();
+    let db = ClientDb::new(&state).await.unwrap();
+    let ctx = SyncCtx::new(
+        &api,
+        &db,
+        client.path(),
+        "workspace",
+        Some("old-key"),
+        LegacyPolicy::Reject,
+    );
+    let engine = SnapshotEngine::new(&ctx);
+    let source = engine
+        .publish_server_view(&HashMap::new(), "source")
+        .await
+        .unwrap();
+    let target_ctx = SyncCtx::new(
+        &api,
+        &db,
+        client.path(),
+        "workspace",
+        Some("new-key"),
+        LegacyPolicy::Reject,
+    );
+    let target = SnapshotEngine::new(&target_ctx);
+    let candidate = target
+        .prepare_rekeyed_view(&HashMap::new(), "rekey")
+        .await
+        .unwrap();
+    let first = target
+        .publish_prepared_rekeyed_view(Some(&source), &candidate)
+        .await
+        .unwrap();
+    // A durable journal retries the exact source/candidate pair after uncertain CAS.
+    let retried = target
+        .publish_prepared_rekeyed_view(Some(&source), &candidate)
+        .await
+        .unwrap();
+    assert_eq!(first, retried);
+}
+
 async fn collect_count(mut entries: tokio::fs::ReadDir) -> usize {
     let mut count = 0;
     while entries.next_entry().await.unwrap().is_some() {

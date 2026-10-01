@@ -10,6 +10,7 @@
 use crate::{hash_bytes, is_valid_hash};
 use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 /// Version string domain-separating every integrator selection draw.
 pub const INTEGRATOR_ALGORITHM_VERSION: &str = "feanorfs-integrator-selection-v1";
@@ -49,11 +50,12 @@ pub const INTEGRATOR_DEFAULT_ACK_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub fn is_valid_agent_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= crate::AGENT_NAME_MAX_BYTES
-        && !name.chars().any(char::is_control)
+        && name.nfc().eq(name.chars())
+        && !name.starts_with([' ', '.'])
+        && !name.ends_with([' ', '.'])
+        && !name.chars().any(|c| c.is_control() || r#"<>:"|?*"#.contains(c))
         && !name.contains(['/', '\\'])
-        && name != "."
-        && name != ".."
-        && name != "*"
+        && !crate::is_windows_reserved_component(name)
 }
 
 /// Whether `value` is exactly `bytes` lowercase hex characters.
@@ -917,6 +919,7 @@ fn validate_profile(profile: &IntegratorProfile) -> Result<()> {
 /// # Errors
 /// Returns an error for any out-of-bounds field.
 pub fn validate_integrator_digest(digest: &IntegratorDigest) -> Result<()> {
+    validate_verification_evidence(&digest.verification)?;
     ensure!(
         is_valid_hex_id(&digest.assignment_id, 32),
         "digest assignment_id must be exactly 32 lowercase hex chars"
@@ -1046,10 +1049,32 @@ mod tests {
             "nested/name",
             "nested\\name",
             "bad\nname",
+            "cafe\u{301}",
+            " name",
+            "name ",
+            ".name",
+            "name.",
+            "CON",
+            "prn.txt",
+            "AuX",
+            "nul",
+            "com1",
+            "LPT9.log",
+            "COM¹",
+            "LPT².txt",
+            "COM³",
+            "CONIN$",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a|b",
+            "a<b",
+            "a>b",
+            "a\"b",
         ] {
             assert!(!is_valid_agent_name(name), "{name:?} must be rejected");
         }
-        for name in ["agent-a", "mac-test", "ci1", "a"] {
+        for name in ["agent-a", "mac-test", "ci1", "a", "a b", "a+b", "café", "COM10", "a.b"] {
             assert!(is_valid_agent_name(name), "{name:?} must be accepted");
         }
         assert!(!is_valid_agent_name(
@@ -1306,6 +1331,24 @@ mod tests {
             risks: vec![],
             decision_required: None,
         }
+    }
+
+    #[test]
+    fn digest_validates_verification_evidence() {
+        let mut value = digest(ASSIGNMENT);
+        value.verification.input_hashes = vec![SNAP_A.to_string(); VERIFICATION_MAX_INPUT_HASHES];
+        value.verification.checks = vec![VerificationCheck {
+            name: "check".to_string(), passed: true, detail: None,
+        }; VERIFICATION_MAX_CHECKS];
+        validate_integrator_digest(&value).unwrap();
+        value.verification.input_hashes.push(SNAP_A.to_string());
+        assert!(validate_integrator_digest(&value).is_err());
+        value.verification.input_hashes.pop();
+        value.verification.checks.push(value.verification.checks[0].clone());
+        assert!(validate_integrator_digest(&value).is_err());
+        value.verification.checks.pop();
+        value.verification.input_hashes[0] = "A".repeat(64);
+        assert!(validate_integrator_digest(&value).is_err());
     }
 
     #[test]

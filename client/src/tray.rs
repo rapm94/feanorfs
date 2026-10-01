@@ -199,8 +199,7 @@ pub fn invalidate_worker_status(current_dir: &Path) {
     }
 }
 
-#[cfg(test)]
-fn load_worker_status(current_dir: &Path) -> Option<WorkerStatusSnapshot> {
+pub(crate) fn load_worker_status(current_dir: &Path) -> Option<WorkerStatusSnapshot> {
     let state = feanorfs_agent_core::ensure_workspace_state(current_dir).ok()?;
     load_worker_status_at_state(&state)
 }
@@ -434,6 +433,9 @@ async fn cheap_tray_status(
     };
 
     Ok(TrayStatusResult {
+        reported_at_ms: None,
+        continuous: None,
+        resolution: None,
         mirror_state: mirror_state_str(mirror),
         paused: is_paused(current_dir),
         watching: is_watching(current_dir),
@@ -494,6 +496,9 @@ pub async fn do_tray_status_with(current_dir: &Path, fresh: bool) -> Result<Tray
         load_agents_summary(current_dir, &db, &api, &config.workspace_id, password).await?;
 
     Ok(TrayStatusResult {
+        reported_at_ms: status.reported_at_ms,
+        continuous: status.continuous,
+        resolution: status.resolution,
         mirror_state: mirror_state_str(status.mirror_state),
         paused,
         watching,
@@ -520,6 +525,9 @@ fn snapshot_tray_status(
         entries: vec![],
     });
     Ok(TrayStatusResult {
+        reported_at_ms: Some(snapshot.published_at_ms),
+        continuous: snapshot.continuous,
+        resolution: snapshot.resolution,
         mirror_state: if syncing {
             "syncing".into()
         } else {
@@ -542,6 +550,9 @@ fn missing_snapshot_tray_status(
     workspace_id: &str,
 ) -> Result<TrayStatusResult> {
     Ok(TrayStatusResult {
+        reported_at_ms: None,
+        continuous: None,
+        resolution: None,
         mirror_state: "syncing".into(),
         paused: is_paused_at_state(state),
         watching: is_watching_at_state(state),
@@ -634,6 +645,8 @@ mod tests {
                 verified_at_ms: None,
                 result,
                 question_generation: 0,
+                human_answer: None,
+                answer_message_id: None,
             }
         };
         let state = ResolutionStateFile {

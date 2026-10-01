@@ -1,11 +1,13 @@
 //! Encrypted agent signals: message-only snapshots and reachability-delta inbox.
 //!
-//! A signal is an ordinary encrypted format-v3 snapshot with no file-tree
+//! A standalone signal is an ordinary encrypted format-v3 snapshot with no file-tree
 //! changes: it reuses the latest head's tree root, keeps the latest head as
 //! its parent, stores the sender in `Snapshot.author`, and stores the
 //! `ffmsg1:` envelope in `Snapshot.message`. Publication uses the existing
 //! workspace-head compare-and-swap operation; every CAS retry reloads both the
 //! latest head and its tree root so a retry can never roll back files.
+//! Guarded resolution snapshots may carry a status envelope alongside their
+//! file change; inbox traversal reads both through the same contract.
 
 use crate::history::traversal;
 use crate::paths::validate_name;

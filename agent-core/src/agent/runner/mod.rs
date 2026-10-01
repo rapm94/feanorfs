@@ -605,6 +605,7 @@ mod tests {
             &program,
             vec!["--replacement".into()],
             7200,
+            RunnerScopeMode::Enforced,
         )
         .unwrap();
         status_pause.release().unwrap();
@@ -1133,9 +1134,22 @@ mod tests {
             &program,
             vec!["--replacement".into()],
             7200,
+            RunnerScopeMode::Enforced,
         )
         .unwrap();
         let after = replaced.status().unwrap();
+        assert_eq!(after.scope_mode, RunnerScopeMode::Enforced);
+        let persisted = fs::read_to_string(
+            RunnerStore::open_configured(base.path())
+                .unwrap()
+                .path()
+                .to_owned(),
+        )
+        .unwrap();
+        assert!(
+            persisted.contains("\"scope_mode\": \"enforced\""),
+            "reconfigure must persist the requested scope mode"
+        );
         assert!(!after.enabled);
         assert_eq!(after.pending_count, before.pending_count);
         assert_eq!(after.attention, before.attention);
@@ -1187,7 +1201,7 @@ mod tests {
             }
             let program = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
             assert!(
-                RunnerStore::reconfigure(base.path(), "worker", &program, vec![], 3600,)
+                RunnerStore::reconfigure(base.path(), "worker", &program, vec![], 3600, RunnerScopeMode::LegacyUnenforced)
                     .unwrap_err()
                     .to_string()
                     .contains("launching or running")
@@ -1855,13 +1869,14 @@ mod tests {
     fn bounds_corrupt_unknown_and_future_state_fail_closed() {
         let (base, store) = setup();
         let program = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-        assert!(RunnerStore::reconfigure(base.path(), "worker", &program, vec![], 59,).is_err());
+        assert!(RunnerStore::reconfigure(base.path(), "worker", &program, vec![], 59, RunnerScopeMode::LegacyUnenforced).is_err());
         assert!(RunnerStore::reconfigure(
             base.path(),
             "worker",
             &program,
             vec![String::new(); MAX_ARGS + 1],
             60,
+            RunnerScopeMode::LegacyUnenforced,
         )
         .is_err());
         fs::write(store.path(), "not-json").unwrap();

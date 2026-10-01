@@ -116,6 +116,9 @@ pub(crate) fn handle_menu_action(
     action: MenuAction,
     proxy: &EventLoopProxy<Action>,
 ) {
+    if state.resolution_inflight && !matches!(&action, MenuAction::OpenFolder | MenuAction::Quit) {
+        return;
+    }
     if (state.setup_inflight || state.switch_inflight) && !matches!(&action, MenuAction::OpenFolder)
     {
         return;
@@ -145,6 +148,23 @@ pub(crate) fn handle_menu_action(
         return;
     }
     match action {
+        MenuAction::ReviewResolutions => {
+            let Some(workspace) = state.workspace.clone() else {
+                return;
+            };
+            state.resolution_inflight = true;
+            let generation = state.task_generation;
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                let review = crate::feanorfs::review_resolution(&workspace)
+                    .map(|review| review.map(Box::new));
+                let _ = proxy.send_event(Action::ResolutionReady {
+                    generation,
+                    workspace,
+                    review,
+                });
+            });
+        }
         MenuAction::AddFolder => {
             if state.setup_inflight
                 || state.stop_inflight

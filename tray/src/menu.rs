@@ -16,7 +16,7 @@ pub(crate) fn header_label(status: &TrayStatusResult) -> String {
         return format!("FeanorFS — {} (paused)", status.workspace_label);
     }
     let state = match status.mirror_state.as_str() {
-        "idle" => "up to date",
+        "idle" => "up to date with hub",
         "out_of_sync" => "has changes",
         "offline" => "offline",
         "conflict" => "needs attention",
@@ -174,6 +174,20 @@ pub(crate) fn build_menu(state: &AppState) -> Menu {
                 None,
             ));
         }
+        for (index, line) in s.activity_lines().into_iter().enumerate() {
+            let _ = menu.append(&MenuItem::with_id(
+                muda::MenuId::new(format!("activity-{index}")),
+                line,
+                false,
+                None,
+            ));
+        }
+        let _ = menu.append(&MenuItem::with_id(
+            muda::MenuId::new("review-resolutions"),
+            "Review Resolutions…",
+            actions_enabled,
+            None,
+        ));
         if let Some(msg) = &state.error_message {
             let _ = menu.append(&MenuItem::with_id(
                 muda::MenuId::new("error"),
@@ -445,12 +459,16 @@ pub(crate) enum MenuAction {
     SwitchWorkspace(PathBuf),
     ForgetUnavailable,
     CheckHealth,
+    ReviewResolutions,
     CheckUpdates,
     InstallUpdate,
     Quit,
 }
 
 pub(crate) fn parse_menu_action(id: &str) -> Option<MenuAction> {
+    if id == "review-resolutions" {
+        return Some(MenuAction::ReviewResolutions);
+    }
     if id == "add-folder" {
         return Some(MenuAction::AddFolder);
     }
@@ -649,6 +667,9 @@ mod tests {
 
     fn status(mirror_state: &str, paused: bool) -> TrayStatusResult {
         TrayStatusResult {
+            reported_at_ms: None,
+            continuous: None,
+            resolution: None,
             mirror_state: mirror_state.into(),
             paused,
             watching: true,

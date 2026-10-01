@@ -206,33 +206,69 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         bail!("workspace head changed too many times while publishing snapshot")
     }
 
-    /// Publishes a re-encrypted root without retaining an unreadable old-key parent.
-    pub async fn publish_rekeyed_view(
+    /// Prepares a parentless rekey snapshot and uploads its reachability closure.
+    /// The caller must durably record the returned ID before attempting publication.
+    pub async fn prepare_rekeyed_view(
         &self,
         files: &HashMap<String, FileState>,
         author: &str,
     ) -> Result<String> {
-        let expected = self.ctx.api.get_head(self.ctx.workspace_id()).await?;
-        let id = self
-            .write(SnapshotInput {
-                files,
-                conflicts: &[],
-                parents: Vec::new(),
-                author,
-                message: Some("rekey workspace".to_string()),
-            })
-            .await?;
+        self.write(SnapshotInput {
+            files,
+            conflicts: &[],
+            parents: Vec::new(),
+            author,
+            message: Some("rekey workspace".to_string()),
+        })
+        .await
+    }
+
+    /// Publishes one durable rekey candidate against its captured source head.
+    /// `None` means an absent source head, never permission to refresh it.
+    /// Retries must reuse both arguments, including after an uncertain CAS result.
+    pub async fn publish_prepared_rekeyed_view(
+        &self,
+        source_head: Option<&str>,
+        candidate_id: &str,
+    ) -> Result<String> {
+        anyhow::ensure!(
+            source_head.is_none_or(feanorfs_common::is_valid_hash)
+                && feanorfs_common::is_valid_hash(candidate_id),
+            "invalid rekey publication binding"
+        );
+        let candidate = self.load_snapshot(candidate_id).await?;
+        anyhow::ensure!(
+            candidate.parents.is_empty() && candidate.message.as_deref() == Some("rekey workspace"),
+            "rekey candidate must be a parentless rekey snapshot"
+        );
         match self
             .ctx
             .api
-            .swap_head(self.ctx.workspace_id(), expected.as_deref(), &id)
+            .swap_head(self.ctx.workspace_id(), source_head, candidate_id)
             .await?
         {
-            SwapHeadResult::Swapped => Ok(id),
+            SwapHeadResult::Swapped => Ok(candidate_id.to_string()),
+            SwapHeadResult::Conflict(current) if current.as_deref() == Some(candidate_id) => {
+                Ok(candidate_id.to_string())
+            }
             SwapHeadResult::Conflict(_) => {
-                bail!("workspace changed during rekey migration; retry from a fresh pull")
+                bail!(
+                    "workspace changed during rekey migration; preserving the publication journal"
+                )
             }
         }
+    }
+
+    /// One-shot source-bound rekey. Crash-resumable callers must instead prepare,
+    /// persist the candidate ID, then call `publish_prepared_rekeyed_view`.
+    pub async fn publish_rekeyed_view(
+        &self,
+        source_head: Option<&str>,
+        files: &HashMap<String, FileState>,
+        author: &str,
+    ) -> Result<String> {
+        let id = self.prepare_rekeyed_view(files, author).await?;
+        self.publish_prepared_rekeyed_view(source_head, &id).await
     }
 
     /// Loads one snapshot object.
@@ -393,6 +429,44 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         self.commit_resolution_publication(&planned).await
     }
 
+    /// Prove that only bounded, single-parent signals separate the current
+    /// head from the immutable preparation identity. No file-tree change,
+    /// unknown history message, or disconnected same-tree head is accepted.
+    pub(crate) async fn validate_resolution_head(
+        &self,
+        identity: &feanorfs_common::ConflictIdentity,
+        head: &str,
+    ) -> Result<()> {
+        let mut cursor = head.to_string();
+        for hops in 0..=64 {
+            if cursor == identity.current_snapshot {
+                if self.load_snapshot(&cursor).await?.root == identity.tree_root {
+                    return Ok(());
+                }
+                break;
+            }
+            if hops == 64 {
+                break;
+            }
+            let snapshot = self.load_snapshot(&cursor).await?;
+            if snapshot.root != identity.tree_root
+                || snapshot.parents.len() != 1
+                || snapshot
+                    .message
+                    .as_deref()
+                    .and_then(feanorfs_common::parse_agent_message)
+                    .is_none()
+            {
+                break;
+            }
+            cursor = snapshot.parents[0].clone();
+        }
+        Err(anyhow::Error::new(StalePublication {
+            kind: feanorfs_common::ResolutionStaleKind::HeadChanged,
+            detail: "workspace advanced beyond the bounded signal-only history of this resolution; review again".into(),
+        }))
+    }
+
     /// Computes the full guarded-publication plan without swapping the head:
     /// validates the head, re-reads/rehashes/uploads the candidate, and
     /// writes the candidate snapshot. The returned id is the head the CAS
@@ -409,6 +483,11 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         use crate::conflict_artifacts::leg_descriptor;
         use feanorfs_common::{compute_conflict_identity_fingerprint, ResolutionStaleKind};
 
+        crate::paths::validate_name(&plan.author)?;
+        anyhow::ensure!(
+            plan.author != "*",
+            "resolution author cannot be a broadcast recipient"
+        );
         let Some(head) = self.ctx.api.get_head(self.ctx.workspace_id()).await? else {
             return Err(anyhow::Error::new(StalePublication {
                 kind: ResolutionStaleKind::HeadChanged,
@@ -418,6 +497,7 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         if head != plan.expected_head {
             return Err(anyhow::Error::new(LostCas { current_head: head }));
         }
+        self.validate_resolution_head(&plan.identity, &head).await?;
         let snapshot = self.load_snapshot(&head).await?;
         let state = self.objects.get_tree_state(&snapshot.root).await?;
         let Some(conflict) = state
@@ -450,8 +530,10 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
             }));
         }
         let mut identity = plan.identity.clone();
-        identity.current_snapshot = head.clone();
-        identity.about_snapshot = head.clone();
+        // Keep the original snapshot binding and fingerprint. The bounded
+        // signal-only proof above authorizes this CAS head, not a new job.
+        identity.about_snapshot = identity.current_snapshot.clone();
+        identity.workspace_id = self.ctx.workspace_id().to_string();
         identity.tree_root = snapshot.root.clone();
         identity.base = leg_descriptor(conflict.base.as_ref());
         identity.ours = leg_descriptor(conflict.ours.as_ref());
@@ -522,7 +604,22 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         let mut conflicts = state.conflicts.clone();
         conflicts.retain(|candidate| candidate.path != plan.identity.path);
 
-        let message = format!("resolve {}", plan.identity.path);
+        // Publish the notice with the resolved tree in the same CAS. There
+        // is no post-publication send to lose on a crash or retry twice.
+        // about_snapshot identifies the conflicted version; the inbox's
+        // message_id identifies this resulting snapshot.
+        let message = feanorfs_common::encode_agent_message(
+            &feanorfs_common::AgentMessagePayload {
+                to: "*".to_string(),
+                kind: feanorfs_common::AgentMessageKind::Status,
+                body: format!(
+                    "Resolved conflict at {} (fingerprint {}). The resulting files are in this message's snapshot.",
+                    plan.identity.path, plan.fingerprint
+                ),
+                about_snapshot: head.clone(),
+                reply_to: None,
+            },
+        )?;
         let candidate_id = self
             .write(SnapshotInput {
                 files: &files,

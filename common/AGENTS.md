@@ -52,6 +52,10 @@ No child directories. `src/` is a flat module and `tests/` is a single integrati
 
 ## Continuous status contract
 
+- `TrayStatusResult` preserves optional worker `continuous`, `resolution`, and
+  `reported_at_ms` observations. Missing fields mean unknown. Shared
+  `activity_lines()` labels cached counts as last reported; they never prove
+  current process liveness or delivery to another computer.
 - `agent_contract.rs` owns `ContinuousPhase`, `ContinuousAttention`,
   `ContinuousAgentStatus`, and `CONTINUOUS_STATUS_SCHEMA_VERSION` with a
   canonical fixture. The projection is bounded, secret-free, and additive
