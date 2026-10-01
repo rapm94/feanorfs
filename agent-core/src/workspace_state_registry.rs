@@ -888,7 +888,10 @@ fn retirement_binding_unchanged(state: &Path, expected: &SlotTombstone) -> Resul
     {
         return Ok(false);
     }
-    Ok(!folder_matches_recorded_identity(&expected.canonical_path, &expected.identity)?)
+    Ok(!folder_matches_recorded_identity(
+        &expected.canonical_path,
+        &expected.identity,
+    )?)
 }
 
 /// Extract the 64-hex slot name from a `workspace-<slot>-<stamp>` quarantine
@@ -1203,13 +1206,20 @@ mod tests {
             fs::remove_dir_all(workspace.path()).unwrap();
             retire_workspace_state_in(root.path(), workspace.path(), Duration::ZERO).unwrap();
             let directory = fs::read_dir(root.path().join("quarantine"))
-                .unwrap().next().unwrap().unwrap().path();
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
             fs::write(directory.join(field), "changed-binding").unwrap();
             let mut sweep = RetirementSweep::default();
             sweep_quarantine(root.path(), u64::MAX, &mut sweep).unwrap();
             assert!(sweep.deleted.is_empty());
             assert_eq!(sweep.retained, vec![slot]);
-            assert_eq!(fs::read(directory.join("config.json")).unwrap(), b"capability");
+            assert_eq!(
+                fs::read(directory.join("config.json")).unwrap(),
+                b"capability"
+            );
         }
     }
 
@@ -1219,7 +1229,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let (state, slot) = prepare_slot(root.path(), workspace.path());
         fs::remove_dir_all(workspace.path()).unwrap();
-        retire_workspace_state_in(root.path(), workspace.path(), Duration::from_secs(3600)).unwrap();
+        retire_workspace_state_in(root.path(), workspace.path(), Duration::from_secs(3600))
+            .unwrap();
         let exclusive = ExclusiveStateLease::try_acquire(root.path(), &slot).unwrap();
         let scanned = read_slot_tombstone(&state).unwrap().unwrap();
         let mut replacement = scanned.clone();
@@ -1233,7 +1244,11 @@ mod tests {
         sweep_tombstoned_slots(root.path(), u64::MAX, &mut sweep).unwrap();
         assert_eq!(sweep.quarantined, vec![slot.clone()]);
         let directory = fs::read_dir(root.path().join("quarantine"))
-            .unwrap().next().unwrap().unwrap().path();
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         let _exclusive = ExclusiveStateLease::try_acquire(root.path(), &slot).unwrap();
         let scanned = read_slot_tombstone(&directory).unwrap().unwrap();
         let mut replacement = scanned.clone();
@@ -1250,7 +1265,8 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             let (state, slot) = prepare_slot(root.path(), workspace.path());
             fs::remove_dir_all(workspace.path()).unwrap();
-            retire_workspace_state_in(root.path(), workspace.path(), Duration::from_secs(3600)).unwrap();
+            retire_workspace_state_in(root.path(), workspace.path(), Duration::from_secs(3600))
+                .unwrap();
             fs::write(state.join(field), "changed-binding").unwrap();
             let mut sweep = RetirementSweep::default();
             sweep_tombstoned_slots(root.path(), u64::MAX, &mut sweep).unwrap();

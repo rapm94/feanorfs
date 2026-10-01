@@ -1200,12 +1200,17 @@ mod tests {
                     .unwrap();
             }
             let program = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-            assert!(
-                RunnerStore::reconfigure(base.path(), "worker", &program, vec![], 3600, RunnerScopeMode::LegacyUnenforced)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("launching or running")
-            );
+            assert!(RunnerStore::reconfigure(
+                base.path(),
+                "worker",
+                &program,
+                vec![],
+                3600,
+                RunnerScopeMode::LegacyUnenforced
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("launching or running"));
         }
     }
 
@@ -1869,7 +1874,15 @@ mod tests {
     fn bounds_corrupt_unknown_and_future_state_fail_closed() {
         let (base, store) = setup();
         let program = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-        assert!(RunnerStore::reconfigure(base.path(), "worker", &program, vec![], 59, RunnerScopeMode::LegacyUnenforced).is_err());
+        assert!(RunnerStore::reconfigure(
+            base.path(),
+            "worker",
+            &program,
+            vec![],
+            59,
+            RunnerScopeMode::LegacyUnenforced
+        )
+        .is_err());
         assert!(RunnerStore::reconfigure(
             base.path(),
             "worker",

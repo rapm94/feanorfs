@@ -228,16 +228,26 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("live.lock");
         let mut held = OpenOptions::new()
-            .read(true).write(true).create_new(true).open(&path).unwrap();
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
         fs2::FileExt::try_lock_exclusive(&held).unwrap();
         // The publication window, corrupt metadata and arbitrarily old dates
         // must all preserve ownership. A separate open simulates a contender.
-        for bytes in [String::new(), "garbage".to_string(), format!("{}\n0\n", std::process::id())] {
+        for bytes in [
+            String::new(),
+            "garbage".to_string(),
+            format!("{}\n0\n", std::process::id()),
+        ] {
             held.set_len(0).unwrap();
             std::io::Seek::rewind(&mut held).unwrap();
             held.write_all(bytes.as_bytes()).unwrap();
             assert!(!is_stale(&path, 0));
-            assert!(is_lock_contention(&try_acquire_lock_file(&path, "test").unwrap_err()));
+            assert!(is_lock_contention(
+                &try_acquire_lock_file(&path, "test").unwrap_err()
+            ));
         }
         drop(held);
         assert!(is_stale(&path, u64::MAX));
@@ -251,7 +261,10 @@ mod tests {
     fn unheld_diagnostics_are_reusable_even_for_live_pid() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("stale.lock");
-        for bytes in ["not-a-lock".to_string(), format!("{}\n0\n", std::process::id())] {
+        for bytes in [
+            "not-a-lock".to_string(),
+            format!("{}\n0\n", std::process::id()),
+        ] {
             fs::write(&path, bytes).unwrap();
             assert!(is_stale(&path, 600));
             let _held = try_acquire_lock_file(&path, "test").unwrap();
@@ -263,9 +276,13 @@ mod tests {
     fn sync_and_land_are_non_reentrant_and_release_without_unlink() {
         let base = tempfile::tempdir().unwrap();
         let sync = SyncLock::acquire(base.path()).unwrap();
-        assert!(is_lock_contention(&SyncLock::acquire(base.path()).err().unwrap()));
+        assert!(is_lock_contention(
+            &SyncLock::acquire(base.path()).err().unwrap()
+        ));
         let land = LandLock::acquire(base.path()).unwrap();
-        assert!(is_lock_contention(&LandLock::acquire(base.path()).err().unwrap()));
+        assert!(is_lock_contention(
+            &LandLock::acquire(base.path()).err().unwrap()
+        ));
         drop(sync);
         drop(land);
         assert!(lock_path(base.path(), "sync.lock").unwrap().exists());

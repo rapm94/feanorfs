@@ -20,8 +20,8 @@ use super::materialize::portable::same_file_identity;
 use super::materialize::unix::{
     inspect_backup_recovery, open_materialization_anchors, portable_component,
     remove_created_descendants_for_backup, remove_created_directories_at,
-    remove_recovered_publication_no_follow,
-    restore_backup_no_follow, unlink_regular_at, BackupRecoveryState,
+    remove_recovered_publication_no_follow, restore_backup_no_follow, unlink_regular_at,
+    BackupRecoveryState,
 };
 #[cfg(windows)]
 use super::materialize::windows::{

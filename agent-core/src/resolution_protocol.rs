@@ -374,23 +374,30 @@ fn apply_profile_to_entry(
             // Select by this profile's id, not an intervening answer's id.
             // Equal content still updates the winning id when it is smaller.
             if entry.result.is_some()
-                && message_id >= entry.result_message_id.as_deref()
-                    .unwrap_or(&entry.observed_message_id)
+                && message_id
+                    >= entry
+                        .result_message_id
+                        .as_deref()
+                        .unwrap_or(&entry.observed_message_id)
             {
                 return Ok(ApplyOutcome::Applied(None));
             }
             entry.question_generation = result.question_generation;
             entry.result = Some(result.clone());
             entry.result_message_id = Some(message_id.to_string());
-            if entry.answer.as_ref().is_some_and(|answer| {
-                answer.question_generation != result.question_generation
-            }) {
+            if entry
+                .answer
+                .as_ref()
+                .is_some_and(|answer| answer.question_generation != result.question_generation)
+            {
                 entry.answer = None;
                 entry.answer_message_id = None;
             }
             if entry.answer.is_some() {
                 entry.state = ProtocolAssignmentState::HumanAnswered;
-                entry.observed_message_id = entry.answer_message_id.clone()
+                entry.observed_message_id = entry
+                    .answer_message_id
+                    .clone()
                     .unwrap_or_else(|| entry.observed_message_id.clone());
             } else {
                 entry.state = ProtocolAssignmentState::ResultReceived;
@@ -427,8 +434,11 @@ fn apply_profile_to_entry(
                 return Ok(ApplyOutcome::Applied(None));
             }
             if entry.answer.is_some()
-                && message_id >= entry.answer_message_id.as_deref()
-                    .unwrap_or(&entry.observed_message_id)
+                && message_id
+                    >= entry
+                        .answer_message_id
+                        .as_deref()
+                        .unwrap_or(&entry.observed_message_id)
             {
                 return Ok(ApplyOutcome::Applied(None));
             }
@@ -1107,21 +1117,43 @@ mod tests {
         }
         assert!(state.entries.is_empty());
         assert!(state.incomplete);
-        assert_eq!(state.pending[&job.conflict_fingerprint].len(), RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT);
-        assert_eq!(state.pending[&job.conflict_fingerprint][0].0.message_id, format!("{:064x}", 0));
+        assert_eq!(
+            state.pending[&job.conflict_fingerprint].len(),
+            RESOLUTION_PROTOCOL_MAX_PENDING_PER_FINGERPRINT
+        );
+        assert_eq!(
+            state.pending[&job.conflict_fingerprint][0].0.message_id,
+            format!("{:064x}", 0)
+        );
         for _ in 1..=RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS {
             let job = unique_job(0);
-            apply_protocol_batch(&mut state, &[message('c', &result_body(&job, 0), &job.owner)]).unwrap();
+            apply_protocol_batch(
+                &mut state,
+                &[message('c', &result_body(&job, 0), &job.owner)],
+            )
+            .unwrap();
         }
-        assert_eq!(state.pending.len(), RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS);
+        assert_eq!(
+            state.pending.len(),
+            RESOLUTION_PROTOCOL_MAX_PENDING_FINGERPRINTS
+        );
         validate_protocol_state(&state).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let store = ResolutionProtocolStore::open(dir.path()).unwrap();
-        store.update(|stored| { *stored = state.clone(); Ok(()) }).unwrap();
+        store
+            .update(|stored| {
+                *stored = state.clone();
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(store.load().unwrap(), state);
         let mut corrupt = state.clone();
         let held = corrupt.pending[&job.conflict_fingerprint][0].clone();
-        corrupt.pending.get_mut(&job.conflict_fingerprint).unwrap().push(held);
+        corrupt
+            .pending
+            .get_mut(&job.conflict_fingerprint)
+            .unwrap()
+            .push(held);
         assert!(validate_protocol_state(&corrupt).is_err());
         let mut corrupt = state;
         corrupt.pending.insert("f".repeat(64), vec![]);
@@ -1137,13 +1169,21 @@ mod tests {
         if let ResolutionProfile::Result(result) = &mut other_result {
             result.diagnostics.push("alternative".into());
         }
-        let other_result = message('e', &encode_resolution_profile(&other_result).unwrap(), &job.owner);
+        let other_result = message(
+            'e',
+            &encode_resolution_profile(&other_result).unwrap(),
+            &job.owner,
+        );
         let first_answer = message('c', &answer_body(&job, 0), "human");
         let mut other_answer = parse_resolution_profile(&first_answer.body).unwrap();
         if let ResolutionProfile::HumanAnswer(answer) = &mut other_answer {
             answer.chosen_option = HumanResolutionOption::KeepUnresolved;
         }
-        let other_answer = message('d', &encode_resolution_profile(&other_answer).unwrap(), "human");
+        let other_answer = message(
+            'd',
+            &encode_resolution_profile(&other_answer).unwrap(),
+            "human",
+        );
         let signals = [first_result, first_answer, other_answer, other_result];
         let mut expected = ResolutionProtocolState::fresh();
         apply_protocol_batch(&mut expected, &[assignment.clone()]).unwrap();
@@ -1157,10 +1197,18 @@ mod tests {
             assert_eq!(state, expected);
             let dir = tempfile::tempdir().unwrap();
             let store = ResolutionProtocolStore::open(dir.path()).unwrap();
-            store.update(|stored| { *stored = state; Ok(()) }).unwrap();
+            store
+                .update(|stored| {
+                    *stored = state;
+                    Ok(())
+                })
+                .unwrap();
             let stored = store.load().unwrap();
             assert_eq!(stored, expected);
-            assert_eq!(entry_status(&stored.entries[&job.conflict_fingerprint]).state, ProtocolAssignmentState::HumanAnswered);
+            assert_eq!(
+                entry_status(&stored.entries[&job.conflict_fingerprint]).state,
+                ProtocolAssignmentState::HumanAnswered
+            );
         }
     }
 

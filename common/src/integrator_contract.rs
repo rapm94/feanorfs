@@ -53,7 +53,9 @@ pub fn is_valid_agent_name(name: &str) -> bool {
         && name.nfc().eq(name.chars())
         && !name.starts_with([' ', '.'])
         && !name.ends_with([' ', '.'])
-        && !name.chars().any(|c| c.is_control() || r#"<>:"|?*"#.contains(c))
+        && !name
+            .chars()
+            .any(|c| c.is_control() || r#"<>:"|?*"#.contains(c))
         && !name.contains(['/', '\\'])
         && !crate::is_windows_reserved_component(name)
 }
@@ -1074,7 +1076,9 @@ mod tests {
         ] {
             assert!(!is_valid_agent_name(name), "{name:?} must be rejected");
         }
-        for name in ["agent-a", "mac-test", "ci1", "a", "a b", "a+b", "café", "COM10", "a.b"] {
+        for name in [
+            "agent-a", "mac-test", "ci1", "a", "a b", "a+b", "café", "COM10", "a.b",
+        ] {
             assert!(is_valid_agent_name(name), "{name:?} must be accepted");
         }
         assert!(!is_valid_agent_name(
@@ -1337,14 +1341,22 @@ mod tests {
     fn digest_validates_verification_evidence() {
         let mut value = digest(ASSIGNMENT);
         value.verification.input_hashes = vec![SNAP_A.to_string(); VERIFICATION_MAX_INPUT_HASHES];
-        value.verification.checks = vec![VerificationCheck {
-            name: "check".to_string(), passed: true, detail: None,
-        }; VERIFICATION_MAX_CHECKS];
+        value.verification.checks = vec![
+            VerificationCheck {
+                name: "check".to_string(),
+                passed: true,
+                detail: None,
+            };
+            VERIFICATION_MAX_CHECKS
+        ];
         validate_integrator_digest(&value).unwrap();
         value.verification.input_hashes.push(SNAP_A.to_string());
         assert!(validate_integrator_digest(&value).is_err());
         value.verification.input_hashes.pop();
-        value.verification.checks.push(value.verification.checks[0].clone());
+        value
+            .verification
+            .checks
+            .push(value.verification.checks[0].clone());
         assert!(validate_integrator_digest(&value).is_err());
         value.verification.checks.pop();
         value.verification.input_hashes[0] = "A".repeat(64);

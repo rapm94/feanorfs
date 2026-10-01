@@ -125,8 +125,14 @@ async fn decay_overflow_preserves_readable_state_and_all_weights() {
         let error = db.decay_access_log(factor).await.unwrap_err();
         assert!(error.to_string().contains("overflow"));
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert_eq!(db.get_predictive_siblings("a", 1).await.unwrap(), vec![("small".into(), 1.0)]);
-        assert_eq!(db.get_predictive_siblings("b", 1).await.unwrap(), vec![("large".into(), 10.0)]);
+        assert_eq!(
+            db.get_predictive_siblings("a", 1).await.unwrap(),
+            vec![("small".into(), 1.0)]
+        );
+        assert_eq!(
+            db.get_predictive_siblings("b", 1).await.unwrap(),
+            vec![("large".into(), 10.0)]
+        );
     }
     drop(db);
     let reopened = super::ClientDb::new(dir.path()).await.unwrap();

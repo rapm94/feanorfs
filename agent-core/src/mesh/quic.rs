@@ -4,8 +4,8 @@ use feanorfs_common::NodeId;
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const AUTH_DOMAIN: &[u8] = b"feanorfs-mesh-auth-v1";
 const AUTH_OK: &[u8; 2] = b"ok";
@@ -91,7 +91,9 @@ pub async fn serve_punch_bridge(
     _peer: PunchPeer,
     upstream: SocketAddr,
 ) -> Result<PunchBridgeHandle> {
-    let socket = tokio::net::UdpSocket::bind(bind).await.context("bind QUIC punch listener")?;
+    let socket = tokio::net::UdpSocket::bind(bind)
+        .await
+        .context("bind QUIC punch listener")?;
     let local = socket.local_addr()?;
     let started = std::time::Instant::now();
     // One bounded blocking probe keeps the pre-listen window short and stays
@@ -130,14 +132,18 @@ pub async fn serve_punch_bridge(
             tokio::spawn(async move {
                 // Bounded concurrent authentication keeps slow peers from
                 // consuming unbounded accept capacity.
-                let Ok(_permit) = auth.acquire_owned().await else { return };
+                let Ok(_permit) = auth.acquire_owned().await else {
+                    return;
+                };
                 if let Err(error) = authenticate_inbound(&connection).await {
                     tracing::debug!("mesh punch authentication failed: {error:#}");
                 } else {
                     let upstream = upstream;
                     let streams = Arc::new(Semaphore::new(MAX_STREAMS));
                     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-                        let Ok(permit) = streams.clone().acquire_owned().await else { break };
+                        let Ok(permit) = streams.clone().acquire_owned().await else {
+                            break;
+                        };
                         let Ok(tcp) = tokio::net::TcpStream::connect(upstream).await else {
                             break;
                         };
@@ -168,11 +174,18 @@ pub struct PunchBridgeHandle {
 /// receive share a deadline; quinn inherits the same unconnected socket.
 async fn probe_reflexive(socket: &tokio::net::UdpSocket) -> Option<SocketAddr> {
     tokio::time::timeout(Duration::from_millis(750), async {
-        let target = crate::mesh::stun::resolve_server(crate::mesh::stun::DEFAULT_PRIMARY_SERVER).await?;
+        let target =
+            crate::mesh::stun::resolve_server(crate::mesh::stun::DEFAULT_PRIMARY_SERVER).await?;
         let address = crate::mesh::stun::query_reflexive_over(socket, target).await?;
-        ensure!(!address.ip().is_loopback() && !address.ip().is_unspecified(), "reflexive address is not remotely reachable");
+        ensure!(
+            !address.ip().is_loopback() && !address.ip().is_unspecified(),
+            "reflexive address is not remotely reachable"
+        );
         Ok::<_, anyhow::Error>(address)
-    }).await.ok().and_then(Result::ok)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
 }
 
 async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
@@ -183,10 +196,13 @@ async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
         .context("mesh auth stream timed out")?
         .context("accept mesh auth stream")?;
 
-    let buffer = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(MAX_AUTH_MESSAGE_BYTES))
-        .await
-        .context("mesh auth reply timed out")?
-        .context("read bounded mesh auth reply")?;
+    let buffer = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv.read_to_end(MAX_AUTH_MESSAGE_BYTES),
+    )
+    .await
+    .context("mesh auth reply timed out")?
+    .context("read bounded mesh auth reply")?;
     let _claimed = decode_auth_message(&buffer)?;
     send.write_all(AUTH_OK).await?;
     send.finish()?;
@@ -194,7 +210,10 @@ async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
 }
 
 fn decode_auth_message(message: &[u8]) -> Result<NodeId> {
-    ensure!(message.len() == MAX_AUTH_MESSAGE_BYTES, "mesh auth message has the wrong length");
+    ensure!(
+        message.len() == MAX_AUTH_MESSAGE_BYTES,
+        "mesh auth message has the wrong length"
+    );
     let signature: [u8; 64] = message[..64].try_into().expect("exact signature slice");
     let claimed = NodeId::from_public_key(message[64..96].try_into().expect("32 bytes"));
     ensure!(

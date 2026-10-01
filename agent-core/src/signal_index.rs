@@ -12,9 +12,9 @@ use feanorfs_common::{
     is_valid_hash, Snapshot, MAX_SNAPSHOT_AUTHOR_BYTES, MAX_SNAPSHOT_MESSAGE_BYTES,
     MAX_SNAPSHOT_PARENTS,
 };
-use std::io::Read;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const SIGNAL_INDEX_SCHEMA_VERSION: u32 = 1;
@@ -37,7 +37,10 @@ impl IndexedSignal {
             && self.parents.len() <= MAX_SNAPSHOT_PARENTS
             && self.parents.iter().all(|parent| is_valid_hash(parent))
             && self.author.len() <= MAX_SNAPSHOT_AUTHOR_BYTES
-            && self.message.as_ref().is_none_or(|message| message.len() <= MAX_SNAPSHOT_MESSAGE_BYTES)
+            && self
+                .message
+                .as_ref()
+                .is_none_or(|message| message.len() <= MAX_SNAPSHOT_MESSAGE_BYTES)
     }
 }
 
@@ -86,7 +89,9 @@ impl SignalIndexSession {
                 return None;
             }
             let mut bytes = Vec::new();
-            file.take(SIGNAL_INDEX_MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+            file.take(SIGNAL_INDEX_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
             if bytes.len() as u64 > SIGNAL_INDEX_MAX_BYTES {
                 return None;
             }
@@ -98,12 +103,14 @@ impl SignalIndexSession {
             // validation and the byte cap are the integrity boundary: full
             // re-authentication requires refetching, deliberately avoided for
             // this disposable cache. It is never snapshot authority.
-            file.entries.retain(|id, entry| entry.structurally_valid(id));
+            file.entries
+                .retain(|id, entry| entry.structurally_valid(id));
             while file.entries.len() > SIGNAL_INDEX_MAX_ENTRIES {
                 file.entries.pop_first();
             }
             Some(file.entries)
-        })().unwrap_or_default();
+        })()
+        .unwrap_or_default();
         Self {
             path: state_dir.to_path_buf(),
             entries,
@@ -272,8 +279,15 @@ mod tests {
         bad.parents = vec!["invalid".into()];
         entries.insert(hex_id(b'f'), bad);
         entries.insert("invalid-id".into(), good);
-        let file = SignalIndexFile { schema_version: SIGNAL_INDEX_SCHEMA_VERSION, entries };
-        std::fs::write(dir.path().join(SIGNAL_INDEX_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
+        let file = SignalIndexFile {
+            schema_version: SIGNAL_INDEX_SCHEMA_VERSION,
+            entries,
+        };
+        std::fs::write(
+            dir.path().join(SIGNAL_INDEX_FILE),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
         let loaded = SignalIndexSession::load(dir.path());
         assert_eq!(loaded.entries.len(), 1);
         assert!(loaded.get(&hex_id(b'a')).is_some());
@@ -286,9 +300,14 @@ mod tests {
         let file = SignalIndexFile {
             schema_version: SIGNAL_INDEX_SCHEMA_VERSION,
             entries: (0..SIGNAL_INDEX_MAX_ENTRIES + 1)
-                .map(|index| (format!("{index:064x}"), entry.clone())).collect(),
+                .map(|index| (format!("{index:064x}"), entry.clone()))
+                .collect(),
         };
-        std::fs::write(dir.path().join(SIGNAL_INDEX_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join(SIGNAL_INDEX_FILE),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
         let loaded = SignalIndexSession::load(dir.path());
         assert_eq!(loaded.entries.len(), SIGNAL_INDEX_MAX_ENTRIES);
         assert!(loaded.get(&format!("{:064x}", 0)).is_none());
