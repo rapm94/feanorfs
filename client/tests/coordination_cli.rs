@@ -166,6 +166,24 @@ async fn compact_mcp_next_actions_and_guard_drive_one_work_lifecycle() {
     );
     assert!(status["sync"]["mirror_state"].is_string());
 
+    // Nothing new for codex: `--wait` returns the projection at its timeout.
+    let started = std::time::Instant::now();
+    let waited: CoordinationStatus = fx.json(&[
+        "--json",
+        "agent",
+        "next",
+        "--for",
+        "codex",
+        "--wait",
+        "--timeout",
+        "1",
+    ]);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    assert!(waited
+        .next_actions
+        .iter()
+        .all(|action| action.actor != "codex"));
+
     let denied = fx.cli(&["agent", "guard", "src/lib.rs", "--for", "codex"]);
     assert_eq!(denied.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&denied.stderr).contains("linux's accepted scope"));
@@ -201,12 +219,6 @@ async fn compact_mcp_next_actions_and_guard_drive_one_work_lifecycle() {
     // A globally installed hook runs in unrelated projects: allow, and create
     // no workspace state there.
     let elsewhere = tempfile::tempdir().unwrap();
-    let slots = || {
-        std::fs::read_dir(fx.state_root.join("workspaces"))
-            .unwrap()
-            .count()
-    };
-    let before = slots();
     let unrelated = Command::new(env!("CARGO_BIN_EXE_feanorfs"))
         .args(["agent", "guard", "--hook", "--for", "codex"])
         .current_dir(elsewhere.path())
@@ -226,7 +238,13 @@ async fn compact_mcp_next_actions_and_guard_drive_one_work_lifecycle() {
         })
         .unwrap();
     assert!(unrelated.status.success());
-    assert_eq!(slots(), before, "the hook must not create workspace state");
+    // Other tests share this isolated home, so check only this folder's slot.
+    let slot = feanorfs_agent_core::workspace_state_id(elsewhere.path()).unwrap();
+    let workspaces = fx.state_root.join("workspaces");
+    assert!(
+        !workspaces.join(&slot).exists() && !workspaces.join(format!(".{slot}.lease")).exists(),
+        "the hook must not create workspace state"
+    );
 }
 
 #[tokio::test]

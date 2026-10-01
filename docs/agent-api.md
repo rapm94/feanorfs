@@ -661,7 +661,7 @@ lifecycle and computes the next action for each actor. Types live in
 
 | Operation | CLI | Rust (`Workspace`) | JSON result type |
 |-----------|-----|-------------------|------------------|
-| Next | `agent next [--for <agent>]` | `coordination_status(Option<&str>)` | `CoordinationStatus` |
+| Next | `agent next [--for <agent>] [--wait [--timeout <secs>]]` | `coordination_status(Option<&str>)` | `CoordinationStatus` |
 | Guard | `agent guard [<path>…] [--for <agent>] [--require-scope] [--hook]` | `guard(GuardInput)` | `GuardResult` |
 | Capabilities | `agent capabilities [--for <agent>] [--set <cap>…]`, `agent run <name> --capability <cap> -- …` | `capabilities(CapabilitiesInput)` | `CapabilityRoster` |
 
@@ -723,6 +723,13 @@ exits:        blocked | stopped
   "projection_incomplete": false
 }
 ```
+
+`--wait` (MCP `status` with `wait_seconds`, at most 600) returns at once
+when the caller has an action it can take now; otherwise it blocks until the
+caller's own next actions change (a decision arrives, its edits land), so an
+agent spends one call, not one turn per poll. The settle action's `inspected_snapshot` is prefilled with
+the agent's live settled snapshot once its controller is idle with no pending
+local edits; until then it stays a placeholder.
 
 Items are sorted by urgency (`awaiting_human` first, terminal stages last)
 and capped at 64; the caller's own actions come first and the list is capped

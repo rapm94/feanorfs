@@ -120,6 +120,14 @@ pub enum AgentAction {
         /// Agent identity; defaults to FEANORFS_AGENT or human.
         #[arg(long = "for")]
         for_agent: Option<String>,
+        /// Block until your own next actions change (a decision arrives,
+        /// your edits land), up to `--timeout` seconds. Use instead of
+        /// polling when nothing is yours to do.
+        #[arg(long)]
+        wait: bool,
+        /// Seconds to wait with `--wait` (default 300, maximum 600).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
     },
     /// Show which agents advertise which capabilities, or announce this
     /// agent's complete capability set with `--set` (repeatable). Route a
@@ -187,8 +195,13 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
         AgentAction::Status { name: Some(name) } | AgentAction::Check { name } => {
             run_agent_check(&control_workspace_root(current_dir)?, &name, json).await?
         }
-        AgentAction::Next { for_agent } => {
-            super::coordination::run_next(current_dir, for_agent.as_deref(), json).await?
+        AgentAction::Next {
+            for_agent,
+            wait,
+            timeout,
+        } => {
+            let wait = wait.then(|| std::time::Duration::from_secs(timeout));
+            super::coordination::run_next(current_dir, for_agent.as_deref(), wait, json).await?
         }
         AgentAction::Guard {
             paths,

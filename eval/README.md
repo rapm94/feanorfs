@@ -20,6 +20,7 @@ Metrics:
 | `tests_pass` | Scenario `verify` command in the final tree |
 | `guard_blocks` | Times an agent's `agent guard` check refused a write |
 | `tokens` | Summed from agent JSON output (`tokens`, or `usage.*tokens`) |
+| `cost_usd` | Summed `total_cost_usd` from agent JSON output (real agents) |
 | `wall_seconds` | End to end, including setup |
 
 ## Run
@@ -38,16 +39,22 @@ with scripted agents (`agent-eval` job) and uploads the JSON report.
 ## Real agents
 
 `--agent-cmd` replaces the scripted agent with any harness; `{prompt}`,
-`{name}`, and `{machine}` are substituted and shell-quoted. The prompt tells
-the agent its identity, task, and the coordination loop (`agent next`,
-`agent work propose`, `agent guard`). For example, with Claude Code:
+`{name}`, and `{machine}` are substituted and shell-quoted. In `feanorfs`
+mode the prompt tells the agent its identity, task, and the coordination loop
+(`agent next`, `agent work propose`, `agent guard`), and `feanorfs` on the
+agent's `PATH` is the binary under test; in `worktrees` mode the prompt is
+the bare task. For example, with Claude Code:
 
 ```bash
 python3 eval/run.py eval/scenarios/overlap.json --timeout 900 \
-  --agent-cmd "claude -p {prompt} --output-format json --permission-mode acceptEdits --allowedTools 'Bash(feanorfs:*)'"
+  --agent-cmd "claude -p {prompt} --output-format json --setting-sources project --strict-mcp-config --permission-mode acceptEdits --allowedTools 'Bash(feanorfs:*)' 'Bash(python3 -m unittest:*)'"
 ```
 
-Real runs call a model and cost money; they are not part of CI.
+`--setting-sources project --strict-mcp-config` keeps your personal hooks,
+command rewriters, and MCP servers out of the agents, so runs are comparable.
+Keep `--allowedTools` last: it takes several values. Real runs call a model
+and cost money; they are not part of CI. With `--keep`, each agent's output
+stays in `agent-<name>.out`/`.err` under the kept directory.
 
 ## Scenarios
 

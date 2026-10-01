@@ -65,7 +65,8 @@ pub use api::{ApiClient, MIN_SUPPORTED_SERVER_VERSION};
 pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
 pub use conflicts::{resolve_conflict, ResolveKeep};
 pub use coordination::{
-    agent_identity, capabilities, capability_roster, coordination_status, guard_paths,
+    agent_identity, capabilities, capability_roster, coordination_status, coordination_status_wait,
+    guard_paths,
 };
 pub use ctx::SyncCtx;
 pub use feanorfs_common::{

@@ -15,13 +15,22 @@ const HOOK_BLOCK_EXIT: i32 = 2;
 /// Hook payloads are small JSON objects; refuse anything larger.
 const HOOK_INPUT_MAX_BYTES: u64 = 1024 * 1024;
 
-pub async fn run_next(current_dir: &Path, agent: Option<&str>, json: bool) -> anyhow::Result<()> {
+pub async fn run_next(
+    current_dir: &Path,
+    agent: Option<&str>,
+    wait: Option<std::time::Duration>,
+    json: bool,
+) -> anyhow::Result<()> {
     let root = control_workspace_root(current_dir)?;
     let config = load_config(&root)?;
     let db = crate::open_client_db(&root).await?;
     let api = crate::open_api_client(&root, &config).await?;
     let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, &root, &config)?;
-    let status = coordination_status(&ctx, &agent_identity(agent)).await?;
+    let agent = agent_identity(agent);
+    let status = match wait {
+        Some(wait) => feanorfs_client::coordination_status_wait(&ctx, &agent, wait).await?,
+        None => coordination_status(&ctx, &agent).await?,
+    };
     if json {
         output_json(&status)
     } else {

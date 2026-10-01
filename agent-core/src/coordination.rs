@@ -63,12 +63,16 @@ pub struct CoordinationInputs {
     pub protocol: Option<ResolutionProtocolStatus>,
     pub conflicts: Vec<PendingConflict>,
     pub roster: Vec<RosterEntry>,
+    /// The agent's live settled snapshot when its controller is idle with no
+    /// pending local edits; prefills settle actions.
+    pub settled_snapshot: Option<String>,
     pub warnings: Vec<String>,
     pub incomplete: bool,
 }
 
 struct Builder<'a> {
     agent: &'a str,
+    settled: Option<&'a str>,
     items: Vec<LifecycleItem>,
     actions: Vec<NextAction>,
 }
@@ -114,6 +118,7 @@ impl Builder<'_> {
 pub fn derive_coordination(inputs: CoordinationInputs) -> CoordinationStatus {
     let mut b = Builder {
         agent: &inputs.agent,
+        settled: inputs.settled_snapshot.as_deref(),
         items: Vec::new(),
         actions: Vec::new(),
     };
@@ -159,6 +164,7 @@ pub fn derive_coordination(inputs: CoordinationInputs) -> CoordinationStatus {
         agent,
         mut items,
         actions,
+        ..
     } = b;
     items.sort_by(|a, b| a.stage.cmp(&b.stage).then_with(|| a.id.cmp(&b.id)));
     items.truncate(COORDINATION_MAX_ITEMS);
@@ -215,6 +221,9 @@ fn derive_task(b: &mut Builder<'_>, task_id: &str, p: &WorkProposalStatus) {
                 &format!("scope accepted: {}", p.accepted_scope.paths.join(", ")),
             );
             if b.is_me(&p.agent) {
+                // The live controller's settled snapshot is what was landed;
+                // until edits land the agent must not guess an id.
+                let snapshot = b.settled.unwrap_or(AWAITING_SNAPSHOT).to_string();
                 b.action(
                     &p.agent,
                     "work",
@@ -223,14 +232,14 @@ fn derive_task(b: &mut Builder<'_>, task_id: &str, p: &WorkProposalStatus) {
                         "task_id": task_id,
                         "intent_message_id": p.intent_message_id,
                         "sequence": next,
-                        "inspected_snapshot": "<snapshot you verified>",
+                        "inspected_snapshot": snapshot,
                         "verification": {"status": "passed", "summary": "<checks you ran>", "applied_message_ids": []}
                     }),
                     format!(
-                        "feanorfs agent work settle --task {task_id} --intent {} --sequence {next} --inspected <snapshot> --verification passed --summary '<checks>'",
+                        "feanorfs agent work settle --task {task_id} --intent {} --sequence {next} --inspected {snapshot} --verification passed --summary '<checks>'",
                         p.intent_message_id
                     ),
-                    "edit only inside the accepted scope, verify, then settle",
+                    "edit only inside the accepted scope, let the edits land (agent next --wait), verify, then settle",
                 );
             }
         }
@@ -860,6 +869,11 @@ pub async fn coordination_status(ctx: &SyncCtx<'_>, agent: &str) -> Result<Coord
         &mut incomplete,
     )
     .unwrap_or_default();
+    let settled_snapshot = crate::agent::continuous::read_continuous_status(ctx.base, agent)
+        .ok()
+        .flatten()
+        .filter(|live| live.phase == feanorfs_common::ContinuousPhase::Idle && !live.pending_local)
+        .and_then(|live| live.settled_snapshot);
     Ok(derive_coordination(CoordinationInputs {
         agent: agent.to_string(),
         work,
@@ -869,9 +883,62 @@ pub async fn coordination_status(ctx: &SyncCtx<'_>, agent: &str) -> Result<Coord
         protocol,
         conflicts,
         roster,
+        settled_snapshot,
         warnings,
         incomplete,
     }))
+}
+
+/// Upper bound for one blocking wait.
+pub const COORDINATION_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Placeholder a settle action carries until the agent's edits land.
+const AWAITING_SNAPSHOT: &str = "<snapshot you verified>";
+
+/// Whether `agent` has an action it can take now (not one that still waits
+/// for its own edits to land).
+fn has_ready_action(status: &CoordinationStatus) -> bool {
+    status.next_actions.iter().any(|action| {
+        action.actor == status.agent
+            && action
+                .args
+                .get("inspected_snapshot")
+                .and_then(Value::as_str)
+                != Some(AWAITING_SNAPSHOT)
+    })
+}
+
+/// Like [`coordination_status`], but blocks up to `wait` while `agent` has
+/// nothing ready: it returns at once when an own action is ready, and
+/// otherwise as soon as its own actions change (a decision arrives, edits
+/// land). Agents wait inside one call instead of polling turn by turn.
+///
+/// # Errors
+/// Returns an error for an invalid agent identity.
+pub async fn coordination_status_wait(
+    ctx: &SyncCtx<'_>,
+    agent: &str,
+    wait: std::time::Duration,
+) -> Result<CoordinationStatus> {
+    let own = |status: &CoordinationStatus| -> Vec<NextAction> {
+        status
+            .next_actions
+            .iter()
+            .filter(|action| action.actor == status.agent)
+            .cloned()
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + wait.min(COORDINATION_MAX_WAIT);
+    let mut latest = coordination_status(ctx, agent).await?;
+    let initial = own(&latest);
+    while !has_ready_action(&latest)
+        && own(&latest) == initial
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        latest = coordination_status(ctx, agent).await?;
+    }
+    Ok(latest)
 }
 
 /// Capability roster: the newest `ffcap1` announcement per sender plus the
@@ -1145,6 +1212,71 @@ mod tests {
         assert_eq!(action.args["op"], "settle");
         assert_eq!(action.args["sequence"], 2);
         assert_eq!(action.args["intent_message_id"], "a".repeat(64));
+    }
+
+    #[test]
+    fn settle_action_uses_the_live_settled_snapshot_once_edits_land() {
+        let accepted = || {
+            work(vec![proposal(
+                "linux",
+                WorkTaskState::Accepted,
+                &["src/a.rs"],
+            )])
+        };
+        let pending = derive_coordination(CoordinationInputs {
+            agent: "linux".to_string(),
+            work: Some(accepted()),
+            ..CoordinationInputs::default()
+        });
+        assert_eq!(
+            pending.next_actions[0].args["inspected_snapshot"],
+            "<snapshot you verified>"
+        );
+        let landed = derive_coordination(CoordinationInputs {
+            agent: "linux".to_string(),
+            work: Some(accepted()),
+            settled_snapshot: Some("e".repeat(64)),
+            ..CoordinationInputs::default()
+        });
+        assert_eq!(
+            landed.next_actions[0].args["inspected_snapshot"],
+            "e".repeat(64)
+        );
+        assert!(landed.next_actions[0].cli.contains(&"e".repeat(64)));
+    }
+
+    #[test]
+    fn only_settle_actions_awaiting_a_snapshot_are_not_ready() {
+        let accepted = || {
+            work(vec![proposal(
+                "linux",
+                WorkTaskState::Accepted,
+                &["src/a.rs"],
+            )])
+        };
+        let waiting = derive_coordination(CoordinationInputs {
+            agent: "linux".to_string(),
+            work: Some(accepted()),
+            ..CoordinationInputs::default()
+        });
+        assert!(!has_ready_action(&waiting));
+        let landed = derive_coordination(CoordinationInputs {
+            agent: "linux".to_string(),
+            work: Some(accepted()),
+            settled_snapshot: Some("e".repeat(64)),
+            ..CoordinationInputs::default()
+        });
+        assert!(has_ready_action(&landed));
+        let coordinator = derive_coordination(CoordinationInputs {
+            agent: "human".to_string(),
+            work: Some(work(vec![proposal(
+                "linux",
+                WorkTaskState::Proposed,
+                &["src/a.rs"],
+            )])),
+            ..CoordinationInputs::default()
+        });
+        assert!(has_ready_action(&coordinator));
     }
 
     #[test]

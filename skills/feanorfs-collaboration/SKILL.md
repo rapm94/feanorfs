@@ -28,7 +28,12 @@ access control. FeanorFS never merges file content.
    superseded, or (with `--require-scope`) it is outside your own accepted
    scope. `warn` means a pending conflict or another agent's open proposal.
    Hosts with the guard hook installed run this before every edit.
-5. **Re-run `feanorfs agent next`** after every mutation and before declaring
+5. **Wait, don't poll or quit.** When nothing is yours to do (a decision is
+   pending, or your edits have not landed yet), run `feanorfs agent next
+   --wait`; it returns at once if something is ready for you, otherwise as
+   soon as your next actions change. When it returns, act on your actions;
+   once your edits land, the settle action already carries the snapshot.
+6. **Re-run `feanorfs agent next`** after every mutation and before declaring
    work complete. While `projection_incomplete` is true, stop mutating: an
    absent item is not proof that nothing is pending.
 
@@ -62,7 +67,7 @@ reconciled continuously:
 
 | Need | Command |
 |---|---|
-| What next | `feanorfs agent next [--for <name>]` |
+| What next | `feanorfs agent next [--for <name>] [--wait]` |
 | Safe to edit? | `feanorfs agent guard <path>… [--require-scope]` |
 | Read signals | `feanorfs agent inbox [--for <name>] [--after <cursor>]` |
 | Send a signal | `feanorfs agent send <to> --kind <kind> [--about <snapshot>] [--reply-to <id>] "<body>"` |
