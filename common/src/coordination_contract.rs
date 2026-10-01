@@ -274,6 +274,9 @@ pub fn parse_capability_announcement(body: &str) -> Option<Vec<String>> {
         .strip_prefix(CAPABILITY_PROFILE_DISCRIMINATOR)?
         .strip_prefix(':')?;
     let announcement: CapabilityAnnouncement = serde_json::from_str(json).ok()?;
+    if serde_json::to_string(&announcement).ok()? != json {
+        return None;
+    }
     let canonical = crate::normalize_capabilities(&announcement.capabilities).ok()?;
     (canonical == announcement.capabilities).then_some(canonical)
 }
@@ -377,6 +380,7 @@ mod tests {
                 .is_none()
         );
         assert!(parse_capability_announcement("plain status text").is_none());
+        assert!(parse_capability_announcement(&format!("{body} ")).is_none());
         assert!(encode_capability_announcement(&["Not Valid".into()]).is_err());
     }
 

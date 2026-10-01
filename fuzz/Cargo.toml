@@ -1,0 +1,43 @@
+[package]
+name = "feanorfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+feanorfs-common = { path = "../common" }
+
+# Separate from the main workspace: cargo-fuzz needs nightly and sanitizers.
+[workspace]
+
+[[bin]]
+name = "tree_codec"
+path = "fuzz_targets/tree_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invites"
+path = "fuzz_targets/invites.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signals"
+path = "fuzz_targets/signals.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aead"
+path = "fuzz_targets/aead.rs"
+test = false
+doc = false
+bench = false
