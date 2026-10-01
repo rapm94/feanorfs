@@ -61,6 +61,9 @@ struct EmptyParams {}
 struct StatusParams {
     #[serde(default)]
     agent: Option<String>,
+    /// Block up to this many seconds until your own next actions change.
+    #[serde(default)]
+    wait_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -844,7 +847,10 @@ fn compact_tool_list() -> Value {
         "tools": [
             tool("status", "Start here. Sync state plus the unified coordination lifecycle (work intent → conflict → resolver → done) and `next_actions`: each is a ready `tool` + `args` call (replace <placeholders>) with the actor who owes it. Read-only.", json!({
                 "type": "object",
-                "properties": { "agent": { "type": "string", "description": "Identity to plan for; defaults to FEANORFS_AGENT or human" } }
+                "properties": {
+                    "agent": { "type": "string", "description": "Identity to plan for; defaults to FEANORFS_AGENT or human" },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 600, "description": "Block until your own next actions change (a decision arrives, your edits land) instead of polling" }
+                }
             })),
             tool("send", "Send an encrypted signal tied to a snapshot. Everyone in the workspace can read it; identity is advisory. Never send credentials or .env values.", json!({
                 "type": "object",
@@ -1055,7 +1061,17 @@ async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Re
                 Ok(status) => compact_sync_status(status),
                 Err(error) => json!({ "error": format!("{error:#}") }),
             };
-            let coordination = feanorfs_client::coordination_status(&ctx, &agent).await?;
+            let coordination = match params.wait_seconds.filter(|seconds| *seconds > 0) {
+                Some(seconds) => {
+                    feanorfs_client::coordination_status_wait(
+                        &ctx,
+                        &agent,
+                        std::time::Duration::from_secs(seconds),
+                    )
+                    .await?
+                }
+                None => feanorfs_client::coordination_status(&ctx, &agent).await?,
+            };
             Ok(json!({ "sync": sync, "coordination": coordination }))
         }
         "work_guard" => {

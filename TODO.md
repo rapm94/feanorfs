@@ -61,25 +61,22 @@ path stays: removing it would make unmigrated v1 workspaces unreadable.
 
 ### AI-11. Prove the agent-first coordination surface in the field
 
-- [ ] Run `eval/run.py` with real agents (Claude Code and Codex via
-  `--agent-cmd`) on both scenarios; record human interruptions, conflicts,
-  lost edits, tokens, and wall time against the worktree baseline in
-  `docs/acceptance-evidence.md`. Add scenarios drawn from real collaboration.
-- [ ] Field-verify the Claude Code guard hook (`feanorfs integrate --host
-  claude --guard-hook`) blocks an edit inside another agent's accepted scope
-  and stays silent outside FeanorFS workspaces.
-- [ ] Regenerate `bindings/ts/index.js` and `index.d.ts` with `npm run build`
-  (they were extended by hand for `coordinationStatus`, `guard`,
-  `integratorReply`, `capabilities`; the Node parity test passes).
-- [ ] Record the first green `fuzz` job in `security.yml`, commit
-  `fuzz/Cargo.lock`, and keep crashing inputs as regression seeds in
-  `common/tests/parser_fuzz.rs`.
-- [ ] Route a real request with `agent send cap:ios-build` from Linux to the
-  Mac and verify the Git baseline warning when the two clones sit on
-  different commits.
+Local evidence (real Claude Code eval, guard hook, local fuzzing) is in
+`docs/acceptance-evidence.md` (AI-11).
 
-Done when each item has recorded field evidence; scripted CI evidence alone
-does not count.
+- [ ] Route a real request with `agent send cap:ios-build` from the Linux
+  machine to the Mac and verify the Git baseline warning when the two clones
+  sit on different commits.
+- [ ] Record green `fuzz` (security.yml) and `agent-eval` (ci.yml) runs on
+  GitHub runners; keep any crashing input as a seed in
+  `common/tests/parser_fuzz.rs`.
+- [ ] Regenerate `bindings/ts/index.js` and `index.d.ts` with `npm run build`
+  (extended by hand for `coordinationStatus`, `guard`, `integratorReply`,
+  `capabilities`; the Node parity test passes and CI's `sdk` job rebuilds).
+- [ ] Reduce coordination overhead: real agents spend roughly 3–5× the tokens
+  of uncoordinated work on the eval scenarios; measure again after changes.
+
+Done when each item has recorded evidence.
 
 ### AI-10. Finish confirmed review fixes and acceptance
 

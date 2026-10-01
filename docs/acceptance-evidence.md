@@ -59,3 +59,51 @@ installed service recovery, abrupt power-loss behavior, mixed released
 versions, native dialog interaction, or Windows/Linux product acceptance.
 Those field rows remain open. The user deferred real multi-device testing
 on 2026-09-12; it does not block completion of this implementation.
+
+## AI-11 — agent-first coordination surface (2026-10-01)
+
+Local macOS evidence for branch `improvements/agent-first`. Secret-free.
+
+### Multi-agent eval with real Claude Code agents
+
+`python3 eval/run.py eval/scenarios/<name>.json --timeout 900 --agent-cmd
+"claude -p {prompt} --output-format json --setting-sources project
+--strict-mcp-config --permission-mode acceptEdits --allowedTools
+'Bash(feanorfs:*)' 'Bash(python3 -m unittest:*)'"` (Claude Code 2.1.231,
+two simulated machines, isolated from personal settings).
+
+| Scenario | Mode | Human interruptions | Conflicts | Lost edits | Tests | Cost | Wall |
+|---|---|---|---|---|---|---|---|
+| overlap | feanorfs | 2 (scope decisions) | 0 | 0 | pass | $0.58 | 92 s |
+| overlap | worktrees | 1 (merge conflict) | 1 | 1 | pass | $0.19 | 84 s |
+| disjoint | feanorfs | 2 (scope decisions) | 0 | 0 | pass | $1.16 | 456 s |
+| disjoint | worktrees | 0 | 0 | 0 | pass | $0.25 | 28 s |
+
+Reading: scoped turns prevent the lost edit that parallel branches suffer
+when two agents touch the same place, at roughly 3–5× the token cost of
+uncoordinated work. The disjoint FeanorFS wall time is dominated by model
+latency (one agent spent 428 of 441 s in API calls). Earlier runs drove two
+fixes now on the branch: one-shot agents quit or polled while waiting for a
+decision (`agent next --wait`, which returns at once when an action is
+ready), and settle actions now carry the agent's settled snapshot. Running
+eval agents with personal hooks enabled let a command-rewriting hook break
+their shell calls; the harness documents the isolation flags.
+
+### Guard hook in real Claude Code
+
+A scratch workspace with `linux`'s accepted scope `src/**` and `feanorfs
+integrate --host claude --guard-hook --project <ws>`; `claude -p` as
+`FEANORFS_AGENT=codex` asked to write `src/new.rs` and append to
+`README.md`: the hook blocked `src/new.rs` with the scope reason and the
+agent reported it; `README.md` was edited. In an unrelated folder the hook
+exits 0 and creates no workspace state (`client/tests/coordination_cli.rs`).
+
+### Coverage-guided fuzzing
+
+`cargo +nightly fuzz run <target> -- -max_total_time=60` (cargo-fuzz 0.12.0):
+`tree_codec` 1.11 M, `invites` 1.07 M, `signals` 0.97 M, `aead` 1.11 M
+executions from empty corpora, no crashes. The stable mutation smoke
+(`common/tests/parser_fuzz.rs`) runs in every `cargo test`.
+
+Not covered here: capability routing and Git-baseline warnings between two
+physical machines, and the CI `fuzz`/`agent-eval` jobs on GitHub runners.

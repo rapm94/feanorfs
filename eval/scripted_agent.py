@@ -71,7 +71,8 @@ def main():
     )["message_id"]
 
     def my_item():
-        status = ff_json("agent", "next")
+        # Blocks until this agent's own actions change, like a real agent.
+        status = ff_json("agent", "next", "--wait", "--timeout", "30")
         return next(
             (item for item in status["items"] if item["id"] == f"{task}:{name}"), None
         )

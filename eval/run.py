@@ -37,8 +37,13 @@ workspace shared with other agents. Task: {task}
 Before editing, propose your scope with `feanorfs agent work propose --task \
 {task_id} --coordinator human --path <path>...` and wait until `feanorfs agent \
 next` shows it accepted. Check paths with `feanorfs agent guard <path>` before \
-writing. When done and verified, follow the settle and complete actions \
+writing. Whenever nothing is yours to do (waiting for a decision, or for \
+your edits to land), run `feanorfs agent next --wait` instead of polling or \
+stopping. When done and verified, follow the settle and complete actions \
 `feanorfs agent next` lists for you."""
+
+PLAIN_PROMPT = """You are coding agent `{name}`. Task: {task}
+Edit the files in the current directory; do not commit."""
 
 
 def git(cwd, *args):
@@ -86,16 +91,29 @@ def verify(root, command):
     return subprocess.run(command, shell=True, cwd=root, capture_output=True).returncode == 0
 
 
-def agent_command(args, scenario_path, agent):
+def agent_command(args, scenario_path, agent, plain=False):
     if not args.agent_cmd:
         return [sys.executable, str(HERE / "scripted_agent.py"), str(scenario_path)]
-    prompt = PROMPT.format(
+    prompt = (PLAIN_PROMPT if plain else PROMPT).format(
         name=agent["name"], machine=agent["machine"], task=agent["prompt"],
         task_id=agent.get("task", f"{agent['name']}-task"),
     )
     return shlex.split(args.agent_cmd.format(
         prompt=shlex.quote(prompt), name=agent["name"], machine=agent["machine"],
     ))
+
+
+def cost_from(output):
+    """Sums `total_cost_usd` from a harness's JSON stdout (Claude Code)."""
+    total = 0.0
+    for line in output.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            total += float(value.get("total_cost_usd") or 0)
+    return round(total, 4)
 
 
 def tokens_from(output):
@@ -125,8 +143,11 @@ class Machine:
         env = dict(os.environ)
         for key in ("FEANORFS_AGENT", "FEANORFS_AGENT_DIR", "FEANORFS_WORKSPACE_ROOT"):
             env.pop(key, None)
+        # Agents call `feanorfs` by name: resolve it to the binary under test,
+        # never an older installed release.
         env.update(FEANORFS_HOME=str(self.home), FEANORFS_EVAL_BIN=str(self.binary),
-                   FEANORFS_NO_LAUNCH="1")
+                   FEANORFS_NO_LAUNCH="1",
+                   PATH=f"{self.binary.parent}{os.pathsep}{env.get('PATH', '')}")
         return env
 
     def run(self, *args, check=True):
@@ -139,10 +160,24 @@ class Machine:
     def json(self, *args):
         return json.loads(self.run("--json", *args).stdout)
 
-    def popen(self, *args, **kwargs):
+    def popen(self, *args, log=None):
+        """Starts a long-lived child; output goes to `log` files (not pipes)
+        so a grandchild that outlives its parent cannot hang the harness."""
+        out = open(f"{log}.out", "w", encoding="utf-8") if log else subprocess.DEVNULL
+        err = open(f"{log}.err", "w", encoding="utf-8") if log else subprocess.DEVNULL
         return subprocess.Popen([str(self.binary), *args], cwd=self.folder, env=self.env(),
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                **kwargs)
+                                stdout=out, stderr=err)
+
+
+def stop(process, grace=15):
+    """SIGTERM first so `agent run` tears down its child tree, then SIGKILL."""
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 def overlaps(a, b):
@@ -209,18 +244,22 @@ def run_feanorfs(args, scenario, scenario_path, tmp):
         for agent in scenario["agents"]:
             machine = machines[agent["machine"]]
             command = agent_command(args, scenario_path, agent)
-            processes.append((agent, machine.popen("agent", "run", agent["name"], "--", *command)))
+            log = tmp / f"agent-{agent['name']}"
+            processes.append(
+                (agent, log, machine.popen("agent", "run", agent["name"], "--", *command, log=log))
+            )
 
         coordinator = machines[names[0]]
         deadline = time.monotonic() + args.timeout
-        while any(p.poll() is None for _, p in processes) and time.monotonic() < deadline:
+        while any(p.poll() is None for _, _, p in processes) and time.monotonic() < deadline:
             coordinate(coordinator, stats)
             time.sleep(POLL_SECONDS)
-        for agent, process in processes:
-            if process.poll() is None:
-                process.kill()
-            out, err = process.communicate()
+        for agent, log, process in processes:
+            stop(process)
+            out = Path(f"{log}.out").read_text(encoding="utf-8")
+            err = Path(f"{log}.err").read_text(encoding="utf-8")
             stats["tokens"] += tokens_from(out)
+            stats["cost_usd"] = round(stats.get("cost_usd", 0) + cost_from(out), 4)
             for line in out.splitlines():
                 if line.startswith("{") and '"guard_blocks"' in line:
                     stats["guard_blocks"] += json.loads(line)["guard_blocks"]
@@ -232,8 +271,7 @@ def run_feanorfs(args, scenario, scenario_path, tmp):
                       f"  next: {view.stdout.strip()[:1500]} {view.stderr.strip()[:300]}",
                       file=sys.stderr)
         for watcher in watchers:
-            watcher.terminate()
-            watcher.wait()
+            stop(watcher)
         for _ in range(2):
             for machine in machines.values():
                 machine.run("sync", "--no-watch", check=False)
@@ -243,9 +281,8 @@ def run_feanorfs(args, scenario, scenario_path, tmp):
         stats["lost_edits"] = expectations_missing(final, scenario.get("expect", {}))
         stats["tests_pass"] = verify(final, scenario.get("verify"))
     finally:
-        for _, process in processes:
-            if process.poll() is None:
-                process.kill()
+        for _, _, process in processes:
+            stop(process)
         hub.terminate()
         hub.wait()
     stats["wall_seconds"] = round(time.monotonic() - started, 1)
@@ -272,9 +309,10 @@ def run_worktrees(args, scenario, scenario_path, tmp):
     for agent in scenario["agents"]:
         path = worktrees[agent["name"]]
         if args.agent_cmd:
-            result = subprocess.run(agent_command(args, scenario_path, agent), cwd=path,
+            result = subprocess.run(agent_command(args, scenario_path, agent, plain=True), cwd=path,
                                     capture_output=True, text=True, timeout=args.timeout)
             stats["tokens"] += tokens_from(result.stdout)
+            stats["cost_usd"] = round(stats.get("cost_usd", 0) + cost_from(result.stdout), 4)
             stats["agents_failed"] += result.returncode != 0
         else:
             cwd = os.getcwd()
