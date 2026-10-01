@@ -511,19 +511,19 @@ async fn full_lifecycle_is_equivalent_inline_cli_and_mcp_with_fixture_parity() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(responses.len(), 3);
-    let tool_names: Vec<&str> = responses[0]["result"]["tools"]
+    // The compact `resolve` tool advertises every operation; the calls
+    // below use the legacy names, which stay callable.
+    let resolve = responses[0]["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|tool| tool["name"].as_str().unwrap())
-        .collect();
-    for name in [
-        "resolution_prepare",
-        "resolution_status",
-        "resolution_submit",
-        "resolution_apply",
-    ] {
-        assert!(tool_names.contains(&name), "MCP must declare {name}");
+        .find(|tool| tool["name"] == "resolve")
+        .expect("MCP must declare the resolve tool");
+    let ops = resolve["inputSchema"]["properties"]["op"]["enum"]
+        .as_array()
+        .unwrap();
+    for op in ["prepare", "status", "submit", "apply"] {
+        assert!(ops.contains(&json!(op)), "resolve must route {op}");
     }
     assert_eq!(
         responses[1]["result"]["structuredContent"]["jobs"],

@@ -48,7 +48,38 @@ Done when GitHub's APIs report these controls enabled. This requires a distinct
 release identity and an independent reviewer; repository code cannot create
 either safely.
 
+### F5. Decide format-v1 legacy decryption retirement
+
+- [ ] Collect `feanorfs doctor --migration-report` from every real install you
+  know of (it reports only aggregate format counts) and decide whether the v1
+  XOR decrypt path and its migration fences can be removed.
+
+Done when the decision and its evidence are recorded. Until then the legacy
+path stays: removing it would make unmigrated v1 workspaces unreadable.
+
 ## AI tasks
+
+### AI-11. Prove the agent-first coordination surface in the field
+
+- [ ] Run `eval/run.py` with real agents (Claude Code and Codex via
+  `--agent-cmd`) on both scenarios; record human interruptions, conflicts,
+  lost edits, tokens, and wall time against the worktree baseline in
+  `docs/acceptance-evidence.md`. Add scenarios drawn from real collaboration.
+- [ ] Field-verify the Claude Code guard hook (`feanorfs integrate --host
+  claude --guard-hook`) blocks an edit inside another agent's accepted scope
+  and stays silent outside FeanorFS workspaces.
+- [ ] Regenerate `bindings/ts/index.js` and `index.d.ts` with `npm run build`
+  (they were extended by hand for `coordinationStatus`, `guard`,
+  `integratorReply`, `capabilities`; the Node parity test passes).
+- [ ] Record the first green `fuzz` job in `security.yml`, commit
+  `fuzz/Cargo.lock`, and keep crashing inputs as regression seeds in
+  `common/tests/parser_fuzz.rs`.
+- [ ] Route a real request with `agent send cap:ios-build` from Linux to the
+  Mac and verify the Git baseline warning when the two clones sit on
+  different commits.
+
+Done when each item has recorded field evidence; scripted CI evidence alone
+does not count.
 
 ### AI-10. Finish confirmed review fixes and acceptance
 
@@ -57,7 +88,11 @@ rekey, lifecycle/transport, then contracts/release tooling. Revalidate findings
 before editing; false positives and compatibility constraints need evidence.
 
 - [ ] Finish Unix materialization backup-retry/durability fixes and broader
-  recovery coverage. Inode-mismatch deletion fallback removed: two regressions
+  recovery coverage. `client/tests/fault_recovery.rs`
+  `interrupted_activation_journal_restores_backups_before_next_sync` fails on
+  this batch (reproduced at commit `b4fb969`, before later work): "local path
+  recover.txt no longer matches its retained publication; refusing automatic
+  recovery". Inode-mismatch deletion fallback removed: two regressions
   failed before the fix; all three focused recovery tests passed afterward.
   Independent static review approved that change. Broader verification pending.
 - [ ] Complete locking/registry/access-log, server GC/waiter/durability, and

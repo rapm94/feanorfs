@@ -123,8 +123,9 @@ pub use work::{
     work_yield,
 };
 pub use workspace_layout::{
-    ensure_workspace_state, global_state_root, maintain_workspace_state, workspace_is_configured,
-    workspace_state_id, workspace_state_path,
+    ensure_workspace_state, global_state_root, maintain_workspace_state,
+    workspace_has_preferred_state, workspace_is_configured, workspace_state_id,
+    workspace_state_path,
 };
 
 use anyhow::{Context, Result};

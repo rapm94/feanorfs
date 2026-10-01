@@ -208,6 +208,16 @@ pub async fn run_guard(current_dir: &Path, args: GuardArgs, json: bool) -> anyho
 
 async fn guard(current_dir: &Path, args: GuardArgs) -> anyhow::Result<Option<GuardResult>> {
     let root = control_workspace_root(current_dir)?;
+    // Probe without creating state: a globally installed hook runs in every
+    // project, and unrelated folders must not gain workspace-state slots.
+    if !feanorfs_agent_core::workspace_has_preferred_state(&root) {
+        anyhow::ensure!(
+            args.hook,
+            "'{}' is not a FeanorFS workspace",
+            root.display()
+        );
+        return Ok(None);
+    }
     let roots = guard_roots(&root);
     let mut paths = Vec::new();
     let raw = if args.hook { hook_paths()? } else { args.paths };

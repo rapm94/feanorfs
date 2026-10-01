@@ -1,8 +1,12 @@
 # FEANORFS KNOWLEDGE BASE
 
-**Generated:** 2026-08-13T00:00:00+02:00
-**Branch:** main
-**Status:** Format-v3 encrypted Merkle snapshots, native Rustls hub transport with capability-pinned private CAs and DHCP-resilient CA-bound mDNS names, direct-P2P mesh transport (signed capability-v2 candidates, Ed25519 machine identity, bounded LAN/direct/UPnP-mapped/STUN-reflexive dials racing ahead of DNS/mDNS, coordinated QUIC punch with loopback TLS bridge) with the WS tunnel demoted to explicit legacy fallback, authenticated fail-closed hub trust refresh, automatic credential-free private-hub and one supervisor login service, encrypted `ffwork1` work-intent coordination with deterministic reducers and enforcement-mode runner admission, exact fingerprinted conflict identity with harness-neutral candidate jobs and guarded publication, cross-machine encrypted `ffres1` assignment/result/revoke/human-answer profiles with a deterministic reducer and typed human escalation, staged-only desktop release workflows gated by a required deterministic policy check, typed error classification replacing rendered-text control flow, shared sealed-envelope recovery cryptography, one persistent child reaper under a split `process_tree/` boundary, and a canonical exact-path client contract, encrypted workspace recovery kits, crash-safe private-hub identity recovery and CA/token rotation, OS-backed unattended credential storage with protected-file fallback, JSON-backed embeddable SDK, safe SQLite import, PAKE-authenticated LAN/off-LAN pairing and bounded opaque inner-TLS hub relay, hardened attestable amd64/arm64 relay OCI product, cross-platform desktop tray, universal notarizable macOS `.dmg`/`.pkg`, attested native Linux `.deb`/`.rpm`/`.pkg.tar.zst`/tar products, Authenticode-g…
+**Status:** pre-1.0 (v0.12.x). Format-v3 encrypted Merkle snapshots over an
+opaque hub; Rustls transport with capability-pinned private CAs, mesh and
+relay reachability; one supervisor login service; agent coordination
+(`ffmsg1` signals, `ffwork1` work intent, `ffint1` integrator assignment,
+`ffres1` resolution, `ffcap1` capabilities) projected into one lifecycle by
+`agent next`; cross-platform tray and native installers. Signed macOS/Windows
+products wait on founder credentials ([TODO.md](TODO.md) F1).
 
 ## Unifying Principle
 
@@ -12,309 +16,111 @@
 
 | Layer | Role |
 |---|---|
-| **Hub** (`feanorfs serve`) | Opaque blob storage plus compare-and-swap heads, format markers, and reachability manifests. The server never decrypts trees or sees format-v3 filenames. |
-| **Engine** (`feanorfs_client` + `feanorfs_agent_core`) | Builds encrypted trees, reconciles snapshots, materializes working copies, and exposes CLI, Rust, C, TypeScript, MCP, and events surfaces. |
-| **Tray client** (shipped) | `tray/` — cross-platform `feanorfs-tray` system-tray app. Shells the CLI for status, lifecycle, pairing, conflict/agent actions, workspace recovery, diagnostics, and release awareness. No duplicate sync, pairing, credential, or cryptography logic. |
+| **Hub** (`feanorfs serve`) | Opaque blob storage plus compare-and-swap heads, format markers, and reachability manifests. Never decrypts trees or sees format-v3 filenames. |
+| **Engine** (`feanorfs_client` + `feanorfs_agent_core`) | Builds encrypted trees, reconciles snapshots, materializes working copies; exposes CLI, Rust, C, TypeScript, MCP, and events surfaces. |
+| **Tray** (`tray/`) | Shells the CLI for status, lifecycle, pairing, conflicts, recovery, diagnostics, and update awareness. No duplicate sync, pairing, credential, or cryptography logic. |
 
 **Defaults:**
-- Prefer smart defaults over flags where practical (`feanorfs start [folder]` creates a secure private hub when no connection exists, syncs, installs automatic hub/workspace services and the desktop tray, and returns; `feanorfs stop [folder]` reversibly removes automatic sync and tray registration; `--foreground` is explicit).
-- Reusing `start fnh1-… <existing-folder>` refreshes hub trust only after an HTTPS CA/token/head probe succeeds; it must preserve that folder's workspace ID, E2EE key, refs, files, and encrypted history.
-- Implicit new folders receive distinct opaque `fsw1-…` workspace IDs; `--workspace` is an advanced/manual override, never a shared consumer default.
-- Server auth = **token**; workspace secrecy = **encryption key** (distinct concepts in user-facing copy).
+- Prefer smart defaults over flags: `feanorfs start [folder]` creates a secure private hub when no connection exists, syncs, installs the background service and tray, and returns; `feanorfs stop [folder]` reversibly removes automatic sync and tray registration; `--foreground` is explicit.
+- `start fnh1-… <existing-folder>` refreshes hub trust only after an HTTPS CA/token/head probe succeeds and preserves the folder's workspace ID, E2EE key, refs, files, and history.
+- New folders get distinct opaque `fsw1-…` workspace IDs; `--workspace` is a manual override, never a shared consumer default.
+- Server auth = **token**; workspace secrecy = **encryption key** (distinct in user-facing copy).
 - Native TLS is the hub default. `--allow-http` is explicit reverse-proxy/development mode; never disable certificate verification in clients.
-- Surface conflicts; never auto-merge file content.
-- Bulk conflict choices may apply one explicitly confirmed local-or-mirror policy to every pending path, but still never merge file content.
+- Surface conflicts; never auto-merge file content. Bulk choices may apply one explicitly confirmed local-or-mirror policy to every pending path.
 - Self-host and hosted deployments share the same API and client binary.
-- Agent-first, human-legible: every agent capability keeps a plain-files, plain-language human path (working copy stays normal files; conflicts resolved by editing + `conflicts keep`/tray). Transport/snapshot internals stay invisible to humans until needed — FeanorFS is not a VCS and grows no git-shaped porcelain.
+- Agent-first, human-legible: every agent capability keeps a plain-files, plain-language human path. FeanorFS is not a VCS and grows no git-shaped porcelain.
 
-## OVERVIEW
-`FeanorFS` is a developer-focused uncommitted-code synchronization tool written in Rust. It uses a self-contained local-first architecture:
-1. **Snapshot synchronization**: Format-v3 clients compare encrypted Merkle trees against the private global workspace ref, stage blobs and tree objects under `~/.feanorfs/workspaces/<opaque-id>/`, then compare-and-swap one workspace head.
-2. **Blob storage**: Content-addressed storage (CAS) blobs use Blake3 ciphertext hashes. Remote `feanorfs serve` uses SQLite for opaque heads, manifests, format markers, and legacy-format metadata; the embedded LocalHub uses lock-protected JSON plus blob files.
-3. **End-to-End Encryption (E2EE)**: New blobs are sealed with ChaCha20-Poly1305 AEAD (`pack_bytes`/`unpack_bytes`), key derived from `blake3(domain ‖ len-prefixed password ‖ len-prefixed path)`, deterministic SIV-style nonce (required for CAS stability). Format v2 workspaces reject non-AEAD blobs (`LegacyPolicy::Reject`); unmigrated v1 workspaces still fall back to legacy XOR on decrypt until `feanorfs migrate`. Removing compatibility requires separately approved representative field evidence. Client re-hashes downloaded ciphertext against `encrypted_hash` before decrypting.
-4. **Local hub (in-process)**: `setup --local` / `hub_local` config uses agent-core `LocalHub` directly — no socket, daemon, server crate, or SQLite. Its data lives in the global workspace state (invites are not portable for embedded hubs).
-5. **On-Demand Hydration (Lazy Sync)**: `pull --lazy` creates 0-byte placeholders; actual bytes fetched via `hydrate` or `cat`.
-6. **Workspace isolation**: `agent spawn` clones files and writes one base snapshot ref. Status and land descend only into changed subtrees. Land commits through head compare-and-swap, and conflicts survive in encrypted tree entries plus human-readable artifacts.
-7. **Agent Library API**: Client crate is split into `lib.rs` + `main.rs`; `feanorfs_client::sync/push/pull/hydrate/cat` are callable from any Rust program. `--json` flag on the CLI emits structurally-typed results for every status-returning command.
-8. **Catch-Up Summary**: `summary` diffs current workspace against the previous session marker stored in `local_state.json` and lists added/modified/deleted paths. `--summarize` shells out to `FEANORFS_SUMMARY_CMD` (default `feanorfs-llm`) with structured JSON; if absent, it falls back to plain paths. File contents never go to a remote LLM.
-9. **History and retention**: `log` walks reachable snapshot parents. `undo` records the selected tree as a new two-parent snapshot. Clients upload complete opaque reachability manifests; server and local GC retain configured snapshot closures. Server GC is serialized against publication.
-10. **Migration safety**: A durable server fence excludes legacy writes from pre-reseal pull through atomic format stamp, flat-row deletion, and fence release. Client journal phases preserve old and target keys across retries.
-11. **Predictive hydration**: `file_access_log` tracks local path co-occurrence and never leaves the client.
-12. **Automatic lifecycle**: First-machine `feanorfs start [folder]` creates/reuses `~/.feanorfs/hub-data` and installs a single credential-free supervisor login job (`com.feanorfs.agent`, running `feanorfs service supervise`); `--host` is the explicit override. A fresh hub prefers port 3030 and atomically persists an available fallback when occupied; existing hubs retain their endpoint. The supervisor is the one background item on macOS/Linux (plus one Task Scheduler task and the interactive tray task on Windows) and spawns every worker: the private hub (`service hub-run <data-dir>`), one watcher per registered workspace (`service run <folder>`), and the desktop tray when installed. `feanorfs stop [folder]` removes that folder from the locked/atomic supervision registry and its recent entry while preserving files, encrypted setup, credentials, remote snapshots, and the shared private hub. `doctor` verifies the complete lifecycle and emits the same secret-free named checks in human or JSON form; the tray's **Check System Health…** projects only fixed check names/statuses and offers explicit repair through the same `start` path. Workers receive only canonical data/workspace paths, read protected credentials and endpoint state in-process, and never put keys, tokens, invites, recovery passphrases, or automatic port selection in argv, environment, logs, or discovery. The supervisor restarts exited children with bounded backoff (the tray excepted, which respects a clean quit) and reconciles the supervision registry, hub data directory, `relay.json`, and `listen-port` every 500 ms; it reaps orphaned children of a replaced or crashed instance on startup and when the supervisor is dead, `stop` terminates only command-line-verified watchers; its path-plus-Blake3 executable identity restarts the one job after same-path package upgrades (legacy per-component jobs migrate into it), and background `start` coordinates with the managed watcher instead of racing its sync lock.
-13. **LAN pairing**: `feanorfs pair` advertises a secret-free ephemeral mDNS session and delivers the automatic hub's stable CA-bound `.local` hostname. The desktop tray presents its short code on the sharing computer and offers **Join Another Computer…** on the receiver; the receiver supplies the capability through masked UI and bounded stdin into the ordinary `start` engine, never argv/environment/logs. The CLI retains all discovery and cryptography. `start fnp1-… [folder]` remains the terminal equivalent and uses SPAKE2 plus ChaCha20-Poly1305 to receive the full invite, sync, and install background service. Pairing is client-to-client; the hub stays opaque and never receives pairing or E2EE secrets.
-14. **Off-LAN pairing and opaque hub relay**: `start --relay <public HTTPS URL> [folder]` persists a random 256-bit reachability route in protected workspace/global config and atomic `0600` hub-local state; its credential-free service receives only the hub data-directory path and maintains outbound WSS offers. Remote clients resolve the CA-bound hub hostname to an ephemeral loopback bridge and tunnel the existing Rustls stream, so the relay never sees bearer tokens, workspace IDs, API paths, object names, or tunneled bytes. The same stored relay makes tray/CLI pairing emit `fnp2`; its 80-bit secret and PAKE/AEAD invite remain client-side. `serve --relay` enables both bounded public routes; no default hosted relay or direct NAT traversal is claimed.
-15. **Secure transport**: `feanorfs serve` uses Rustls HTTPS by default. A durable private CA under the hub data directory signs leaves containing a stable CA-derived mDNS hostname; automatic address tracking survives interface and DHCP changes without router reservations. `fnh1`/`fnr1` capabilities carry only the public certificate. Public CA chains remain supported. Client requests carry bounded connect/read-idle timeouts so a silent or unreachable hub fails with a retryable error instead of hanging sync, the watcher, or CLI commands indefinitely.
-16. **Local credential protection**: Secure onboarding stores E2EE keys and server tokens in macOS Keychain for signed releases, Windows Credential Manager, or Linux Secret Service and leaves only a random reference in config JSON. Unsigned macOS/source builds and unavailable platform stores use atomic `0600` config as the compatibility fallback; an already-migrated reference fails closed instead of spilling secrets back to disk.
-17. **Private-hub recovery**: `serve recovery export` seals the durable hub CA and bearer token with Argon2id + XChaCha20-Poly1305 into a bounded bundle outside hub state. Offline import rejects hub-internal/symlink-aliased sources, validates identity, fences partial writes across crashes, regenerates leaf certificates, and preserves client trust without placing recovery passphrases in argv or environment variables. Offline rotation writes the same external encrypted backup before crash-safe replacement of both CA and token, preserves opaque storage, and deliberately requires authenticated `fnh1` re-pairing on every client.
-18. **Workspace recovery kit**: `recovery export|import` seals the complete portable `WorkspaceInvite` capability with Argon2id + XChaCha20-Poly1305 in an atomic private file. Import authenticates and validates before workspace/global writes, then supplies the decrypted invite in-process to the ordinary `start` path. The tray owns only native file/masked-input dialogs and a bounded stdin pipe; passphrases and decrypted capabilities never enter argv, environment variables, or logs. Kits are access backup, not blob backup, and require the hub to remain reachable.
-19. **Release awareness**: `feanorfs update` performs a bounded HTTPS-only lookup of the official stable GitHub release, compares versions with `semver`, and validates the exact matching public tag URL. `update --periodic` throttles per machine through `~/.feanorfs/update-state.json` (24 h window) so the CLI, tray, and `doctor` report the same typed result without repeated network checks. The tray presents the typed result and opens that page only after an explicit choice. Neither surface downloads, installs, or executes artifacts; signed/checksummed platform installers and release attestations remain the trust boundary.
-20. **Large-file transport**: Format-v3 files above 64 MiB use path/index-bound 8 MiB ChaCha20-Poly1305 chunks and an authenticated encrypted manifest whose ciphertext hash remains the tree file identity. Requests remain below the hub's 100 MiB body bound, chunks are included in opaque reachability manifests, and streaming reconstruction verifies ciphertext hashes, AEAD, order, sizes, total length, and plaintext Blake3 before commit.
-21. **Portable workspace-state identity and retirement**: workspace-state slots carry filesystem-stable identity on macOS, Linux, Windows, and weak filesystems, with one-time provenance-recorded adoption of legacy path-only slots; a crash-safe identity index replaces the moved-workspace scan; full-lifetime per-slot state leases serialize migration and retirement; and `feanorfs retire` tombstones state through grace, quarantine, and identity-revalidated deletion. State is never deleted by age, missing location, registry absence, or name inference.
+## Architecture
 
----
+1. **Sync:** format-v3 clients diff encrypted Merkle trees against the private `last-synced` ref, stage objects under `~/.feanorfs/workspaces/<opaque-id>/`, and compare-and-swap one workspace head. Sync snapshots carry an encrypted `ffbase1` Git baseline label (read-only from `.git/HEAD`).
+2. **Storage:** Blake3 ciphertext-addressed blobs; `feanorfs serve` keeps opaque heads/manifests in SQLite, the embedded `LocalHub` in lock-protected JSON.
+3. **E2EE:** ChaCha20-Poly1305 with a deterministic SIV-style nonce (required for CAS stability). Format ≥2 rejects non-AEAD blobs; unmigrated v1 decrypts via legacy XOR until `feanorfs migrate`, and removing that path requires approved field evidence (`doctor --migration-report`). Clients re-hash downloaded ciphertext before decrypting.
+4. **Lazy hydration:** `--lazy` writes 0-byte placeholders; `hydrate`/`cat` fetch bytes.
+5. **Agents:** `agent spawn` clones a worktree with one base snapshot ref; land commits through head CAS; conflicts persist in encrypted tree entries plus private artifacts. Agent workspaces isolate data, not processes.
+6. **Coordination:** signals are no-file-change snapshots; reducers project work intent, integrator assignment, and resolution; `agent next` derives one lifecycle with prefilled actions; `agent guard` checks writes; `cap:<capability>` routes requests.
+7. **History:** `log` walks reachable parents; `undo` appends a two-parent snapshot; complete reachability manifests drive server and local GC.
+8. **Lifecycle:** one supervisor job (`com.feanorfs.agent`) spawns the private hub, one watcher per workspace, configured runners, and the tray. Workers receive only canonical paths; keys, tokens, invites, and passphrases never appear in argv, environment, logs, or discovery.
+9. **Pairing and reachability:** SPAKE2 + AEAD pairing (`fnp1` LAN, `fnp2` relay rendezvous); signed mesh candidates race ahead of mDNS; the opaque relay forwards inner TLS only.
+10. **Recovery and credentials:** Argon2id + XChaCha20-Poly1305 workspace kits and hub identity bundles; OS credential stores with protected-file fallback that never spills back once migrated.
+11. **Local-only data:** catch-up summaries send paths, never contents; predictive-hydration weights never leave the client; workspace state is never deleted by age, absence, or name inference (only `retire`).
 
-## STRUCTURE
+## Structure
+
 ```
-feanorfs/
-├── Dockerfile.relay-binary # Binary-only native-architecture release image assembly
-├── common/              # Shared data models and utilities
-│   └── src/lib.rs       # FileState, SyncRequest/Response, invite encode/decode, crypto
-├── server/              # Pure blob storage server
-│   ├── src/db.rs        # SQLite metadata DB coordinator using SQLx
-│   ├── src/app.rs       # Axum routes for sync negotiation, blob uploads & downloads
-│   ├── src/serve.rs     # run_http_server, GC, shared with client embed
-│   ├── src/tls.rs       # Native TLS, durable private CA, refreshed interface leaf
-│   ├── src/recovery.rs  # Encrypted CA/token backup, offline crash-safe restore
-│   ├── src/private_file.rs # Private directory, lock, and atomic-write helpers
-│   ├── src/lib.rs       # feanorfs_server library (build_router, init_app_state)
-│   └── src/main.rs      # CLI entrypoint
-├── agent-core/          # Embeddable agent SDK (Runtime, Workspace, spawn/land/conflicts)
-│   └── src/             # agent, local, hub, api, conflicts, sync_pass, …
-├── feanorfs-ffi/        # C ABI (JSON strings in/out) + feanorfs.h
-├── test-support/        # Dev-only pre-main isolation for state-capable test processes
-├── bindings/ts/         # @feanorfs/agent napi-rs Node bindings
-├── client/              # CLI terminal client + library crate
-│   ├── src/lib.rs       # feanorfs_client lib export surface (sync/push/pull/hydrate/cat, types, Db, ApiClient)
-│   ├── src/api.rs       # HTTP + in-process ApiClient backends
-│   ├── src/hub.rs       # Thin re-export of agent-core LocalHub
-│   ├── src/migrate_sqlite/ # One-time workspace/agent/embedded-hub importer
-│   ├── src/commands.rs  # Push/pull/sync/hydrate/cat command implementations (Serialize'd result types)
-│   ├── src/recovery.rs  # Encrypted offline workspace-capability recovery kit
-│   ├── src/agent.rs     # Thin re-export of agent-core operations
-│   ├── src/conflicts.rs # Thin re-export of agent-core conflict operations
-│   ├── src/conflict_artifacts.rs # Conflict version files (.original/.local/.cloud) + sentinel placeholders
-│   ├── src/fs_util.rs   # atomic_write_visible/atomic_write_durable (temp+rename, durable adds parent sync), file mtime helpers
-│   ├── src/cli/         # CLI handlers (agent, conflicts, serve, start, mcp, events, workspace, …)
-│   ├── src/summary.rs   # Catch-up summary: diff against last_session, FEANORFS_SUMMARY_CMD shell-out with plain fallback
-│   ├── src/predictive.rs # Predictive hydration: access recording + co-occurrence prefetch + time decay
-│   ├── src/local.rs     # Client-side config, ignore rules, rebuildable cache, access log, session markers
-│   ├── src/main.rs      # CLI subcommand router with global --json flag and AgentAction subcommand
-│   └── src/watch.rs     # Debounced real-time change watcher
-└── server-data/         # Created by server to store file blobs and sqlite metadata (git-ignored)
+common/        wire models, canonical trees, crypto, protocol contracts (no I/O)
+server/        Axum hub: opaque blobs, SQLite heads/manifests, TLS, recovery
+agent-core/    embeddable engine: snapshots, sync pass, agents, coordination, local hub
+client/        `feanorfs` CLI + library: start/stop lifecycle, watcher, MCP, events
+feanorfs-ffi/  C ABI (JSON in/out) + generated feanorfs.h
+bindings/ts/   @feanorfs/agent napi-rs bindings
+tray/          cross-platform desktop tray (shells the CLI)
+test-support/  pre-main test profile isolation
+eval/          multi-agent evaluation harness and scenarios
+fuzz/          cargo-fuzz targets (properties in common/tests/fuzz/)
+scripts/       installers, packaging, smoke tests
 ```
 
----
+## Where to look
 
-## THE LOCAL CACHE DESIGN
-To avoid unnecessary re-hashing, the client stores schema-versioned state under `~/.feanorfs/workspaces/<opaque-id>/local_state.json`, protected by a separate advisory lock and atomic replacement. No FeanorFS metadata or ignore file is created inside a project:
-1. **State maps:** cache entries, pending conflicts, conflict resolution history, session markers, and bounded predictive access weights.
-2. **Legacy import:** client-owned migration reads WAL-visible `local_cache.db` rows for the workspace and each agent, verifies semantic equality after JSON import, then archives SQLite files as `.migrated-v1.db`.
-3. **Double-hash and Server Mtime Tracking** in cache entries:
-   - `plaintext_hash`: Used to quickly detect disk modifications.
-   - `encrypted_hash`: Stores the actual crypt hash matching the server blob key.
-   - `server_mtime`: Tracks the server's official commit mtime for cache/order and rollback evidence. Conflict identity and final sync direction use hashes relative to the last agreed state, not cross-machine clocks.
+| Task | Location |
+| :--- | :--- |
+| Wire types, crypto, invites | [common/src/](common/src/) (`lib.rs`, `invite.rs`, `*_contract.rs`, `git_baseline.rs`) |
+| Objects, snapshots, refs, history | [objects.rs](agent-core/src/objects.rs), [snapshot.rs](agent-core/src/snapshot.rs), [history.rs](agent-core/src/history.rs) |
+| Sync pass and materialization | [sync_pass/](agent-core/src/sync_pass/), [commands.rs](client/src/commands.rs), [watch.rs](client/src/watch.rs) |
+| Local state and scanning | [local/](agent-core/src/local/), [state/](agent-core/src/state/), [workspace_read.rs](agent-core/src/workspace_read.rs) |
+| Workspace-state identity and retirement | [workspace_state_registry.rs](agent-core/src/workspace_state_registry.rs), [workspace_layout.rs](agent-core/src/workspace_layout.rs) |
+| Agents and continuous reconciliation | [agent/](agent-core/src/agent/), [agent_live.rs](client/src/cli/agent_live.rs) |
+| Signals and coordination | [messages.rs](agent-core/src/messages.rs), [work.rs](agent-core/src/work.rs), [integrator.rs](agent-core/src/integrator.rs), [resolution.rs](agent-core/src/resolution.rs), [resolution_protocol.rs](agent-core/src/resolution_protocol.rs), [coordination.rs](agent-core/src/coordination.rs) |
+| Conflicts | [conflicts.rs](agent-core/src/conflicts.rs), [conflict_artifacts.rs](agent-core/src/conflict_artifacts.rs), [tree_reconcile.rs](agent-core/src/tree_reconcile.rs) |
+| Transport, TLS, mesh, relay | [api.rs](agent-core/src/api.rs), [mesh/](agent-core/src/mesh/), [tunnel.rs](agent-core/src/tunnel.rs), [tls.rs](server/src/tls.rs), [endpoint.rs](client/src/endpoint.rs) |
+| Lifecycle, pairing, recovery | [supervisor/](client/src/cli/supervisor/), [start.rs](client/src/cli/start.rs), [pair.rs](client/src/cli/pair.rs), [recovery.rs](client/src/recovery.rs), [server/src/recovery.rs](server/src/recovery.rs) |
+| MCP, events, agent CLI | [mcp.rs](client/src/cli/mcp.rs), [events.rs](client/src/cli/events.rs), [cli/](client/src/cli/) |
+| Agent JSON contract and docs | [docs/agent-api.md](docs/agent-api.md), [docs/agent-communication.md](docs/agent-communication.md), [skills/feanorfs-collaboration/](skills/feanorfs-collaboration/SKILL.md) |
+| Sync scope rationale | [docs/sync-scope.md](docs/sync-scope.md) |
+| Threat model | [docs/threat-model.md](docs/threat-model.md) |
+| CI and releases | [.github/](.github/AGENTS.md) |
 
----
+## Conventions
 
-## WHERE TO LOOK
+1. **Portable paths:** track forward-slash paths normalized with `feanorfs_common::normalize_path`; validate the exact path you later join or persist.
+2. **No redundant hashing:** consult `local_state.json`; rehash only when mtime or size changed.
+3. **Descriptor-anchored reads:** never reopen scanned workspace content by pathname; traverse with `openat`/`O_NOFOLLOW` from a retained root descriptor (checked portable fallbacks elsewhere).
+4. **Zero knowledge:** seal file bytes by path and objects under the object domain before upload; format-v3 hub metadata contains no filenames.
+5. **Library-first results:** commands return `Serialize` structs shared by `--json` and library callers; no `println!` in engine code.
+6. **No auto-merge:** conflicts produce `.original`/`.local`/`.cloud` artifacts in private state; consumers resolve with `conflicts keep`.
+7. **Data isolation ≠ sandbox:** never claim process sandboxing; link [docs/threat-model.md](docs/threat-model.md).
+8. **Sync scope:** mirror disk contents including gitignored paths; hard-skip `.git/`, `.jj/`, legacy metadata, symlinks, nested valid `CACHEDIR.TAG` trees; keep `DEFAULT_IGNORES` small and frozen; custom rules live in global state via `feanorfs ignore`. Never write `.git`; read only `HEAD` and the ref it names.
+9. **One operation, every surface:** new agent operations land on Rust, CLI, C FFI, napi/JS/d.ts, MCP, docs, and skill together and join `client/tests/operation_matrix.rs`.
+10. **CI/CD:** pin actions to SHAs, keep permissions least-privilege, validate with actionlint/zizmor; never hand-edit cargo-dist's generated `release.yml`.
+11. **Changelog:** root `CHANGELOG.md` only (`changelog_path = "./CHANGELOG.md"`).
+12. **Shared pre-1.0 versions:** internal path dependencies use a pre-1.0 range so release-plz bumps every `version.workspace` crate together.
+13. **Test isolation:** every state-capable test executable links `feanorfs-test-support`; tests never mutate HOME/FEANORFS_HOME after startup.
 
-| Task / Feature | Location | Notes |
-| :--- | :--- | :--- |
-| FileState definition | [lib.rs](common/src/lib.rs) | Tracks relative path, Blake3 hash (encrypted), size, mtime, and deleted status. |
-| Agent snapshot + conflict types | [lib.rs](common/src/lib.rs) | `AgentSnapshotEntry`, `ConcurrentEdit`, `AgentLandResult` (land JSON); `AgentCommitResult` is a legacy subset alias. |
-| E2EE primitives | [lib.rs](common/src/lib.rs) | `pack_bytes`/`unpack_bytes` (ChaCha20-Poly1305 AEAD, deterministic SIV-style nonce) with legacy `crypt_bytes` XOR fallback on decrypt for unmigrated v1. Format v2 rejects non-AEAD. Also exports `is_valid_hash` for path-traversal defense. |
-| Library API surface | [lib.rs](client/src/lib.rs) | `feanorfs_client::sync/push/pull/hydrate/cat` callable from any Rust program. Re-exports `ApiClient`, `ClientDb`, `Config`, types. |
-| Local state + migration | [local.rs](agent-core/src/local.rs), [migrate_sqlite/](client/src/migrate_sqlite/) | Lock-protected JSON cache/conflict/session/access state plus one-time legacy SQLite import. Snapshot authority lives in refs and encrypted objects. |
-| Encrypted objects + snapshots | [objects.rs](agent-core/src/objects.rs), [snapshot.rs](agent-core/src/snapshot.rs) | Immutable encrypted tree/snapshot CAS, refs, manifests, and head publication. |
-| Workspace-state identity + retirement | [workspace_state_registry.rs](agent-core/src/workspace_state_registry.rs), [workspace_layout.rs](agent-core/src/workspace_layout.rs) | Platform identity (`macos-v2`/`linux-v2`/`windows-v2`/`-weak`), crash-safe identity index, full-lifetime per-slot state leases, and tombstone grace/quarantine/verified-deletion retirement (`feanorfs retire`). |
-| History | [history.rs](agent-core/src/history.rs) | Reachable DAG log, short-ID resolution, append-only undo, and worktree materialization. |
-| Directory Scanning | [local.rs](client/src/local.rs) | Uses `ignore` WalkBuilder. Matches size and mtime. Reports cached `server_mtime` for untouched placeholders. |
-| Sync scope & ignores | [sync-scope.md](docs/sync-scope.md) | Why we sync gitignored paths, hard-exclude `.git`/`.jj`/legacy metadata, keep custom rules in global state, and prune valid `CACHEDIR.TAG` trees. |
-| Transport (`ApiClient`) | [api.rs](client/src/api.rs) + [hub.rs](client/src/hub.rs) | HTTP or in-process hub via `Backend::Http` / `Backend::Local`. Wraps `/api/sync/diff`, upload, download, workspaces. |
-| Native TLS | [tls.rs](server/src/tls.rs), [api.rs](agent-core/src/api.rs), [invite.rs](common/src/invite.rs) | Rustls server, invite-pinned private CA, system-root public TLS, and secure hub/workspace capabilities. |
-| Mesh transport | [mesh_contract.rs](common/src/mesh_contract.rs), [mesh/](agent-core/src/mesh/), [endpoint.rs](client/src/endpoint.rs) | Signed capability-v2 candidates, Ed25519 machine identity, bounded direct dials, NAT mapping, STUN reflexive, coordinated QUIC punch bridge; decisions in [docs/mesh-transport.md](docs/mesh-transport.md), two-machine field evidence in [docs/mesh-field-evidence.md](docs/mesh-field-evidence.md). |
-| Private-hub recovery | [recovery.rs](server/src/recovery.rs), [serve.rs](client/src/cli/serve.rs) | Argon2id + XChaCha20-Poly1305 identity bundles, offline runtime lock, durable import fence, CA/key validation, and leaf regeneration. |
-| Workspace recovery | [recovery.rs](client/src/recovery.rs), [recovery.rs](client/src/cli/recovery.rs) | Opaque Argon2id + XChaCha20-Poly1305 capability kits, atomic private writes, fail-before-write import, and in-process delegation to `start`. |
-| CLI Actions | [main.rs](client/src/main.rs) + [cli/](client/src/cli/) | Subcommand router. Global `--json`. Agent: spawn/check/refresh/land (commit alias). Workspace: start/stop/setup/join/serve. |
-| Sync Engine | [commands.rs](client/src/commands.rs) | Pure sync logic returning `Serialize`-derived result types (`SyncResult`, `PushResult`, etc.). No `println!` — UI-agnostic. |
-| Workspace Isolation | [agent.rs](agent-core/src/agent.rs) | `spawn_agent`, `check_agent`, `land_agent`, `refresh_agent`, `list_agents`, `clean_agent`. Format v3 compares encrypted snapshot heads; legacy formats retain peek/diff compatibility. |
-| Workspace sync conflicts | [conflicts.rs](agent-core/src/conflicts.rs), [tree_reconcile.rs](agent-core/src/tree_reconcile.rs) | Tree-based last-synced reconciliation, registry/artifacts, and `conflicts keep`. |
-| Catch-up Summary | [summary.rs](client/src/summary.rs) | `diff_since_last_session`, `commit_session_marker`, `render_via_summary_tool` (shells out to `FEANORFS_SUMMARY_CMD`, default `feanorfs-llm`, falls back to plain listing). |
-| Predictive Hydration | [predictive.rs](client/src/predictive.rs) | `record_access_with_recent`, `prefetch_related` (top-5 siblings, 0.95 decay factor). Triggered from `hydrate` and `cat` CLI arms. |
-| Change Watching | [watch.rs](client/src/watch.rs) | Debounced (500ms) filesystem watcher that triggers `do_sync` on changes; publishes the tray `worker-status.json` snapshot after each sync. |
-| Continuous agents | [continuous.rs](agent-core/src/agent/continuous.rs), [head.rs](agent-core/src/head.rs), [agent_live.rs](client/src/cli/agent_live.rs), [head_wait.rs](server/src/app/head_wait.rs), [watch.rs](client/src/watch.rs), [cli/events.rs](client/src/cli/events.rs) | Process-lifetime lease per (workspace, agent); guarded automatic land (`clean=false, propose=false`) and safe refresh (never `--replace`) driven by a 500 ms debounced worktree watcher plus the bounded head observer; signal-only heads wake messaging with zero file work; bounded `continuous-status.json` projection and `agent_reconcile_*` events; activation only via `agent run` or an enabled configured runner. Docs: [docs/usage.md](docs/usage.md), [docs/agent-communication.md](docs/agent-communication.md), [docs/agent-api.md](docs/agent-api.md). |
-| Agent signals | [messages.rs](agent-core/src/messages.rs), [agent_contract.rs](common/src/agent_contract.rs), [cli/agent.rs](client/src/cli/agent.rs), [cli/mcp.rs](client/src/cli/mcp.rs), [cli/events.rs](client/src/cli/events.rs), [skills/feanorfs-collaboration/](skills/feanorfs-collaboration/SKILL.md) | `ffmsg1` envelopes in `Snapshot.message`; send = no-file-change snapshot with fresh-root CAS retry; inbox = reachability-delta traversal with cursors. Protocol: [docs/agent-communication.md](docs/agent-communication.md). |
-| Integrator assignment | [integrator_contract.rs](common/src/integrator_contract.rs), [integrator.rs](agent-core/src/integrator.rs), [cli/integrator.rs](client/src/cli/integrator.rs), [cli/mcp.rs](client/src/cli/mcp.rs), [cli/events.rs](client/src/cli/events.rs) | `ffint1` profiles inside `ffmsg1` bodies; auditable Blake3 ranking (OS-CSPRNG nonce), dispatcher state machine + `orchestrator/integrator-state.json`, cross-machine conflict materialization. Docs: [docs/agent-communication.md](docs/agent-communication.md), [docs/agent-api.md](docs/agent-api.md). |
-| Tray status snapshot | [tray.rs](client/src/tray.rs), [tray_contract.rs](common/src/tray_contract.rs) | Bounded secret-free `WorkerStatusSnapshot`; routine tray refreshes never scan or take the sync lock; `tray status --fresh` is explicit. |
-| Work-intent coordination | [work_contract.rs](common/src/work_contract.rs), [work.rs](agent-core/src/work.rs), [scope.rs](agent-core/src/agent/scope.rs), [cli/work.rs](client/src/cli/work.rs) | `ffwork1` profiles inside `ffmsg1` bodies; pure canonical contract + overlap evaluation; deterministic reducer over the existing signal stream with bounded `orchestrator/work-state.json`; enforcement-mode runner admission and the canonical scope-filtered land guard. Docs: [docs/agent-communication.md](docs/agent-communication.md), [docs/agent-api.md](docs/agent-api.md). |
-| Exact conflict resolution | [resolution_contract.rs](common/src/resolution_contract.rs), [resolution.rs](agent-core/src/resolution.rs), [resolution_protocol.rs](agent-core/src/resolution_protocol.rs), [cli/resolution.rs](client/src/cli/resolution.rs) | Versioned `ConflictIdentity` + domain-separated Blake3 fingerprints; legacy path-only records are `LegacyUnfingerprinted` (manual only); causally-behind owner designation with `ffint1` fallback evidence; immutable `ResolutionJob`/candidate stores; guarded publication revalidates every identity field and the candidate before one CAS from the reloaded head. Cross-machine `ffres1` profiles ride the encrypted signal stream into a pure deterministic reducer with pending-order convergence, durable projection, job import by ID and fingerprint, authenticated leg materialization, typed answers, and bounded metadata-only status. |
-| Release awareness | [cli/update.rs](client/src/cli/update.rs) | `update --periodic` throttles per machine via `~/.feanorfs/update-state.json`; CLI + tray share the same `--json` result; `doctor` exposes `update_available`. |
-| Snapshot-engine review | [snapshot-engine-review.md](docs/snapshot-engine-review.md) | Merkle snapshot engine findings, fixes, and acceptance evidence: stale-mtime download bug, conflict leg sizes, manifest cap, uploaded-object dedupe, cache-first reads, GC throttle. |
-| Code review sweep | [code-review-sweep.md](docs/code-review-sweep.md) | Watcher/predictive/summary/lock findings and fixes: live-lock staleness, placeholder readonly hydration, summary-tool EPIPE fallback, temp-file watcher filter. |
-| Background lifecycle | [supervisor/](client/src/cli/supervisor/), [service.rs](client/src/cli/service.rs), [hub_service.rs](client/src/cli/hub_service.rs) | One supervisor launchd/systemd user job / Task Scheduler task (`com.feanorfs.agent`) owns the private hub, every workspace watcher, and the tray (macOS/Linux); registry `supervisor.json`, status snapshot, legacy migration, and child restarts live here. Worker argv contains only the workspace or protected hub-data path. |
-| Secure LAN pairing | [pair.rs](client/src/cli/pair.rs) | Single-use `fnp1` code, mDNS rendezvous, SPAKE2, AEAD invite delivery, key confirmation, attempt/expiry limits, and stable managed-hub endpoint delivery. |
-| Off-LAN pairing rendezvous | [routes_pair_relay.rs](server/src/app/routes_pair_relay.rs), [pair.rs](client/src/cli/pair.rs) | Optional bounded public WSS PAKE/AEAD frame relay plus `fnp2`; private-hub reachability is supplied separately by the inner-TLS tunnel route. |
-| Opaque inner-TLS relay | [routes_tunnel_relay.rs](server/src/app/routes_tunnel_relay.rs), [tunnel.rs](agent-core/src/tunnel.rs), [hub_service.rs](client/src/cli/hub_service.rs) | Capability-routed WebSocket byte forwarding; original hub CA/SNI and bearer authentication remain end to end. |
-| CI, security, and releases | [ci.yml](.github/workflows/ci.yml), [npm-release.yml](.github/workflows/npm-release.yml), [security.yml](.github/workflows/security.yml), [release-plz.yml](.github/workflows/release-plz.yml), [release.yml](.github/workflows/release.yml), [tray-release.yml](.github/workflows/tray-release.yml), [desktop-release.yml](.github/workflows/desktop-release.yml), [validate-release-assets.yml](.github/workflows/validate-release-assets.yml) | Main CI verifies SDK dependency boundaries and packed Node tarballs. One cargo-dist graph builds and stages every app asset, validates the exact checksummed manifest, then creates the public release once; signing-only products are opt-in. npm package assembly is manual dry-run only. Cargo-dist owns its generated workflow. |
+## Anti-patterns
 
----
+- **DO NOT** scan `.git`, `.jj`, legacy metadata, or global state as project content.
+- **DO NOT** sync on every raw filesystem event; debounce 500 ms.
+- **DO NOT** download bytes during a `--lazy` sync.
+- **DO NOT** add a hub endpoint when objects, manifests, and head CAS already express the operation.
+- **DO NOT** send file contents or the E2EE key to a remote LLM (`--summarize` gets paths and metadata only).
+- **DO NOT** merge concurrent edits.
+- **DO NOT** honor `.gitignore` or grow `DEFAULT_IGNORES` into a framework denylist ([docs/sync-scope.md](docs/sync-scope.md)).
 
-## CODE MAP
+## Commands
 
-### Core Data Models ([common/src/lib.rs](common/src/lib.rs))
-- `FileState`: Schema for paths, hashes, sizes, mtimes, and deleted states.
-- `SyncRequest` & `SyncResponse`: Serialization structs for endpoint negotiation.
-- `Tree`, `TreeEntry`, and `Snapshot`: canonical encrypted workspace structure and append-only parent graph.
-- `ConcurrentEdit`: Three-way triple (base/ours/theirs) emitted by `agent land` for conflicting paths. FeanorFS does not merge — consumers reconcile.
-- `AgentLandResult`: Aggregate result of `agent land` — `our_changes`, `their_changes`, `conflicts`, `landed`, `message`. `AgentCommitResult` is a legacy subset (no `landed`/`message`).
-
-### Server API Endpoints ([server/src/app.rs](server/src/app.rs))
-- `POST /api/sync/diff`: Legacy format-v1/v2 metadata compatibility path.
-- `GET/PUT /api/head`: Read and compare-and-swap the opaque format-v3 snapshot head.
-- `POST /api/manifest`: Store a canonical immutable opaque reachability closure containing its snapshot root; exact-set retries are idempotent and retention keys heads by workspace plus snapshot.
-- `POST /api/workspace/format`: Stamp format v3 and delete that workspace's flat metadata rows.
-- `POST /api/upload?workspace_id=...`: Receives hash-verified encrypted bytes and atomically writes `server-data/blobs/<hash>` before legacy metadata. A later metadata failure retains the immutable CAS object because another workspace/concurrent upload may reference it; GC removes unreferenced blobs. Request body size is capped at 100 MB via `DefaultBodyLimit`.
-- `GET /api/download/:hash`: Streams raw file contents. Rejects non-hex hashes via `is_valid_hash` to prevent path traversal.
-- `GET /api/workspaces`: Lists all workspace IDs that have at least one non-deleted file.
-- **Auth middleware**: All routes require `Authorization: Bearer <token>` by default. The hub generates/persists a 64-hex token when none is supplied; `--token`/`--password` rotates it and `--allow-open` is explicit development mode. Comparison uses constant-time equality.
-- **mDNS**: Server advertises `_feanorfs._tcp.local.` plus scheme and public CA fingerprint on port 3030 when started with `--mdns`. mDNS never establishes private-CA trust; use the `fnh1` capability.
-- **Multi-instance**: `--port` and `--data-dir` flags allow running multiple isolated instances behind a reverse proxy (SaaS deployment model).
-
-### Client Local State ([agent-core/src/state.rs](agent-core/src/state.rs))
-- Cache entries map paths to plaintext/encrypted hashes, size, disk/server mtimes, mode, hydration, and deletion metadata.
-- Access log entries store local-only co-occurrence weights and timestamps with deterministic bounds and decay.
-- Conflict registry and resolution history preserve needs-attention state and explicit choices.
-- Session key/value state stores the previous `last_scan` summary baseline.
-- Global config: `~/.feanorfs/global.json` stores server URL, optional public hub CA, and either a random OS-credential reference or a protected-file token fallback (cached automatically by `feanorfs start`; hidden `connect` also writes it).
-- Workspace config: `~/.feanorfs/workspaces/<opaque-id>/config.json` stores server URL, workspace ID, optional public hub CA, and either a random OS-credential reference or a protected-file E2EE key/token fallback.
-
----
-
-## CONVENTIONS
-1. **Cross-Platform Paths**: All files are tracked and uploaded using forward slashes (`/`). Normalize with `feanorfs_common::normalize_path` before cache or database operations.
-2. **No Redundant Hashing**: Check `local_state.json` first. Rehash only if `mtime` or `size` differs.
-3. **Descriptor-Anchored Workspace Reads**: Never reopen scanned workspace content by pathname before upload, copy, migration, conflict choice, hydration, or `cat`. Unix readers retain a workspace-root descriptor, traverse with `openat`/`O_NOFOLLOW`, and read/hash stable regular-file descriptors; portable fallbacks reject unsafe aliases and checked symlink/reparse components.
-4. **Zero-knowledge encryption**: Seal file bytes by path and tree/snapshot objects under the fixed object domain before upload. Format-v3 server metadata contains no filenames.
-5. **Library-First Result Types**: Commands return `Serialize`-derived structs (`SyncResult`, `PushResult`, etc.) so the `--json` flag and `feanorfs_client::` library callers see the same shape.
-6. **No Auto-Merge**: `agent land` emits three-way `ConcurrentEdit` triples in private global conflict state (`.original`/`.local`/`.cloud`). Reconciliation is the consumer's job via `conflicts keep`.
-7. **Predictive Hydration is Local-Only**: access weights never leave the client. They stay in the global workspace `local_state.json`.
-8. **Data Isolation ≠ Sandbox**: agent workspaces isolate files, not processes. Never claim sandboxing in code or copy; link the "Process isolation" section of [docs/threat-model.md](docs/threat-model.md) instead.
-9. **Sync scope**: mirror disk contents (including gitignored paths); hard skip `.git/`, `.jj/`, legacy Feanor metadata, symlinks, and nested valid `CACHEDIR.TAG` trees; small frozen `DEFAULT_IGNORES` only — see [docs/sync-scope.md](docs/sync-scope.md). Do not honor `.gitignore` or expand defaults into a framework-specific denylist. Custom rules are managed with `feanorfs ignore` and stored globally.
-10. **CI/CD ownership**: Pin repository-owned actions to immutable SHAs, keep permissions least-privilege, and validate workflows with actionlint/zizmor. Never hand-edit cargo-dist's generated `.github/workflows/release.yml`; change `dist-workspace.toml` and regenerate it.
-11. **Release changelog ownership**: Root `CHANGELOG.md` is canonical. Release-plz must use `changelog_path = "./CHANGELOG.md"`; do not create crate-local changelogs.
-12. **Shared pre-1.0 versions**: Internal workspace path dependencies use a pre-1.0 range so release-plz can bump all `version.workspace` crates together. These crates remain unpublished; main CI validates their compatibility.
-13. **Test profile isolation**: Every state-capable Rust unit/integration test executable links `feanorfs-test-support`, which installs one temporary process profile before test threads start and passes it to subprocesses. Tests never mutate HOME/FEANORFS_HOME after startup or write into a developer's real profile.
-
----
-
-## ANTI-PATTERNS (THIS PROJECT)
-- **DO NOT** scan `.git`, `.jj`, legacy Feanor metadata, or global state as project content. Agents have a separate global `worktree/` and `state/` (separate `ClientDb`).
-- **DO NOT** trigger syncs on every raw filesystem change event. Filesystem saves are noisy. Debounce updates for 500ms using a channel.
-- **DO NOT** download remote file bytes immediately during sync if `--lazy` is enabled. Write 0-byte placeholders instead.
-- **DO NOT** add a new server endpoint when encrypted objects, manifests, and head compare-and-swap already express the operation. Keep the server dumb.
-- **DO NOT** ship file contents to a remote LLM when implementing `--summarize`. The shell-out tool is fed paths and metadata only; the E2EE password and file bytes stay local.
-- **DO NOT** attempt to merge concurrent edits. `agent land` writes `.original`/`.local`/`.cloud` in private global conflict state and stops. A consumer reconciles with `conflicts keep`.
-- **DO NOT** honor `.gitignore` or grow `DEFAULT_IGNORES` into a per-framework cache list. Follow [docs/sync-scope.md](docs/sync-scope.md) admission criteria; use `feanorfs ignore <pattern>` for project-specific exclusions.
-
----
-
-## COMMANDS
-
-### Workspace Commands
 ```bash
-# Cross-platform core and native desktop tray
 cargo build --workspace --locked
-
-# Core, integration, and native tray tests
 cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+python3 eval/run.py eval/scenarios/overlap.json        # multi-agent eval (needs target/debug/feanorfs)
+
+cargo run --bin feanorfs -- start ~/projects/app        # create/resume + background sync
+cargo run --bin feanorfs -- serve --allow-http --port 3030 --data-dir server-data --token dev  # dev hub
+cargo run --bin feanorfs -- --json agent next           # coordination lifecycle
+cargo run --bin feanorfs -- mcp                         # MCP server (compact tools)
 ```
 
-### Starting the Blob Hub
-```bash
-# Same binary as the sync client (recommended)
-cargo run --bin feanorfs -- serve --port 3030 --data-dir server-data
-cargo run --bin feanorfs -- serve --allow-http --port 3030 --data-dir server-data --token server-secret # reverse proxy/dev only
-cargo run --bin feanorfs -- serve --gc-only --data-dir server-data
-
-# Source-only compatibility binary; not a release product
-cargo run --bin feanorfs-server
-```
-
-### Client CLI Usage
-```bash
-# Begin: create, pair/join, or resume — then sync + automatic service
-cargo run --bin feanorfs -- start ~/projects/app   # first use auto-hosts; later use resumes
-cargo run --bin feanorfs -- start --host ~/projects/app # explicit first-machine host
-cargo run --bin feanorfs -- start 127.0.0.1:3030 --workspace my-workspace --token "server-pass"
-cargo run --bin feanorfs -- start fnr1-...
-cargo run --bin feanorfs -- start fnh1-... ~/projects/app
-cargo run --bin feanorfs -- pair
-cargo run --bin feanorfs -- start fnp1-... ~/projects/app
-cargo run --bin feanorfs -- start --local --workspace my-workspace
-cargo run --bin feanorfs -- start --no-watch       # sync once after create/join
-cargo run --bin feanorfs -- stop ~/projects/app    # stop automatic sync; preserve setup
-cargo run --bin feanorfs -- recovery export ~/FeanorFS-recovery.fnrk
-cargo run --bin feanorfs -- recovery import ~/FeanorFS-recovery.fnrk ~/projects/app-restored
-
-# Hidden script aliases (configure only — no auto watch)
-cargo run --bin feanorfs -- setup --workspace my-workspace https://my-server.com:3030
-cargo run --bin feanorfs -- init 127.0.0.1:3030 --workspace my-workspace
-cargo run --bin feanorfs -- attach my-workspace --encryption-key <KEY> --server-url https://my-server.com:3030
-
-# Inspect
-cargo run --bin feanorfs -- config
-cargo run --bin feanorfs -- config --key
-cargo run --bin feanorfs -- doctor
-cargo run --bin feanorfs -- service supervise  # hidden: the one supervisor job that owns hub + watchers + tray
-
-# Sync
-cargo run --bin feanorfs -- status
-cargo run --bin feanorfs -- sync --no-watch
-cargo run --bin feanorfs -- sync --up --no-watch
-cargo run --bin feanorfs -- sync --down --lazy --no-watch
-cargo run --bin feanorfs -- hydrate src/main.rs
-cargo run --bin feanorfs -- cat src/main.rs
-```
-
-### Agent Workspace Commands
-```bash
-cargo run --bin feanorfs -- agent                    # list agents
-cargo run --bin feanorfs -- agent status ci1         # preview one agent
-cargo run --bin feanorfs -- agent spawn ci1
-cargo run --bin feanorfs -- agent land ci1
-cargo run --bin feanorfs -- agent run ci1 -- cargo test
-```
-
-### Conflict Commands
-```bash
-cargo run --bin feanorfs -- conflicts
-cargo run --bin feanorfs -- conflicts keep src/main.rs --local
-cargo run --bin feanorfs -- conflicts keep --all --local
-cargo run --bin feanorfs -- conflicts keep --all --cloud
-cargo run --bin feanorfs -- conflicts show src/main.rs --open
-```
-
-### Catch-Up & Predictive Commands
-```bash
-# Show which files changed since the last session marker (plain path listing by default)
-cargo run --bin feanorfs -- summary
-
-# Shell out to FEANORFS_SUMMARY_CMD (default: feanorfs-llm) feeding it the structured diff as JSON
-cargo run --bin feanorfs -- summary --summarize
-
-# Session baseline is updated by default; pass --no-remember to skip `cat`/`hydrate` record access patterns and
-# `prefetch_related` fetches the top-5 co-occurring siblings in the background.
-# No explicit command needed.
-```
-
-### JSON Output & Library API
-```bash
-# Global --json flag emits machine-readable structs for Status/Push/Pull/Sync/Hydrate/Cat/Summary/Agent
-cargo run --bin feanorfs -- --json status
-cargo run --bin feanorfs -- --json agent land ci1
-```
-
-```rust
-// Library crate usage (feanorfs-client)
-use feanorfs_client::{ApiClient, ClientDb, Config, sync};
-
-let config = Config { /* ... */ };
-let db = ClientDb::new(".feanorfs").await?;
-let api = ApiClient::from_config(std::path::Path::new("."), &config).await?;
-let result = sync(&api, &db, std::path::Path::new("."), &config.workspace_id,
-                  config.encryption_password.as_deref(), /* lazy */ false).await?;
-```
-
+Full CLI reference: [docs/usage.md](docs/usage.md).
 
 # DOX framework
 
@@ -426,13 +232,15 @@ Direct children own durable crate or automation boundaries; subdirectories insid
 
 | Child | Purpose |
 | :--- | :--- |
-| [.github/](.github/AGENTS.md) | CI, security scanning, dependency automation, release orchestration, and contributor templates. |
-| [common/](common/AGENTS.md) | Shared wire models, canonical portable paths/trees, encrypted snapshot types, and AEAD/legacy crypto. Zero I/O and zero side effects; dependencies stay limited to leaf serialization, hashing, randomness/time/error, Unicode normalization, and ChaCha20-Poly1305 primitives. |
-| [server/](server/AGENTS.md) | Axum blob storage server and SQLite metadata coordinator. Pure transport — never decrypts, never inspects file content. |
-| [client/](client/AGENTS.md) | CLI + library crate. Sync engine, watch, summary, predictive; agent ops delegate to agent-core. |
-| [bindings/ts/](bindings/ts/AGENTS.md) | napi-rs 3 Node bindings, strict bounded adapters, five native platform packages, and deterministic architecture-verified assembly. |
-| [feanorfs-ffi/](feanorfs-ffi/AGENTS.md) | Unsafe-pointer C ABI with bounded UTF-8/JSON inputs, registry-owned immutable output strings, and the generated header consumed by the Zig example. |
-| [tray/](tray/) | macOS/Linux/Windows system-tray companion (`feanorfs-tray`). Shells CLI `--json`; see [tray/README.md](tray/README.md). |
-| [agent-core/](agent-core/AGENTS.md) | Embeddable agent SDK: `Runtime`, `Workspace`, local hub, conflict gate. Consumed by client, FFI, and Node bindings. |
-| [scripts/](scripts/AGENTS.md) | Platform installers, exact native package assembly, and executable product/release smoke tests. |
-| [test-support/](test-support/AGENTS.md) | Dev-only process-wide temporary HOME/FEANORFS_HOME isolation for state-capable Rust test targets. |
+| [.github/](.github/AGENTS.md) | CI, security scanning, fuzzing, agent eval gate, dependency automation, and release orchestration. |
+| [common/](common/AGENTS.md) | Shared wire models, canonical trees, crypto, and protocol contracts. Zero I/O. |
+| [server/](server/AGENTS.md) | Axum blob hub and SQLite metadata. Pure transport — never decrypts or inspects content. |
+| [agent-core/](agent-core/AGENTS.md) | Embeddable engine: snapshots, sync, agents, coordination, local hub. |
+| [client/](client/AGENTS.md) | `feanorfs` CLI + library: lifecycle, watcher, MCP, events. |
+| [bindings/ts/](bindings/ts/AGENTS.md) | napi-rs Node bindings and platform package assembly. |
+| [feanorfs-ffi/](feanorfs-ffi/AGENTS.md) | C ABI with bounded JSON inputs and the generated header. |
+| [tray/](tray/AGENTS.md) | Cross-platform desktop tray that shells the CLI. |
+| [scripts/](scripts/AGENTS.md) | Installers, native packaging, and product/release smoke tests. |
+| [test-support/](test-support/AGENTS.md) | Dev-only process-wide test profile isolation. |
+
+`eval/` (multi-agent evaluation harness; see [eval/README.md](eval/README.md)) and `fuzz/` (cargo-fuzz targets over `common/tests/fuzz/properties.rs`) are small tool directories documented by their READMEs and file headers; they carry no separate AGENTS.md.

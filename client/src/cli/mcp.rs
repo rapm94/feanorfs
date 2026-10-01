@@ -1621,7 +1621,10 @@ mod tests {
         for (_, _, handler) in ROUTES {
             assert!(
                 legacy_names.contains(handler)
-                    || matches!(*handler, "work_guard" | "integrator_reply"),
+                    || matches!(
+                        *handler,
+                        "work_guard" | "integrator_reply" | "agent_capabilities"
+                    ),
                 "route {handler} has no handler"
             );
         }
