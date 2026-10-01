@@ -756,6 +756,25 @@ pub(crate) fn workspace_identity_matches(workspace: &Path, stored: &str) -> Resu
         .is_some_and(|identity| identity.matches(Some(stored))))
 }
 
+/// Side-effect-free hint that `workspace` has configuration at its
+/// preferred path-hash slot or in legacy in-project state. Unlike
+/// [`workspace_is_configured`] it takes no state lease, so hooks that run in
+/// arbitrary folders leave no files behind; a moved workspace reads `false`.
+#[must_use]
+pub fn workspace_has_preferred_state(workspace: &Path) -> bool {
+    let preferred = workspace_state_id(workspace).and_then(|id| {
+        Ok(global_state_root()?
+            .join("workspaces")
+            .join(id)
+            .join("config.json"))
+    });
+    preferred.is_ok_and(|config| config.is_file())
+        || workspace
+            .join(LEGACY_STATE_DIR)
+            .join("config.json")
+            .is_file()
+}
+
 pub fn workspace_is_configured(workspace: &Path) -> bool {
     workspace_state_path(workspace).is_ok_and(|state| state.join("config.json").is_file())
         || workspace

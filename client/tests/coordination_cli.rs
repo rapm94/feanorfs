@@ -197,6 +197,36 @@ async fn compact_mcp_next_actions_and_guard_drive_one_work_lifecycle() {
     assert!(outside.status.success());
     let unparseable = fx.cli_with_stdin(&["agent", "guard", "--hook"], Some("not json"));
     assert!(unparseable.status.success());
+
+    // A globally installed hook runs in unrelated projects: allow, and create
+    // no workspace state there.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let slots = || {
+        std::fs::read_dir(fx.state_root.join("workspaces"))
+            .unwrap()
+            .count()
+    };
+    let before = slots();
+    let unrelated = Command::new(env!("CARGO_BIN_EXE_feanorfs"))
+        .args(["agent", "guard", "--hook", "--for", "codex"])
+        .current_dir(elsewhere.path())
+        .env("FEANORFS_HOME", &fx.state_root)
+        .env_remove("FEANORFS_WORKSPACE_ROOT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(
+                json!({ "cwd": elsewhere.path(), "tool_input": { "file_path": "a.rs" } })
+                    .to_string()
+                    .as_bytes(),
+            )?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(unrelated.status.success());
+    assert_eq!(slots(), before, "the hook must not create workspace state");
 }
 
 #[tokio::test]

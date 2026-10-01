@@ -744,9 +744,10 @@ scope with `require_scope`; `warn` for a pending conflict or another agent's
 unaccepted proposal. The CLI exits `2` on `deny`. With `--hook` it reads a
 harness PreToolUse payload from stdin (`tool_input.file_path`, `path`, or
 `notebook_path`), resolves paths against the agent worktree
-(`FEANORFS_AGENT_DIR`) or the shared root, ignores paths outside them, and
-allows the edit on any internal error: the guard is advisory coordination,
-not access control.
+(`FEANORFS_AGENT_DIR`) or the shared root, ignores paths outside them, exits
+0 without creating workspace state in folders that are not FeanorFS
+workspaces, and allows the edit on any internal error: the guard is advisory
+coordination, not access control.
 
 ## Live continuous status (SDK-1 additive)
 
