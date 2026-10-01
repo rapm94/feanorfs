@@ -89,7 +89,9 @@ const fn default_true() -> bool {
 pub struct IntegratorAssignInput {
     /// Full reachable format-v3 snapshot ID the batch concerns.
     pub about_snapshot: String,
-    /// Explicit candidate descriptors from the authorized dispatcher.
+    /// Candidate descriptors from the authorized dispatcher; empty means
+    /// the engine's capability roster.
+    #[serde(default)]
     pub candidates: Vec<IntegratorCandidate>,
     /// Required capabilities; every eligible candidate must have all of them.
     #[serde(default)]

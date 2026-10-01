@@ -30,6 +30,27 @@ impl ClientDb {
         })
     }
 
+    /// Pending path → fingerprint for records eligible for automatic
+    /// resolution (record-matching identity sidecar present).
+    pub async fn pending_conflict_fingerprints(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        self.state.with_read(|state| {
+            Ok(state
+                .conflict_registry
+                .values()
+                .filter(|record| record.status == ConflictRecordStatus::Pending)
+                .filter(|record| sidecar_matches_record(record))
+                .filter_map(|record| {
+                    record
+                        .conflict_fingerprint
+                        .clone()
+                        .map(|fingerprint| (record.path.clone(), fingerprint))
+                })
+                .collect())
+        })
+    }
+
     pub async fn get_conflict_record(
         &self,
         path: &str,

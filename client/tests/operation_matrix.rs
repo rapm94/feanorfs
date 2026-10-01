@@ -57,6 +57,10 @@ fn rust_sdk_surface_compiles(
     let _ = workspace.integrator_status(None);
     let _ = workspace.integrator_revoke("assignment", "reason");
     let _ = workspace.integrator_resume(*observe_options);
+    let _ = workspace.coordination_status(None);
+    let _ = workspace.guard(feanorfs_common::GuardInput::default());
+    let _ = workspace.capabilities(feanorfs_common::CapabilitiesInput::default());
+    let _ = workspace.integrator_reply(serde_json::from_str(r#"{"kind":"accept"}"#).unwrap());
     let _ = workspace.materialize_conflicts("snapshot", &["src/main.rs".to_string()]);
     let _ = workspace.work_propose(propose_input.clone());
     let _ = workspace.work_decide(decide_input.clone());
@@ -603,6 +607,54 @@ const OPERATIONS: &[Operation] = &[
         skill: Some("agent resolution publish-answer"),
         cli: Some("ResolutionAction::PublishAnswer"),
     },
+    Operation {
+        name: "coordination_status",
+        ffi: Some("ffs_coordination_status"),
+        napi: Some("fn coordination_status"),
+        facade: Some("coordinationStatus"),
+        dts: Some("coordinationStatus"),
+        mcp: Some("tool(\"status\""),
+        events: None,
+        docs: "agent next",
+        skill: Some("feanorfs agent next"),
+        cli: Some("Next {"),
+    },
+    Operation {
+        name: "guard",
+        ffi: Some("ffs_guard"),
+        napi: Some("fn guard"),
+        facade: Some("function guard"),
+        dts: Some("function guard"),
+        mcp: Some("(\"work\", \"guard\", \"work_guard\")"),
+        events: None,
+        docs: "agent guard",
+        skill: Some("feanorfs agent guard"),
+        cli: Some("Guard {"),
+    },
+    Operation {
+        name: "integrator_reply",
+        ffi: Some("ffs_integrator_reply"),
+        napi: Some("fn integrator_reply"),
+        facade: Some("integratorReply"),
+        dts: Some("integratorReply"),
+        mcp: Some("(\"integrator\", \"reply\", \"integrator_reply\")"),
+        events: None,
+        docs: "agent integrator reply",
+        skill: Some("agent integrator reply"),
+        cli: Some("Reply {"),
+    },
+    Operation {
+        name: "capabilities",
+        ffi: Some("ffs_capabilities"),
+        napi: Some("fn capabilities"),
+        facade: Some("function capabilities"),
+        dts: Some("function capabilities"),
+        mcp: Some("(\"agent\", \"capabilities\", \"agent_capabilities\")"),
+        events: None,
+        docs: "agent capabilities",
+        skill: Some("feanorfs agent capabilities"),
+        cli: Some("Capabilities {"),
+    },
 ];
 
 fn check_marker(operation: &str, surface: &str, content: &str, marker: &str) {
@@ -692,6 +744,10 @@ fn cli_json_results_match_documented_result_types() {
         "ResolutionProtocolStatus",
         "HumanResolutionAnswer",
         "CandidateDescriptor",
+        "CoordinationStatus",
+        "GuardResult",
+        "IntegratorReplyResult",
+        "CapabilityRoster",
     ] {
         assert!(
             docs.contains(result_type),

@@ -58,6 +58,13 @@ struct EmptyParams {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StatusParams {
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NameParams {
     name: String,
 }
@@ -344,7 +351,7 @@ fn write_response(
     Ok(())
 }
 
-fn tool_list() -> Value {
+fn legacy_tool_list() -> Value {
     json!({
         "tools": [
             tool("agent_spawn", "Spawn an agent workspace", json!({
@@ -688,6 +695,295 @@ fn tool_list() -> Value {
     })
 }
 
+/// Environment switch that restores the original per-operation tool list for
+/// clients whose permissions or prompts name the legacy tools. Legacy names
+/// remain callable either way.
+const LEGACY_TOOLS_ENV: &str = "FEANORFS_MCP_LEGACY_TOOLS";
+
+fn tool_list() -> Value {
+    if std::env::var(LEGACY_TOOLS_ENV).is_ok_and(|value| value == "1") {
+        legacy_tool_list()
+    } else {
+        compact_tool_list()
+    }
+}
+
+/// Compact routes: (tool, op, typed handler). Every operation keeps its
+/// strict per-operation parameter contract after `op` is removed.
+const ROUTES: &[(&str, &str, &str)] = &[
+    ("agent", "spawn", "agent_spawn"),
+    ("agent", "status", "agent_check"),
+    ("agent", "refresh", "agent_refresh"),
+    ("agent", "land", "agent_land"),
+    ("agent", "capabilities", "agent_capabilities"),
+    ("work", "propose", "work_propose"),
+    ("work", "decide", "work_decide"),
+    ("work", "amend", "work_amend"),
+    ("work", "yield", "work_yield"),
+    ("work", "settle", "work_settle"),
+    ("work", "complete", "work_complete"),
+    ("work", "block", "work_block"),
+    ("work", "status", "work_status"),
+    ("work", "guard", "work_guard"),
+    ("conflicts", "list", "conflicts_list"),
+    ("conflicts", "keep", "conflicts_keep"),
+    ("conflicts", "materialize", "conflict_materialize"),
+    ("resolve", "prepare", "resolution_prepare"),
+    ("resolve", "status", "resolution_status"),
+    ("resolve", "materialize", "resolution_materialize"),
+    ("resolve", "put", "resolution_put"),
+    ("resolve", "submit", "resolution_submit"),
+    ("resolve", "apply", "resolution_apply"),
+    ("resolve", "answer", "resolution_answer"),
+    ("resolve", "defer", "resolution_defer"),
+    ("resolve", "assign", "resolution_assign"),
+    ("resolve", "reply", "resolution_reply"),
+    ("resolve", "revoke", "resolution_revoke"),
+    ("resolve", "publish_answer", "resolution_publish_answer"),
+    ("resolve", "protocol_status", "resolution_protocol_status"),
+    ("integrator", "assign", "integrator_assign"),
+    ("integrator", "status", "integrator_status"),
+    ("integrator", "revoke", "integrator_revoke"),
+    ("integrator", "resume", "integrator_resume"),
+    ("integrator", "reply", "integrator_reply"),
+    ("history", "log", "workspace_log"),
+    ("history", "undo", "workspace_undo"),
+];
+
+/// Maps a compact tool call onto its typed handler and strips `op`.
+/// Legacy tool names pass through unchanged.
+fn route_compact(tool: &str, params: &Value) -> anyhow::Result<(String, Value)> {
+    match tool {
+        "send" => return Ok(("agent_send".to_string(), params.clone())),
+        "inbox" => return Ok(("agent_inbox".to_string(), params.clone())),
+        "work_decide" => {
+            let mut args = params.as_object().cloned().unwrap_or_default();
+            nest_decision_kind(&mut args);
+            return Ok((tool.to_string(), Value::Object(args)));
+        }
+        _ => {}
+    }
+    if !ROUTES.iter().any(|(name, _, _)| *name == tool) {
+        return Ok((tool.to_string(), params.clone()));
+    }
+    let mut args = params.as_object().cloned().unwrap_or_default();
+    let ops: Vec<&str> = ROUTES
+        .iter()
+        .filter(|(name, _, _)| *name == tool)
+        .map(|(_, op, _)| *op)
+        .collect();
+    let op = args
+        .remove("op")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .ok_or_else(|| {
+            anyhow::Error::new(InvalidParams(format!(
+                "{tool}: `op` is required (one of: {})",
+                ops.join(", ")
+            )))
+        })?;
+    let handler = ROUTES
+        .iter()
+        .find(|(name, candidate, _)| *name == tool && *candidate == op)
+        .map(|(_, _, handler)| *handler)
+        .ok_or_else(|| {
+            anyhow::Error::new(InvalidParams(format!(
+                "{tool}: unknown op `{op}` (one of: {})",
+                ops.join(", ")
+            )))
+        })?;
+    if handler == "work_decide" {
+        nest_decision_kind(&mut args);
+    }
+    Ok((handler.to_string(), Value::Object(args)))
+}
+
+/// Accepts the flat decision form the schema advertises
+/// (`"kind": "accept", "reason": …`) by nesting it into the internally
+/// tagged `WorkDecisionKind` object the reducer contract requires.
+fn nest_decision_kind(args: &mut serde_json::Map<String, Value>) {
+    let Some(Value::String(kind)) = args.get("kind").cloned() else {
+        return;
+    };
+    let mut nested = serde_json::Map::new();
+    nested.insert("kind".into(), Value::String(kind.clone()));
+    for field in ["reason", "paths", "concerns", "after", "overlap"] {
+        if let Some(value) = args.remove(field) {
+            nested.insert(field.into(), value);
+        }
+    }
+    if kind == "narrow" && !nested.contains_key("concerns") {
+        nested.insert("concerns".into(), json!([]));
+    }
+    args.insert("kind".into(), Value::Object(nested));
+}
+
+fn op_tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+    let ops: Vec<&str> = ROUTES
+        .iter()
+        .filter(|(tool, _, _)| *tool == name)
+        .map(|(_, op, _)| *op)
+        .collect();
+    let mut properties = properties;
+    properties
+        .as_object_mut()
+        .expect("properties is an object")
+        .insert("op".into(), json!({ "type": "string", "enum": ops }));
+    let mut required_list = vec!["op"];
+    required_list.extend_from_slice(required);
+    tool(
+        name,
+        description,
+        json!({ "type": "object", "properties": properties, "required": required_list }),
+    )
+}
+
+fn compact_tool_list() -> Value {
+    let id64 = json!({ "type": "string", "minLength": 64, "maxLength": 64 });
+    let strings = json!({ "type": "array", "items": { "type": "string" } });
+    json!({
+        "tools": [
+            tool("status", "Start here. Sync state plus the unified coordination lifecycle (work intent → conflict → resolver → done) and `next_actions`: each is a ready `tool` + `args` call (replace <placeholders>) with the actor who owes it. Read-only.", json!({
+                "type": "object",
+                "properties": { "agent": { "type": "string", "description": "Identity to plan for; defaults to FEANORFS_AGENT or human" } }
+            })),
+            tool("send", "Send an encrypted signal tied to a snapshot. Everyone in the workspace can read it; identity is advisory. Never send credentials or .env values.", json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string" },
+                    "to": { "type": "string", "description": "Agent name, * to broadcast, or cap:<capability> for the one agent advertising it" },
+                    "kind": { "type": "string", "enum": ["request", "status", "result", "blocked"] },
+                    "body": { "type": "string", "minLength": 1, "maxLength": 8192 },
+                    "about_snapshot": { "type": "string" },
+                    "reply_to": { "type": "string" }
+                },
+                "required": ["to", "kind", "body"]
+            })),
+            tool("inbox", "Read signals addressed to you or *. Pass the previous `cursor` as `after`; `cursor_reset` means older signals may be missed.", json!({
+                "type": "object",
+                "properties": {
+                    "for": { "type": "string" },
+                    "after": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                }
+            })),
+            op_tool("agent", "Isolated agent worktrees. spawn{name}; status{name} previews changes; refresh{name} pulls untouched paths; land{name} publishes clean changes and registers conflicts; capabilities{agent?,announce?} lists who can do what or announces your machine's capabilities (route requests with send to=\"cap:<capability>\").", json!({
+                "name": { "type": "string" },
+                "agent": { "type": "string" },
+                "announce": { "type": "array", "items": { "type": "string" }, "description": "capabilities: complete set to announce" },
+                "no_sync": { "type": "boolean" },
+                "replace": { "type": "boolean" },
+                "clean": { "type": "boolean" },
+                "propose": { "type": "boolean" }
+            }), &[]),
+            op_tool("work", "Scope before you edit (advisory, never access control). propose{task_id,sequence,paths}; decide{proposal_message_id,kind=accept|reject|narrow|order|accept_overlap,reason?,paths?}; amend/yield/settle/complete/block{task_id,intent_message_id,sequence,…}; status; guard{paths} says whether paths are safe to write.", json!({
+                "task_id": { "type": "string", "maxLength": 128 },
+                "agent": { "type": "string" },
+                "from": { "type": "string" },
+                "to": { "type": "string" },
+                "sequence": { "type": "integer", "minimum": 1 },
+                "causal_base": { "type": "string" },
+                "coordinator": { "type": "string" },
+                "paths": strings,
+                "concerns": strings,
+                "dependencies": strings,
+                "capabilities": strings,
+                "about_snapshot": { "type": "string" },
+                "proposal_message_id": id64,
+                "intent_message_id": id64,
+                "kind": { "type": "string", "enum": ["accept", "reject", "narrow", "order", "accept_overlap"] },
+                "reason": { "type": "string", "maxLength": 512 },
+                "after": { "type": "string" },
+                "overlap": { "type": "array", "items": { "type": "object" } },
+                "inspected_snapshot": id64,
+                "verification": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "enum": ["passed", "failed", "skipped"] },
+                        "summary": { "type": "string", "maxLength": 512 },
+                        "applied_message_ids": strings
+                    },
+                    "required": ["status", "summary", "applied_message_ids"]
+                },
+                "outcome": { "type": "string", "maxLength": 512 },
+                "require_scope": { "type": "boolean", "description": "guard: also deny paths outside your accepted scope" }
+            }), &[]),
+            op_tool("conflicts", "Pending file conflicts. list; keep{path,keep=local|cloud|both|file,file?} records your choice (edit first for file); materialize{about_snapshot?,paths?} writes read-only legs. Never merges content.", json!({
+                "path": { "type": "string" },
+                "keep": { "type": "string", "enum": ["local", "cloud", "both", "file"] },
+                "file": { "type": "string" },
+                "about_snapshot": { "type": "string" },
+                "paths": strings
+            }), &[]),
+            op_tool("resolve", "Exact automatic conflict resolution, last resort after scoping. Usual order: prepare{path,prevention} → materialize{job_id} → put{job_id,base64} → submit{job_id,result} → apply{job_id}. Humans: answer/publish_answer{job_id,option}. Cross-machine: assign/reply/revoke{job_id}, protocol_status. Submit never applies.", json!({
+                "path": { "type": "string" },
+                "prevention": {
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "enum": ["exhausted", "violated"] },
+                        "detail": { "type": "string", "minLength": 1, "maxLength": 1024 }
+                    },
+                    "required": ["type", "detail"],
+                    "additionalProperties": false
+                },
+                "job_id": { "type": "string" },
+                "base64": { "type": "string" },
+                "result": { "type": "object", "description": "Full ResolutionResult document" },
+                "option": { "type": "string", "enum": ["defer", "keep_unresolved", "submit_candidate"] },
+                "candidate_base64": { "type": "string" },
+                "superseded": { "type": "boolean" },
+                "rebuild": { "type": "boolean" }
+            }), &[]),
+            op_tool("integrator", "One temporary integrator per batch. Dispatcher: assign{about_snapshot,candidates,task_summary,required_capabilities?}, status, revoke{assignment_id,reason}, resume. Candidate: reply{kind=accept|result|blocked,…}; the engine binds every protocol id and refuses superseded attempts.", json!({
+                "about_snapshot": { "type": "string" },
+                "candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "capabilities": strings,
+                            "enabled": { "type": "boolean" },
+                            "available": { "type": "boolean" }
+                        },
+                        "required": ["name"]
+                    },
+                    "maxItems": 64
+                },
+                "required_capabilities": strings,
+                "conflict_authors": strings,
+                "excluded": strings,
+                "task_summary": { "type": "string", "maxLength": 1024 },
+                "ack_timeout_ms": { "type": "integer", "minimum": 0 },
+                "assignment_id": { "type": "string" },
+                "reason": { "type": "string", "maxLength": 512 },
+                "fallback_on_blocked": { "type": "boolean" },
+                "agent": { "type": "string" },
+                "kind": { "type": "string", "enum": ["accept", "result", "blocked"] },
+                "state": { "type": "string", "enum": ["completed", "blocked", "requires_human", "cancelled"] },
+                "outcome": { "type": "string" },
+                "verification": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "enum": ["passed", "failed", "unknown"] },
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["status", "summary"]
+                },
+                "inspected_snapshot": { "type": "string" },
+                "landed_paths": { "type": "integer", "minimum": 0 },
+                "resolved_conflicts": { "type": "integer", "minimum": 0 },
+                "remaining_conflicts": { "type": "integer", "minimum": 0 },
+                "risks": strings,
+                "decision_required": { "type": "string" }
+            }), &[]),
+            op_tool("history", "Workspace snapshot history. log{limit?}; undo{snapshot_id} restores a reachable snapshot as a new snapshot.", json!({
+                "limit": { "type": "integer", "minimum": 0, "maximum": 1000 },
+                "snapshot_id": { "type": "string", "minLength": 8 }
+            }), &[]),
+        ]
+    })
+}
+
 fn tool(name: &str, description: &str, mut schema: Value) -> Value {
     if let Some(object) = schema.as_object_mut() {
         object.insert("additionalProperties".into(), Value::Bool(false));
@@ -734,6 +1030,8 @@ fn mcp_tool_result(result: Value) -> anyhow::Result<Value> {
 }
 
 async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Result<Value> {
+    let (tool, routed) = route_compact(tool, params)?;
+    let (tool, params) = (tool.as_str(), &routed);
     let control_root = super::agent::control_workspace_root(current_dir)?;
     let config = load_config(&control_root)?;
     let db = crate::open_client_db(&control_root).await?;
@@ -742,6 +1040,44 @@ async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Re
     let pw = config.encryption_password.as_deref();
 
     match tool {
+        "status" => {
+            let params: StatusParams = parse_params(tool, params)?;
+            let agent = agent_identity(params.agent.as_deref());
+            let sync = match feanorfs_client::do_status(
+                &api,
+                &db,
+                &control_root,
+                &config.workspace_id,
+                pw,
+            )
+            .await
+            {
+                Ok(status) => compact_sync_status(status),
+                Err(error) => json!({ "error": format!("{error:#}") }),
+            };
+            let coordination = feanorfs_client::coordination_status(&ctx, &agent).await?;
+            Ok(json!({ "sync": sync, "coordination": coordination }))
+        }
+        "work_guard" => {
+            let input: feanorfs_common::GuardInput = parse_params(tool, params)?;
+            let agent = agent_identity(input.agent.as_deref());
+            let result =
+                feanorfs_client::guard_paths(&ctx, &agent, &input.paths, input.require_scope)
+                    .await?;
+            Ok(serde_json::to_value(result)?)
+        }
+        "agent_capabilities" => {
+            let input: feanorfs_common::CapabilitiesInput = parse_params(tool, params)?;
+            let agent = agent_identity(input.agent.as_deref());
+            let roster = feanorfs_client::capabilities(&ctx, &agent, input.announce).await?;
+            Ok(serde_json::to_value(roster)?)
+        }
+        "integrator_reply" => {
+            let input: feanorfs_common::IntegratorReplyInput = parse_params(tool, params)?;
+            let agent = agent_identity(input.agent.as_deref());
+            let result = feanorfs_client::integrator_reply(&ctx, &agent, input).await?;
+            Ok(serde_json::to_value(result)?)
+        }
         "agent_spawn" => {
             let params: AgentSpawnParams = parse_params(tool, params)?;
             let count = spawn_agent(
@@ -1177,14 +1513,16 @@ fn compact_sync_status(status: StatusResult) -> Value {
         "offline_backlog": status.offline_backlog,
         "server_rollback_warning": status.server_rollback_warning,
         "skipped_symlink_count": status.skipped_symlinks.len(),
+        "git_baseline_mismatch": status.git_baseline_mismatch,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_identity, compact_sync_status, mcp_tool_result, parse_params, response_error_code,
-        tool_list, AgentInboxParams, AgentSendParams, IntegratorResumeParams, ToolsCallParams,
+        agent_identity, compact_sync_status, compact_tool_list, legacy_tool_list, mcp_tool_result,
+        parse_params, response_error_code, route_compact, AgentInboxParams, AgentSendParams,
+        IntegratorResumeParams, ToolsCallParams, ROUTES,
     };
     use feanorfs_client::{MirrorState, StatusResult};
     use feanorfs_common::FileState;
@@ -1228,6 +1566,7 @@ mod tests {
             offline_backlog: 0,
             server_rollback_warning: None,
             skipped_symlinks: vec!["linked-cache".to_string()],
+            git_baseline_mismatch: None,
         };
 
         let value = compact_sync_status(status);
@@ -1245,8 +1584,89 @@ mod tests {
     }
 
     #[test]
+    fn compact_list_has_nine_tools_and_routes_every_operation() {
+        let list = compact_tool_list();
+        let names: Vec<&str> = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "status",
+                "send",
+                "inbox",
+                "agent",
+                "work",
+                "conflicts",
+                "resolve",
+                "integrator",
+                "history"
+            ]
+        );
+        let legacy = legacy_tool_list();
+        let legacy_names: Vec<&str> = legacy["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        for name in &legacy_names {
+            let reachable = ROUTES.iter().any(|(_, _, handler)| handler == name)
+                || matches!(*name, "agent_send" | "agent_inbox" | "sync_status");
+            assert!(reachable, "legacy tool {name} has no compact route");
+        }
+        for (_, _, handler) in ROUTES {
+            assert!(
+                legacy_names.contains(handler)
+                    || matches!(*handler, "work_guard" | "integrator_reply"),
+                "route {handler} has no handler"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_routing_strips_op_and_rejects_unknown_ops() {
+        let (handler, args) =
+            route_compact("resolve", &json!({ "op": "apply", "job_id": "abc" })).unwrap();
+        assert_eq!(handler, "resolution_apply");
+        assert_eq!(args, json!({ "job_id": "abc" }));
+        let (handler, _) = route_compact("send", &json!({ "to": "*" })).unwrap();
+        assert_eq!(handler, "agent_send");
+        let (handler, _) = route_compact("agent_land", &json!({ "name": "a" })).unwrap();
+        assert_eq!(handler, "agent_land");
+        let missing = route_compact("work", &json!({})).unwrap_err();
+        assert_eq!(response_error_code(&missing), -32602);
+        assert!(missing.to_string().contains("propose"));
+        let unknown = route_compact("history", &json!({ "op": "rewrite" })).unwrap_err();
+        assert!(unknown.to_string().contains("unknown op `rewrite`"));
+    }
+
+    #[test]
+    fn flat_decision_form_parses_through_both_tool_names() {
+        let id = "a".repeat(64);
+        for (tool, extra) in [
+            ("work", json!({ "op": "decide" })),
+            ("work_decide", json!({})),
+        ] {
+            let mut call = json!({ "proposal_message_id": id, "kind": "narrow", "paths": ["src/a.rs"], "reason": "smaller" });
+            call.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (handler, args) = route_compact(tool, &call).unwrap();
+            let input: feanorfs_common::WorkDecideInput = parse_params(&handler, &args).unwrap();
+            assert_eq!(input.kind.type_name(), "narrow");
+        }
+        let nested = json!({ "proposal_message_id": id, "kind": { "kind": "accept" } });
+        let (handler, args) = route_compact("work_decide", &nested).unwrap();
+        assert!(parse_params::<feanorfs_common::WorkDecideInput>(&handler, &args).is_ok());
+    }
+
+    #[test]
     fn tool_list_declares_bounded_agent_message_schemas() {
-        let list = tool_list();
+        let list = legacy_tool_list();
         let tools = list["tools"].as_array().unwrap();
         let send = tools
             .iter()
@@ -1289,7 +1709,7 @@ mod tests {
             ResolutionPrepareParams, ResolutionProtocolStatusParams, ResolutionPutParams,
             ResolutionRevokeParams, ResolutionStatusParams,
         };
-        let list = tool_list();
+        let list = super::legacy_tool_list();
         let tools = list["tools"].as_array().unwrap();
 
         let prepare = tools

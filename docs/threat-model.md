@@ -121,6 +121,15 @@ exchange. Can race legitimate clients or open connections to the pairing port.
 **Goal:** Recover the server token/E2EE key, substitute an invite, or prevent
 pairing.
 
+### Git baseline labels
+
+Each sync snapshot's encrypted `Snapshot.message` may carry an `ffbase1`
+label: the publishing clone's Git commit id and branch name, read without
+writing `.git` or running Git. The hub never sees it. Every workspace
+participant can read it, so branch names are shared with everyone who holds
+the workspace key — the same audience as the files themselves. Labels are
+advisory: a participant can forge one, which only changes a warning.
+
 ### Agent signals and workspace participants
 
 Named agents coordinate through encrypted signals stored in snapshot history

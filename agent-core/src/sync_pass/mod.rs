@@ -105,7 +105,8 @@ async fn finish_sync_pass(
                     conflicts: &head_conflicts,
                     parents: expected.iter().cloned().collect(),
                     author: "sync",
-                    message: None,
+                    message: crate::git_baseline::read_git_baseline(ctx.base)
+                        .map(|baseline| baseline.encode()),
                 })
                 .await?;
             match ctx

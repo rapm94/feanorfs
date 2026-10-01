@@ -76,6 +76,10 @@ pub enum AgentAction {
     /// Run a command with the agent workspace as its working directory.
     Run {
         name: String,
+        /// Announce a capability of this machine for the agent before the
+        /// command starts (repeatable), e.g. `--capability ios-build`.
+        #[arg(long = "capability", value_name = "CAPABILITY")]
+        capabilities: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -110,7 +114,42 @@ pub enum AgentAction {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Random integrator assignment (dispatcher-side orchestration).
+    /// Show what is in flight across work intent, integrator assignment,
+    /// and conflict resolution, with the exact next command for each actor.
+    Next {
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+    },
+    /// Show which agents advertise which capabilities, or announce this
+    /// agent's complete capability set with `--set` (repeatable). Route a
+    /// request to the capable agent with `agent send cap:<capability>`.
+    Capabilities {
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Capability to announce (repeatable; replaces the previous set).
+        #[arg(long = "set", value_name = "CAPABILITY")]
+        set: Vec<String>,
+    },
+    /// Check whether paths may be edited now (other agents' accepted scope,
+    /// pending conflicts, superseded integrator attempts). Exits 2 on deny.
+    Guard {
+        /// Workspace paths (absolute or relative) about to be written.
+        paths: Vec<String>,
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Also deny paths outside your own accepted scope.
+        #[arg(long)]
+        require_scope: bool,
+        /// Read a harness PreToolUse JSON payload from stdin (Claude Code
+        /// hooks); internal errors allow the edit.
+        #[arg(long)]
+        hook: bool,
+    },
+    /// Random integrator assignment (dispatcher assign/status/revoke/resume
+    /// and candidate reply).
     Integrator {
         #[command(subcommand)]
         action: super::integrator::IntegratorAction,
@@ -145,6 +184,27 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
     match action {
         AgentAction::Status { name: Some(name) } | AgentAction::Check { name } => {
             run_agent_check(current_dir, &name, json).await?
+        }
+        AgentAction::Next { for_agent } => {
+            super::coordination::run_next(current_dir, for_agent.as_deref(), json).await?
+        }
+        AgentAction::Guard {
+            paths,
+            for_agent,
+            require_scope,
+            hook,
+        } => {
+            super::coordination::run_guard(
+                current_dir,
+                super::coordination::GuardArgs {
+                    paths,
+                    agent: for_agent,
+                    require_scope,
+                    hook,
+                },
+                json,
+            )
+            .await?
         }
         AgentAction::Integrator { action } => {
             super::integrator::run(current_dir, action, json).await?
@@ -252,11 +312,27 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 println!("Agent '{name}' removed.");
             }
         }
-        AgentAction::Run { name, command } => {
+        AgentAction::Capabilities { for_agent, set } => {
+            super::coordination::run_capabilities(
+                current_dir,
+                for_agent.as_deref(),
+                (!set.is_empty()).then_some(set),
+                json,
+            )
+            .await?
+        }
+        AgentAction::Run {
+            name,
+            capabilities,
+            command,
+        } => {
             if command.is_empty() {
                 anyhow::bail!("`agent run` requires a command after `--`");
             }
             feanorfs_client::agent::validate_name(&name)?;
+            if !capabilities.is_empty() {
+                super::coordination::announce_quietly(current_dir, &name, capabilities).await?;
+            }
             let workspace_root = current_dir.canonicalize().map_err(|error| {
                 anyhow::anyhow!(
                     "Could not resolve shared workspace root '{}': {error}",

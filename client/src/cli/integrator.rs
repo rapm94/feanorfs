@@ -1,7 +1,12 @@
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use feanorfs_client::{
-    integrator_assign, integrator_resume, integrator_revoke, integrator_status, load_config,
-    IntegratorAssignInput, IntegratorCandidate, IntegratorObserveOptions,
+    agent_identity, integrator_assign, integrator_reply, integrator_resume, integrator_revoke,
+    integrator_status, load_config, IntegratorAssignInput, IntegratorCandidate,
+    IntegratorObserveOptions,
+};
+use feanorfs_common::{
+    IntegratorOutcomeState, IntegratorReplyInput, IntegratorReplyKind, VerificationStatus,
+    VerificationSummary,
 };
 use std::path::Path;
 
@@ -15,7 +20,9 @@ pub enum IntegratorAction {
         /// Full reachable format-v3 snapshot the batch concerns.
         #[arg(long)]
         about: String,
-        /// Candidate agent name (repeatable; include capabilities via JSON).
+        /// Candidate agent (repeatable): `name` uses its advertised
+        /// capabilities, `name=cap1,cap2` states them. Omit to offer to every
+        /// agent in the capability roster.
         #[arg(long = "candidate", value_name = "AGENT")]
         candidate: Vec<String>,
         /// Required capability (repeatable; every eligible candidate needs all).
@@ -59,6 +66,70 @@ pub enum IntegratorAction {
         #[arg(long)]
         fallback_on_blocked: bool,
     },
+    /// Candidate side: accept an offer, send the terminal result, or report
+    /// a blocker. The engine binds assignment, attempt, snapshot, dispatcher,
+    /// and request ids, and refuses superseded attempts.
+    Reply {
+        kind: ReplyKindArg,
+        /// Assignment id; defaults to the newest open offer to you.
+        #[arg(long = "assignment")]
+        assignment_id: Option<String>,
+        /// Replying candidate; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Blocker reason (`blocked`).
+        #[arg(long)]
+        reason: Option<String>,
+        /// Outcome summary (`result`).
+        #[arg(long)]
+        outcome: Option<String>,
+        /// Outcome state (`result`); defaults to completed.
+        #[arg(long)]
+        state: Option<OutcomeStateArg>,
+        /// Verification status (`result`).
+        #[arg(long)]
+        verification: Option<VerificationArg>,
+        /// Verification summary (`result`).
+        #[arg(long)]
+        summary: Option<String>,
+        /// Snapshot actually inspected; defaults to the current head.
+        #[arg(long)]
+        inspected: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        landed: u64,
+        #[arg(long, default_value_t = 0)]
+        resolved: u64,
+        #[arg(long, default_value_t = 0)]
+        remaining: u64,
+        /// Risk line (repeatable).
+        #[arg(long = "risk")]
+        risks: Vec<String>,
+        /// The one decision question for a requires-human result.
+        #[arg(long)]
+        decision: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ReplyKindArg {
+    Accept,
+    Result,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum OutcomeStateArg {
+    Completed,
+    Blocked,
+    RequiresHuman,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum VerificationArg {
+    Passed,
+    Failed,
+    Unknown,
 }
 
 fn parse_duration_ms(value: &str) -> anyhow::Result<u64> {
@@ -81,11 +152,77 @@ fn parse_duration_ms(value: &str) -> anyhow::Result<u64> {
 }
 
 pub async fn run(current_dir: &Path, action: IntegratorAction, json: bool) -> anyhow::Result<()> {
+    let root = super::agent::control_workspace_root(current_dir)?;
+    let current_dir = root.as_path();
     let config = load_config(current_dir)?;
     let db = crate::open_client_db(current_dir).await?;
     let api = crate::open_api_client(current_dir, &config).await?;
     let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, current_dir, &config)?;
     match action {
+        IntegratorAction::Reply {
+            kind,
+            assignment_id,
+            for_agent,
+            reason,
+            outcome,
+            state,
+            verification,
+            summary,
+            inspected,
+            landed,
+            resolved,
+            remaining,
+            risks,
+            decision,
+        } => {
+            let agent = agent_identity(for_agent.as_deref());
+            let verification = verification.map(|status| VerificationSummary {
+                status: match status {
+                    VerificationArg::Passed => VerificationStatus::Passed,
+                    VerificationArg::Failed => VerificationStatus::Failed,
+                    VerificationArg::Unknown => VerificationStatus::Unknown,
+                },
+                summary: summary.clone().unwrap_or_default(),
+                ..VerificationSummary::default()
+            });
+            let input = IntegratorReplyInput {
+                agent: Some(agent.clone()),
+                assignment_id,
+                kind: match kind {
+                    ReplyKindArg::Accept => IntegratorReplyKind::Accept,
+                    ReplyKindArg::Result => IntegratorReplyKind::Result,
+                    ReplyKindArg::Blocked => IntegratorReplyKind::Blocked,
+                },
+                reason,
+                state: state.map(|state| match state {
+                    OutcomeStateArg::Completed => IntegratorOutcomeState::Completed,
+                    OutcomeStateArg::Blocked => IntegratorOutcomeState::Blocked,
+                    OutcomeStateArg::RequiresHuman => IntegratorOutcomeState::RequiresHuman,
+                    OutcomeStateArg::Cancelled => IntegratorOutcomeState::Cancelled,
+                }),
+                outcome,
+                verification,
+                inspected_snapshot: inspected,
+                landed_paths: landed,
+                resolved_conflicts: resolved,
+                remaining_conflicts: remaining,
+                risks,
+                decision_required: decision,
+            };
+            let result = integrator_reply(&ctx, &agent, input).await?;
+            if json {
+                output_json(&result)?;
+            } else {
+                println!(
+                    "Sent {:?} for assignment {} attempt {} to '{}' (signal {}).",
+                    result.kind,
+                    &result.assignment_id[..8],
+                    result.attempt,
+                    result.dispatcher,
+                    &result.message_id[..8]
+                );
+            }
+        }
         IntegratorAction::Assign {
             about,
             candidate,
@@ -95,18 +232,40 @@ pub async fn run(current_dir: &Path, action: IntegratorAction, json: bool) -> an
             ack_timeout,
             task_summary,
         } => {
-            if candidate.is_empty() {
-                anyhow::bail!(
-                    "at least one --candidate is required; the dispatcher owns the roster"
-                );
-            }
+            // Bare names take their advertised capabilities from the
+            // roster; `name=cap1,cap2` states them explicitly; no candidates
+            // lets the engine offer to the whole roster.
+            let roster = if candidate.iter().any(|name| !name.contains('=')) {
+                feanorfs_client::capability_roster(&ctx).await?.agents
+            } else {
+                Vec::new()
+            };
             let candidates = candidate
                 .iter()
-                .map(|name| IntegratorCandidate {
-                    name: name.clone(),
-                    capabilities: require.clone(),
-                    enabled: true,
-                    available: true,
+                .map(|spec| {
+                    let (name, capabilities) = match spec.split_once('=') {
+                        Some((name, caps)) => (
+                            name.to_string(),
+                            caps.split(',')
+                                .filter(|cap| !cap.is_empty())
+                                .map(str::to_string)
+                                .collect(),
+                        ),
+                        None => (
+                            spec.clone(),
+                            roster
+                                .iter()
+                                .find(|entry| &entry.agent == spec)
+                                .map(|entry| entry.capabilities.clone())
+                                .unwrap_or_default(),
+                        ),
+                    };
+                    IntegratorCandidate {
+                        name,
+                        capabilities,
+                        enabled: true,
+                        available: true,
+                    }
                 })
                 .collect();
             let result = integrator_assign(
