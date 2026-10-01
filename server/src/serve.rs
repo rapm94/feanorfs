@@ -571,15 +571,25 @@ mod tests {
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             std::future::pending::<()>().await;
         });
-        tokio::time::timeout(Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
         let mut task = task;
         task.0.abort();
         drop(runtime);
         let runtime_still_locked = crate::acquire_hub_runtime(data.path()).is_err();
         let publication_still_locked = publication.try_read().is_err();
         release_tx.send(()).unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(2), &mut task.0).await.unwrap().unwrap_err().is_cancelled());
-        assert!(runtime_still_locked, "runtime lock released before GC critical section ended");
+        assert!(tokio::time::timeout(Duration::from_secs(2), &mut task.0)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
+        assert!(
+            runtime_still_locked,
+            "runtime lock released before GC critical section ended"
+        );
         assert!(publication_still_locked);
         assert!(crate::acquire_hub_runtime(data.path()).is_ok());
         assert!(publication.try_read().is_ok());

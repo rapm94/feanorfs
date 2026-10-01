@@ -1568,26 +1568,49 @@ mod tests {
 
     #[test]
     fn result_and_human_answer_validate_evidence() {
-        use crate::integrator_contract::{VerificationCheck, VERIFICATION_MAX_CHECKS, VERIFICATION_MAX_INPUT_HASHES};
+        use crate::integrator_contract::{
+            VerificationCheck, VERIFICATION_MAX_CHECKS, VERIFICATION_MAX_INPUT_HASHES,
+        };
         let mut result = fixtures::result();
-        result.verification.checks = vec![VerificationCheck {
-            name: "check".to_string(), passed: true, detail: None,
-        }; VERIFICATION_MAX_CHECKS];
+        result.verification.checks = vec![
+            VerificationCheck {
+                name: "check".to_string(),
+                passed: true,
+                detail: None,
+            };
+            VERIFICATION_MAX_CHECKS
+        ];
         result.verification.input_hashes = vec!["a".repeat(64); VERIFICATION_MAX_INPUT_HASHES];
         let mut answer = HumanResolutionAnswer {
             schema_version: RESOLUTION_SCHEMA_VERSION,
-            job_id: result.job_id.clone(), assignment_id: result.assignment_id.clone(),
-            attempt: result.attempt, conflict_fingerprint: result.conflict_fingerprint.clone(),
-            question_generation: 0, chosen_option: HumanResolutionOption::SubmitCandidate,
-            candidate: result.candidate.clone(), verification: Some(result.verification.clone()),
+            job_id: result.job_id.clone(),
+            assignment_id: result.assignment_id.clone(),
+            attempt: result.attempt,
+            conflict_fingerprint: result.conflict_fingerprint.clone(),
+            question_generation: 0,
+            chosen_option: HumanResolutionOption::SubmitCandidate,
+            candidate: result.candidate.clone(),
+            verification: Some(result.verification.clone()),
         };
         validate_resolution_result(&result).unwrap();
         validate_human_resolution_answer(&answer).unwrap();
         for bad in [
-            crate::VerificationSummary { checks: vec![result.verification.checks[0].clone(); VERIFICATION_MAX_CHECKS + 1], ..result.verification.clone() },
-            crate::VerificationSummary { input_hashes: vec!["a".repeat(64); VERIFICATION_MAX_INPUT_HASHES + 1], ..result.verification.clone() },
-            crate::VerificationSummary { input_hashes: vec!["a".repeat(32)], ..result.verification.clone() },
-            crate::VerificationSummary { output_hash: Some("A".repeat(64)), ..result.verification.clone() },
+            crate::VerificationSummary {
+                checks: vec![result.verification.checks[0].clone(); VERIFICATION_MAX_CHECKS + 1],
+                ..result.verification.clone()
+            },
+            crate::VerificationSummary {
+                input_hashes: vec!["a".repeat(64); VERIFICATION_MAX_INPUT_HASHES + 1],
+                ..result.verification.clone()
+            },
+            crate::VerificationSummary {
+                input_hashes: vec!["a".repeat(32)],
+                ..result.verification.clone()
+            },
+            crate::VerificationSummary {
+                output_hash: Some("A".repeat(64)),
+                ..result.verification.clone()
+            },
         ] {
             result.verification = bad.clone();
             answer.verification = Some(bad);
@@ -1601,13 +1624,22 @@ mod tests {
         let mut result = fixtures::result();
         // JSON escaping permits a large body while individual evidence
         // strings remain within their decoded byte bounds.
-        result.verification.checks = vec![crate::integrator_contract::VerificationCheck {
-            name: "check".into(), passed: true, detail: Some("\n".repeat(512)),
-        }; 6];
-        let initial = encode_resolution_profile(&ResolutionProfile::Result(result.clone())).unwrap().len();
+        result.verification.checks = vec![
+            crate::integrator_contract::VerificationCheck {
+                name: "check".into(),
+                passed: true,
+                detail: Some("\n".repeat(512)),
+            };
+            6
+        ];
+        let initial = encode_resolution_profile(&ResolutionProfile::Result(result.clone()))
+            .unwrap()
+            .len();
         let remaining = RESOLUTION_MAX_PROFILE_BYTES - initial;
         result.diagnostics = vec![String::new(); remaining.div_ceil(RESOLUTION_DIAGNOSTIC_BYTES)];
-        let overhead = encode_resolution_profile(&ResolutionProfile::Result(result.clone())).unwrap().len();
+        let overhead = encode_resolution_profile(&ResolutionProfile::Result(result.clone()))
+            .unwrap()
+            .len();
         let mut padding = RESOLUTION_MAX_PROFILE_BYTES - overhead;
         for diagnostic in &mut result.diagnostics {
             let take = padding.min(RESOLUTION_DIAGNOSTIC_BYTES);
@@ -1619,7 +1651,10 @@ mod tests {
         assert_eq!(body.len(), RESOLUTION_MAX_PROFILE_BYTES);
         assert!(parse_resolution_profile(&body).is_some());
         result.diagnostics.last_mut().unwrap().push('x');
-        let oversized = format!("{RESOLUTION_JOB_DISCRIMINATOR}:{}", serde_json::to_string(&ResolutionProfile::Result(result.clone())).unwrap());
+        let oversized = format!(
+            "{RESOLUTION_JOB_DISCRIMINATOR}:{}",
+            serde_json::to_string(&ResolutionProfile::Result(result.clone())).unwrap()
+        );
         assert_eq!(oversized.len(), RESOLUTION_MAX_PROFILE_BYTES + 1);
         assert!(encode_resolution_profile(&ResolutionProfile::Result(result)).is_err());
         assert!(parse_resolution_profile(&oversized).is_none());

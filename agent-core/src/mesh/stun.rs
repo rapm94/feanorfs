@@ -25,7 +25,9 @@ const DEFAULT_SERVERS: [&str; 3] = [
 /// deadline includes binding, DNS, and responses; each server also has a budget.
 pub async fn discover_reflexive(bind_port: Option<u16>) -> Result<SocketAddr> {
     tokio::time::timeout(Duration::from_secs(3), async {
-        let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, bind_port.unwrap_or(0))).await?;
+        let socket =
+            tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, bind_port.unwrap_or(0)))
+                .await?;
         for server in DEFAULT_SERVERS {
             let attempt = async {
                 let target = resolve_server(server).await?;
@@ -36,11 +38,14 @@ pub async fn discover_reflexive(bind_port: Option<u16>) -> Result<SocketAddr> {
             }
         }
         anyhow::bail!("no STUN server reported a reflexive address")
-    }).await.context("STUN discovery timed out")?
+    })
+    .await
+    .context("STUN discovery timed out")?
 }
 
 pub(crate) async fn resolve_server(server: &str) -> Result<SocketAddr> {
-    tokio::net::lookup_host(server).await?
+    tokio::net::lookup_host(server)
+        .await?
         .find(|address| address.is_ipv4())
         .context("STUN server has no IPv4 address")
 }
@@ -58,12 +63,19 @@ pub(crate) async fn query_reflexive_over(
         let mut response = [0_u8; MAX_RESPONSE_BYTES];
         loop {
             let (received, source) = socket.recv_from(&mut response).await?;
-            if source != target || response.get(8..HEADER_BYTES).filter(|_| received >= HEADER_BYTES) != Some(&request[8..]) {
+            if source != target
+                || response
+                    .get(8..HEADER_BYTES)
+                    .filter(|_| received >= HEADER_BYTES)
+                    != Some(&request[8..])
+            {
                 continue;
             }
             return parse_reflexive_address(&response[..received]);
         }
-    }).await.context("STUN response timed out")?
+    })
+    .await
+    .context("STUN response timed out")?
 }
 
 fn binding_request() -> Result<[u8; HEADER_BYTES]> {
@@ -126,7 +138,10 @@ fn decode_xor_mapped(value: &[u8], transaction: &[u8]) -> Result<SocketAddr> {
             for (slot, byte) in octets.iter_mut().zip(value[4..20].iter()) {
                 *slot = *byte;
             }
-            for (slot, mask) in octets.iter_mut().zip(MAGIC_COOKIE.iter().chain(transaction)) {
+            for (slot, mask) in octets
+                .iter_mut()
+                .zip(MAGIC_COOKIE.iter().chain(transaction))
+            {
                 *slot ^= mask;
             }
             std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
@@ -174,11 +189,24 @@ mod tests {
     #[test]
     fn rfc5769_xor_address_vectors_and_header_validation() {
         // RFC 5769 section 2.2: 192.0.2.1:32853.
-        assert_eq!(decode_xor_mapped(&[0, 1, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43], &[0; 12]).unwrap(), "192.0.2.1:32853".parse::<SocketAddr>().unwrap());
-        let transaction = [0xb7, 0xe7, 0xa7, 1, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae];
+        assert_eq!(
+            decode_xor_mapped(&[0, 1, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43], &[0; 12]).unwrap(),
+            "192.0.2.1:32853".parse::<SocketAddr>().unwrap()
+        );
+        let transaction = [
+            0xb7, 0xe7, 0xa7, 1, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
+        ];
         // RFC 5769 section 2.3.
-        let value = [0, 2, 0xa1, 0x47, 1, 0x13, 0xa9, 0xfa, 0xa5, 0xd3, 0xf1, 0x79, 0xbc, 0x25, 0xf4, 0xb5, 0xbe, 0xd2, 0xb9, 0xd9];
-        assert_eq!(decode_xor_mapped(&value, &transaction).unwrap(), "[2001:db8:1234:5678:11:2233:4455:6677]:32853".parse::<SocketAddr>().unwrap());
+        let value = [
+            0, 2, 0xa1, 0x47, 1, 0x13, 0xa9, 0xfa, 0xa5, 0xd3, 0xf1, 0x79, 0xbc, 0x25, 0xf4, 0xb5,
+            0xbe, 0xd2, 0xb9, 0xd9,
+        ];
+        assert_eq!(
+            decode_xor_mapped(&value, &transaction).unwrap(),
+            "[2001:db8:1234:5678:11:2233:4455:6677]:32853"
+                .parse::<SocketAddr>()
+                .unwrap()
+        );
         let request = binding_request().unwrap();
         assert_eq!(&request[2..4], &[0, 0]);
         for length in 0..HEADER_BYTES {

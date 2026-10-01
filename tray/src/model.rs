@@ -5,8 +5,8 @@
 //! `sync` watch child, which is the state's own responsibility).
 
 use crate::feanorfs::{
-    background_service_managed, feanorfs_bin, graceful_stop_child, spawn_process_group, tray_recent,
-    tray_status, workspace_has_config,
+    background_service_managed, feanorfs_bin, graceful_stop_child, spawn_process_group,
+    tray_recent, tray_status, workspace_has_config,
 };
 use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
 use std::cell::Cell;

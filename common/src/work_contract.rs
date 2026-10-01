@@ -2390,20 +2390,26 @@ mod tests {
             intent_message_id: work_fixtures::hex64(b'c'),
             operations: vec![ScopeChangeOperation::Modify],
             paths: vec!["src/lib.rs".into()],
-            concerns: vec!["x".repeat(256); 28], reason: String::new(),
+            concerns: vec!["x".repeat(256); 28],
+            reason: String::new(),
         };
         let initial = encode_scope_change_request(&profile).unwrap().len();
         // Extend reason using JSON escapes, whose encoded size is twice the
         // decoded size, to reach the complete-body limit exactly.
         let padding = WORK_MAX_PROFILE_BYTES - initial;
         profile.reason = "\n".repeat(padding / 2);
-        if padding % 2 != 0 { profile.reason.push('x'); }
+        if padding % 2 != 0 {
+            profile.reason.push('x');
+        }
         let body = encode_scope_change_request(&profile).unwrap();
         assert_eq!(body.len(), WORK_MAX_PROFILE_BYTES);
         assert_eq!(parse_scope_change_request(&body), Some(profile.clone()));
         profile.reason.push('x');
         validate_scope_change_request(&profile).unwrap();
-        let oversized = format!("{SCOPE_CHANGE_REQUEST_DISCRIMINATOR}:{}", serde_json::to_string(&profile).unwrap());
+        let oversized = format!(
+            "{SCOPE_CHANGE_REQUEST_DISCRIMINATOR}:{}",
+            serde_json::to_string(&profile).unwrap()
+        );
         assert_eq!(oversized.len(), WORK_MAX_PROFILE_BYTES + 1);
         assert!(encode_scope_change_request(&profile).is_err());
         assert!(parse_scope_change_request(&oversized).is_none());
