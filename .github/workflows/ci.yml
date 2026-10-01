@@ -183,6 +183,43 @@ jobs:
       - name: Run source product smoke
         run: bash scripts/smoke-test.sh
 
+  agent-eval:
+    name: Multi-agent eval (scripted)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build CLI
+        run: cargo build --locked --bin feanorfs
+      # Two simulated machines per scenario; FeanorFS runs must finish with
+      # no conflicts or lost edits, and the worktree baseline is reported
+      # alongside for comparison.
+      - name: Run scenarios
+        # Explicit bash enables pipefail so a failing run fails the step.
+        shell: bash
+        run: |
+          for scenario in eval/scenarios/*.json; do
+            python3 eval/run.py "$scenario" --timeout 240 | tee -a eval-report.jsonl
+          done
+      - name: Upload report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: agent-eval-report
+          path: eval-report.jsonl
+          if-no-files-found: ignore
+
   docs:
     name: Documentation
     if: ${{ github.event_name != 'pull_request' }}
@@ -616,6 +653,7 @@ jobs:
       - cross-platform
       - upgrade-smoke
       - source-smoke
+      - agent-eval
       - docs
       - build
       - sdk
@@ -646,6 +684,7 @@ jobs:
             needs.cross-platform.result != 'success' ||
             needs.upgrade-smoke.result != 'success' ||
             needs.source-smoke.result != 'success' ||
+            needs.agent-eval.result != 'success' ||
             needs.docs.result != 'success' ||
             needs.build.result != 'success' ||
             needs.sdk.result != 'success' ||

@@ -1,0 +1,51 @@
+{
+  "name": "disjoint",
+  "description": "Two machines edit different directories; nothing should need a human beyond scope decisions.",
+  "files": {
+    "src/__init__.py": "",
+    "src/parser.py": "def parse(text):\n    return text.split()\n",
+    "tests/__init__.py": "",
+    "tests/test_parser.py": "import unittest\n\nfrom src.parser import parse\n\n\nclass ParseTest(unittest.TestCase):\n    def test_split(self):\n        self.assertEqual(parse(\"a b\"), [\"a\", \"b\"])\n"
+  },
+  "verify": "python3 -m unittest discover -s tests -t .",
+  "agents": [
+    {
+      "name": "linux-dev",
+      "machine": "linux",
+      "scope": [
+        "src/**"
+      ],
+      "edits": [
+        {
+          "path": "src/parser.py",
+          "insert_after": "    return text.split()",
+          "text": "\n\ndef count(text):\n    return len(parse(text))"
+        }
+      ],
+      "prompt": "Add count(text) to src/parser.py returning the number of words."
+    },
+    {
+      "name": "mac-test",
+      "machine": "mac",
+      "scope": [
+        "tests/**"
+      ],
+      "edits": [
+        {
+          "path": "tests/test_parser.py",
+          "insert_after": "        self.assertEqual(parse(\"a b\"), [\"a\", \"b\"])",
+          "text": "\n    def test_empty(self):\n        self.assertEqual(parse(\"\"), [])"
+        }
+      ],
+      "prompt": "Add a test that parse('') returns [] to tests/test_parser.py."
+    }
+  ],
+  "expect": {
+    "src/parser.py": [
+      "def count(text):"
+    ],
+    "tests/test_parser.py": [
+      "def test_empty"
+    ]
+  }
+}
