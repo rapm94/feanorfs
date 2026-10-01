@@ -1139,13 +1139,8 @@ mod tests {
         .unwrap();
         let after = replaced.status().unwrap();
         assert_eq!(after.scope_mode, RunnerScopeMode::Enforced);
-        let persisted = fs::read_to_string(
-            RunnerStore::open_configured(base.path())
-                .unwrap()
-                .path()
-                .to_owned(),
-        )
-        .unwrap();
+        let persisted =
+            fs::read_to_string(RunnerStore::open_configured(base.path()).unwrap().path()).unwrap();
         assert!(
             persisted.contains("\"scope_mode\": \"enforced\""),
             "reconfigure must persist the requested scope mode"

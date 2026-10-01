@@ -158,6 +158,10 @@ pub struct StatusResult {
     pub server_rollback_warning: Option<String>,
     /// Symlink paths skipped during scan (DX-19).
     pub skipped_symlinks: Vec<String>,
+    /// This clone's Git commit differs from the one the shared work was
+    /// published on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_baseline_mismatch: Option<feanorfs_common::git_baseline::GitBaselineMismatch>,
 }
 
 pub async fn do_push_only(
@@ -477,6 +481,7 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
                 offline_backlog,
                 server_rollback_warning: None,
                 skipped_symlinks,
+                git_baseline_mismatch: None,
             })
         }
         Ok((response, blocked, _)) => {
@@ -497,6 +502,15 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
                 offline_backlog: 0,
                 server_rollback_warning: conflicts::detect_server_rollback(&last, &server_files),
                 skipped_symlinks,
+                // Advisory: an unreadable label never fails status.
+                git_baseline_mismatch: if ctx.format_version() >= 3 {
+                    feanorfs_agent_core::git_baseline::baseline_mismatch(ctx)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                },
             })
         }
     }
@@ -599,7 +613,7 @@ mod mirror_state_tests {
 
     #[test]
     fn human_label_idle() {
-        assert_eq!(MirrorState::Idle.human_label(), "up to date");
+        assert_eq!(MirrorState::Idle.human_label(), "up to date with hub");
         assert_eq!(MirrorState::Conflict.human_label(), "needs attention");
     }
 

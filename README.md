@@ -24,8 +24,10 @@ working tree = local Git baseline + shared FeanorFS WIP
 Both machines keep normal Git clones. When one machine or agent edits a
 tracked file, Git correctly shows that file as modified on every synchronized
 clone — that dirty state is the shared WIP, not corruption. FeanorFS never
-reads or writes `.git`/`.jj`, never runs Git commands, and never stages,
-commits, resets, or merges. Git remains the publication and history layer;
+writes or syncs `.git`/`.jj`, never runs Git commands, and never stages,
+commits, resets, or merges. It reads only `.git/HEAD` and the ref it names to
+label each encrypted sync snapshot with its commit, so `feanorfs status`
+warns when another clone shares work on a different baseline. Git remains the publication and history layer;
 you publish the WIP by committing on one machine and advancing the baseline on
 the others. See [docs/usage.md](docs/usage.md) for the guarded publication
 flow and branch guidance.

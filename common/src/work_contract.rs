@@ -2398,7 +2398,7 @@ mod tests {
         // decoded size, to reach the complete-body limit exactly.
         let padding = WORK_MAX_PROFILE_BYTES - initial;
         profile.reason = "\n".repeat(padding / 2);
-        if padding % 2 != 0 {
+        if !padding.is_multiple_of(2) {
             profile.reason.push('x');
         }
         let body = encode_scope_change_request(&profile).unwrap();

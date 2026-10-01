@@ -36,6 +36,24 @@ Separately, an operator may explicitly configure a local agent runner; it
 invokes only that runner's fixed local command and only for direct requests to
 its configured agent. See [the operator runbook](usage.md#agent-runner).
 
+### One lifecycle over three protocols
+
+Work intent (`ffwork1`), integrator assignment (`ffint1`), and conflict
+resolution (`ffres1`) stay separate versioned profiles with their own
+reducers, but agents read them as one state machine through
+`feanorfs agent next` (MCP `status`):
+
+```text
+task:         proposed → accepted → settled → done
+conflict:     conflicted → assigned → resolving → (awaiting_human) → done
+integration:  assigned → resolving → (awaiting_human) → done
+```
+
+Each projection item names its current owner, and `next_actions` carries a
+prefilled command per actor, so agents never assemble protocol ids or JSON by
+hand. `feanorfs agent guard` applies the same projection before an edit.
+Field-level contracts: [agent-api.md](agent-api.md#unified-coordination-sdk-1-additive).
+
 ## Envelope
 
 The encoded message uses an exact versioned discriminator followed by
@@ -241,7 +259,7 @@ Human output is concise. Global `--json` emits the stable result types below.
   take and return JSON strings (see `feanorfs.h`).
 - TypeScript: `sendMessage(root, input)` and `inbox(root, query)` in
   `@feanorfs/agent` (see `contract.d.ts`).
-- MCP: `agent_send` and `agent_inbox` tools with bounded schemas. Tool
+- MCP: `send` and `inbox` (legacy `agent_send` / `agent_inbox`) with bounded schemas. Tool
   descriptions explain that all workspace participants can read messages,
   identity is advisory, and requests/results should carry exact snapshot
   context.

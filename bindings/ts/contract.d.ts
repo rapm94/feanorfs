@@ -322,6 +322,109 @@ export type ConflictMaterializeInput =
 export declare function integratorResume(root: string, options?: IntegratorObserveInput): Promise<IntegratorObserveResult>
 export declare function conflictMaterialize(root: string, input: ConflictMaterializeInput): Promise<ConflictMaterializeResult>
 
+// --- Unified coordination (one lifecycle over ffwork1/ffint1/ffres1) ---
+
+export type LifecycleKind = 'task' | 'conflict' | 'integration'
+export type LifecycleStage =
+  | 'awaiting_human'
+  | 'conflicted'
+  | 'proposed'
+  | 'assigned'
+  | 'resolving'
+  | 'accepted'
+  | 'settled'
+  | 'blocked'
+  | 'stopped'
+  | 'done'
+
+export interface LifecycleItem {
+  kind: LifecycleKind
+  id: string
+  stage: LifecycleStage
+  owner?: string
+  detail: string
+}
+
+/** A ready MCP `tools/call` (`tool` + `args`, replace `<placeholders>`) plus its CLI form. */
+export interface NextAction {
+  actor: string
+  tool: string
+  args: Record<string, unknown>
+  cli: string
+  reason: string
+}
+
+export interface CoordinationStatus {
+  schema_version: number
+  agent: string
+  items: LifecycleItem[]
+  next_actions: NextAction[]
+  warnings?: string[]
+  roster?: RosterEntry[]
+  projection_incomplete: boolean
+}
+
+export type GuardVerdict = 'allow' | 'warn' | 'deny'
+export interface GuardInput {
+  agent?: string | null
+  paths: string[]
+  require_scope?: boolean
+}
+export interface GuardFinding {
+  path: string
+  verdict: GuardVerdict
+  reason: string
+}
+export interface GuardResult {
+  schema_version: number
+  agent: string
+  verdict: GuardVerdict
+  findings: GuardFinding[]
+}
+
+export interface IntegratorReplyInput {
+  agent?: string | null
+  assignment_id?: string | null
+  kind: 'accept' | 'result' | 'blocked'
+  reason?: string | null
+  state?: 'completed' | 'blocked' | 'requires_human' | 'cancelled' | null
+  outcome?: string | null
+  verification?: { status: 'passed' | 'failed' | 'unknown'; summary: string } | null
+  inspected_snapshot?: string | null
+  landed_paths?: number
+  resolved_conflicts?: number
+  remaining_conflicts?: number
+  risks?: string[]
+  decision_required?: string | null
+}
+export interface IntegratorReplyResult {
+  message_id: string
+  assignment_id: string
+  attempt: number
+  dispatcher: string
+  kind: 'accept' | 'result' | 'blocked'
+}
+
+export interface RosterEntry {
+  agent: string
+  capabilities: string[]
+}
+export interface CapabilitiesInput {
+  agent?: string | null
+  /** Complete capability set to announce for `agent`. */
+  announce?: string[] | null
+}
+export interface CapabilityRoster {
+  announced?: string
+  agents: RosterEntry[]
+  projection_incomplete: boolean
+}
+
+export declare function capabilities(root: string, input?: CapabilitiesInput): Promise<CapabilityRoster>
+export declare function coordinationStatus(root: string, agent?: string | null): Promise<CoordinationStatus>
+export declare function guard(root: string, input: GuardInput): Promise<GuardResult>
+export declare function integratorReply(root: string, input: IntegratorReplyInput): Promise<IntegratorReplyResult>
+
 // --- Encrypted work-intent protocol (ffwork1, SDK-1 additive) ---
 // Proposals and decisions are ordinary ffmsg1 signals carrying ffwork1
 // profiles. A sent proposal is never a claim of acceptance: the local

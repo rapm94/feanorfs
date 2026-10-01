@@ -365,6 +365,51 @@ pub async fn integrator_status(root: String, assignment_id: Option<String>) -> R
     .await
 }
 
+/// Unified coordination lifecycle and prefilled next actions.
+/// JSON out: `CoordinationStatus`.
+#[napi]
+pub async fn coordination_status(root: String, agent: Option<String>) -> Result<String> {
+    if let Some(agent) = agent.as_deref() {
+        ensure_bounded(agent, MAX_NAME_BYTES, "agent name")?;
+    }
+    execute_json(root, "coordination_status", move |workspace| {
+        workspace.coordination_status(agent.as_deref())
+    })
+    .await
+}
+
+/// Send one typed candidate-side integrator reply.
+/// JSON in: `IntegratorReplyInput`; JSON out: `IntegratorReplyResult`.
+#[napi]
+pub async fn integrator_reply(root: String, input_json: String) -> Result<String> {
+    let input: feanorfs_common::IntegratorReplyInput =
+        parse_bounded_json(&input_json, "integrator_reply input")?;
+    execute_json(root, "integrator_reply", move |workspace| {
+        workspace.integrator_reply(input)
+    })
+    .await
+}
+
+/// Announce capabilities (when `announce` is set) and read the roster.
+/// JSON in: `CapabilitiesInput`; JSON out: `CapabilityRoster`.
+#[napi]
+pub async fn capabilities(root: String, input_json: String) -> Result<String> {
+    let input: feanorfs_common::CapabilitiesInput =
+        parse_bounded_json(&input_json, "capabilities input")?;
+    execute_json(root, "capabilities", move |workspace| {
+        workspace.capabilities(input)
+    })
+    .await
+}
+
+/// Evaluate whether an agent may write workspace paths now.
+/// JSON in: `GuardInput`; JSON out: `GuardResult`.
+#[napi]
+pub async fn guard(root: String, input_json: String) -> Result<String> {
+    let input: feanorfs_common::GuardInput = parse_bounded_json(&input_json, "guard input")?;
+    execute_json(root, "guard", move |workspace| workspace.guard(input)).await
+}
+
 /// Explicitly revoke the active integrator assignment.
 /// JSON out: `IntegratorStatusResult`.
 #[napi]

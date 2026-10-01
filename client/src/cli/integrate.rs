@@ -28,6 +28,12 @@ pub struct IntegrateCli {
     /// Overwrite conflicting user-owned entries instead of skipping them.
     #[arg(long, global = true)]
     force: bool,
+
+    /// Also register `feanorfs agent guard --hook` as a Claude Code
+    /// PreToolUse hook so edits inside another agent's accepted scope are
+    /// blocked before they happen (Claude only; opt-in).
+    #[arg(long, global = true)]
+    guard_hook: bool,
 }
 
 #[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
@@ -497,7 +503,19 @@ pub(super) async fn run(_current_dir: &Path, cli: IntegrateCli, json: bool) -> R
                     continue;
                 }
 
-                match install_host_integration(&paths, &exe_path, cli.force).await {
+                let installed = install_host_integration(&paths, &exe_path, cli.force)
+                    .await
+                    .and_then(|done| {
+                        if cli.guard_hook && matches!(host, HostKind::Claude) {
+                            install_guard_hook(
+                                &claude_settings_path(&env, cli.project.as_deref()),
+                                &exe_path,
+                            )?;
+                            report.installed.push("claude: Guard hook=true".to_string());
+                        }
+                        Ok(done)
+                    });
+                match installed {
                     Ok((mcp_done, skill_done)) => {
                         let configured_str =
                             format!("{}: MCP={}, Skill={}", host.id(), mcp_done, skill_done);
@@ -532,6 +550,15 @@ pub(super) async fn run(_current_dir: &Path, cli: IntegrateCli, json: bool) -> R
                 }
             }
             IntegrateSubcommand::Uninstall => {
+                if matches!(host, HostKind::Claude) {
+                    match remove_guard_hook(&claude_settings_path(&env, cli.project.as_deref())) {
+                        Ok(true) => report.removed.push("claude: Guard hook=true".to_string()),
+                        Ok(false) => {}
+                        Err(err) => report
+                            .warnings
+                            .push(format!("claude: failed to remove guard hook: {err}")),
+                    }
+                }
                 if !detected
                     && !paths.mcp_config_path.exists()
                     && !paths.skill_dir.join("feanorfs-collaboration").exists()
@@ -828,6 +855,113 @@ pub(super) async fn install_detected_hosts_quiet() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Tools whose writes the guard hook checks.
+const GUARD_HOOK_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
+const GUARD_HOOK_ARGS: &str = "agent guard --hook";
+
+/// Claude Code settings file for the scope (`.claude/settings.json`).
+fn claude_settings_path(env: &EnvironmentContext, project: Option<&Path>) -> PathBuf {
+    project
+        .unwrap_or(&env.home_dir)
+        .join(".claude")
+        .join("settings.json")
+}
+
+fn guard_hook_command(exe_path: &Path) -> Result<String> {
+    let exe = exe_path
+        .to_str()
+        .with_context(|| format!("executable path is not valid UTF-8: {}", exe_path.display()))?;
+    Ok(if exe.contains(char::is_whitespace) {
+        format!("\"{exe}\" {GUARD_HOOK_ARGS}")
+    } else {
+        format!("{exe} {GUARD_HOOK_ARGS}")
+    })
+}
+
+fn is_guard_hook(entry: &serde_json::Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|hooks| hooks.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|command| command.as_str())
+                    .is_some_and(|command| {
+                        command.ends_with(GUARD_HOOK_ARGS) && command.contains("feanorfs")
+                    })
+            })
+        })
+}
+
+fn read_settings(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    match serde_json::from_str(&content)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?
+    {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => bail!("{} is not a JSON object", path.display()),
+    }
+}
+
+/// Adds the guard PreToolUse hook once, preserving every other setting.
+fn install_guard_hook(settings_path: &Path, exe_path: &Path) -> Result<bool> {
+    let mut root = read_settings(settings_path)?;
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .with_context(|| format!("'hooks' in {} is not an object", settings_path.display()))?;
+    let pre = hooks
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .with_context(|| {
+            format!(
+                "'hooks.PreToolUse' in {} is not an array",
+                settings_path.display()
+            )
+        })?;
+    pre.retain(|entry| !is_guard_hook(entry));
+    pre.push(serde_json::json!({
+        "matcher": GUARD_HOOK_MATCHER,
+        "hooks": [{ "type": "command", "command": guard_hook_command(exe_path)? }]
+    }));
+    atomic_write_file(
+        settings_path,
+        serde_json::to_string_pretty(&root)?.as_bytes(),
+    )?;
+    Ok(true)
+}
+
+/// Removes only FeanorFS guard hook entries.
+fn remove_guard_hook(settings_path: &Path) -> Result<bool> {
+    if !settings_path.exists() {
+        return Ok(false);
+    }
+    let mut root = read_settings(settings_path)?;
+    let Some(pre) = root
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut("PreToolUse"))
+        .and_then(|pre| pre.as_array_mut())
+    else {
+        return Ok(false);
+    };
+    let before = pre.len();
+    pre.retain(|entry| !is_guard_hook(entry));
+    if pre.len() == before {
+        return Ok(false);
+    }
+    atomic_write_file(
+        settings_path,
+        serde_json::to_string_pretty(&root)?.as_bytes(),
+    )?;
+    Ok(true)
 }
 
 fn is_feanorfs_command(command: &str) -> bool {
@@ -1161,5 +1295,38 @@ mod tests {
         let preserved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&paths.mcp_config_path).unwrap()).unwrap();
         assert_eq!(preserved, config);
+    }
+    #[test]
+    fn guard_hook_install_is_idempotent_preserves_settings_and_uninstalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"model":"opus","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo hi"}]}]}}"#,
+        )
+        .unwrap();
+        let exe = Path::new("/opt/feanorfs/bin/feanorfs");
+        assert!(install_guard_hook(&settings, exe).unwrap());
+        assert!(install_guard_hook(&settings, exe).unwrap());
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(value["model"], "opus");
+        let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[1]["matcher"], GUARD_HOOK_MATCHER);
+        assert_eq!(
+            pre[1]["hooks"][0]["command"],
+            "/opt/feanorfs/bin/feanorfs agent guard --hook"
+        );
+        assert!(remove_guard_hook(&settings).unwrap());
+        assert!(!remove_guard_hook(&settings).unwrap());
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            guard_hook_command(Path::new("/Program Files/feanorfs")).unwrap(),
+            "\"/Program Files/feanorfs\" agent guard --hook"
+        );
     }
 }

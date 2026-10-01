@@ -92,7 +92,7 @@ publication and history layer.
 
 ## Reading project status
 
-`feanorfs status`, MCP `sync_status`, and the tray expose the worker's last
+`feanorfs status`, MCP `status` (legacy `sync_status`), and the tray expose the worker's last
 reported agent and resolution health. JSON includes `reported_at_ms`,
 `continuous`, and `resolution` when observed (MCP uses `null` when unknown).
 These are cached observations, not proof that a process is still running.
@@ -171,6 +171,14 @@ clones. Before changing the shared baseline:
 3. Use Git to align the intended branch/commit on every participating clone.
 4. Resume FeanorFS only after the participating clones share the same
    baseline.
+
+FeanorFS detects the mismatch for you. Each sync snapshot carries, inside its
+encryption, the commit and branch the publishing clone sat on (read-only from
+`.git/HEAD` and the ref it names; FeanorFS never writes `.git` or runs Git).
+When this clone's commit differs, `feanorfs status` prints a warning, and
+`--json status` / MCP `status` include `git_baseline_mismatch` with the
+`local` and `shared` baselines. `feanorfs log` shows each sync's baseline as
+`(git main@1a2b3c4)`.
 
 Teams that intentionally maintain simultaneous branch work should use
 separate folders and FeanorFS workspace identities; FeanorFS does not model
@@ -820,6 +828,8 @@ feanorfs agent clean <NAME>
 feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
 feanorfs agent send <TO> --kind <request|status|result|blocked> [--about <SNAPSHOT>] [--reply-to <MSG-ID>] [--from <NAME>] "<BODY>"
 feanorfs agent inbox [--for <NAME>] [--after <HEAD>] [--limit <N>]
+feanorfs agent next [--for <NAME>]           # what is in flight + the next command per actor
+feanorfs agent guard <PATH>... [--for <NAME>] [--require-scope] [--hook]
 ```
 
 | Subcommand | Description |
@@ -832,6 +842,31 @@ feanorfs agent inbox [--for <NAME>] [--after <HEAD>] [--limit <N>]
 | `run` | Run a command in the agent dir with continuous reconciliation for the command's lifetime — not a sandbox. Sets `FEANORFS_AGENT`, `FEANORFS_AGENT_DIR`, and the absolute shared control root in `FEANORFS_WORKSPACE_ROOT`. |
 | `send` | Publish one encrypted signal tied to a snapshot; sender defaults to `FEANORFS_AGENT`, then `human` |
 | `inbox` | Read signals addressed to you (or `*` broadcasts); pass `--after` the previous cursor for new-signal deltas; a reset cursor means older signals may have been missed |
+| `next` | One lifecycle over work intent, integrator offers, conflicts, and resolution jobs, with the exact next command (and MCP call) for each actor. Start every agent turn here. |
+| `guard` | Advisory pre-edit check: exits 2 when a path is inside another agent's accepted scope or your integrator attempt was superseded; warns on pending conflicts and open proposals. `--hook` reads a Claude Code PreToolUse payload from stdin and allows the edit on any internal error. |
+
+### Route work to the machine that can do it
+
+Agents on different machines have different tools. Each machine announces
+what it can do, and work that needs a capability goes to that machine:
+
+```bash
+# On the Mac (Xcode, iOS simulator)
+feanorfs agent run mac-test --capability ios-build -- claude
+
+# On Linux: write code, then ask the Mac to verify it
+feanorfs agent send cap:ios-build --kind request "Run the iOS simulator tests for src/parser"
+feanorfs agent capabilities            # who advertises what
+```
+
+`cap:<capability>` resolves to the one agent advertising it and refuses to
+guess when several do; `feanorfs agent integrator assign --require ios-build`
+(no `--candidate`) chooses fairly among every capable agent instead.
+
+Claude Code can run the guard before every edit:
+`feanorfs integrate --host claude --guard-hook` adds a PreToolUse hook
+(`Edit|Write|MultiEdit|NotebookEdit`) to `.claude/settings.json`; `feanorfs
+integrate uninstall --host claude` removes only that entry.
 
 **Isolation caveat:** data isolation only — see [threat-model.md](threat-model.md).
 
@@ -1114,13 +1149,16 @@ troubleshooting, and `ffint1` details.
 feanorfs events    # NDJSON: sync_state, folder_changed, conflict_risk, conflict_registered,
                    #        agent_message, agent_message_cursor_reset,
                    #        integrator_assigned/accepted/completed/blocked/requires_human, …
-feanorfs mcp       # MCP protocol + tools (agent_*, conflicts_*, sync_status, workspace_log,
-                   #        workspace_undo, integrator_assign/status/revoke/resume, conflict_materialize)
+feanorfs mcp       # MCP: status, send, inbox, and op-routed agent, work, conflicts,
+                   #      resolve, integrator, history (FEANORFS_MCP_LEGACY_TOOLS=1 lists
+                   #      the original per-operation tools; both names stay callable)
 ```
 
-File contents never leave the machine on either surface. MCP `sync_status`
-returns counts plus actionable pending paths instead of the complete local file
-map, keeping routine agent checks small even in large workspaces.
+File contents never leave the machine on either surface. MCP `status`
+(and legacy `sync_status`) returns counts plus actionable pending paths
+instead of the complete local file map, keeping routine agent checks small
+even in large workspaces, and adds the unified coordination lifecycle with
+ready-to-call `next_actions`.
 
 `agent_message` wakeup records carry only `message_id`, `from`, `to`, `kind`,
 and `about_snapshot` — never the body. An orchestrator that sees one calls
@@ -1186,6 +1224,7 @@ FeanorFS isolates **files**, not processes. An agent workspace is a normal workt
 ### Loop
 
 ```bash
+feanorfs agent next                 # what to do now, per actor
 feanorfs sync --no-watch          # optional: ensure folder is current
 feanorfs agent spawn ci1
 feanorfs agent run ci1 -- cargo test

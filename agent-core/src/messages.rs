@@ -43,8 +43,22 @@ pub enum HeadConditionalSendResult {
 /// # Errors
 /// Returns an error for invalid names/ids/bodies, unreachable snapshot
 /// references, offline transport, or repeated concurrent head changes.
-pub async fn send_message(ctx: &SyncCtx<'_>, input: AgentMessageInput) -> Result<AgentSendResult> {
+pub async fn send_message(
+    ctx: &SyncCtx<'_>,
+    mut input: AgentMessageInput,
+) -> Result<AgentSendResult> {
     ensure_signal_format(ctx)?;
+    let routed_to = match input
+        .to
+        .strip_prefix(feanorfs_common::CAPABILITY_RECIPIENT_PREFIX)
+    {
+        Some(capability) => {
+            let agent = crate::coordination::resolve_capability(ctx, capability).await?;
+            input.to.clone_from(&agent);
+            Some(agent)
+        }
+        None => None,
+    };
     let engine = SnapshotEngine::new(ctx);
     let initial_head = ctx.api.get_head(ctx.workspace_id()).await?;
     let prepared = prepare_message(ctx, input, initial_head.as_deref()).await?;
@@ -72,6 +86,7 @@ pub async fn send_message(ctx: &SyncCtx<'_>, input: AgentMessageInput) -> Result
                 return Ok(AgentSendResult {
                     message_id: candidate,
                     about_snapshot: prepared.about_snapshot,
+                    routed_to,
                 })
             }
             SwapHeadResult::Conflict(current) => expected = current,
@@ -121,6 +136,7 @@ pub async fn send_message_if_head(
         SwapHeadResult::Swapped => Ok(HeadConditionalSendResult::Sent(AgentSendResult {
             message_id: candidate,
             about_snapshot: prepared.about_snapshot,
+            routed_to: None,
         })),
         SwapHeadResult::Conflict(current) => Ok(HeadConditionalSendResult::Conflict(current)),
     }

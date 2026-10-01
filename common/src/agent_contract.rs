@@ -237,6 +237,9 @@ pub struct AgentMessageInput {
 pub struct AgentSendResult {
     pub message_id: String,
     pub about_snapshot: String,
+    /// Agent a `cap:<capability>` recipient resolved to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_to: Option<String>,
 }
 
 /// One typed agent signal returned by inbox reads.
@@ -512,6 +515,7 @@ pub mod fixtures {
                 .to_string(),
             about_snapshot: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
                 .to_string(),
+            routed_to: None,
         }
     }
 

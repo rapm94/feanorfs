@@ -1186,11 +1186,11 @@ mod tests {
         );
         let signals = [first_result, first_answer, other_answer, other_result];
         let mut expected = ResolutionProtocolState::fresh();
-        apply_protocol_batch(&mut expected, &[assignment.clone()]).unwrap();
+        apply_protocol_batch(&mut expected, std::slice::from_ref(&assignment)).unwrap();
         apply_protocol_batch(&mut expected, &signals).unwrap();
         for order in [[3, 2, 1, 0], [1, 3, 0, 2], [0, 3, 2, 1]] {
             let mut state = ResolutionProtocolState::fresh();
-            apply_protocol_batch(&mut state, &[assignment.clone()]).unwrap();
+            apply_protocol_batch(&mut state, std::slice::from_ref(&assignment)).unwrap();
             for index in order {
                 apply_protocol_batch(&mut state, std::slice::from_ref(&signals[index])).unwrap();
             }
