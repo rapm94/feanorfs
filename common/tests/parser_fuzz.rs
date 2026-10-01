@@ -50,7 +50,11 @@ fn tree_seeds() -> Vec<Vec<u8>> {
             parents: vec!["b".repeat(64)],
             author: "linux".into(),
             created_at_ms: 1,
-            message: Some(GitBaseline::new(&"c".repeat(40), Some("main")).unwrap().encode()),
+            message: Some(
+                GitBaseline::new(&"c".repeat(40), Some("main"))
+                    .unwrap()
+                    .encode(),
+            ),
         }
         .to_canonical_bytes(),
     );

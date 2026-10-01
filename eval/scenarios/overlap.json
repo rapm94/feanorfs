@@ -1,0 +1,49 @@
+{
+  "name": "overlap",
+  "description": "Two machines insert at the same place in one file; parallel branches conflict, scoped turns do not.",
+  "files": {
+    "src/__init__.py": "",
+    "src/parser.py": "def parse(text):\n    return text.split()\n",
+    "tests/__init__.py": "",
+    "tests/test_parser.py": "import unittest\n\nfrom src.parser import parse\n\n\nclass ParseTest(unittest.TestCase):\n    def test_split(self):\n        self.assertEqual(parse(\"a b\"), [\"a\", \"b\"])\n"
+  },
+  "verify": "python3 -m unittest discover -s tests -t .",
+  "agents": [
+    {
+      "name": "linux-dev",
+      "machine": "linux",
+      "scope": [
+        "src/parser.py"
+      ],
+      "edits": [
+        {
+          "path": "src/parser.py",
+          "insert_after": "    return text.split()",
+          "text": "\n\ndef count(text):\n    return len(parse(text))"
+        }
+      ],
+      "prompt": "Add count(text) right after parse() in src/parser.py."
+    },
+    {
+      "name": "mac-dev",
+      "machine": "mac",
+      "scope": [
+        "src/parser.py"
+      ],
+      "edits": [
+        {
+          "path": "src/parser.py",
+          "insert_after": "    return text.split()",
+          "text": "\n\ndef first(text):\n    words = parse(text)\n    return words[0] if words else None"
+        }
+      ],
+      "prompt": "Add first(text) right after parse() in src/parser.py returning the first word or None."
+    }
+  ],
+  "expect": {
+    "src/parser.py": [
+      "def count(text):",
+      "def first(text):"
+    ]
+  }
+}

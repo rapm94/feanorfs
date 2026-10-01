@@ -416,3 +416,30 @@ async fn capability_announcements_route_requests_and_integrator_rosters() {
         .collect();
     assert_eq!(names, vec!["ci-mac", "linux", "mac"]);
 }
+
+#[tokio::test]
+async fn work_proposals_default_their_author_to_feanorfs_agent() {
+    let fx = fixture("coordination-author").await;
+    let output = Command::new(env!("CARGO_BIN_EXE_feanorfs"))
+        .args([
+            "--json", "agent", "work", "propose", "--task", "parser", "--path", "src/**",
+        ])
+        .current_dir(&fx.workspace)
+        .env("FEANORFS_HOME", &fx.state_root)
+        .env("FEANORFS_AGENT", "codex")
+        .env_remove("FEANORFS_WORKSPACE_ROOT")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sent: feanorfs_common::WorkSendResult = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(sent.agent, "codex");
+    assert!(fx
+        .next("codex")
+        .items
+        .iter()
+        .any(|item| item.id == "parser:codex"));
+}

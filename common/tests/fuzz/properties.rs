@@ -21,10 +21,18 @@ use feanorfs_common::{
 /// Canonical tree and snapshot object bytes.
 pub fn tree_codec(data: &[u8]) {
     if let Ok(tree) = Tree::from_canonical_bytes(data) {
-        assert_eq!(tree.to_canonical_bytes(), data, "tree decode is not canonical");
+        assert_eq!(
+            tree.to_canonical_bytes(),
+            data,
+            "tree decode is not canonical"
+        );
     }
     if let Ok(snapshot) = Snapshot::from_canonical_bytes(data) {
-        assert_eq!(snapshot.to_canonical_bytes(), data, "snapshot decode is not canonical");
+        assert_eq!(
+            snapshot.to_canonical_bytes(),
+            data,
+            "snapshot decode is not canonical"
+        );
     }
 }
 
@@ -35,10 +43,15 @@ pub fn invites(data: &[u8]) {
     };
     if let Ok(invite) = decode_invite(text) {
         let again = decode_invite(&encode_invite(&invite).expect("decoded invite re-encodes"));
-        assert_eq!(again.ok(), Some(invite), "workspace invite does not roundtrip");
+        assert_eq!(
+            again.ok(),
+            Some(invite),
+            "workspace invite does not roundtrip"
+        );
     }
     if let Ok(invite) = decode_hub_invite(text) {
-        let again = decode_hub_invite(&encode_hub_invite(&invite).expect("decoded invite re-encodes"));
+        let again =
+            decode_hub_invite(&encode_hub_invite(&invite).expect("decoded invite re-encodes"));
         assert_eq!(again.ok(), Some(invite), "hub invite does not roundtrip");
     }
 }
@@ -52,17 +65,25 @@ pub fn signals(data: &[u8]) {
         assert_eq!(encode_agent_message(&payload).ok().as_deref(), Some(text));
     }
     if let Some(profile) = parse_integrator_profile(text) {
-        assert_eq!(encode_integrator_profile(&profile).ok().as_deref(), Some(text));
+        assert_eq!(
+            encode_integrator_profile(&profile).ok().as_deref(),
+            Some(text)
+        );
     }
     if let Some(profile) = parse_work_profile(text) {
         assert_eq!(encode_work_profile(&profile).ok().as_deref(), Some(text));
     }
     if let Some(profile) = parse_resolution_profile(text) {
-        assert_eq!(encode_resolution_profile(&profile).ok().as_deref(), Some(text));
+        assert_eq!(
+            encode_resolution_profile(&profile).ok().as_deref(),
+            Some(text)
+        );
     }
     if let Some(capabilities) = parse_capability_announcement(text) {
         assert_eq!(
-            encode_capability_announcement(&capabilities).ok().as_deref(),
+            encode_capability_announcement(&capabilities)
+                .ok()
+                .as_deref(),
             Some(text)
         );
     }

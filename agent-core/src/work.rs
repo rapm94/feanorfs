@@ -1555,11 +1555,11 @@ async fn publish_profile(
     ))
 }
 
-fn resolve_sender(explicit: Option<&str>, fallback: &str) -> String {
-    explicit
-        .map(str::to_string)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| fallback.to_string())
+/// Explicit sender, then `FEANORFS_AGENT`, then `human`: the default every
+/// surface documents. (Proposals previously ignored `FEANORFS_AGENT`, so an
+/// agent's scope was attributed to `human`.)
+fn resolve_sender(explicit: Option<&str>) -> String {
+    crate::coordination::agent_identity(explicit)
 }
 
 /// Proposes one work intent. Sends an ordinary `ffmsg1` `request` signal
@@ -1570,7 +1570,7 @@ fn resolve_sender(explicit: Option<&str>, fallback: &str) -> String {
 /// Returns an error for invalid input, unbounded profiles, or failed signal
 /// publication.
 pub async fn work_propose(ctx: &SyncCtx<'_>, input: WorkProposeInput) -> Result<WorkSendResult> {
-    let sender = resolve_sender(input.agent.as_deref(), "human");
+    let sender = resolve_sender(input.agent.as_deref());
     let profile = WorkProfile::WorkIntent(feanorfs_common::WorkIntentProfile {
         task_id: input.task_id.clone(),
         agent: sender.clone(),
@@ -1602,7 +1602,7 @@ pub async fn work_propose(ctx: &SyncCtx<'_>, input: WorkProposeInput) -> Result<
 /// # Errors
 /// Returns an error for invalid input or failed signal publication.
 pub async fn work_decide(ctx: &SyncCtx<'_>, input: WorkDecideInput) -> Result<WorkSendResult> {
-    let sender = resolve_sender(input.from.as_deref(), "human");
+    let sender = resolve_sender(input.from.as_deref());
     let profile = WorkProfile::WorkDecision(feanorfs_common::WorkDecisionProfile {
         proposal_message_id: input.proposal_message_id,
         kind: input.kind,
@@ -1623,7 +1623,7 @@ pub async fn work_decide(ctx: &SyncCtx<'_>, input: WorkDecideInput) -> Result<Wo
 /// # Errors
 /// Returns an error for invalid input or failed signal publication.
 pub async fn work_amend(ctx: &SyncCtx<'_>, input: WorkAmendInput) -> Result<WorkSendResult> {
-    let sender = resolve_sender(input.from.as_deref(), "human");
+    let sender = resolve_sender(input.from.as_deref());
     let profile = WorkProfile::WorkAmendment(feanorfs_common::WorkAmendmentProfile {
         task_id: input.task_id,
         intent_message_id: input.intent_message_id,
@@ -1654,7 +1654,7 @@ pub async fn work_amend(ctx: &SyncCtx<'_>, input: WorkAmendInput) -> Result<Work
 /// # Errors
 /// Returns an error for invalid input or failed signal publication.
 pub async fn work_yield(ctx: &SyncCtx<'_>, input: WorkYieldInput) -> Result<WorkSendResult> {
-    let sender = resolve_sender(input.from.as_deref(), "human");
+    let sender = resolve_sender(input.from.as_deref());
     let profile = WorkProfile::WorkYield(feanorfs_common::WorkYieldProfile {
         task_id: input.task_id,
         intent_message_id: input.intent_message_id,
@@ -1677,7 +1677,7 @@ pub async fn work_yield(ctx: &SyncCtx<'_>, input: WorkYieldInput) -> Result<Work
 /// # Errors
 /// Returns an error for invalid input or failed signal publication.
 pub async fn work_settle(ctx: &SyncCtx<'_>, input: WorkSettleInput) -> Result<WorkSendResult> {
-    let sender = resolve_sender(input.from.as_deref(), "human");
+    let sender = resolve_sender(input.from.as_deref());
     let profile = WorkProfile::WorkSettled(feanorfs_common::WorkSettledProfile {
         task_id: input.task_id,
         intent_message_id: input.intent_message_id,
@@ -1701,7 +1701,7 @@ pub async fn work_settle(ctx: &SyncCtx<'_>, input: WorkSettleInput) -> Result<Wo
 /// # Errors
 /// Returns an error for invalid input or failed signal publication.
 pub async fn work_complete(ctx: &SyncCtx<'_>, input: WorkCompleteInput) -> Result<WorkSendResult> {
-    let sender = resolve_sender(input.from.as_deref(), "human");
+    let sender = resolve_sender(input.from.as_deref());
     let profile = WorkProfile::WorkCompleted(feanorfs_common::WorkCompletedProfile {
         task_id: input.task_id,
         intent_message_id: input.intent_message_id,
@@ -1724,7 +1724,7 @@ pub async fn work_complete(ctx: &SyncCtx<'_>, input: WorkCompleteInput) -> Resul
 /// # Errors
 /// Returns an error for invalid input or failed signal publication.
 pub async fn work_block(ctx: &SyncCtx<'_>, input: WorkBlockInput) -> Result<WorkSendResult> {
-    let sender = resolve_sender(input.from.as_deref(), "human");
+    let sender = resolve_sender(input.from.as_deref());
     let profile = WorkProfile::WorkBlocked(feanorfs_common::WorkBlockedProfile {
         task_id: input.task_id,
         intent_message_id: input.intent_message_id,

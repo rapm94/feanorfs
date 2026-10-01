@@ -182,8 +182,10 @@ pub enum AgentAction {
 
 pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow::Result<()> {
     match action {
+        // Read-only views resolve the shared root so live agents (whose cwd is
+        // their worktree) can read their own status, as the skill instructs.
         AgentAction::Status { name: Some(name) } | AgentAction::Check { name } => {
-            run_agent_check(current_dir, &name, json).await?
+            run_agent_check(&control_workspace_root(current_dir)?, &name, json).await?
         }
         AgentAction::Next { for_agent } => {
             super::coordination::run_next(current_dir, for_agent.as_deref(), json).await?
@@ -217,7 +219,9 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             let control_root = control_workspace_root(current_dir)?;
             super::runner::run(&control_root, action, json).await?
         }
-        AgentAction::Status { name: None } => run_agent_status_list(current_dir, json).await?,
+        AgentAction::Status { name: None } => {
+            run_agent_status_list(&control_workspace_root(current_dir)?, json).await?
+        }
         AgentAction::List => run_agent_list_legacy(current_dir, json).await?,
         AgentAction::Spawn {
             name,
