@@ -95,17 +95,59 @@ jobs:
           command: check
           arguments: --all-features
 
+  fuzz:
+    name: Fuzz parsers (${{ matrix.target }})
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [tree_codec, invites, signals, aead]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.12.0 --locked
+      # Same properties as common/tests/parser_fuzz.rs (stable, every test
+      # run): never panic, and every accepted input re-encodes exactly.
+      - name: Fuzz for two minutes
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=120
+      - name: Upload crashing inputs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   security-success:
     name: Security success
     if: ${{ always() }}
     needs:
       - codeql
       - workflow-security
+      - fuzz
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require workflow security
         if: ${{ needs.workflow-security.result != 'success' }}
+        run: exit 1
+      - name: Require parser fuzzing outside pull requests
+        if: >-
+          github.event_name != 'pull_request' &&
+          needs.fuzz.result != 'success'
         run: exit 1
       - name: Require CodeQL outside pull requests
         if: >-
