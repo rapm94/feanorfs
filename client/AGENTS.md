@@ -4,6 +4,23 @@
 
 CLI + library crate. Owns directory scanning, format-v3 snapshot sync orchestration, local cache metadata, predictive hydration, summaries, and the watcher. Agent and history operations delegate to `feanorfs-agent-core`. It transports content without interpreting or merging it. Serializable result types are shared by library callers and `--json`.
 
+Ordinary status, MCP `sync_status`, and routine tray status forward the same
+worker activity counts and their observation time without extra agent scans.
+Missing activity is unknown; paths that did not observe activity leave it absent. Idle means up to date
+with the hub, not acknowledged by every other computer.
+
+Explicit `agent resolution review [job]` returns one validated engine record
+with paths and resolver text; routine status remains metadata-only. Answer and
+publish-answer accept `--question-generation` to preserve a reviewed question
+across user input, checking it before any candidate write. Candidate answers
+start with Unknown verification evidence; the engine verifies them before
+recording a candidate-ready result. Submission still never applies.
+Omitting the job selects a pending question or result; JSON is `null` when no
+job needs review. It also selects saved answers whose publication is pending.
+`publish-answer <job>` without an option retries the exact saved answer and
+records its signal receipt through the engine; it never rebinds the question.
+This avoids a separate status/list process in the tray.
+
 ## Ownership
 
 - Crates: `feanorfs-client` produces binary `feanorfs` (sync + `serve` hub + agents) and library `feanorfs_client`. Agent workspace logic lives in `feanorfs-agent-core` — this crate re-exports `Runtime`, `Workspace`, and thin `agent.rs` / `conflicts.rs` wrappers.
@@ -36,7 +53,7 @@ CLI + library crate. Owns directory scanning, format-v3 snapshot sync orchestrat
   - `cli/integrator.rs` — `agent integrator assign|status|revoke|resume` and `conflicts materialize` thin adapters over `feanorfs_agent_core::integrator`; human output shows only selected agent/state/next action, `--json` emits canonical types.
   - `cli/mcp.rs` — MCP request adapter. Every tool input is parsed through a `deny_unknown_fields` typed contract; unknown fields or wrong optional-field types return JSON-RPC `-32602` before any tool mutation. Tool schemas declare `additionalProperties: false` and documented optional defaults remain stable.
   - `cli/events.rs` — long-lived metadata-only NDJSON stream. Private typed variants preserve the shipped wire shapes; transient status/head/signal failures retain cursors and retry instead of ending the stream, and `agent_message_cursor_reset` is emitted before wakeups returned by that reset poll. Signal inbox reads and the status cycle are driven by the shared bounded head observer (`feanorfs_agent_core::HeadObserver`) instead of an independent 30-second poll; `agent_reconcile_*` lifecycle events are metadata-only projections of the bounded per-agent `continuous-status.json` files.
-  - `cli/agent_live.rs` — the continuous reconciliation controller for one active agent. Runs for `agent run` (interactive lease) and configured runner workers (revalidated `RunnerOwnership`). One bounded notify watcher with a 500 ms debounce, one dirty generation, one rerun bit, guarded automatic land (`clean=false, propose=false`) and safe refresh (never `--replace`), offline backoff, fail-closed attention, and one bounded final flush on child exit/shutdown. Publishes the bounded, secret-free `continuous-status.json` projection; `live_reconciliation_health` aggregates it for `doctor`/tray without scanning worktrees. The controller never merges content, never chooses conflict winners, and never activates a dormant agent.
+  - `cli/agent_live.rs` — the continuous reconciliation controller for one active agent. Runs for `agent run` (interactive lease) and configured runner workers (revalidated `RunnerOwnership`). One bounded notify watcher with a 500 ms debounce, one dirty generation, one rerun bit, guarded automatic land (`clean=false, propose=false`) and safe refresh (never `--replace`), offline backoff, fail-closed attention, and one bounded final flush on child exit/shutdown. A `pending_conflicts` pause is re-probed after head/local changes and clears only for an authenticated conflict-free state, refreshing before new land; other attention reasons remain paused. Publishes the bounded, secret-free `continuous-status.json` projection; `live_reconciliation_health` aggregates it for `doctor`/tray without scanning worktrees. The controller never merges content, never chooses conflict winners, and never activates a dormant agent.
   - `fs_util.rs` — re-exports `feanorfs_agent_core::fs_util` (`atomic_write_visible`/`atomic_write_durable`, `file_mtime_ms`).
   - `local.rs` — `Config` (`hub_local`, `format_version`), `ClientDb`, `scan_local_directory`.
   - `agent.rs` — re-exports `feanorfs_agent_core` agent ops; CLI `--json` uses the same shapes as [docs/agent-api.md](../docs/agent-api.md).
@@ -49,6 +66,9 @@ CLI + library crate. Owns directory scanning, format-v3 snapshot sync orchestrat
 
 ## Local Contracts
 
+- Canonicalize the agent's watched root once before installing the native
+  watcher. Event paths on macOS use `/private/var`; matching them against
+  `/var` leaves `.feanorfs` in the relative-path filter and drops real edits.
 - Unit and integration test crate roots link `feanorfs-test-support` once. The pre-main temporary profile is inherited by real-CLI subprocesses; tests set alternate homes only on `Command` and never mutate HOME/FEANORFS_HOME after startup.
 - All paths stored in `local_state.json` use forward slashes via `feanorfs_common::normalize_path`. Always normalize before cache lookup or mutation.
 - CLI and managed-worker file logging defaults to `info`, waits up to two seconds for the cross-process rotation/write lock, reopens the active path per record, uses private creation permissions, and hard-caps both `feanorfs.log` and its single rotated `.old` generation at 10 MiB each. Tray-facing commands are latency-sensitive: global tray commands select the global log without resolving `$HOME` as a workspace, and every tray command tries the log lock once before degrading to a sink. Other still-contended writers degrade after the bounded wait rather than blocking the product indefinitely. An existing retired global-root log is repaired under the same cap/private mode; fresh installs never recreate it. Never restore an unbounded persistent debug writer.
@@ -70,7 +90,7 @@ CLI + library crate. Owns directory scanning, format-v3 snapshot sync orchestrat
 - Predictive hydration is local-only: `file_access_log` never leaves the client.
 - Local-hub workspaces (`hub_local` / `start --local`): in-process transport via `LocalHub` (agent-core JSON/state at the private global workspace `hub_data_dir/hub_state.json` + `blobs/`). `hub.rs` is a re-export shim; the Axum router for `feanorfs serve` is in `cli/serve.rs`. Embedded hubs are not portable; use the managed private hub for sharing.
 - Sync reconciliation compares local and head trees with the private global workspace `refs/last-synced`. The `last_synced_files` and `agent_snapshots` tables are removed in format v3. `mtime` remains cache and rollback evidence, never content identity.
-- Format-v3 migration journals old key, target key, fence token, and phase in private global workspace `migration-v3.json`; this is distinct from the SQLite import journal `metadata-migration.json`. Rekey never persists the target key before reseal, parentless head CAS, server stamp, and local finalization complete. Resume the command after interruption.
+- Format-v3 migration journals old key, target key, fence token, phase, and a publication binding in private global workspace `migration-v3.json`. The binding captures the head after fenced synchronization, distinguishes captured absence from missing binding, and durably records the exact prepared candidate before CAS. Uncertain publication retries reuse both IDs; older pre-publication journals without binding fail closed and preserve keys for manual recovery; this is distinct from the SQLite import journal `metadata-migration.json`. The protected recovery journal retains both keys from creation; rekey never commits the target key into workspace config before reseal, parentless head CAS, server stamp, and local finalization complete. Resume the command after interruption. Plain migration on a format-v3 workspace refuses an unfinished rekey journal without deleting it; explicit `migrate --rekey` resumes. A stamped journal whose target key already matches saved config is cleanup-only for either invocation and must not initiate another key rotation. Stamped resumes before config commit finalize locally without reacquiring the already-released hub fence.
 - Rekey requires clean or landed agent workspaces because old-key agent base refs cannot cross the key boundary.
 - Onboarding: `start [target] [folder]` accepts an `fnh1-…` secure hub invite, full `fnr1-…` workspace invite, single-use LAN `fnp1-…` or off-LAN `fnp2-…` pairing capability, or folder. With no workspace or cached connection, a folder target creates the automatic secure private hub; `--host` explicitly selects that path and `--relay <URL>` adds outbound-only off-LAN reachability without a new command. Every branch converges on link/create → initial sync → workspace service + tray. Hidden `tray join <folder>` is the bundled receiver UI adapter: it accepts only bounded stdin `fnp1`/`fnp2`, constructs the existing zeroizing pairing type, and enters `run_start`. Hidden `attach`/`init`/`setup` configure only.
 - Joining a non-empty folder first produces bounded local-only, mirror-only, identical, and same-path-different counts without touching destination setup or files. The sender's normalized, bounded global ignore policy travels inside the encrypted invite; a differing known policy requires confirmation and is applied atomically to private global state before the first real scan. Terminal automation may use public `--accept-join` only after reviewing the preview. Hidden tray join keeps the full invite inside the CLI child and exposes only the typed preview over bounded stdout before accepting a bounded public decision on the same stdin pipe.

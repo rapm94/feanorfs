@@ -1,11 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STALE_SYNC_SECS: u64 = 600;
-const STALE_LAND_SECS: u64 = 600;
 
 /// Typed marker for an otherwise healthy operation that lost a non-blocking
 /// workspace lock race. Callers may preserve arbitrary context around this
@@ -67,33 +66,24 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 fn read_lock_meta(path: &Path) -> Option<(u32, u64)> {
-    let mut file = File::open(path).ok()?;
+    let file = File::open(path).ok()?;
     let mut buf = String::new();
-    file.read_to_string(&mut buf).ok()?;
+    file.take(128).read_to_string(&mut buf).ok()?;
     let mut lines = buf.lines();
     let pid: u32 = lines.next()?.parse().ok()?;
     let ts: u64 = lines.next()?.parse().ok()?;
     Some((pid, ts))
 }
 
-/// Locks owned by a live process are never stale within this window. The age
-/// bound at call sites only guards against PID reuse after a crash; breaking a
-/// live process's lock would let a second sync run concurrently with a
-/// long-running chunked upload (which legitimately exceeds 10 minutes).
-const LIVE_PID_STALE_GRACE_SECS: u64 = 24 * 60 * 60;
-
-pub fn is_stale(path: &Path, max_age_secs: u64) -> bool {
-    let Some((pid, ts)) = read_lock_meta(path) else {
-        return true;
+/// Ownership is the kernel lock, never the diagnostic PID or wall-clock age.
+/// Errors other than absence fail closed. This probe never unlinks a file:
+/// even an unlocked inode may already be open in another contender.
+pub fn is_stale(path: &Path, _max_age_secs: u64) -> bool {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
-    if !pid_alive(pid) {
-        return true;
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now.saturating_sub(ts) > max_age_secs.max(LIVE_PID_STALE_GRACE_SECS)
+    fs2::FileExt::try_lock_exclusive(&file).is_ok()
 }
 
 /// Check whether the sync lock is actively held (not stale) by another process.
@@ -122,14 +112,39 @@ fn write_pid_ts(file: &mut File) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    file.set_len(0)?;
     writeln!(file, "{pid}\n{ts}")?;
     Ok(())
 }
 
-fn break_stale(path: &Path, max_age_secs: u64, label: &str) {
-    if path.exists() && is_stale(path, max_age_secs) {
-        tracing::warn!("Breaking stale {label} lock at {}", path.display());
-        let _ = std::fs::remove_file(path);
+/// Nonblocking counterpart of durable::create_lock_acquire_exclusive.
+/// Keep the inode permanently: unlink/rename can split ownership between an
+/// already-open contender and a newly-created file. Stale diagnostics are
+/// overwritten only after ownership is won; closing the file releases it.
+pub(crate) fn try_acquire_lock_file(path: &Path, label: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            write_pid_ts(&mut file)?;
+            Ok(file)
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Err(lock_contention(format!(
+                "another {label} is running; wait for it to finish ({})",
+                path.display()
+            )))
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -138,82 +153,31 @@ fn break_stale(path: &Path, max_age_secs: u64, label: &str) {
 /// Acquisitions are deliberately non-reentrant: same-PID concurrent futures
 /// must serialize just like separate processes. Callers that already hold a
 /// guard use an explicitly guarded internal operation instead of reacquiring.
+/// The kernel releases ownership on guard drop or process exit, without unlink.
 pub struct SyncLock {
-    path: Option<PathBuf>,
     _file: File,
 }
 
 impl SyncLock {
     pub fn acquire(base: &Path) -> Result<Self> {
-        let dir = crate::workspace_layout::ensure_workspace_state(base)?;
-        std::fs::create_dir_all(&dir)?;
         let path = lock_path(base, "sync.lock")?;
-        break_stale(&path, STALE_SYNC_SECS, "sync");
-
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        match opts.open(&path) {
-            Ok(mut file) => {
-                write_pid_ts(&mut file)?;
-                Ok(Self {
-                    path: Some(path),
-                    _file: file,
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(lock_contention(format!(
-                    "another sync is running on this folder; wait or remove {}",
-                    path.display()
-                )))
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-impl Drop for SyncLock {
-    fn drop(&mut self) {
-        if let Some(ref path) = self.path {
-            let _ = std::fs::remove_file(path);
-        }
+        Ok(Self {
+            _file: try_acquire_lock_file(&path, "sync")?,
+        })
     }
 }
 
 /// Land lock serializes concurrent `agent land` operations.
 pub struct LandLock {
-    path: PathBuf,
     _file: File,
 }
 
 impl LandLock {
     pub fn acquire(base: &Path) -> Result<Self> {
-        let dir = crate::workspace_layout::ensure_workspace_state(base)?;
-        std::fs::create_dir_all(&dir)?;
         let path = lock_path(base, "land.lock")?;
-
-        break_stale(&path, STALE_LAND_SECS, "agent land");
-
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        match opts.open(&path) {
-            Ok(mut file) => {
-                write_pid_ts(&mut file)?;
-                Ok(Self { path, _file: file })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(lock_contention(format!(
-                    "another agent land is in progress; wait or remove {}",
-                    path.display()
-                )))
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-impl Drop for LandLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        Ok(Self {
+            _file: try_acquire_lock_file(&path, "agent land")?,
+        })
     }
 }
 
@@ -236,67 +200,23 @@ pub async fn try_acquire_sync_lock(base: &Path, wait: Duration) -> Result<SyncLo
 /// Orchestrator dispatcher lock serializes `agent integrator` operations and
 /// makes a second dispatcher fail closed on the workspace orchestration lock.
 pub struct DispatcherLock {
-    path: Option<PathBuf>,
     _file: File,
 }
 
 impl DispatcherLock {
-    /// Acquire the per-workspace dispatcher lock; fails when another
-    /// dispatcher process holds it (stale locks are broken after 10 minutes).
+    /// Nonblocking, non-reentrant acquisition; age never revokes ownership.
     pub fn acquire(base: &Path) -> Result<Self> {
-        const STALE_DISPATCHER_SECS: u64 = 600;
-        let dir = crate::workspace_layout::ensure_workspace_state(base)?;
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join("dispatcher.lock");
-        let self_pid = std::process::id();
-
-        if let Some((pid, _)) = read_lock_meta(&path) {
-            if pid == self_pid {
-                let file = File::open(&path)?;
-                return Ok(Self {
-                    path: None,
-                    _file: file,
-                });
-            }
-        }
-
-        break_stale(&path, STALE_DISPATCHER_SECS, "dispatcher");
-
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        match opts.open(&path) {
-            Ok(mut file) => {
-                write_pid_ts(&mut file)?;
-                Ok(Self {
-                    path: Some(path),
-                    _file: file,
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                bail!(
-                    "another integrator dispatcher is active for this workspace;                      one dispatcher per batch is required (or remove {})",
-                    path.display()
-                )
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-impl Drop for DispatcherLock {
-    fn drop(&mut self) {
-        if let Some(ref path) = self.path {
-            let _ = std::fs::remove_file(path);
-        }
+        let path = lock_path(base, "dispatcher.lock")?;
+        Ok(Self {
+            _file: try_acquire_lock_file(&path, "integrator dispatcher")?,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stale, is_sync_lock_active_at_state, pid_alive};
+    use super::*;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn current_process_is_alive() {
@@ -304,44 +224,67 @@ mod tests {
     }
 
     #[test]
-    fn lock_of_live_process_is_not_stale_within_grace() {
+    fn live_kernel_lock_never_expires_or_depends_on_metadata() {
         let directory = tempfile::tempdir().unwrap();
-        let path: PathBuf = directory.path().join("live.lock");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // A lock older than the call-site cap (600s) but held by a live
-        // process must not be treated as stale.
-        fs::write(&path, format!("{}\n{}\n", std::process::id(), now - 3600)).unwrap();
-        assert!(!is_stale(&path, 600));
-
-        // A dead pid is stale immediately, regardless of age. i32::MAX maps
-        // to a positive pid that cannot exist (pid_max is ~4 million), so
-        // kill(pid, 0) returns ESRCH instead of special -1/group semantics.
-        fs::write(&path, format!("{}\n{}\n", i32::MAX, now)).unwrap();
-        assert!(is_stale(&path, 600));
+        let path = directory.path().join("live.lock");
+        let mut held = OpenOptions::new()
+            .read(true).write(true).create_new(true).open(&path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+        // The publication window, corrupt metadata and arbitrarily old dates
+        // must all preserve ownership. A separate open simulates a contender.
+        for bytes in [String::new(), "garbage".to_string(), format!("{}\n0\n", std::process::id())] {
+            held.set_len(0).unwrap();
+            std::io::Seek::rewind(&mut held).unwrap();
+            held.write_all(bytes.as_bytes()).unwrap();
+            assert!(!is_stale(&path, 0));
+            assert!(is_lock_contention(&try_acquire_lock_file(&path, "test").unwrap_err()));
+        }
+        drop(held);
+        assert!(is_stale(&path, u64::MAX));
+        let next = try_acquire_lock_file(&path, "test").unwrap();
+        assert!(!is_stale(&path, 0));
+        drop(next);
+        assert!(path.is_file());
     }
 
     #[test]
-    fn unparsable_lock_is_stale() {
+    fn unheld_diagnostics_are_reusable_even_for_live_pid() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("garbage.lock");
-        fs::write(&path, b"not-a-lock").unwrap();
-        assert!(is_stale(&path, 600));
+        let path = directory.path().join("stale.lock");
+        for bytes in ["not-a-lock".to_string(), format!("{}\n0\n", std::process::id())] {
+            fs::write(&path, bytes).unwrap();
+            assert!(is_stale(&path, 600));
+            let _held = try_acquire_lock_file(&path, "test").unwrap();
+            assert!(!is_stale(&path, 600));
+        }
+    }
+
+    #[test]
+    fn sync_and_land_are_non_reentrant_and_release_without_unlink() {
+        let base = tempfile::tempdir().unwrap();
+        let sync = SyncLock::acquire(base.path()).unwrap();
+        assert!(is_lock_contention(&SyncLock::acquire(base.path()).err().unwrap()));
+        let land = LandLock::acquire(base.path()).unwrap();
+        assert!(is_lock_contention(&LandLock::acquire(base.path()).err().unwrap()));
+        drop(sync);
+        drop(land);
+        assert!(lock_path(base.path(), "sync.lock").unwrap().exists());
+        let _sync = SyncLock::acquire(base.path()).unwrap();
+        let _land = LandLock::acquire(base.path()).unwrap();
     }
 
     #[test]
     fn pre_resolved_sync_lock_probe_uses_state_directory_directly() {
         let state = tempfile::tempdir().unwrap();
-        fs::write(
-            state.path().join("sync.lock"),
-            format!("{}\n{}\n", i32::MAX, 0),
-        )
-        .unwrap();
-
-        // The helper receives the private state directory itself. It must not
-        // reinterpret it as a project path and run workspace migration.
+        let path = state.path().join("sync.lock");
+        fs::write(&path, format!("{}\n0\n", i32::MAX)).unwrap();
+        assert!(!is_sync_lock_active_at_state(state.path()));
+        let held = try_acquire_lock_file(&path, "test").unwrap();
+        assert!(!is_sync_lock_active_at_state(state.path()));
+        // Diagnostic foreign PID retains the existing "other process" UI rule.
+        fs::write(&path, format!("{}\n0\n", i32::MAX)).unwrap();
+        assert!(is_sync_lock_active_at_state(state.path()));
+        drop(held);
         assert!(!is_sync_lock_active_at_state(state.path()));
     }
 }

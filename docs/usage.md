@@ -90,6 +90,20 @@ error. FeanorFS never hides, stages, commits, resets, pulls, merges, or
 synchronizes Git metadata; `.git`/`.jj` stay hard-excluded. Git remains the
 publication and history layer.
 
+## Reading project status
+
+`feanorfs status`, MCP `sync_status`, and the tray expose the worker's last
+reported agent and resolution health. JSON includes `reported_at_ms`,
+`continuous`, and `resolution` when observed (MCP uses `null` when unknown).
+These are cached observations, not proof that a process is still running.
+An up-to-date mirror means agreement with the hub at the observation, not
+confirmation that every other computer has downloaded it. Agent completion
+and file delivery are separate facts.
+
+Terminal status prints read-only next commands when cached activity needs
+attention; MCP includes them in `next_actions`. In the tray, use **Review
+Resolutions…** for pending questions or candidates.
+
 ## Git across machines
 
 FeanorFS transports unfinished working state; Git publishes it. The two
@@ -128,6 +142,7 @@ remote and branch for `origin/main`:
 ```bash
 if git fetch origin &&
    git merge-base --is-ancestor HEAD origin/main &&
+   git diff --cached --quiet HEAD -- &&
    git diff --quiet origin/main --; then
   git reset --mixed origin/main
 else
@@ -135,9 +150,11 @@ else
 fi
 ```
 
-The reset is appropriate only when both checks succeed: the published commit
-is a fast-forward from your local `HEAD`, and your tracked working tree
-already equals that published commit. `--mixed` advances `HEAD` and the index
+The reset is appropriate only when all checks succeed: the published commit
+is a fast-forward from your local `HEAD`, you have no staged changes, and your
+tracked working tree already equals that published commit. If you have staged
+work, preserve or publish that staging intentionally before retrying; a mixed
+reset would otherwise erase your staging choices. `--mixed` advances `HEAD` and the index
 while preserving working files and ignored/untracked files (`.env` stays in
 place). If either check fails, inspect the divergence with Git — FeanorFS
 never performs or suggests a destructive reset, and it never marks leftover
@@ -158,6 +175,32 @@ clones. Before changing the shared baseline:
 Teams that intentionally maintain simultaneous branch work should use
 separate folders and FeanorFS workspace identities; FeanorFS does not model
 Git branches.
+
+### Parallel branches with Git worktrees
+
+Create a sibling folder for each branch, then mirror that folder separately:
+
+```bash
+git worktree add ../app-search -b feature/search
+feanorfs start ../app-search
+```
+
+On the other computer, fetch the branch if it has been published, create its
+own worktree at the same Git commit, and join that folder using the pairing
+code for `app-search`. For an unpublished branch, create a local branch from
+the same base commit first. Each worktree has its own local Git index; staging
+does not travel between computers. FeanorFS excludes the `.git` worktree file
+as well as `.git` directories.
+
+Keep worktrees as siblings, outside other mirrored folders. Share each folder
+with its own pairing code; never attach different branches to the same
+FeanorFS workspace. Agents working on a branch use that branch's mirrored
+folder as their shared root.
+
+The publication guard above is exercised against staged changes, remaining
+WIP, divergent commits, ignored/untracked files, and separate worktrees by
+`sh scripts/test-git-workflow.sh`. This verifies the Git recipe locally;
+cross-machine transport is covered separately by the sync tests.
 
 ## Dedicated server and advanced self-hosting
 
@@ -845,6 +888,12 @@ final attempt. Run `agent run` again after connectivity returns to reconcile
 the preserved work. An enabled configured runner continues retrying only while
 its worker/controller remains active.
 
+An active controller rechecks a conflict pause when the shared head or local
+files change. After explicit resolution it safely refreshes and resumes;
+you do not need to stop its watcher. Edits made after the captured conflict
+remain protected and may still require attention. Corrupt state, unsafe paths,
+and other attention reasons are not cleared by a resolution.
+
 Failure semantics are bounded: filesystem bursts coalesce into one dirty
 generation, one operation mutates one agent at a time, retryable transport
 failures retry with backoff, and conflicts/corrupt state/unsafe layouts stop
@@ -1158,6 +1207,32 @@ feanorfs conflicts keep <path> --local | --cloud | --both | --file <reconciled>
 **Tiered policy:** proactive `ffwork1` coordination first; engine-proven last resort with a causally-behind designated agent; typed human escalation only for a closed-enum ambiguity.
 
 Resolution history: `feanorfs conflicts history --json` (records method, resolver from `FEANORFS_AGENT` or `human`).
+
+### Reviewing a resolution
+
+Choose **Review Resolutions…** in the tray to inspect a pending question or
+candidate. **Open Preserved Versions…** authenticates the original/local/mirror
+files and opens their folder. Save a reconciled replacement separately.
+Choose an offered answer or replacement file; a later **Publish Resolution**
+choice explicitly applies a ready result through the engine's conflict checks.
+The tray preserves the question generation across the dialog and leaves
+automatic watchers running. If the conflict changed, review it again.
+
+The terminal equivalent starts with `feanorfs agent resolution review` (or add
+a job ID). Answer with the full job ID and `--question-generation` from the
+review, plus exactly one of `--defer`, `--keep-unresolved`, or
+`--candidate <replacement-file>`. Answering records local state; it does not
+publish file changes. Use `agent resolution apply <job-id>` for a ready result.
+The tray then sends the saved answer through the encrypted signal stream.
+If publication fails, choose **Review Resolutions… → Send Saved Answer** to
+retry. In the terminal, use `agent resolution publish-answer <job-id>` with
+no answer option to send or retry the exact saved answer, including after a
+restart. Pending answers are retained until publication is confirmed. A
+publication receipt is not a delivery acknowledgement from another agent.
+Guarded publication includes a broadcast status notice in the resolved
+snapshot itself. Both agents can read it in their inboxes; the notice's
+message ID identifies the resulting snapshot. It does not acknowledge that
+either agent has consumed the result.
 
 ### Demo script
 

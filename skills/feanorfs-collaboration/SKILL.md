@@ -25,6 +25,9 @@ runner's child), your agent worktree is continuously reconciled:
    snapshot without claiming that pending work settled. Never claim a snapshot
    you did not inspect; a signal-only head changes the observed head id but not
    the tree or the existing settled snapshot.
+   Capture the settled snapshot before running checks and read it again after
+   they finish. If it changed or became unsettled, retest the new snapshot or
+   report `blocked`; never attach earlier checks to the latest head by default.
 3. **Stop on attention.** If status shows `needs_attention` (conflicts,
    unsafe path, corrupt state) or the runner reports `cursor_reset` /
    `ambiguous_execution`, stop mutating files and await explicit resolution.
@@ -63,6 +66,9 @@ runner's child), your agent worktree is continuously reconciled:
 5. Send at most one `status` update per request, and only when it adds real information.
 6. Finish every accepted request with one `result` or `blocked` reply; do not
    infer exactly-once delivery from that child-side contract.
+   Include changed paths, the exact commands/checks run and their reported
+   outcomes (`passed`, `failed`, or `not run`), and any remaining limitation.
+   Keep this evidence bounded; the transport does not certify a model's claims.
 7. Reference the original request with `--reply-to <message-id>` and keep its `about_snapshot` when its file tree still applies.
 
 ## Handle a configured runner-child invocation
@@ -268,7 +274,7 @@ enter automatic prepare/apply.
    `resolution_submitted`, `resolution_applied`, and `resolution_revoked`
    metadata wakeups on transitions.
 8. **Protocol observation is metadata only.** `feanorfs agent resolution protocol-status [--rebuild]` projects the encrypted `ffres1` signal stream (ids/state/counts only). `feanorfs agent resolution assign <job-id>` publishes the assignment profile, `feanorfs agent resolution reply <job-id>` publishes the result profile, and `feanorfs agent resolution revoke <job-id> [--superseded]` publishes the revoke/supersede profile. The NDJSON stream adds `resolution_assigned`, `resolution_result_received`, and `resolution_human_answered` wakeups on protocol transitions.
-9. **Human escalation is exact and local-first.** `feanorfs agent resolution answer <job-id> --defer|--keep-unresolved|--candidate <file>` records one typed human answer bound to the live projection (identity fields are never caller-supplied, so stale answers are impossible by construction); `feanorfs agent resolution publish-answer <job-id> --defer|--keep-unresolved|--candidate <file>` sends the `ffres1` human-answer profile. `feanorfs agent resolution defer <job-id>` records the terminal deferred state. `feanorfs agent resolution materialize <job-id>` reconstructs the conflict legs by id. `feanorfs agent resolution put <job-id> <file>` writes the immutable engine-owned candidate.
+9. **Human escalation is exact and local-first.** `feanorfs agent resolution answer <job-id> --question-generation <reviewed-generation> --defer|--keep-unresolved|--candidate <file>` records one typed human answer bound to the reviewed question. `feanorfs agent resolution publish-answer <job-id>` publishes or retries that exact saved answer after an outage or restart; a signal receipt does not acknowledge peer consumption. `feanorfs agent resolution defer <job-id>` records the terminal deferred state without an answer signal. `feanorfs agent resolution materialize <job-id>` reconstructs the conflict legs by id. `feanorfs agent resolution put <job-id> <file>` writes the immutable engine-owned candidate.
 10. **The tray only projects.** Tray/menu surfaces show resolution counts and
    status; mutation stays in the CLI (`feanorfs agent resolution
    prepare|submit|apply|answer|defer|assign|reply|revoke|publish-answer`).

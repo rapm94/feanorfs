@@ -506,12 +506,12 @@ fn maintain_bounds(state: &mut WorkStateFile) {
             };
             key(a).cmp(&key(b))
         });
-        for index in evict
-            .iter()
-            .take(terminal.len() - WORK_MAX_TERMINAL_TASKS)
-            .rev()
-        {
-            state.tasks.remove(*index);
+        evict.truncate(terminal.len() - WORK_MAX_TERMINAL_TASKS);
+        // Priority order is not vector order. Remove descending indices so
+        // every selected index still identifies its original task.
+        evict.sort_unstable();
+        for index in evict.into_iter().rev() {
+            state.tasks.remove(index);
         }
     }
     // Bounded evidence: keep the canonical (smallest) message ids. Evidence
@@ -624,13 +624,10 @@ fn narrow_within_scope(scope: &WorkScope, paths: &[String], concerns: &[String])
             if candidate == entry {
                 return true;
             }
-            let candidate_root = candidate.strip_suffix("/**").unwrap_or(candidate);
-            if is_under_or_equal(entry, candidate_root) {
-                return true;
-            }
-            entry
-                .strip_suffix("/**")
-                .is_some_and(|root| is_under_or_equal(candidate, root))
+            candidate.strip_suffix("/**").is_some_and(|candidate_root| {
+                let entry_root = entry.strip_suffix("/**").unwrap_or(entry);
+                is_under_or_equal(entry_root, candidate_root)
+            })
         })
     };
     paths.iter().all(|path| path_covered(path))
@@ -2688,6 +2685,79 @@ mod tests {
             state.incomplete,
             "evicting a non-terminal proposal marks the projection incomplete"
         );
+    }
+
+    #[test]
+    fn simultaneous_terminal_eviction_uses_priority_not_vector_order() {
+        let mut state = apply_all(&[("a", "agent-a", intent("active", "agent-a", 1, None))]);
+        let template = state.tasks[0].clone();
+        let count = WORK_MAX_TERMINAL_TASKS + 4;
+        // Reverse vector order relative to eviction priority.
+        for index in (0..count).rev() {
+            let mut task = template.clone();
+            task.task_id = format!("done-{index:04}");
+            task.proposals[0].state = WorkTaskState::Completed;
+            task.proposals[0].sequence = index as u64 + 1;
+            state.tasks.push(task);
+        }
+        maintain_bounds(&mut state);
+        assert_eq!(state.tasks.len(), WORK_MAX_TERMINAL_TASKS + 1);
+        assert_eq!(
+            serde_json::to_value(&state.tasks[0]).unwrap(),
+            serde_json::to_value(&template).unwrap()
+        );
+        for index in 0..count {
+            assert_eq!(
+                state
+                    .tasks
+                    .iter()
+                    .any(|task| task.task_id == format!("done-{index:04}")),
+                index >= 4
+            );
+        }
+        assert!(!state.incomplete);
+    }
+
+    #[test]
+    fn narrow_wildcards_never_expand_exact_or_glob_scope() {
+        let state = apply_all(&[
+            (
+                "a",
+                "agent-a",
+                intent("task-a", "agent-a", 1, Some("human")),
+            ),
+            ("b", "human", narrow('a', "src/**")),
+        ]);
+        assert_eq!(
+            find_proposal(&state, "task-a").state,
+            WorkTaskState::Proposed
+        );
+        assert!(state
+            .evidence
+            .iter()
+            .any(|entry| entry.disposition == WorkRejectReason::NarrowOutsideScope.as_str()));
+        let mut scope = find_proposal(&state, "task-a").scope.clone();
+        for paths in [vec!["src/**".into()], vec!["src/task-a.rs/**".into()]] {
+            assert!(!narrow_within_scope(&scope, &paths, &[]));
+        }
+        scope.paths = vec!["src/parser/**".into()];
+        assert!(!narrow_within_scope(&scope, &["src/**".into()], &[]));
+        assert!(narrow_within_scope(
+            &scope,
+            &["src/parser/ast/**".into()],
+            &[]
+        ));
+        assert!(narrow_within_scope(
+            &scope,
+            &["src/parser/ast.rs".into()],
+            &[]
+        ));
+        assert!(!narrow_within_scope(
+            &scope,
+            &["src/parser2/**".into()],
+            &[]
+        ));
+        assert!(!narrow_within_scope(&scope, &[], &["unclaimed".into()]));
     }
 
     #[test]

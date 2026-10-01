@@ -5,8 +5,8 @@
 //! `sync` watch child, which is the state's own responsibility).
 
 use crate::feanorfs::{
-    background_service_managed, feanorfs_bin, graceful_stop_child, tray_recent, tray_status,
-    workspace_has_config,
+    background_service_managed, feanorfs_bin, graceful_stop_child, spawn_process_group, tray_recent,
+    tray_status, workspace_has_config,
 };
 use feanorfs_common::tray_contract::{RecentWorkspacesResult, TrayStatusResult};
 use std::cell::Cell;
@@ -53,6 +53,7 @@ pub(crate) struct AppState {
     pub(crate) pair_inflight: bool,
     pub(crate) recovery_inflight: bool,
     pub(crate) health_inflight: bool,
+    pub(crate) resolution_inflight: bool,
     pub(crate) update_inflight: bool,
     /// Last completed check; drives the gated Install Update item.
     pub(crate) last_update: Option<crate::feanorfs::UpdateCheckResult>,
@@ -87,6 +88,7 @@ impl AppState {
             pair_inflight: false,
             recovery_inflight: false,
             health_inflight: false,
+            resolution_inflight: false,
             update_inflight: false,
             last_update: None,
             pair_cancel: None,
@@ -129,14 +131,14 @@ impl AppState {
             return;
         };
 
-        match Command::new(feanorfs_bin())
+        let mut command = Command::new(feanorfs_bin());
+        command
             .args(["sync"])
             .current_dir(workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        match spawn_process_group(&mut command) {
             Ok(child) => {
                 self.watch_child = Some(child);
                 self.owns_watch = true;
@@ -453,7 +455,8 @@ pub(crate) fn should_prompt_first_run(requested: bool, workspace: Option<&Path>)
 }
 
 pub(crate) fn menu_actions_enabled(state: &AppState) -> bool {
-    !state.setup_inflight
+    !state.resolution_inflight
+        && !state.setup_inflight
         && !state.stop_inflight
         && !state.switch_inflight
         && !state.pair_inflight
@@ -468,6 +471,9 @@ pub(crate) fn unmanaged_terminal_watcher_active(
 }
 
 pub(crate) fn activity_header(state: &AppState) -> Option<&'static str> {
+    if state.resolution_inflight {
+        return Some("FeanorFS — reviewing resolution…");
+    }
     if state.setup_inflight {
         return Some(match state.setup_kind {
             Some(SetupKind::AddFolder) => "FeanorFS — adding folder…",
@@ -503,6 +509,7 @@ pub(crate) fn menu_revision(state: &AppState) -> u64 {
     state.pair_inflight.hash(&mut hasher);
     state.recovery_inflight.hash(&mut hasher);
     state.health_inflight.hash(&mut hasher);
+    state.resolution_inflight.hash(&mut hasher);
     state.update_inflight.hash(&mut hasher);
     if let Some(status) = state.last_status.as_ref() {
         serde_json::to_vec(status)
@@ -522,8 +529,21 @@ mod tests {
     use super::*;
     use feanorfs_common::tray_contract::{RecentWorkspaceEntry, TrayAgentsSummary};
 
+    #[test]
+    fn resolution_review_disables_mutations_and_changes_menu_revision() {
+        let mut state = AppState::new(None);
+        let before = menu_revision(&state);
+        state.resolution_inflight = true;
+        assert!(!menu_actions_enabled(&state));
+        assert_ne!(menu_revision(&state), before);
+        assert!(activity_header(&state).unwrap().contains("resolution"));
+    }
+
     fn make_status(mirror_state: &str, paused: bool) -> TrayStatusResult {
         TrayStatusResult {
+            reported_at_ms: None,
+            continuous: None,
+            resolution: None,
             mirror_state: mirror_state.into(),
             paused,
             watching: true,

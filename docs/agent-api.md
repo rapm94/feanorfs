@@ -829,6 +829,7 @@ harness produces a candidate, and only the engine validates/publishes it.
 |-----------|-----|-------------------|------------------|
 | Prepare | `agent resolution prepare <path> --reason exhausted\|violated --detail <text>` | `resolution_prepare(path, PreventionReason)` | `ResolutionJob` |
 | Status | `agent resolution status [<job-id>]` | `resolution_status(Option<&str>)` | `ResolutionStatusProjection` |
+| Review | `agent resolution review [<job-id>]` | CLI projection of `ResolutionStore` | `PersistedResolutionJob` or `null` |
 | Submit | `agent resolution submit <job-id> --result <file-or->` | `resolution_submit(job_id, ResolutionResult)` | `ResolutionResult` |
 | Apply | `agent resolution apply <job-id>` | `resolution_apply(job_id)` | `ResolutionApplyOutcome` |
 | Materialize | `agent resolution materialize <job-id>` | `resolution_materialize_legs(job_id)` | `[{"role","path"}]` |
@@ -840,6 +841,21 @@ harness produces a candidate, and only the engine validates/publishes it.
 | Reply | `agent resolution reply <job-id>` | `resolution_reply(job_id)` | `{"message_id"}` |
 | Revoke | `agent resolution revoke <job-id> [--superseded]` | `resolution_revoke(job_id, superseded)` | `{"message_id"}` |
 | Publish answer | `agent resolution publish-answer <job-id> --defer\|--keep-unresolved\|--candidate <file>` | `resolution_publish_answer(&HumanResolutionAnswer)` | `{"message_id"}` |
+| Retry saved answer | `agent resolution publish-answer <job-id>` | `resolution::publish_saved_human_answer(ctx, job_id, generation)` (async engine function) | `{"message_id"}` |
+
+Guarded apply embeds a broadcast `status` envelope in the published snapshot.
+The notice's `about_snapshot` is the conflicted head and its inbox `message_id`
+is the resolved head. This uses the same CAS as the file change, so crash
+recovery cannot leave a published resolution without its notice. The notice
+is available to both participants; it is not a read acknowledgement or an
+`ffres1` reducer completion event.
+
+Assignment/result/answer signals do not invalidate a job when the engine can
+prove a chain of at most 64 valid `ffmsg1` snapshots, each with one parent and
+the exact prepared tree root, back to its captured snapshot. The original
+identity and fingerprint remain unchanged; publication uses the latest proven
+head for its CAS. Any changed tree, unknown history message, disconnected head,
+or exhausted bound remains stale and requires a new review.
 
 MCP tools: `resolution_prepare`, `resolution_status`, `resolution_submit`,
 `resolution_apply`, `resolution_materialize`, `resolution_put`,
@@ -1014,11 +1030,14 @@ current conflict and its evidence untouched.
 Materializes the authenticated base/ours/theirs legs of one job into the
 engine-owned job directory (create-new, no-follow, fsync'd) so a designated
 machine can reconstruct the conflict context by ID and fingerprint.
+Repeated inspection reuses only regular files whose bytes still match the
+authenticated versions. Modified files or symlink aliases are refused without
+replacement; save reconciled content separately.
 Read-only: never changes the worktree, conflict registry, artifacts, or
 head. JSON out is an array of `{role, path}` with absolute paths:
 
 ```json
-[{"role": "original", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/legs/original"}, {"role": "local", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/legs/local"}, {"role": "cloud", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/legs/cloud"}]
+[{"role": "original", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/leg-original.bin"}, {"role": "local", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/leg-local.bin"}, {"role": "cloud", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/leg-cloud.bin"}]
 ```
 
 `role` is `original`, `local`, or `cloud`. Adapter `put` inputs are bounded:
@@ -1044,12 +1063,19 @@ takes base64 directly; MCP `resolution_put` takes `{job_id, base64}`.
 
 ### `resolution answer` and `resolution publish-answer`
 
+Use `feanorfs agent resolution review [job-id]` to inspect the question and
+preserved-version descriptors explicitly. With no ID it selects a pending
+question or result; JSON returns one engine record, or `null` when none is
+waiting. Routine `status` remains metadata-only.
+
 Both commands build one typed `HumanResolutionAnswer` bound to the exact
 current escalation. Every identity field (job, assignment, attempt,
 fingerprint, and the exact `question_generation`) is read from the bounded
-`resolution status` projection — the caller never supplies them, so stale
-answers are impossible by construction (the engine re-validates the full
-binding, including the generation). `--candidate <file>` reads the file
+`resolution status` projection. Pass `--question-generation <reviewed-generation>`
+to refuse a question changed while the human was deciding, before any candidate
+write. Native UI always supplies this value; legacy calls without it bind to
+the current question at invocation. The engine revalidates the full binding
+when recording the answer. `--candidate <file>` reads the file
 bounded (64 MiB cap) and records the engine-owned candidate via
 `put_resolution_candidate` first.
 
@@ -1059,11 +1085,20 @@ bounded (64 MiB cap) and records the engine-owned candidate via
 
 `chosen_option` is `defer`, `keep_unresolved`, or `submit_candidate`; a
 `submit_candidate` answer carries the engine-validated candidate descriptor
-and (for the local `answer` op) verification evidence produced by the
-engine's inline verification path. `answer` records the terminal local state
+and explicit Unknown verification at the CLI boundary. The local `answer`
+operation runs inline verification and stores its evidence on the resulting
+candidate-ready result; the returned answer retains the original input evidence.
+`answer` records the terminal local state
 or a `candidate_ready` result without any publication; `publish-answer`
 validates the answer (`validate_human_resolution_answer`) and sends it as an
-`ffres1` profile — the local store is never mutated by publication, and a
+`ffres1` profile. With no answer option, the CLI instead calls
+`resolution::publish_saved_human_answer`: it sends the exact durably saved
+local answer and records its signal message ID. Failed or uncertain sends
+remain retryable after restart; retries can emit duplicate signals, which the
+reducer treats as the same answer. Pending answers cannot be evicted from the
+bounded job store. Confirmed publication avoids another send but does not
+acknowledge peer consumption. The explicit-answer API retains its original
+publication-only behavior, and a
 published `submit_candidate` answer carries an explicit `Unknown`
 verification status unless the caller supplies real evidence. FFI:
 `ffs_resolution_answer(root, answer_json)` /

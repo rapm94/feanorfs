@@ -6,13 +6,22 @@ never become project files, never dirty Git, and require no new hub endpoint.
 
 ## Mental model
 
-A signal is an ordinary encrypted format-v3 snapshot with **no file-tree
+A standalone signal is an ordinary encrypted format-v3 snapshot with **no file-tree
 changes**:
 
 - the latest workspace tree root;
 - the latest workspace head as its parent;
 - the sender name in `Snapshot.author`;
 - the signal envelope in `Snapshot.message`.
+
+Guarded conflict publication also embeds a broadcast `status` envelope in
+the snapshot that resolves the conflict. This notice and the file change
+share one compare-and-swap: neither can publish without the other. Its
+`about_snapshot` is the conflicted head; its `message_id` is the resolved
+snapshot. Both participants can read the notice through their existing
+inboxes. Publication proves availability, not that either agent has read
+or acted on it. Consumers must compare tree roots to detect file changes;
+the presence of an envelope alone does not imply a signal-only head.
 
 The hub observes only ordinary ciphertext objects, object sizes, manifests,
 head changes, and timing — never plaintext routing, bodies, or snapshot
@@ -275,6 +284,13 @@ code snapshot S1
   snapshot from `agent status` (the bounded `live` projection) before
   replying, and the configured runner flushes the final file generation
   before delivering its terminal reply.
+  Capture `live.settled_snapshot` before checking the files and confirm it
+  again afterward. If it changes or becomes unsettled, retest or send
+  `blocked`. Include changed paths, checks actually run, their reported
+  outcomes, and remaining limitations in the bounded body. Check results are
+  consumer evidence; transport does not certify them. The requester reads
+  the correlated reply from its inbox rather than treating process exit as
+  delivery.
 - Old hubs ignore the wait parameters; clients detect the unsupported
   response and keep bounded periodic polling with jitter — never a busy
   loop. Mixed versions degrade to the previous safe behavior.

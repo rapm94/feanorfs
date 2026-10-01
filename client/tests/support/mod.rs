@@ -49,12 +49,35 @@ impl TestServer {
 }
 
 pub async fn spawn_test_server() -> TestServer {
+    spawn_test_server_with_gate(None).await
+}
+
+/// A deterministic transport outage for real-client journeys. Existing
+/// requests may finish; every subsequent request fails until the gate opens.
+pub async fn spawn_test_server_with_gate(
+    online: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> TestServer {
     let data_dir = TempDir::new().unwrap();
     let state = init_app_state(data_dir.path().to_path_buf(), None)
         .await
         .unwrap();
     let db = std::sync::Arc::clone(&state.db);
-    let app = build_router(state);
+    let mut app = build_router(state);
+    if let Some(online) = online {
+        app = app.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let online = std::sync::Arc::clone(&online);
+                async move {
+                    use axum::response::IntoResponse as _;
+                    if online.load(std::sync::atomic::Ordering::SeqCst) {
+                        next.run(request).await
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                }
+            },
+        ));
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {

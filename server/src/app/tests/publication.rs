@@ -472,6 +472,24 @@ async fn head_json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&body).expect("parse head body")
 }
 
+async fn poll_until_waiting<F: std::future::Future>(
+    mut request: std::pin::Pin<&mut F>,
+    registry: &super::super::head_wait::HeadWaiters,
+    workspace: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            if registry.waiting_count(workspace) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request must reach receiver waiting before publication");
+}
+
 #[tokio::test]
 async fn head_wait_returns_immediately_when_head_already_differs() {
     let state = app_state().await;
@@ -507,18 +525,19 @@ async fn head_wait_wakes_after_durable_cas() {
             .expect("store manifest");
     }
     state.db.swap_head("ws", None, &first).await.unwrap();
+    let registry = state.head_waiters.clone();
     let app = build_router(state);
     let wait = app
         .clone()
         .oneshot(wait_request("ws", Some(&first), Some(5000)));
-    // Publish after a short delay so the waiter is registered first.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::pin!(wait);
+    poll_until_waiting(wait.as_mut(), &registry, "ws").await;
     let swap = app
         .oneshot(swap_request("ws", Some(&first), &second))
         .await
         .expect("swap head");
     assert_eq!(swap.status(), StatusCode::OK);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), wait)
         .await
         .expect("waiter must wake")
         .expect("waiter response");
@@ -541,11 +560,13 @@ async fn head_wait_does_not_wake_after_rejected_cas() {
             .expect("store manifest");
     }
     state.db.swap_head("ws", None, &first).await.unwrap();
+    let registry = state.head_waiters.clone();
     let app = build_router(state);
     let wait = app
         .clone()
-        .oneshot(wait_request("ws", Some(&first), Some(500)));
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        .oneshot(wait_request("ws", Some(&first), Some(5000)));
+    tokio::pin!(wait);
+    poll_until_waiting(wait.as_mut(), &registry, "ws").await;
     // A rejected CAS must never wake the waiter.
     let rejected = app
         .clone()
@@ -553,13 +574,19 @@ async fn head_wait_does_not_wake_after_rejected_cas() {
         .await
         .expect("rejected swap");
     assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        registry.waiting_count("ws"),
+        1,
+        "rejected CAS must not notify"
+    );
+    assert!(futures_util::poll!(wait.as_mut()).is_pending());
     // The accepted swap wakes the waiter with the new head.
     let accepted = app
         .oneshot(swap_request("ws", Some(&first), &second))
         .await
         .expect("accepted swap");
     assert_eq!(accepted.status(), StatusCode::OK);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), wait)
         .await
         .expect("waiter must resolve")
         .expect("waiter response");
@@ -654,16 +681,24 @@ async fn head_wait_workspace_a_publication_never_wakes_b() {
     }
     state.db.swap_head("a", None, &head_a).await.unwrap();
     state.db.swap_head("b", None, &head_b).await.unwrap();
+    let registry = state.head_waiters.clone();
     let app = build_router(state);
     let wait_b = app
         .clone()
         .oneshot(wait_request("b", Some(&head_b), Some(400)));
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::pin!(wait_b);
+    poll_until_waiting(wait_b.as_mut(), &registry, "b").await;
     let swap_a = app
         .oneshot(swap_request("a", Some(&head_a), &next_a))
         .await
         .expect("swap workspace a");
     assert_eq!(swap_a.status(), StatusCode::OK);
+    assert_eq!(
+        registry.waiting_count("b"),
+        1,
+        "workspace b must stay registered"
+    );
+    assert!(futures_util::poll!(wait_b.as_mut()).is_pending());
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), wait_b)
         .await
         .expect("waiter b must resolve by timeout");

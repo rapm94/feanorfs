@@ -18,6 +18,30 @@ macOS, Linux, and Windows system-tray companion for FeanorFS. Shells `feanorfs -
 
 ## Local Contracts
 
+- `CapturedCommand` owns and polls both output pipes without reader threads:
+  Unix uses `O_NONBLOCK`; Windows uses `PeekNamedPipe` and reads only available
+  bytes. Each polling turn reads at most 16 × 4096 bytes per stream, preserving
+  cancellation and deadline checks. Both pipe handles close on every return.
+  After observing child exit, draining has a one-second bound or the earlier
+  configured timeout; incomplete draining at that deadline returns `Timeout`.
+  Existing `stop_child` terminates the Unix process group; Windows terminates
+  only the direct child, not descendants. Separate interactive join pipes do
+  not use this capture contract.
+- **Review Resolutions…** explicitly fetches one pending question or result via
+  one CLI review; routine polling never fetches resolver text. Native choices
+  use the offered safe options and preserve the displayed question generation.
+  Candidate selection records an engine-verified result; publishing requires a
+  separate explicit choice and delegates to guarded CLI apply. The asynchronous
+  action blocks workspace mutations, checks task generation on completion, and
+  never stops the watcher. After local recording, the tray publishes the saved
+  answer; a failure leaves it available through **Send Saved Answer** on the
+  next review. Publication does not claim peer acknowledgement.
+  **Open Preserved Versions…** delegates to CLI materialize and opens only the
+  returned absolute directory matching that job. Repeated inspection does not
+  overwrite modified files.
+- Activity rows use the common `TrayStatusResult::activity_lines()` projection;
+  cached agent and resolution counts are explicitly last reported. The idle
+  header means up to date with the hub, not receipt on every other computer.
 - Recurring configured-workspace refreshes use one background `feanorfs --json tray overview` process (`TrayOverviewResult` in `common/src/tray_contract.rs`), combining worker-published sync status with the recent-folder registry. The stable `tray status` / `TrayStatusResult` surface remains available for individual status reads. An unconfigured tray fetches `tray recent` on a worker thread.
 - CLI discovery prefers an explicit `FEANORFS_BIN`, then a colocated binary, then the native package location (`/usr/local/bin/feanorfs` on macOS or `/usr/bin/feanorfs` on Linux), then `PATH`. This order is required for first launch from Finder/LaunchServices, whose `PATH` may omit `/usr/local/bin`.
 - Status subprocess failures retain the last good state but set the error visual and surface a bounded cause, explicit file-preservation reassurance, and the native **Check System Health…** recovery path. Never collapse a known failure into generic “feanorfs failed” copy or send a normal desktop user to Terminal.

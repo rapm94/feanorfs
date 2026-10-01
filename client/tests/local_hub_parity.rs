@@ -467,6 +467,169 @@ async fn parity_manifest_valid_and_errors() {
 }
 
 #[tokio::test]
+async fn v3_rekey_fence_denies_competing_tokens_and_releases() {
+    let h = Harness::new(None).await;
+    let root = mk_hash(b"v3 root");
+    let owner = mk_hash(b"rekey owner");
+    let other = mk_hash(b"rekey competitor");
+    for local in [true, false] {
+        let h = &h;
+        let request = |method, path, query, body, token| async move {
+            if local {
+                h.local_req(&method, path, query, body, token).await.0
+            } else {
+                h.http_req(method, path, query, body, token).await.0
+            }
+        };
+        let upload_query =
+            format!("workspace_id=ws&path=obj&hash={root}&size=7&mtime=0&object=true");
+        let manifest_query = format!("workspace_id=ws&snapshot_id={root}");
+        let head = serde_json::to_vec(&SwapHeadRequest {
+            workspace_id: "ws".into(),
+            expected: None,
+            new: root.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            request(
+                Method::POST,
+                "/api/upload",
+                &upload_query,
+                b"v3 root".to_vec(),
+                None
+            )
+            .await,
+            200
+        );
+        assert_eq!(
+            request(
+                Method::POST,
+                "/api/manifest",
+                &manifest_query,
+                root.as_bytes().to_vec(),
+                None
+            )
+            .await,
+            200
+        );
+        assert_eq!(request(Method::PUT, "/api/head", "", head, None).await, 200);
+        assert_eq!(
+            request(
+                Method::POST,
+                "/api/workspace/format",
+                "workspace_id=ws&format_version=3",
+                vec![],
+                None
+            )
+            .await,
+            200
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                request(
+                    Method::POST,
+                    "/api/workspace/migration",
+                    "workspace_id=ws",
+                    vec![],
+                    Some(owner.as_str())
+                )
+                .await,
+                200
+            );
+        }
+        assert_eq!(
+            request(
+                Method::POST,
+                "/api/workspace/migration",
+                "workspace_id=ws",
+                vec![],
+                Some(other.as_str())
+            )
+            .await,
+            423
+        );
+        let fenced_head = serde_json::to_vec(&SwapHeadRequest {
+            workspace_id: "ws".into(),
+            expected: Some(root.clone()),
+            new: root.clone(),
+        })
+        .unwrap();
+        for token in [None, Some(other.as_str())] {
+            assert_eq!(
+                request(Method::PUT, "/api/head", "", fenced_head.clone(), token).await,
+                423
+            );
+            assert_eq!(
+                request(
+                    Method::POST,
+                    "/api/upload",
+                    &upload_query,
+                    b"v3 root".to_vec(),
+                    token
+                )
+                .await,
+                423
+            );
+            assert_eq!(
+                request(
+                    Method::POST,
+                    "/api/manifest",
+                    &manifest_query,
+                    root.as_bytes().to_vec(),
+                    token
+                )
+                .await,
+                423
+            );
+            assert_eq!(
+                request(
+                    Method::POST,
+                    "/api/workspace/format",
+                    "workspace_id=ws&format_version=3",
+                    vec![],
+                    token
+                )
+                .await,
+                423
+            );
+        }
+        assert_eq!(
+            request(
+                Method::POST,
+                "/api/upload",
+                &upload_query,
+                b"v3 root".to_vec(),
+                Some(owner.as_str())
+            )
+            .await,
+            200
+        );
+        assert_eq!(
+            request(
+                Method::POST,
+                "/api/workspace/format",
+                "workspace_id=ws&format_version=3",
+                vec![],
+                Some(owner.as_str())
+            )
+            .await,
+            200
+        );
+        assert_eq!(
+            request(
+                Method::POST,
+                "/api/upload",
+                &upload_query,
+                b"v3 root".to_vec(),
+                None
+            )
+            .await,
+            200
+        );
+    }
+}
+
+#[tokio::test]
 async fn parity_migration_different_token_is_locked() {
     let h = Harness::new(None).await;
     let token = mk_hash(b"fence-tok");

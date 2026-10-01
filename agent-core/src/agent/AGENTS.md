@@ -31,6 +31,11 @@ Own agent workspace diffing, spawning, landing, refreshing, unattended runner li
 - Agent scan/materialization cache lives at `agents/<name>/state/runtime`; an agent worktree is never registered as another top-level workspace. First open copies only identity-verified legacy `local_state.json` under source/destination locks and preserves the legacy directory. `spawn --replace` rotates any existing named agent root, even when its worktree is missing, through the rollback guard so failure restores worktree/base/runtime together and success starts with a fresh runtime cache. A failed rollback reports and preserves the original backup; backup deletion begins only after the new worktree and base ref are published. `clean_agent` removes the owned worktree, base ref, and runtime state together.
 - Folder changes after land gating must divert rather than overwrite.
 - Conflict content is surfaced, never auto-merged into working files.
+- After a conflict land, the agent base records its exact published local
+  legs. Safe refresh refuses an unresolved shared tree, then accepts an
+  explicitly resolved version only where the agent has not edited those
+  legs again. Continuous probes include shared-tree conflicts so restart
+  cannot bypass that pause.
 
 ## Work Guidance
 

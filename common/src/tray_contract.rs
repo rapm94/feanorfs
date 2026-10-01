@@ -21,6 +21,64 @@ pub struct TrayStatusResult {
     pub pending_conflict_count: u32,
     pub pending_conflicts: Vec<TrayConflictEntry>,
     pub agents: TrayAgentsSummary,
+    /// Last worker observation, not a receipt from every other computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuous: Option<ContinuousHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ResolutionHealth>,
+}
+
+impl TrayStatusResult {
+    /// Fixed-size presentation shared by the CLI and native tray. Counts are
+    /// explicitly historical: a worker snapshot cannot prove current liveness.
+    pub fn activity_lines(&self) -> Vec<String> {
+        activity_lines(self.continuous, self.resolution)
+    }
+}
+
+/// Shared human presentation for observed agent and resolution health.
+pub fn activity_lines(
+    continuous: Option<ContinuousHealth>,
+    resolution: Option<ResolutionHealth>,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(2);
+    if let Some(health) = continuous {
+        lines.push(format!(
+            "Agents last reported: {} running · {} need attention · {} offline",
+            health.agents_live, health.agents_attention, health.agents_offline
+        ));
+    }
+    if let Some(health) = resolution {
+        if health.requires_human > 0 {
+            lines.push(format!(
+                "Resolutions last reported: {} need your answer",
+                health.requires_human
+            ));
+        } else if health.submitted > 0 {
+            lines.push(format!(
+                "Resolutions last reported: {} results awaiting application",
+                health.submitted
+            ));
+        }
+    }
+    lines
+}
+
+/// Read-only next steps for terminal and MCP consumers of cached activity.
+pub fn activity_commands(
+    continuous: Option<ContinuousHealth>,
+    resolution: Option<ResolutionHealth>,
+) -> Vec<&'static str> {
+    let mut commands = Vec::with_capacity(2);
+    if continuous.is_some_and(|health| health.agents_attention > 0 || health.agents_offline > 0) {
+        commands.push("feanorfs agent status");
+    }
+    if resolution.is_some_and(|health| health.requires_human > 0 || health.submitted > 0) {
+        commands.push("feanorfs agent resolution review");
+    }
+    commands
 }
 
 /// One bounded desktop refresh: status plus the global folder registry.
@@ -75,7 +133,7 @@ pub struct WorkerStatusSnapshot {
 
 /// Bounded, secret-free resolution counts/status projection for the tray:
 /// constant-cost job counts by lifecycle state, never paths or bodies.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ResolutionHealth {
     /// Active jobs (prepared, no submitted result).
     pub active: u32,
@@ -90,7 +148,7 @@ pub struct ResolutionHealth {
 }
 
 /// Fixed, secret-free live-reconciliation health for the tray and `doctor`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ContinuousHealth {
     pub agents_live: u32,
     pub agents_attention: u32,
@@ -262,6 +320,9 @@ pub mod fixtures {
 
     pub fn tray_status_result() -> TrayStatusResult {
         TrayStatusResult {
+            reported_at_ms: None,
+            continuous: None,
+            resolution: None,
             mirror_state: "idle".into(),
             paused: false,
             watching: true,

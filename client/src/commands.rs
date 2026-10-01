@@ -28,7 +28,7 @@ impl MirrorState {
     #[must_use]
     pub const fn human_label(self) -> &'static str {
         match self {
-            Self::Idle => "up to date",
+            Self::Idle => "up to date with hub",
             Self::OutOfSync => "has changes",
             Self::Offline => "offline",
             Self::Conflict => "needs attention",
@@ -139,6 +139,13 @@ pub struct CatResult {
 #[derive(Debug, Serialize)]
 pub struct StatusResult {
     pub mirror_state: MirrorState,
+    /// Cached activity observation time; separate from the fresh file comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuous: Option<feanorfs_common::ContinuousHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<feanorfs_common::ResolutionHealth>,
     pub upload_required: Vec<String>,
     pub download_required: Vec<FileState>,
     pub delete_local: Vec<String>,
@@ -441,6 +448,7 @@ pub async fn do_status(
 }
 
 async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
+    let activity = crate::tray::load_worker_status(ctx.base);
     let local_files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     let skipped_symlinks = crate::local::collect_symlink_warnings(ctx.base);
     let pending = conflicts::pending_conflict_paths(ctx.db).await?;
@@ -457,6 +465,9 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
                 })
                 .count() as u32;
             Ok(StatusResult {
+                reported_at_ms: activity.as_ref().map(|s| s.published_at_ms),
+                continuous: activity.as_ref().and_then(|s| s.continuous),
+                resolution: activity.as_ref().and_then(|s| s.resolution),
                 mirror_state: derive_mirror_state(None, Some(&pending)),
                 upload_required: Vec::new(),
                 download_required: Vec::new(),
@@ -474,6 +485,9 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
                 .into_values()
                 .collect();
             Ok(StatusResult {
+                reported_at_ms: activity.as_ref().map(|s| s.published_at_ms),
+                continuous: activity.as_ref().and_then(|s| s.continuous),
+                resolution: activity.as_ref().and_then(|s| s.resolution),
                 mirror_state: derive_mirror_state(Some(&response), Some(&blocked)),
                 upload_required: response.upload_required,
                 download_required: response.download_required,

@@ -144,6 +144,15 @@ async fn run_status(current_dir: &Path, json: bool) -> anyhow::Result<()> {
     if !result.skipped_symlinks.is_empty() {
         println!("  {}", skipped_symlink_summary(&result.skipped_symlinks));
     }
+    for line in feanorfs_common::tray_contract::activity_lines(result.continuous, result.resolution)
+    {
+        println!("{line}");
+    }
+    for command in
+        feanorfs_common::tray_contract::activity_commands(result.continuous, result.resolution)
+    {
+        println!("Next: {command}");
+    }
     Ok(())
 }
 

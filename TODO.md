@@ -50,6 +50,108 @@ either safely.
 
 ## AI tasks
 
+### AI-10. Finish confirmed review fixes and acceptance
+
+Preserve pre-existing working-tree changes. Order: data preservation/locking,
+rekey, lifecycle/transport, then contracts/release tooling. Revalidate findings
+before editing; false positives and compatibility constraints need evidence.
+
+- [ ] Finish Unix materialization backup-retry/durability fixes and broader
+  recovery coverage. Inode-mismatch deletion fallback removed: two regressions
+  failed before the fix; all three focused recovery tests passed afterward.
+  Independent static review approved that change. Broader verification pending.
+- [ ] Complete locking/registry/access-log, server GC/waiter/durability, and
+  lifecycle batches; collect independent review and exact test results.
+- [ ] Finish compatibility acceptance for source-bound rekey publication.
+  Independent static review approved the publication lifecycle. Local-drift
+  test review was cancelled. The proposed local-overwrite finding was not
+  reproduced in the narrow legacy/v3 crash-resume case tested only after
+  uncertain CAS: local edits survive the next sync with a pending conflict,
+  and the peer retains committed candidate bytes. This is not broad local-drift
+  safety evidence; no auto-merge is expected.
+  Publication now journals the captured source and prepared
+  candidate before CAS; retry reuses both IDs. Stale-source and exact-candidate
+  snapshot regressions pass, as does legacy/v3 crash-after-CAS recovery with
+  unchanged head and successful fresh-client decryption. All 41 negotiation
+  tests pass. Older pre-publication journals missing source binding fail closed
+  and retain keys for manual recovery; do not claim automatic compatibility.
+  V3 fencing now persists on both hubs;
+  explicit status assertions verify competing tokens and unfenced publication
+  are rejected. All 14 parity tests and 87 server tests passed. Stamped resume
+  no longer reacquires a released fence; legacy/v3 crash-before-config tests
+  pass, and independent static review approved the scoped fence/resume fix.
+  Journal-preservation regression reproduced then passed: plain migration
+  preserves unfinished v3 rekey state; stamped/config-matching finalization is
+  cleanup-only. All five migration integration tests passed locally.
+- [ ] Complete contract/reducer review and compatibility handling. Two reducer
+  test compile errors repaired and independently reviewed. Resolution producer
+  now hashes the 32-hex job ID before recording verification input digests;
+  all 35 resolution tests pass. Older persisted evidence containing raw job
+  IDs still requires explicit compatibility handling before release.
+- [ ] Complete transport/embedded-hub fixes after interrupted agent execution.
+- [ ] Finish independent review and native Windows cleanup/verification for
+  bounded tray capture; separate interactive join pipes remain unfixed.
+  `CapturedCommand` now polls both streams without reader threads and bounds
+  post-exit draining; Unix retains process-group termination, while Windows
+  stops only the direct child. Main session reported successful
+  `cargo check -p feanorfs-tray --locked --offline` and
+  `cargo test -p feanorfs-tray --locked --offline`: 67/67 tests passed,
+  including inherited-pipe timeout, cancellation, and over-limit coverage.
+  Exact inherited-pipe regression passes in 0.17 s; an isolated reproduction
+  of the old join ordering fails after 4.02 s (not a full old-revision run).
+  Tray/common Clippy pass with warnings denied; all 181 common tests pass.
+  The two equivalent common size-guard rewrites received independent approval.
+  No native Windows runtime verification is claimed.
+- [ ] Revalidate/fix staged desktop release evidence ordering, Windows checkout,
+  unsigned release provenance/overwrite policy, and installer PATH removal.
+  Zig example finding is resolved: sentinel-terminated fopen path; checked
+  fputs/fclose before land. Independent review approved; Zig 0.16 build and
+  isolated local-hub run verified exact task.txt bytes and zig1 cleanup.
+- [ ] Run final formatting, Clippy, cross-crate tests, independent review, and
+  DOX pass. Latest agent-core unit run: 432 passed, 0 failed, 5 ignored;
+  migration integration subset: 5 passed. Mesh compiler warnings remain.
+  Server follow-up review still identifies GC cancellation ownership,
+  metadata-bearing GC logs, and timing-dependent waiter tests; its repair
+  agent was cancelled. Cross-crate and platform acceptance remain pending.
+  Do not treat these focused green runs as final acceptance.
+
+Done when every confirmed finding has executable acceptance evidence or an
+explicit compatibility/platform blocker. Native Windows, Wayland, signing,
+and cross-NAT field claims require their actual environments. Remove this
+entry when its implementation and verification work is complete.
+
+### AI-9. Complete the shared-workspace daily workflow
+
+- [x] Expose the same bounded activity observations and concrete next actions
+  through ordinary CLI status, MCP, and tray, with unknown/stale states explicit.
+- [x] Complete the agent handoff: exact tested snapshot, changed paths, reported
+  verification, and result delivery to the requester while continuous work remains enabled.
+- [x] Complete the conflict round trip through existing resolution jobs: human
+  answer or configured resolver, guarded publication, and notification to both
+  participants without manual watcher shutdown.
+  Native answers must retain the assignment/fingerprint/question generation
+  shown before the dialog; do not rebind an old answer to a newer question
+  when submitting. Reuse engine validation of `HumanResolutionAnswer`.
+  Local review, guarded application, atomic completion notices, and continued
+  live work have executable coverage. Assignment/result signaling followed by
+  guarded apply passes across local clients. Durable human-answer retries pass
+  after an injected outage and from a fresh CLI process; the peer observes the
+  same answer. A local answer is not a peer acknowledgement.
+- [x] Execute the documented Git publication guard and preserve independent
+  worktree indexes, untracked files, staging, and divergent local history.
+- [x] Exercise two clients and two active agents through independent edits,
+  conflict, disconnection, restart, resolution and continued work; verify file
+  hashes and preserved versions, with convergence timing and manual interventions.
+  The loopback source-binary journey now covers an injected outage, conflict,
+  explicit resolution, continued work, controlled restart, and requester
+  receipt with full worktree equality. Real multi-device testing is deferred
+  by the user (2026-09-12) and does not block this implementation; the field
+  acceptance rows in AI-1/AI-6/AI-7 remain unverified. Native-dialog interaction
+  remains open. See `docs/acceptance-evidence.md`.
+
+Done when each surface and the local complete journey have executable evidence;
+deferred field testing must remain explicitly unverified.
+
 ### AI-1. Complete released-product installation acceptance
 
 - [ ] Install the exact published products on macOS, CachyOS, and Windows.

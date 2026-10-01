@@ -1487,8 +1487,20 @@ async fn visible_runner_repeated_setup_without_supervisor_authority_succeeds() {
     setup_args.extend(fixture.fixed_args.iter().map(String::as_str));
 
     assert_cli_success(&run_cli(fixture.root(), &setup_args).await);
+    let separator = setup_args.iter().position(|arg| *arg == "--").unwrap();
+    setup_args.splice(separator..separator, ["--scope-mode", "enforced"]);
     let output = run_cli(fixture.root(), &setup_args).await;
     assert_cli_success(&output);
+    assert_eq!(
+        fixture.store().config().unwrap().scope_mode,
+        RunnerScopeMode::Enforced
+    );
+    setup_args[separator + 1] = "advisory";
+    assert_cli_success(&run_cli(fixture.root(), &setup_args).await);
+    assert_eq!(
+        fixture.store().config().unwrap().scope_mode,
+        RunnerScopeMode::Advisory
+    );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["action"], "setup");
     assert_eq!(value["runner"]["agent"], AGENT);

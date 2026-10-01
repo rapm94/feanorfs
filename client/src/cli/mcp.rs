@@ -1161,6 +1161,10 @@ async fn build_mcp_human_answer(
 fn compact_sync_status(status: StatusResult) -> Value {
     json!({
         "mirror_state": status.mirror_state,
+        "reported_at_ms": status.reported_at_ms,
+        "continuous": status.continuous,
+        "resolution": status.resolution,
+        "next_actions": feanorfs_common::tray_contract::activity_commands(status.continuous, status.resolution),
         "local_file_count": status.local_files.len(),
         "upload_required": status.upload_required,
         "download_required": status
@@ -1201,6 +1205,13 @@ mod tests {
             },
         )]);
         let status = StatusResult {
+            reported_at_ms: Some(42),
+            continuous: Some(feanorfs_common::ContinuousHealth {
+                agents_live: 2,
+                agents_attention: 1,
+                agents_offline: 0,
+            }),
+            resolution: None,
             mirror_state: MirrorState::OutOfSync,
             upload_required: vec!["src/main.rs".to_string()],
             download_required: vec![FileState {
@@ -1221,6 +1232,11 @@ mod tests {
 
         let value = compact_sync_status(status);
         assert_eq!(value["mirror_state"], "out_of_sync");
+        assert_eq!(value["reported_at_ms"], 42);
+        assert_eq!(value["continuous"]["agents_attention"], 1);
+        assert_eq!(value["next_actions"], json!(["feanorfs agent status"]));
+        assert!(value["resolution"].is_null());
+        assert!(feanorfs_common::tray_contract::activity_commands(None, None).is_empty());
         assert_eq!(value["local_file_count"], 1);
         assert_eq!(value["upload_required"], json!(["src/main.rs"]));
         assert_eq!(value["download_required"], json!(["README.md"]));

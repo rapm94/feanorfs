@@ -115,6 +115,25 @@ async fn decay_access_log_rejects_non_finite_factor() {
 }
 
 #[tokio::test]
+async fn decay_overflow_preserves_readable_state_and_all_weights() {
+    let (dir, db) = new_db().await;
+    db.record_access_pair("a", "small", 1.0).await.unwrap();
+    db.record_access_pair("b", "large", 10.0).await.unwrap();
+    let path = dir.path().join("local_state.json");
+    let before = std::fs::read(&path).unwrap();
+    for factor in [1e308, -1e308] {
+        let error = db.decay_access_log(factor).await.unwrap_err();
+        assert!(error.to_string().contains("overflow"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(db.get_predictive_siblings("a", 1).await.unwrap(), vec![("small".into(), 1.0)]);
+        assert_eq!(db.get_predictive_siblings("b", 1).await.unwrap(), vec![("large".into(), 10.0)]);
+    }
+    drop(db);
+    let reopened = super::ClientDb::new(dir.path()).await.unwrap();
+    reopened.decay_access_log(0.5).await.unwrap();
+}
+
+#[tokio::test]
 async fn record_access_pair_rejects_weight_overflow() {
     let (_dir, db) = new_db().await;
     db.record_access_pair("a", "b", f64::MAX / 2.0)

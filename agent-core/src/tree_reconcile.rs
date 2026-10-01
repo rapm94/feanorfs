@@ -75,10 +75,12 @@ fn reconcile_changes(
 ) -> Reconciliation {
     let local_changed: HashSet<_> = local_changes
         .iter()
+        .filter(|change| file_content_changed(change))
         .map(|change| change.path.as_str())
         .collect();
     let remote_changed: HashSet<_> = remote_changes
         .iter()
+        .filter(|change| file_content_changed(change))
         .map(|change| change.path.as_str())
         .collect();
     let mut base = HashMap::new();
@@ -98,6 +100,18 @@ fn reconcile_changes(
         }
     }
     reconcile_sets(base, &local_changed, &remote_changed, local, remote)
+}
+
+// File views flatten a conflict entry into its visible leg. Removing the
+// conflict metadata is not a local byte edit. Treating it as one suppresses
+// the resolved download and lets the stale local leg be published again.
+fn file_content_changed(change: &TreeChange) -> bool {
+    match (&change.before, &change.after) {
+        (Some(before), Some(after)) if !before.is_dir() && !after.is_dir() => {
+            before.hash != after.hash || before.mode != after.mode
+        }
+        _ => true,
+    }
 }
 
 fn reconcile_sets(
@@ -141,5 +155,66 @@ fn same_content(left: Option<&FileState>, right: Option<&FileState>) -> bool {
         (Some(left), Some(right)) => left.hash == right.hash && left.mode == right.mode,
         (None, None) => true,
         (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feanorfs_common::{ConflictModes, TreeChangeKind, TreeEntry, TreeEntryKind};
+
+    #[test]
+    fn resolved_conflict_downloads_without_treating_flattening_as_a_local_edit() {
+        let before = TreeEntry {
+            name: "file.txt".into(),
+            kind: TreeEntryKind::Conflict {
+                base: Some("c".repeat(64)),
+                ours: Some("b".repeat(64)),
+                theirs: Some("a".repeat(64)),
+                modes: ConflictModes::default(),
+            },
+            hash: "a".repeat(64),
+            size: 9,
+            mode: 0,
+        };
+        let mut local_entry = before.clone();
+        local_entry.kind = TreeEntryKind::File;
+        let mut remote_entry = local_entry.clone();
+        remote_entry.hash = "d".repeat(64);
+        let state = |entry: &TreeEntry| FileState {
+            path: entry.name.clone(),
+            hash: entry.hash.clone(),
+            size: entry.size,
+            mtime: 0,
+            deleted: false,
+            mode: entry.mode,
+        };
+        let change = |entry: &TreeEntry| TreeChange {
+            path: entry.name.clone(),
+            kind: TreeChangeKind::Modified,
+            before: Some(before.clone()),
+            after: Some(entry.clone()),
+        };
+        let remote = HashMap::from([("file.txt".into(), state(&remote_entry))]);
+        let response = reconcile_changes(
+            &[change(&local_entry)],
+            &[change(&remote_entry)],
+            &HashMap::from([("file.txt".into(), state(&local_entry))]),
+            &remote,
+        )
+        .response;
+        assert_eq!(response.download_required, vec![state(&remote_entry)]);
+        assert!(response.upload_required.is_empty());
+        // A real newer edit, including executable intent, stays protected.
+        local_entry.mode = 0o111;
+        let response = reconcile_changes(
+            &[change(&local_entry)],
+            &[change(&remote_entry)],
+            &HashMap::from([("file.txt".into(), state(&local_entry))]),
+            &remote,
+        )
+        .response;
+        assert!(response.download_required.is_empty());
+        assert!(response.upload_required.is_empty());
     }
 }

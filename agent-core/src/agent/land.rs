@@ -229,6 +229,19 @@ pub(super) async fn land_agent_with_ctx(
                     base_state.files.insert(change.path.clone(), change.clone());
                 }
             }
+            // The local conflict leg was published too. Remember exactly
+            // those bytes so a later explicit resolution is an inbound
+            // change, while edits made after this land remain local edits.
+            for (conflict, _) in &diff.conflicts {
+                match conflict.ours.as_ref().filter(|file| !file.deleted) {
+                    Some(file) => {
+                        base_state.files.insert(conflict.path.clone(), file.clone());
+                    }
+                    None => {
+                        base_state.files.remove(&conflict.path);
+                    }
+                }
+            }
             snapshots
                 .write_local(crate::snapshot::SnapshotInput {
                     files: &base_state.files,

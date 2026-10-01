@@ -33,3 +33,29 @@ procedure in the required environment.
 
 Prerequisite for all AI-6/AI-2 field rows: AI-1 installed-product acceptance
 (founder-dependent).
+
+## AI-9 — local daily-workflow evidence (2026-09-12)
+
+`scripts/acceptance-matrix.sh` now fails when a local check fails and retains
+explicit skips for installed-product and real-network work.
+
+| Local check | Evidence | Command |
+|---|---|---|
+| Shared status | Cached activity/time survive CLI/tray adapters; missing observations stay unknown; MCP offers read-only next steps | `cargo test -p feanorfs-client --test tray_status_engine --locked` |
+| Human resolution review | Reviewed question generation is retained; stale answers refuse before staging; candidate verification runs in the engine; preserved versions refuse edits/symlinks; published notice is readable by both participants | `cargo test -p feanorfs-client --test resolution_parity --test resolution_protocol --locked` |
+| Saved human answers | Injected outage leaves the exact accepted answer durable; a fresh CLI process retries it; wrong generations refuse; confirmed receipt avoids another send; the other client's reducer observes the same answer | `cargo test -p feanorfs-client --test resolution_protocol saved_human_answer_survives_outage_and_retries_without_rebinding --locked` |
+| Git publication | Actual documented guard preserves staged/WIP/divergent state; valid advancement preserves untracked files; worktree indexes remain independent | `sh scripts/test-git-workflow.sh` |
+| Two active agents | Two real CLI owners against a loopback hub: injected HTTP outage, preserved offline edits, conflict, explicit resolution without watcher shutdown, continued edits, controlled restart, snapshot-bound result received by requester, complete worktree byte equality | `cargo test -p feanorfs-client --test continuous_agents two_active_agents_resume_after_resolution_and_continue_work --locked -- --nocapture` |
+
+The journey emits resolution-to-continued-work timing and intervention counts.
+Its result body carries changed paths, reported verification, and a worktree
+digest. The regression also exposed and fixes canonical-path event filtering
+on macOS, a permanent conflict pause, and a conflict-metadata transition that
+could republish the old visible leg over a resolution. A separate engine check
+proves edits made after the captured conflict are not overwritten.
+
+This is source-binary loopback evidence. It does not establish LAN p95,
+installed service recovery, abrupt power-loss behavior, mixed released
+versions, native dialog interaction, or Windows/Linux product acceptance.
+Those field rows remain open. The user deferred real multi-device testing
+on 2026-09-12; it does not block completion of this implementation.
