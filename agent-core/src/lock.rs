@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -65,16 +65,6 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-fn read_lock_meta(path: &Path) -> Option<(u32, u64)> {
-    let file = File::open(path).ok()?;
-    let mut buf = String::new();
-    file.take(128).read_to_string(&mut buf).ok()?;
-    let mut lines = buf.lines();
-    let pid: u32 = lines.next()?.parse().ok()?;
-    let ts: u64 = lines.next()?.parse().ok()?;
-    Some((pid, ts))
-}
-
 /// Ownership is the kernel lock, never the diagnostic PID or wall-clock age.
 /// Errors other than absence fail closed. This probe never unlinks a file:
 /// even an unlocked inode may already be open in another contender.
@@ -93,12 +83,24 @@ pub fn is_stale(path: &Path, _max_age_secs: u64) -> bool {
 /// maintain a workspace path.
 pub fn is_sync_lock_active_at_state(state: &Path) -> bool {
     let path = state.join("sync.lock");
-    if !path.exists() || is_stale(&path, STALE_SYNC_SECS) {
-        return false;
-    }
-    // The kernel lock is held; its diagnostic PID only excludes this process.
-    // Windows locks are mandatory, so other handles cannot read the PID at all.
-    read_lock_meta(&path).is_none_or(|(pid, _)| pid != std::process::id())
+    path.exists()
+        && !held_sync_locks().contains(&lock_identity(&path))
+        && !is_stale(&path, STALE_SYNC_SECS)
+}
+
+/// Sync locks this process holds. Windows locks are mandatory, so a probe
+/// cannot read the holder's diagnostic PID through a second handle; whether
+/// this process is the holder is recorded here instead.
+static SYNC_LOCKS_HELD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn held_sync_locks() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    SYNC_LOCKS_HELD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn is_sync_lock_active(base: &Path) -> bool {
@@ -158,14 +160,28 @@ pub(crate) fn try_acquire_lock_file(path: &Path, label: &str) -> Result<File> {
 /// The kernel releases ownership on guard drop or process exit, without unlink.
 pub struct SyncLock {
     _file: File,
+    path: PathBuf,
 }
 
 impl SyncLock {
     pub fn acquire(base: &Path) -> Result<Self> {
         let path = lock_path(base, "sync.lock")?;
-        Ok(Self {
-            _file: try_acquire_lock_file(&path, "sync")?,
-        })
+        Ok(Self::hold(try_acquire_lock_file(&path, "sync")?, &path))
+    }
+
+    fn hold(file: File, path: &Path) -> Self {
+        let path = lock_identity(path);
+        held_sync_locks().push(path.clone());
+        Self { _file: file, path }
+    }
+}
+
+impl Drop for SyncLock {
+    fn drop(&mut self) {
+        let mut held = held_sync_locks();
+        if let Some(index) = held.iter().position(|path| *path == self.path) {
+            held.swap_remove(index);
+        }
     }
 }
 
@@ -298,15 +314,14 @@ mod tests {
         let path = state.path().join("sync.lock");
         fs::write(&path, format!("{}\n0\n", i32::MAX)).unwrap();
         assert!(!is_sync_lock_active_at_state(state.path()));
-        let mut held = try_acquire_lock_file(&path, "test").unwrap();
-        // Only Unix can read this process's own PID through another handle.
-        assert_eq!(is_sync_lock_active_at_state(state.path()), cfg!(windows));
-        // Diagnostic foreign PID retains the existing "other process" UI rule.
-        held.set_len(0).unwrap();
-        std::io::Seek::rewind(&mut held).unwrap();
-        write!(held, "{}\n0\n", i32::MAX).unwrap();
+        // A holder outside this process's sync locks is active whatever PID
+        // its diagnostics name (Windows cannot even read them).
+        let foreign = try_acquire_lock_file(&path, "test").unwrap();
         assert!(is_sync_lock_active_at_state(state.path()));
-        drop(held);
+        drop(foreign);
+        let own = SyncLock::hold(try_acquire_lock_file(&path, "test").unwrap(), &path);
+        assert!(!is_sync_lock_active_at_state(state.path()));
+        drop(own);
         assert!(!is_sync_lock_active_at_state(state.path()));
     }
 }
