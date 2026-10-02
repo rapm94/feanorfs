@@ -60,6 +60,8 @@ impl HeadWaiters {
             Ok(permit) => permit,
             Err(_) => return None,
         };
+        // `try_update` (the rename) is newer than the 1.88 MSRV.
+        #[allow(deprecated)]
         let waiter_id = NEXT_WAITER_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .ok()?;

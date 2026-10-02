@@ -135,6 +135,8 @@ fn relay_cost(message: &Message, policy: &ForwardPolicy) -> Option<MessageCost> 
 }
 
 /// Reserve a message's cost against the configured budgets.
+// `try_update` (the rename) is newer than the 1.88 MSRV.
+#[allow(deprecated)]
 fn claim(frames: &AtomicU64, bytes: &AtomicU64, cost: MessageCost, policy: &ForwardPolicy) -> bool {
     if let Some(limit) = policy.max_frames {
         let ok = frames
