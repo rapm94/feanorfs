@@ -86,13 +86,11 @@ rekey, lifecycle/transport, then contracts/release tooling. Revalidate findings
 before editing; false positives and compatibility constraints need evidence.
 
 - [ ] Finish Unix materialization backup-retry/durability fixes and broader
-  recovery coverage. `client/tests/fault_recovery.rs`
-  `interrupted_activation_journal_restores_backups_before_next_sync` fails on
-  this batch (reproduced at commit `b4fb969`, before later work): "local path
-  recover.txt no longer matches its retained publication; refusing automatic
-  recovery". Inode-mismatch deletion fallback removed: two regressions
+  recovery coverage. Inode-mismatch deletion fallback removed: two regressions
   failed before the fix; all three focused recovery tests passed afterward.
-  Independent static review approved that change. Broader verification pending.
+  Independent static review approved that change. `client/tests/fault_recovery.rs`
+  (11 tests) passes on macOS once its Unix case links `stage/new` like real
+  publication does. Broader verification pending.
 - [ ] Complete locking/registry/access-log, server GC/waiter/durability, and
   lifecycle batches; collect independent review and exact test results.
   First PR CI found two lock bugs, both fixed with tests: the sync-lock probe

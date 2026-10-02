@@ -936,20 +936,17 @@ async fn interrupted_activation_journal_restores_backups_before_next_sync() {
     .await
     .unwrap();
     write_workspace_file(client.workspace.path(), "recover.txt", b"interrupted-new").await;
-    #[cfg(windows)]
-    {
-        // Preserve the real interrupted topology: recovery only trusts this
-        // publication when stage/new and the destination are the same file
-        // identity.  The old-journal compatibility case omits only the
-        // created_directories field.
-        tokio::fs::create_dir_all(stage.join("new")).await.unwrap();
-        tokio::fs::hard_link(
-            client.workspace.path().join("recover.txt"),
-            stage.join("new/recover.txt"),
-        )
-        .await
-        .unwrap();
-    }
+    // Preserve the real interrupted topology: publication links stage/new into
+    // the worktree, and recovery only trusts a destination with that same file
+    // identity. The old-journal compatibility case omits only the
+    // created_directories field.
+    tokio::fs::create_dir_all(stage.join("new")).await.unwrap();
+    tokio::fs::hard_link(
+        client.workspace.path().join("recover.txt"),
+        stage.join("new/recover.txt"),
+    )
+    .await
+    .unwrap();
     let ciphertext =
         feanorfs_common::pack_bytes(b"interrupted-new", TEST_PASSWORD, "recover.txt").unwrap();
     let journal = serde_json::json!({
