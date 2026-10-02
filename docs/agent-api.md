@@ -686,11 +686,13 @@ per task; these commands take two, and the hooks take none.
   until the proposal is accepted, then until a live agent's worktree reflects
   the current head. Exit 0 for `covered`/`accepted`, 3 for `pending` (with
   the scopes it waits on), 1 for `rejected`.
-- `agent done` waits until the agent's edits have landed (live controller
-  idle, no unlanded changes), then settles every task it holds with that
-  snapshot and completes it. Verification defaults to `skipped`: nothing is
-  claimed that was not reported. As a `Stop` hook (`--hook`), a failure
-  blocks stopping once so the agent can fix it, and never loops.
+- `agent done` waits until the agent's edits have landed (controller idle
+  or stopped after its final flush, no unlanded changes), then settles every
+  task it holds with that snapshot and completes it. Verification defaults to
+  `skipped`: nothing is claimed that was not reported. As a `Stop` hook
+  (`--hook`), a failure blocks stopping once so the agent can fix it, and
+  never loops. `agent run` does the same after its command exits 0 with every
+  edit settled; on failure the claim stays open for an explicit `agent done`.
 - `agent coordinate` decides for an identity (default `human`): it accepts
   proposals addressed to it whose scope overlaps no other agent's live scope
   and leaves overlapping ones waiting until that scope finishes. It never

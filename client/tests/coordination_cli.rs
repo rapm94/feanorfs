@@ -592,3 +592,48 @@ async fn claim_coordinate_and_done_replace_the_manual_protocol() {
         .filter(|item| item.id.ends_with(":ci"))
         .all(|item| item.stage == LifecycleStage::Done));
 }
+
+#[tokio::test]
+async fn agent_run_finishes_claimed_work_when_its_command_exits_cleanly() {
+    let fx = fixture("coordination-run-finish").await;
+    let spawned = fx.cli(&["agent", "spawn", "runner"]);
+    assert!(
+        spawned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&spawned.stderr)
+    );
+    let claimed = fx.cli(&[
+        "agent",
+        "claim",
+        "src/run.txt",
+        "--for",
+        "runner",
+        "--timeout",
+        "1",
+    ]);
+    assert_eq!(claimed.status.code(), Some(3));
+    let pass: feanorfs_common::CoordinatePass = fx.json(&["--json", "agent", "coordinate"]);
+    assert_eq!(pass.accepted.len(), 1);
+    let agent_dir = feanorfs_agent_core::agent_dir(&fx.workspace, "runner").unwrap();
+    std::fs::create_dir_all(agent_dir.join("src")).unwrap();
+    std::fs::write(agent_dir.join("src/run.txt"), b"edited").unwrap();
+
+    // No `agent done`: a clean, settled exit finishes the claim.
+    let run = fx.cli(&[
+        "agent",
+        "run",
+        "runner",
+        "--",
+        env!("CARGO_BIN_EXE_feanorfs"),
+        "--version",
+    ]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("Completed 1 claimed task(s)"), "{stderr}");
+    assert!(fx
+        .next("runner")
+        .items
+        .iter()
+        .filter(|item| item.id.ends_with(":runner"))
+        .all(|item| item.stage == LifecycleStage::Done));
+}

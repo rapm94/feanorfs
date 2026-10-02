@@ -479,6 +479,13 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             } else {
                 eprintln!("{}", render_live_outcome(&name, &outcome));
             }
+            if outcome.child_exit == Some(0)
+                && outcome.settled
+                && !outcome.offline
+                && outcome.attention.is_none()
+            {
+                super::coordination::finish_quietly(current_dir, &name).await;
+            }
             if let Some(code) = outcome.child_exit {
                 if code != 0 {
                     std::process::exit(code);

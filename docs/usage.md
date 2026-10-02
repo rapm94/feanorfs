@@ -842,7 +842,7 @@ feanorfs agent guard <PATH>... [--for <NAME>] [--require-scope] [--hook]
 | `refresh` | Pull cloud changes the agent hasn't touched. `--replace` discards agent-local edits after preserving them as a parent snapshot. |
 | `land` | Apply clean work, upload, register conflicts |
 | `clean` | Remove agent dir and snapshot rows |
-| `run` | Run a command in the agent dir with continuous reconciliation for the command's lifetime — not a sandbox. Sets `FEANORFS_AGENT`, `FEANORFS_AGENT_DIR`, and the absolute shared control root in `FEANORFS_WORKSPACE_ROOT`. |
+| `run` | Run a command in the agent dir with continuous reconciliation for the command's lifetime — not a sandbox. Sets `FEANORFS_AGENT`, `FEANORFS_AGENT_DIR`, and the absolute shared control root in `FEANORFS_WORKSPACE_ROOT`. When the command exits 0 with every edit settled, it finishes the agent's claimed work as `agent done` would (verification `skipped`). |
 | `send` | Publish one encrypted signal tied to a snapshot; sender defaults to `FEANORFS_AGENT`, then `human` |
 | `inbox` | Read signals addressed to you (or `*` broadcasts); pass `--after` the previous cursor for new-signal deltas; a reset cursor means older signals may have been missed |
 | `next` | One lifecycle over work intent, integrator offers, conflicts, and resolution jobs, with the exact next command (and MCP call) for each actor. Start every agent turn here. |
@@ -869,7 +869,8 @@ guess when several do; `feanorfs agent integrator assign --require ios-build`
 Agents coordinate in two calls: `feanorfs agent claim <path>…` before
 editing (it waits until the paths are theirs) and `feanorfs agent done
 --verification passed --summary '<s>'` afterwards (it waits for the edits to
-land, then settles and completes). Run `feanorfs agent coordinate --watch` on
+land, then settles and completes). Under `feanorfs agent run`, a clean exit
+runs the second call for them; calling it reports verification. Run `feanorfs agent coordinate --watch` on
 one machine to accept non-overlapping scope automatically for `human`;
 overlapping claims wait their turn, and nothing is rejected without you.
 

@@ -315,12 +315,12 @@ async fn landed_snapshot(ctx: &SyncCtx<'_>, agent: &str, deadline: Instant) -> R
                 .await
                 .map(|check| !check.our_changes.is_empty())
                 .unwrap_or(true);
-                if let (false, ContinuousPhase::Idle, false, Some(snapshot)) = (
-                    unlanded,
-                    live.phase,
-                    live.pending_local,
-                    live.settled_snapshot,
-                ) {
+                // An idle controller, or one that stopped after its final flush.
+                let quiet = live.phase == ContinuousPhase::Idle
+                    || (!live.active && live.phase == ContinuousPhase::Stopping);
+                if let (false, true, false, Some(snapshot)) =
+                    (unlanded, quiet, live.pending_local, live.settled_snapshot)
+                {
                     return Ok(snapshot);
                 }
             }

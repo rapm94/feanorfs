@@ -73,9 +73,9 @@ Local evidence (real Claude Code eval, guard hook, local fuzzing) is in
 - [ ] Regenerate `bindings/ts/index.js` and `index.d.ts` with `npm run build`
   (extended by hand for `coordinationStatus`, `guard`, `integratorReply`,
   `capabilities`; the Node parity test passes and CI's `sdk` job rebuilds).
-- [ ] Bring harnesses without hooks closer to hook-mode cost: explicit
-  `agent claim`/`agent done` agents still cost about 1.8× the worktree
-  baseline (hooks: 1.06–1.14×); measure Codex and record it.
+- [ ] Measure Codex (no Claude Code hooks) on both scenarios and record it.
+  Claude Code without hooks now costs 1.09–1.17× the worktree baseline
+  (hooks: 1.06–1.14×) because `agent run` finishes claims on clean exit.
 
 Done when each item has recorded evidence.
 

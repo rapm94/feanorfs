@@ -35,8 +35,7 @@ POLL_SECONDS = 0.5
 PROMPT = """You are coding agent `{name}` on machine `{machine}` in a FeanorFS \
 workspace shared with other agents. Task: {task}
 Before editing a file, run `feanorfs agent claim <path>`; it waits until the \
-file is yours. When finished and verified, run `feanorfs agent done \
---verification passed --summary '<what you did>'`."""
+file is yours. Exiting when finished releases it."""
 
 PLAIN_PROMPT = """You are coding agent `{name}`. Task: {task}
 Edit the files in the current directory; do not commit."""

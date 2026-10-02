@@ -21,6 +21,8 @@ access control. FeanorFS never merges file content.
 3. **Finish in one call.** When your edits are done and verified, run
    `feanorfs agent done --verification passed --summary '<what you did>'`
    (use `failed` or `skipped` honestly). It waits for your edits to land.
+   Under `agent run`, exiting cleanly finishes for you (verification
+   `skipped`); call `done` yourself to report verification.
 4. **For anything else, ask.** `feanorfs agent next` (MCP: `status`) lists
    integrator offers, conflicts, resolution jobs, and decisions owed by each
    actor as ready `tool` + `args` calls; `--wait` blocks until something is
