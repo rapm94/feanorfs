@@ -501,6 +501,8 @@ impl ReadyChildReaper {
 }
 
 #[cfg(test)]
+// `try_update` (the rename) is newer than the 1.88 MSRV.
+#[allow(deprecated)]
 fn take_test_counter(counter: &AtomicUsize) -> bool {
     counter
         .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |count| {

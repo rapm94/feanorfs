@@ -115,8 +115,12 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly
+      # Build the tool with stable: its locked rustix enables nightly-only
+      # layout attributes that current nightly rejects.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.12.0 --locked
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-fuzz --version 0.12.0 --locked
       # Same properties as common/tests/parser_fuzz.rs (stable, every test
       # run): never panic, and every accepted input re-encodes exactly.
       - name: Fuzz for two minutes
