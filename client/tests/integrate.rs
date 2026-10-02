@@ -197,3 +197,64 @@ fn project_scope_creates_local_files() {
         .join("feanorfs-collaboration")
         .exists());
 }
+
+#[test]
+fn codex_auto_claim_hooks_install_and_uninstall_in_project_scope() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("proj");
+    std::fs::create_dir_all(project.join(".codex")).unwrap();
+    let hooks_path = project.join(".codex").join("hooks.json");
+    let read = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap()
+    };
+    let project_arg = project.to_str().unwrap();
+
+    let installed = run_cli(
+        &[
+            "integrate",
+            "install",
+            "--host",
+            "codex",
+            "--project",
+            project_arg,
+            "--auto-claim",
+        ],
+        &[],
+    );
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let hooks = read();
+    let guard = &hooks["hooks"]["PreToolUse"][0];
+    assert_eq!(guard["matcher"], "Edit|Write|MultiEdit|NotebookEdit");
+    assert!(guard["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .ends_with("agent guard --hook --claim"));
+    assert!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .ends_with("agent done --hook"));
+
+    let removed = run_cli(
+        &[
+            "integrate",
+            "uninstall",
+            "--host",
+            "codex",
+            "--project",
+            project_arg,
+        ],
+        &[],
+    );
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let hooks = read();
+    assert!(hooks["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
+    assert!(hooks["hooks"]["Stop"].as_array().unwrap().is_empty());
+}

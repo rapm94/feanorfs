@@ -67,10 +67,12 @@ Local evidence (real Claude Code eval, guard hook, local fuzzing) is in
 - [ ] Route a real request with `agent send cap:ios-build` from the Linux
   machine to the Mac and verify the Git baseline warning when the two clones
   sit on different commits.
-- [ ] Bring Codex closer to Claude Code's 1.09–1.17×: with the current skill
-  it used about 1.75× the worktree baseline's weighted tokens, because agents
-  read the skill and followed its `agent status`/`agent done` advice (17 vs
-  8–9 commands). Measure again after any skill change.
+- [ ] Measure Codex in hooks mode on the founder machine:
+  `feanorfs integrate --host codex --auto-claim`, trust the hooks once in
+  Codex, then run the eval without `--ignore-user-config` (an isolated run
+  cannot trust them without also running personal hooks). Without hooks,
+  Codex takes 14–15 commands vs 6–8 for worktrees (input tokens 1.9–2.4×;
+  the revised skill cut 17 commands and ~10% of input).
 
 Done when each item has recorded evidence.
 

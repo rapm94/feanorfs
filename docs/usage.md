@@ -879,7 +879,10 @@ Claude Code can run all of it for the agent:
 hook (`Edit|Write|MultiEdit|NotebookEdit`) and a Stop hook that finishes the
 work to `.claude/settings.json`, so agents spend no turns on coordination.
 `--guard-hook` installs only the deny-only guard. `feanorfs integrate
-uninstall --host claude` removes only FeanorFS's entries. Installed skills
+uninstall --host claude` removes only FeanorFS's entries. Codex reads the same
+hooks: `--host codex` writes them to `.codex/hooks.json` (Codex matches its
+`apply_patch` edits as `Edit`/`Write`), and Codex asks you to trust new hooks
+once. Installed skills
 are copies: after upgrading FeanorFS, `feanorfs integrate status` reports a
 host whose skill differs from the new binary's as partially configured, and
 `feanorfs integrate` refreshes it.

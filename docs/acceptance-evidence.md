@@ -136,7 +136,12 @@ byte-for-byte afterwards), correctness was the same and weighted tokens were
 1.74× (disjoint: 17 vs 8 commands, 55k / 334k / 1.4k vs 36k / 152k / 0.8k).
 Each extra command re-reads the whole cached context, so cost follows command
 count: agents read the skill, then followed its `agent status` and
-`agent done` advice on top of the one required `agent claim`.
+`agent done` advice on top of the one required `agent claim`. After the skill
+was revised to lead with claim → edit → exit (same procedure), runs took
+14–15 commands and about 10% less input (overlap 452k vs 507k total input
+tokens, disjoint 356k vs 390k; worktrees 188–189k); the remaining
+FeanorFS-specific commands were reading the skill, one claim, re-reading the
+claimed file, and an optional `agent done`.
 
 Coordination itself was one `agent claim` per agent (one agent re-ran it
 while waiting). The other extra commands came from the machine's global

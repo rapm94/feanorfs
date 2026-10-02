@@ -700,9 +700,12 @@ per task; these commands take two, and the hooks take none.
   workspace (`--watch` keeps it running).
 - `agent guard --hook --claim` claims unclaimed paths before allowing a
   write (waiting up to `--claim-timeout`, default 240 s). With
-  `feanorfs integrate --host claude --auto-claim`, Claude Code runs that
-  guard before every write and `agent done --hook` when it stops, so agents
-  spend no turns on coordination.
+  `feanorfs integrate --host claude --auto-claim` (or `--host codex`, which
+  writes `.codex/hooks.json`), the harness runs that guard before every write
+  and `agent done --hook` when it stops, so agents spend no turns on
+  coordination. The guard reads paths from `tool_input.file_path`, `path`,
+  `notebook_path`, or an `apply_patch` envelope's file headers; hook stdout
+  stays empty because Codex parses it as JSON.
 
 ### Capability routing
 
