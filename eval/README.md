@@ -7,14 +7,15 @@ finishing shared work with few human interruptions and no lost edits.
 
 | Mode | Setup |
 |---|---|
-| `feanorfs` | Each machine gets its own `FEANORFS_HOME` and Git clone; one HTTP hub connects them; agents run under `feanorfs agent run`; an auto-coordinator stands in for the human and accepts proposals whose scope does not overlap another agent's live accepted scope. |
+| `feanorfs` | Each machine gets its own `FEANORFS_HOME` and Git clone; one HTTP hub connects them; agents run under `feanorfs agent run`; the product's `agent coordinate` accepts scope for `human` when it overlaps no other agent's live scope. |
 | `worktrees` | The same agents work on separate branches in Git worktrees, merged afterwards. Baseline for comparison. |
 
 Metrics:
 
 | Field | Meaning |
 |---|---|
-| `human_interruptions` | Coordinator decisions plus unresolved conflicts (feanorfs); merge conflicts (worktrees) |
+| `human_interruptions` | Unresolved conflicts (feanorfs); merge conflicts (worktrees) |
+| `coordinator_decisions` | Scope decisions made automatically by `agent coordinate` (feanorfs) |
 | `conflicts` | Pending FeanorFS conflicts after the run, or failed merges |
 | `lost_edits` | Expected strings (`expect`) missing from the final tree |
 | `tests_pass` | Scenario `verify` command in the final tree |
@@ -39,13 +40,21 @@ with scripted agents (`agent-eval` job) and uploads the JSON report.
 ## Real agents
 
 `--agent-cmd` replaces the scripted agent with any harness; `{prompt}`,
-`{name}`, and `{machine}` are substituted and shell-quoted. In `feanorfs`
-mode the prompt tells the agent its identity, task, and the coordination loop
-(`agent next`, `agent work propose`, `agent guard`), and `feanorfs` on the
-agent's `PATH` is the binary under test; in `worktrees` mode the prompt is
-the bare task. For example, with Claude Code:
+`{name}`, `{machine}`, and `{settings}` are substituted and shell-quoted. In
+`feanorfs` mode the prompt tells the agent to `agent claim` before editing
+and `agent done` when finished, and `feanorfs` on the agent's `PATH` is the
+binary under test. With `--hooks`, agents instead get the bare task and a
+settings file (`{settings}`) whose PreToolUse hook claims before every write
+and whose Stop hook runs `agent done`, so they spend no turns on
+coordination. In `worktrees` mode the prompt is the bare task and
+`{settings}` is an empty file. For example, with Claude Code:
 
 ```bash
+# Hooks: the protocol runs in Claude Code hooks, not in agent turns.
+python3 eval/run.py eval/scenarios/overlap.json --timeout 900 --hooks \
+  --agent-cmd "claude -p {prompt} --output-format json --settings {settings} --setting-sources project --strict-mcp-config --permission-mode acceptEdits --allowedTools 'Bash(python3 -m unittest:*)'"
+
+# Explicit claim/done calls.
 python3 eval/run.py eval/scenarios/overlap.json --timeout 900 \
   --agent-cmd "claude -p {prompt} --output-format json --setting-sources project --strict-mcp-config --permission-mode acceptEdits --allowedTools 'Bash(feanorfs:*)' 'Bash(python3 -m unittest:*)'"
 ```

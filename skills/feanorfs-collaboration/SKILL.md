@@ -14,28 +14,21 @@ access control. FeanorFS never merges file content.
 1. **Know who you are.** Use `FEANORFS_AGENT` (set by `agent run` and runner
    children), else the name you were spawned as. Never claim another agent's
    name.
-2. **Ask what to do.** Run `feanorfs agent next` (MCP: `status`). It projects
-   work intent, integrator offers, conflicts, and resolution jobs into one
-   lifecycle and returns `next_actions`. Each names the `actor` who owes it,
-   a ready MCP `tool` + `args`, and the `cli` form. Replace `<placeholders>`
-   with real values; never invent ids.
-3. **Do only your actions** (`actor` is you), in order. Leave other agents'
-   actions to them. `human` actions are escalations: tell the user, do not
-   perform them yourself.
-4. **Check before you write.** Run `feanorfs agent guard <path>…` (MCP:
-   `work` with `op: guard`) before editing. `deny` (exit 2) means the path is
-   inside another agent's accepted scope, your integrator attempt was
-   superseded, or (with `--require-scope`) it is outside your own accepted
-   scope. `warn` means a pending conflict or another agent's open proposal.
-   Hosts with the guard hook installed run this before every edit.
-5. **Wait, don't poll or quit.** When nothing is yours to do (a decision is
-   pending, or your edits have not landed yet), run `feanorfs agent next
-   --wait`; it returns at once if something is ready for you, otherwise as
-   soon as your next actions change. When it returns, act on your actions;
-   once your edits land, the settle action already carries the snapshot.
-6. **Re-run `feanorfs agent next`** after every mutation and before declaring
-   work complete. While `projection_incomplete` is true, stop mutating: an
-   absent item is not proof that nothing is pending.
+2. **Claim, then edit.** Run `feanorfs agent claim <path>…` before editing;
+   it waits until the paths are yours (exit 3 means still waiting: run it
+   again later; exit 1 means rejected). If your harness installed the
+   FeanorFS hooks, claiming and finishing happen automatically: just work.
+3. **Finish in one call.** When your edits are done and verified, run
+   `feanorfs agent done --verification passed --summary '<what you did>'`
+   (use `failed` or `skipped` honestly). It waits for your edits to land.
+4. **For anything else, ask.** `feanorfs agent next` (MCP: `status`) lists
+   integrator offers, conflicts, resolution jobs, and decisions owed by each
+   actor as ready `tool` + `args` calls; `--wait` blocks until something is
+   yours. `human` actions are escalations: tell the user. While
+   `projection_incomplete` is true, stop mutating.
+5. **Check before risky writes.** `feanorfs agent guard <path>…` denies
+   paths inside another agent's accepted scope or after your integrator
+   attempt was superseded.
 
 Lifecycle stages (`items[].stage`):
 
@@ -67,6 +60,8 @@ reconciled continuously:
 
 | Need | Command |
 |---|---|
+| Claim before editing | `feanorfs agent claim <path>…` |
+| Finish | `feanorfs agent done --verification passed --summary '<s>'` |
 | What next | `feanorfs agent next [--for <name>] [--wait]` |
 | Safe to edit? | `feanorfs agent guard <path>… [--require-scope]` |
 | Read signals | `feanorfs agent inbox [--for <name>] [--after <cursor>]` |

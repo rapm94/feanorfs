@@ -60,6 +60,8 @@ fn rust_sdk_surface_compiles(
     let _ = workspace.coordination_status(None);
     let _ = workspace.guard(feanorfs_common::GuardInput::default());
     let _ = workspace.capabilities(feanorfs_common::CapabilitiesInput::default());
+    let _ = workspace.claim(feanorfs_common::ClaimInput::default());
+    let _ = workspace.done(feanorfs_common::DoneInput::default());
     let _ = workspace.integrator_reply(serde_json::from_str(r#"{"kind":"accept"}"#).unwrap());
     let _ = workspace.materialize_conflicts("snapshot", &["src/main.rs".to_string()]);
     let _ = workspace.work_propose(propose_input.clone());
@@ -655,6 +657,30 @@ const OPERATIONS: &[Operation] = &[
         skill: Some("feanorfs agent capabilities"),
         cli: Some("Capabilities {"),
     },
+    Operation {
+        name: "claim",
+        ffi: Some("ffs_claim"),
+        napi: Some("fn claim"),
+        facade: Some("function claim"),
+        dts: Some("function claim"),
+        mcp: Some("(\"work\", \"claim\", \"work_claim\")"),
+        events: None,
+        docs: "agent claim",
+        skill: Some("feanorfs agent claim"),
+        cli: Some("Claim {"),
+    },
+    Operation {
+        name: "done",
+        ffi: Some("ffs_done"),
+        napi: Some("fn done"),
+        facade: Some("function done"),
+        dts: Some("function done"),
+        mcp: Some("(\"work\", \"done\", \"work_done\")"),
+        events: None,
+        docs: "agent done",
+        skill: Some("feanorfs agent done"),
+        cli: Some("Done {"),
+    },
 ];
 
 fn check_marker(operation: &str, surface: &str, content: &str, marker: &str) {
@@ -748,6 +774,8 @@ fn cli_json_results_match_documented_result_types() {
         "GuardResult",
         "IntegratorReplyResult",
         "CapabilityRoster",
+        "ClaimResult",
+        "DoneResult",
     ] {
         assert!(
             docs.contains(result_type),

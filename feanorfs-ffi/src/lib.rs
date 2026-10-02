@@ -966,6 +966,39 @@ pub unsafe extern "C" fn ffs_capabilities(
     })
 }
 
+/// Claim scope in one call (propose and wait for the decision). JSON in:
+/// `ClaimInput`; JSON out: `ClaimResult`. NULL on error.
+///
+/// Returns an owned NUL-terminated UTF-8 string. The caller owns the
+/// allocation and must release it with `ffs_string_free` (never with libc
+/// `free`). NULL means an error; read `ffs_last_error` for the
+/// thread-local diagnostic.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ffs_claim(
+    root: *const c_char,
+    input_json: *const c_char,
+) -> *const c_char {
+    catch_ptr(|| run_json_op(root, input_json, "claim", |ws, input| ws.claim(input)))
+}
+
+/// Finish in one call (wait for edits to land, settle, complete). JSON in:
+/// `DoneInput`; JSON out: `DoneResult`. NULL on error.
+///
+/// Returns an owned NUL-terminated UTF-8 string. The caller owns the
+/// allocation and must release it with `ffs_string_free` (never with libc
+/// `free`). NULL means an error; read `ffs_last_error` for the
+/// thread-local diagnostic.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ffs_done(root: *const c_char, input_json: *const c_char) -> *const c_char {
+    catch_ptr(|| run_json_op(root, input_json, "done", |ws, input| ws.done(input)))
+}
+
 /// Evaluate whether an agent may write workspace paths now. JSON in:
 /// `GuardInput`; JSON out: `GuardResult`. NULL on error.
 ///

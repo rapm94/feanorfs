@@ -89,6 +89,16 @@ export async function capabilities(root, input = {}) {
   return JSON.parse(await native.capabilities(root, JSON.stringify(input)))
 }
 
+/** Claim scope in one call: propose the paths and wait for the decision. */
+export async function claim(root, input) {
+  return JSON.parse(await native.claim(root, JSON.stringify(input)))
+}
+
+/** Finish in one call: wait for edits to land, then settle and complete. */
+export async function done(root, input = {}) {
+  return JSON.parse(await native.done(root, JSON.stringify(input)))
+}
+
 /** Whether an agent may write these workspace paths now (advisory). */
 export async function guard(root, input) {
   return JSON.parse(await native.guard(root, JSON.stringify(input)))

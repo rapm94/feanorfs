@@ -18,7 +18,8 @@ Embeddable Rust engine (`feanorfs-agent-core`) for snapshot sync, agent workspac
   - `work.rs` — `ffwork1` reducer and `orchestrator/work-state.json` projection.
   - `integrator.rs` — `ffint1` dispatcher state machine, offers seen by candidates, typed candidate replies, owner designation, conflict materialization.
   - `resolution.rs`, `resolution_protocol.rs` — exact-fingerprint jobs, guarded publication, `ffres1` reducer.
-  - `coordination.rs` — pure lifecycle derivation (`agent next`), edit guard, capability roster and `ffcap1` announcements, `agent_identity`.
+  - `coordination.rs` — pure lifecycle derivation (`agent next`, `--wait`), edit guard, capability roster and `ffcap1` announcements, `agent_identity`.
+  - `claim.rs` — one-call protocol: `claim_scope` (propose + wait), `finish_work` (wait for landing, settle + complete), `coordinate_pass` (auto-accept non-overlapping scope); pure policies `claim_covered` and `auto_decisions`.
   - `git_baseline.rs` — read-only `.git/HEAD` baseline and `ffbase1` mismatch detection.
   - `api.rs`, `hub.rs` + `hub/`, `hub_state/`, `tunnel.rs`, `mesh/`, `head.rs` — transports, embedded hub, opaque relay, mesh dialing/NAT/STUN/QUIC, bounded head waits.
   - `ctx.rs`, `crypto.rs`, `fs_util.rs`, `durable.rs`, `lock.rs`, `paths.rs` — shared helpers; path helpers live in `paths.rs` to avoid agent ↔ conflicts cycles.
@@ -53,6 +54,7 @@ Embeddable Rust engine (`feanorfs-agent-core`) for snapshot sync, agent workspac
 - Resolution publication embeds its broadcast status in the same CAS as the resolved tree; a prepared job may cross at most 64 single-parent signal-only snapshots with the same tree root; leg materialization reuses only byte-identical regular files.
 - Work, integrator, resolution, and capability senders default to `FEANORFS_AGENT`, then `human`.
 - `coordination_status` reads every projection once and fails soft: a source error becomes a warning plus `projection_incomplete`. `derive_coordination` and `evaluate_guard` stay pure and unit-tested. Items ≤64, actions ≤8, warnings ≤16, text ≤512 bytes.
+- `claim_scope` never sends a signal for covered paths and reuses an identical pending proposal; `finish_work` settles only with a snapshot proven landed (live controller idle, no unlanded changes) and defaults verification to `skipped`; `coordinate_pass` only accepts (never rejects or narrows) proposals addressed to its identity that overlap no other agent's live scope.
 - Capability roster = newest `ffcap1` announcement per sender plus work-intent capabilities. `cap:` routing resolves to exactly one agent or errors; `integrator_assign` with no candidates uses the roster.
 - Keep this crate free of `clap`, `notify`, and `tracing-subscriber`. New agent-facing operations land here first and on every surface in the operation matrix.
 

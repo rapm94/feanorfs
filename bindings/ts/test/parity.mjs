@@ -65,6 +65,8 @@ const OPERATIONS = [
   ['guard', 'guard', 'guard'],
   ['integratorReply', 'integratorReply', 'integratorReply'],
   ['capabilities', 'capabilities', 'capabilities'],
+  ['claim', 'claim', 'claim'],
+  ['done', 'done', 'done'],
 ]
 
 for (const [nativeName, facadeName, declareName] of OPERATIONS) {

@@ -728,6 +728,8 @@ const ROUTES: &[(&str, &str, &str)] = &[
     ("work", "block", "work_block"),
     ("work", "status", "work_status"),
     ("work", "guard", "work_guard"),
+    ("work", "claim", "work_claim"),
+    ("work", "done", "work_done"),
     ("conflicts", "list", "conflicts_list"),
     ("conflicts", "keep", "conflicts_keep"),
     ("conflicts", "materialize", "conflict_materialize"),
@@ -881,7 +883,7 @@ fn compact_tool_list() -> Value {
                 "clean": { "type": "boolean" },
                 "propose": { "type": "boolean" }
             }), &[]),
-            op_tool("work", "Scope before you edit (advisory, never access control). propose{task_id,sequence,paths}; decide{proposal_message_id,kind=accept|reject|narrow|order|accept_overlap,reason?,paths?}; amend/yield/settle/complete/block{task_id,intent_message_id,sequence,…}; status; guard{paths} says whether paths are safe to write.", json!({
+            op_tool("work", "Scope before you edit (advisory, never access control). Simplest: claim{paths} before editing (waits for the decision), done{summary?,verification_status?} when finished (waits for your edits to land, settles, completes). Fine-grained: propose{task_id,sequence,paths}; decide{proposal_message_id,kind=accept|reject|narrow|order|accept_overlap,reason?,paths?}; amend/yield/settle/complete/block{task_id,intent_message_id,sequence,…}; status; guard{paths} says whether paths are safe to write.", json!({
                 "task_id": { "type": "string", "maxLength": 128 },
                 "agent": { "type": "string" },
                 "from": { "type": "string" },
@@ -905,13 +907,15 @@ fn compact_tool_list() -> Value {
                     "type": "object",
                     "properties": {
                         "status": { "type": "string", "enum": ["passed", "failed", "skipped"] },
-                        "summary": { "type": "string", "maxLength": 512 },
-                        "applied_message_ids": strings
+                        "summary": { "type": "string", "maxLength": 512 }
                     },
-                    "required": ["status", "summary", "applied_message_ids"]
+                    "required": ["status", "summary"]
                 },
                 "outcome": { "type": "string", "maxLength": 512 },
-                "require_scope": { "type": "boolean", "description": "guard: also deny paths outside your accepted scope" }
+                "require_scope": { "type": "boolean", "description": "guard: also deny paths outside your accepted scope" },
+                "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 600, "description": "claim/done: how long to wait" },
+                "summary": { "type": "string", "maxLength": 512, "description": "done: one-line outcome" },
+                "verification_status": { "type": "string", "enum": ["passed", "failed", "skipped"], "description": "done: verification you actually ran" }
             }), &[]),
             op_tool("conflicts", "Pending file conflicts. list; keep{path,keep=local|cloud|both|file,file?} records your choice (edit first for file); materialize{about_snapshot?,paths?} writes read-only legs. Never merges content.", json!({
                 "path": { "type": "string" },
@@ -1073,6 +1077,32 @@ async fn call_tool(current_dir: &Path, tool: &str, params: &Value) -> anyhow::Re
                 None => feanorfs_client::coordination_status(&ctx, &agent).await?,
             };
             Ok(json!({ "sync": sync, "coordination": coordination }))
+        }
+        "work_claim" => {
+            let input: feanorfs_common::ClaimInput = parse_params(tool, params)?;
+            let agent = agent_identity(input.agent.as_deref());
+            let result = feanorfs_client::claim_scope(
+                &ctx,
+                &agent,
+                &input.paths,
+                input.coordinator.as_deref(),
+                feanorfs_client::bounded_wait(input.wait_seconds),
+            )
+            .await?;
+            Ok(serde_json::to_value(result)?)
+        }
+        "work_done" => {
+            let input: feanorfs_common::DoneInput = parse_params(tool, params)?;
+            let agent = agent_identity(input.agent.as_deref());
+            let result = feanorfs_client::finish_work(
+                &ctx,
+                &agent,
+                input.summary.as_deref(),
+                input.verification_status,
+                feanorfs_client::bounded_wait(input.wait_seconds),
+            )
+            .await?;
+            Ok(serde_json::to_value(result)?)
         }
         "work_guard" => {
             let input: feanorfs_common::GuardInput = parse_params(tool, params)?;
@@ -1639,7 +1669,11 @@ mod tests {
                 legacy_names.contains(handler)
                     || matches!(
                         *handler,
-                        "work_guard" | "integrator_reply" | "agent_capabilities"
+                        "work_guard"
+                            | "work_claim"
+                            | "work_done"
+                            | "integrator_reply"
+                            | "agent_capabilities"
                     ),
                 "route {handler} has no handler"
             );

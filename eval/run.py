@@ -34,13 +34,9 @@ POLL_SECONDS = 0.5
 
 PROMPT = """You are coding agent `{name}` on machine `{machine}` in a FeanorFS \
 workspace shared with other agents. Task: {task}
-Before editing, propose your scope with `feanorfs agent work propose --task \
-{task_id} --coordinator human --path <path>...` and wait until `feanorfs agent \
-next` shows it accepted. Check paths with `feanorfs agent guard <path>` before \
-writing. Whenever nothing is yours to do (waiting for a decision, or for \
-your edits to land), run `feanorfs agent next --wait` instead of polling or \
-stopping. When done and verified, follow the settle and complete actions \
-`feanorfs agent next` lists for you."""
+Before editing a file, run `feanorfs agent claim <path>`; it waits until the \
+file is yours. When finished and verified, run `feanorfs agent done \
+--verification passed --summary '<what you did>'`."""
 
 PLAIN_PROMPT = """You are coding agent `{name}`. Task: {task}
 Edit the files in the current directory; do not commit."""
@@ -91,16 +87,29 @@ def verify(root, command):
     return subprocess.run(command, shell=True, cwd=root, capture_output=True).returncode == 0
 
 
-def agent_command(args, scenario_path, agent, plain=False):
+def agent_command(args, scenario_path, agent, plain=False, settings=None):
     if not args.agent_cmd:
         return [sys.executable, str(HERE / "scripted_agent.py"), str(scenario_path)]
     prompt = (PLAIN_PROMPT if plain else PROMPT).format(
         name=agent["name"], machine=agent["machine"], task=agent["prompt"],
-        task_id=agent.get("task", f"{agent['name']}-task"),
     )
     return shlex.split(args.agent_cmd.format(
         prompt=shlex.quote(prompt), name=agent["name"], machine=agent["machine"],
+        settings=shlex.quote(str(settings or HERE / "empty-settings.json")),
     ))
+
+
+def write_hook_settings(path, binary):
+    """Claude Code settings that run the protocol for the agent: a claiming
+    guard before every write and `agent done` when it stops."""
+    def hook(args):
+        return {"type": "command", "command": f"{shlex.quote(str(binary))} {args}", "timeout": 300}
+    path.write_text(json.dumps({"hooks": {
+        "PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                        "hooks": [hook("agent guard --hook --claim")]}],
+        "Stop": [{"hooks": [hook("agent done --hook")]}],
+    }}), encoding="utf-8")
+    return path
 
 
 def cost_from(output):
@@ -180,33 +189,17 @@ def stop(process, grace=15):
             process.wait()
 
 
-def overlaps(a, b):
-    def covers(glob, path):
-        return glob == path or (glob.endswith("/**") and path.startswith(glob[:-2]))
-    return any(covers(x, y) or covers(y, x) for x in a for y in b)
-
-
 def coordinate(machine, stats):
-    """One auto-coordinator pass: accept proposals whose scope does not
-    overlap another agent's live accepted scope; defer the rest."""
-    work = machine.json("agent", "work", "status")
-    proposals = [p for task in work["tasks"] for p in task["proposals"]]
-    live = [p for p in proposals if p["state"] in ("accepted", "settled")]
-    for proposal in proposals:
-        if proposal["state"] != "proposed":
-            continue
-        paths = proposal["accepted_scope"]["paths"]
-        if any(other["agent"] != proposal["agent"] and overlaps(paths, other["accepted_scope"]["paths"])
-               for other in live):
-            continue
-        machine.run("agent", "work", "decide", proposal["intent_message_id"], "--kind", "accept")
-        stats["human_interruptions"] += 1
-        live.append(proposal)
+    """One pass of the product's automatic coordinator acting for `human`:
+    it accepts scope that overlaps no live scope and lets overlap wait."""
+    result = machine.run("--json", "agent", "coordinate", check=False)
+    if result.returncode == 0:
+        stats["coordinator_decisions"] += len(json.loads(result.stdout)["accepted"])
 
 
 def run_feanorfs(args, scenario, scenario_path, tmp):
-    stats = {"mode": "feanorfs", "human_interruptions": 0, "conflicts": 0,
-             "guard_blocks": 0, "tokens": 0, "agents_failed": 0}
+    stats = {"mode": "feanorfs", "human_interruptions": 0, "coordinator_decisions": 0,
+             "conflicts": 0, "guard_blocks": 0, "tokens": 0, "agents_failed": 0}
     started = time.monotonic()
     origin = tmp / "origin"
     write_fixture(origin, scenario["files"])
@@ -243,7 +236,8 @@ def run_feanorfs(args, scenario, scenario_path, tmp):
         watchers = [m.popen("sync") for m in machines.values()]
         for agent in scenario["agents"]:
             machine = machines[agent["machine"]]
-            command = agent_command(args, scenario_path, agent)
+            settings = write_hook_settings(tmp / "hooks.json", args.bin) if args.hooks else None
+            command = agent_command(args, scenario_path, agent, plain=args.hooks, settings=settings)
             log = tmp / f"agent-{agent['name']}"
             processes.append(
                 (agent, log, machine.popen("agent", "run", agent["name"], "--", *command, log=log))
@@ -347,6 +341,8 @@ def main():
     parser.add_argument("--mode", choices=["feanorfs", "worktrees", "both"], default="both")
     parser.add_argument("--agent-cmd", help="real agent command template; default: scripted")
     parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--hooks", action="store_true",
+                        help="real agents get claim/done hooks and the bare task prompt")
     parser.add_argument("--keep", action="store_true", help="keep the temporary directory")
     args = parser.parse_args()
     args.bin = args.bin.resolve()

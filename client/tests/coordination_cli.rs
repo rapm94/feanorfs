@@ -491,3 +491,104 @@ async fn work_proposals_default_their_author_to_feanorfs_agent() {
         .iter()
         .any(|item| item.id == "parser:codex"));
 }
+
+#[tokio::test]
+async fn claim_coordinate_and_done_replace_the_manual_protocol() {
+    let fx = fixture("coordination-claim").await;
+    let claim = |agent: &str, path: &str, timeout: &str| {
+        fx.cli(&[
+            "--json",
+            "agent",
+            "claim",
+            path,
+            "--for",
+            agent,
+            "--timeout",
+            timeout,
+        ])
+    };
+    let outcome = |output: &Output| -> feanorfs_common::ClaimResult {
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    // No coordinator yet: the claim stays pending (exit 3) and explains why.
+    let pending = claim("linux", "src/lib.rs", "1");
+    assert_eq!(pending.status.code(), Some(3));
+    assert!(outcome(&pending).reason.unwrap().contains("coordinate"));
+
+    let pass: feanorfs_common::CoordinatePass = fx.json(&["--json", "agent", "coordinate"]);
+    assert_eq!(pass.accepted.len(), 1);
+    let held = claim("linux", "src/lib.rs", "5");
+    assert!(held.status.success());
+    assert_eq!(
+        outcome(&held).outcome,
+        feanorfs_common::ClaimOutcome::Covered
+    );
+
+    // Overlap waits for the holder instead of being accepted.
+    let blocked = claim("mac", "src/lib.rs", "1");
+    assert_eq!(blocked.status.code(), Some(3));
+    assert!(outcome(&blocked).reason.unwrap().contains("linux"));
+    let pass: feanorfs_common::CoordinatePass = fx.json(&["--json", "agent", "coordinate"]);
+    assert!(pass.accepted.is_empty() && pass.waiting.len() == 1);
+
+    let done: feanorfs_common::DoneResult = fx.json(&[
+        "--json",
+        "agent",
+        "done",
+        "--for",
+        "linux",
+        "--summary",
+        "lib edited",
+        "--verification",
+        "passed",
+    ]);
+    assert_eq!(done.completed.len(), 1);
+    let pass: feanorfs_common::CoordinatePass = fx.json(&["--json", "agent", "coordinate"]);
+    assert_eq!(pass.accepted.len(), 1);
+    assert!(claim("mac", "src/lib.rs", "5").status.success());
+
+    // Hooks: a claiming guard plus the Stop hook, with a coordinator running.
+    let mut coordinator = Command::new(env!("CARGO_BIN_EXE_feanorfs"))
+        .args(["agent", "coordinate", "--watch"])
+        .current_dir(&fx.workspace)
+        .env("FEANORFS_HOME", &fx.state_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let payload =
+        json!({ "cwd": fx.workspace, "tool_input": { "file_path": "docs/notes.md" } }).to_string();
+    let hooked = fx.cli_with_stdin(
+        &[
+            "agent",
+            "guard",
+            "--hook",
+            "--claim",
+            "--claim-timeout",
+            "60",
+            "--for",
+            "ci",
+        ],
+        Some(&payload),
+    );
+    assert!(
+        hooked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hooked.stderr)
+    );
+    let finished = fx.cli_with_stdin(&["agent", "done", "--hook", "--for", "ci"], Some("{}"));
+    assert!(
+        finished.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    coordinator.kill().unwrap();
+    let _ = coordinator.wait();
+    let ci = fx.next("ci");
+    assert!(ci
+        .items
+        .iter()
+        .filter(|item| item.id.ends_with(":ci"))
+        .all(|item| item.stage == LifecycleStage::Done));
+}

@@ -233,7 +233,7 @@ fn derive_task(b: &mut Builder<'_>, task_id: &str, p: &WorkProposalStatus) {
                         "intent_message_id": p.intent_message_id,
                         "sequence": next,
                         "inspected_snapshot": snapshot,
-                        "verification": {"status": "passed", "summary": "<checks you ran>", "applied_message_ids": []}
+                        "verification": {"status": "passed", "summary": "<checks you ran>"}
                     }),
                     format!(
                         "feanorfs agent work settle --task {task_id} --intent {} --sequence {next} --inspected {snapshot} --verification passed --summary '<checks>'",
@@ -1212,6 +1212,69 @@ mod tests {
         assert_eq!(action.args["op"], "settle");
         assert_eq!(action.args["sequence"], 2);
         assert_eq!(action.args["intent_message_id"], "a".repeat(64));
+    }
+
+    /// Prefilled actions must parse into the real input types once
+    /// placeholders are replaced, or agents get schema errors.
+    #[test]
+    fn prefilled_actions_parse_into_their_input_types() {
+        let fill = |args: &serde_json::Map<String, Value>| {
+            let mut args = args.clone();
+            args.remove("op");
+            let text = serde_json::to_string(&args)
+                .unwrap()
+                .replace("<snapshot you verified>", &"e".repeat(64))
+                .replace("<checks you ran>", "cargo test")
+                .replace("<one-line outcome>", "done")
+                .replace("<summary>", "done");
+            serde_json::from_str::<Value>(&text).unwrap()
+        };
+        let accepted = derive_coordination(CoordinationInputs {
+            agent: "linux".to_string(),
+            work: Some(work(vec![proposal(
+                "linux",
+                WorkTaskState::Accepted,
+                &["src/a.rs"],
+            )])),
+            ..CoordinationInputs::default()
+        });
+        serde_json::from_value::<feanorfs_common::WorkSettleInput>(fill(
+            &accepted.next_actions[0].args,
+        ))
+        .expect("settle action parses");
+        let settled = derive_coordination(CoordinationInputs {
+            agent: "linux".to_string(),
+            work: Some(work(vec![proposal(
+                "linux",
+                WorkTaskState::Settled,
+                &["src/a.rs"],
+            )])),
+            ..CoordinationInputs::default()
+        });
+        serde_json::from_value::<feanorfs_common::WorkCompleteInput>(fill(
+            &settled.next_actions[0].args,
+        ))
+        .expect("complete action parses");
+        let offer = IntegratorOffer {
+            assignment_id: "0".repeat(32),
+            attempt: 0,
+            dispatcher: "human".into(),
+            about_snapshot: "b".repeat(64),
+            request_message_id: "c".repeat(64),
+            task: "batch".into(),
+            accepted: true,
+            terminal: false,
+            superseded_by: None,
+        };
+        let integrating = derive_coordination(CoordinationInputs {
+            agent: "mac".to_string(),
+            offers: vec![offer],
+            ..CoordinationInputs::default()
+        });
+        serde_json::from_value::<feanorfs_common::IntegratorReplyInput>(fill(
+            &integrating.next_actions[0].args,
+        ))
+        .expect("integrator reply action parses");
     }
 
     #[test]

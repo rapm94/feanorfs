@@ -402,6 +402,22 @@ pub async fn capabilities(root: String, input_json: String) -> Result<String> {
     .await
 }
 
+/// Claim scope in one call (propose and wait for the decision).
+/// JSON in: `ClaimInput`; JSON out: `ClaimResult`.
+#[napi]
+pub async fn claim(root: String, input_json: String) -> Result<String> {
+    let input: feanorfs_common::ClaimInput = parse_bounded_json(&input_json, "claim input")?;
+    execute_json(root, "claim", move |workspace| workspace.claim(input)).await
+}
+
+/// Finish in one call (wait for edits to land, settle, complete).
+/// JSON in: `DoneInput`; JSON out: `DoneResult`.
+#[napi]
+pub async fn done(root: String, input_json: String) -> Result<String> {
+    let input: feanorfs_common::DoneInput = parse_bounded_json(&input_json, "done input")?;
+    execute_json(root, "done", move |workspace| workspace.done(input)).await
+}
+
 /// Evaluate whether an agent may write workspace paths now.
 /// JSON in: `GuardInput`; JSON out: `GuardResult`.
 #[napi]

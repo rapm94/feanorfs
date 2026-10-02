@@ -8,6 +8,7 @@ feanorfs_test_support::isolate_test_process!();
 
 pub mod agent;
 pub mod api;
+pub mod claim;
 pub mod conflict_artifacts;
 pub mod conflicts;
 pub mod coordination;
@@ -62,6 +63,7 @@ pub use agent::{
     ACCEPTED_WORK_SCHEMA_VERSION,
 };
 pub use api::{ApiClient, MIN_SUPPORTED_SERVER_VERSION};
+pub use claim::{bounded_wait, claim_scope, coordinate_pass, finish_work};
 pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
 pub use conflicts::{resolve_conflict, ResolveKeep};
 pub use coordination::{
@@ -452,6 +454,37 @@ impl Workspace {
         let agent = coordination::agent_identity(input.agent.as_deref());
         self.rt
             .block_on(coordination::capabilities(&ctx, &agent, input.announce))
+    }
+
+    /// Claims scope in one call: returns at once when already covered,
+    /// otherwise proposes and waits for the coordinator's decision.
+    pub fn claim(
+        &self,
+        input: feanorfs_common::ClaimInput,
+    ) -> Result<feanorfs_common::ClaimResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        let agent = coordination::agent_identity(input.agent.as_deref());
+        self.rt.block_on(claim::claim_scope(
+            &ctx,
+            &agent,
+            &input.paths,
+            input.coordinator.as_deref(),
+            claim::bounded_wait(input.wait_seconds),
+        ))
+    }
+
+    /// Finishes in one call: waits for the agent's edits to land, then
+    /// settles and completes every task it holds.
+    pub fn done(&self, input: feanorfs_common::DoneInput) -> Result<feanorfs_common::DoneResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        let agent = coordination::agent_identity(input.agent.as_deref());
+        self.rt.block_on(claim::finish_work(
+            &ctx,
+            &agent,
+            input.summary.as_deref(),
+            input.verification_status,
+            claim::bounded_wait(input.wait_seconds),
+        ))
     }
 
     /// Evaluates whether an agent may write the given workspace paths.

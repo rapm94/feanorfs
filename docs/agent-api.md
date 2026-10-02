@@ -664,10 +664,43 @@ lifecycle and computes the next action for each actor. Types live in
 | Next | `agent next [--for <agent>] [--wait [--timeout <secs>]]` | `coordination_status(Option<&str>)` | `CoordinationStatus` |
 | Guard | `agent guard [<path>…] [--for <agent>] [--require-scope] [--hook]` | `guard(GuardInput)` | `GuardResult` |
 | Capabilities | `agent capabilities [--for <agent>] [--set <cap>…]`, `agent run <name> --capability <cap> -- …` | `capabilities(CapabilitiesInput)` | `CapabilityRoster` |
+| Claim | `agent claim <path>… [--for <agent>] [--coordinator <id>] [--timeout <secs>]` | `claim(ClaimInput)` | `ClaimResult` |
+| Done | `agent done [--for <agent>] [--summary <s>] [--verification passed\|failed\|skipped] [--timeout <secs>] [--hook]` | `done(DoneInput)` | `DoneResult` |
+| Coordinate (CLI-only) | `agent coordinate [--for <id>] [--watch]` | — | `CoordinatePass` |
 
-MCP: `status` (next), `work` `op: guard`, and `agent` `op: capabilities`.
-FFI: `ffs_coordination_status`, `ffs_guard`, `ffs_capabilities`. TypeScript:
-`coordinationStatus`, `guard`, `capabilities`.
+MCP: `status` (next), `work` with `op: guard`, `claim`, or `done`, and
+`agent` with `op: capabilities`. FFI: `ffs_coordination_status`,
+`ffs_guard`, `ffs_capabilities`, `ffs_claim`, `ffs_done`. TypeScript:
+`coordinationStatus`, `guard`, `capabilities`, `claim`, `done`.
+
+### One-call protocol: claim, done, coordinate
+
+Every agent turn re-sends the harness's full context (about 35–40k cached
+tokens for Claude Code), so cost tracks turns. The fine-grained protocol
+(`propose`, `next`, `guard`, `settle`, `complete`) takes about eight turns
+per task; these commands take two, and the hooks take none.
+
+- `agent claim` returns `covered` at once when the paths are already inside
+  the caller's live accepted scope; otherwise it proposes (or reuses an
+  identical pending proposal) to the coordinator (default `human`) and blocks
+  until the proposal is accepted, then until a live agent's worktree reflects
+  the current head. Exit 0 for `covered`/`accepted`, 3 for `pending` (with
+  the scopes it waits on), 1 for `rejected`.
+- `agent done` waits until the agent's edits have landed (live controller
+  idle, no unlanded changes), then settles every task it holds with that
+  snapshot and completes it. Verification defaults to `skipped`: nothing is
+  claimed that was not reported. As a `Stop` hook (`--hook`), a failure
+  blocks stopping once so the agent can fix it, and never loops.
+- `agent coordinate` decides for an identity (default `human`): it accepts
+  proposals addressed to it whose scope overlaps no other agent's live scope
+  and leaves overlapping ones waiting until that scope finishes. It never
+  rejects or narrows; those stay human decisions. Run one coordinator per
+  workspace (`--watch` keeps it running).
+- `agent guard --hook --claim` claims unclaimed paths before allowing a
+  write (waiting up to `--claim-timeout`, default 240 s). With
+  `feanorfs integrate --host claude --auto-claim`, Claude Code runs that
+  guard before every write and `agent done --hook` when it stops, so agents
+  spend no turns on coordination.
 
 ### Capability routing
 
@@ -715,7 +748,7 @@ exits:        blocked | stopped
     "tool": "work",
     "args": {"op":"settle","task_id":"parser","intent_message_id":"<64 hex>","sequence":2,
              "inspected_snapshot":"<snapshot you verified>",
-             "verification":{"status":"passed","summary":"<checks you ran>","applied_message_ids":[]}},
+             "verification":{"status":"passed","summary":"<checks you ran>"}},
     "cli": "feanorfs agent work settle --task parser …",
     "reason": "edit only inside the accepted scope, verify, then settle"
   }],

@@ -312,6 +312,96 @@ pub struct CapabilityRoster {
     pub projection_incomplete: bool,
 }
 
+/// Upper bound for any blocking claim, done, or next wait.
+pub const COORDINATION_MAX_WAIT_SECONDS: u64 = 600;
+
+/// One-call scope claim: propose (if not already covered) and wait for the
+/// coordinator's decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimInput {
+    /// Claimant; defaults to `FEANORFS_AGENT`, then `human`.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Canonical paths or `dir/**` globs to claim.
+    pub paths: Vec<String>,
+    /// Coordinator whose decision is awaited; defaults to `human`.
+    #[serde(default)]
+    pub coordinator: Option<String>,
+    /// Seconds to wait for the decision (default 300, maximum 600).
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
+}
+
+/// Outcome of a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimOutcome {
+    /// Already inside the claimant's live accepted scope; nothing was sent.
+    Covered,
+    /// Accepted by the coordinator; the worktree reflects the current head.
+    Accepted,
+    /// Still waiting for a decision when the wait expired.
+    Pending,
+    Rejected,
+}
+
+/// Result of a claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimResult {
+    pub agent: String,
+    pub outcome: ClaimOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_message_id: Option<String>,
+    pub paths: Vec<String>,
+    /// Why a pending or rejected claim did not succeed, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One-call finish: wait for the agent's edits to land, then settle and
+/// complete every task the agent holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DoneInput {
+    /// Finishing agent; defaults to `FEANORFS_AGENT`, then `human`.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// One-line outcome; defaults to a neutral note.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// `passed`, `failed`, or `skipped` (default `skipped`: nothing is
+    /// claimed that was not reported).
+    #[serde(default)]
+    pub verification_status: Option<crate::WorkVerificationStatus>,
+    /// Seconds to wait for edits to land (default 300, maximum 600).
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
+}
+
+/// Result of finishing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoneResult {
+    pub agent: String,
+    /// Tasks moved to completed by this call.
+    pub completed: Vec<String>,
+    /// Snapshot recorded as inspected, when any task was settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspected_snapshot: Option<String>,
+}
+
+/// Result of one automatic coordinator pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatePass {
+    pub coordinator: String,
+    /// Proposal (intent) ids accepted in this pass.
+    pub accepted: Vec<String>,
+    /// Proposal ids left waiting because they overlap live scope.
+    pub waiting: Vec<String>,
+}
+
 /// Truncates text to the coordination byte bound on a char boundary.
 #[must_use]
 pub fn bounded_text(text: &str) -> String {
