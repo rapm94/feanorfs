@@ -130,6 +130,14 @@ input.
 | disjoint | feanorfs | 15 | 2 | 0 | 0 | 49k / 261k / 1.3k | 1.32× |
 | disjoint | worktrees | 7 | — | 0 | 0 | 43k / 146k / 0.9k | 1× |
 
+With the current skill installed temporarily (the original was restored
+byte-for-byte afterwards), correctness was the same and weighted tokens were
+1.75× (overlap: 17 vs 9 commands, 52k / 455k / 1.7k vs 43k / 146k / 0.8k) and
+1.74× (disjoint: 17 vs 8 commands, 55k / 334k / 1.4k vs 36k / 152k / 0.8k).
+Each extra command re-reads the whole cached context, so cost follows command
+count: agents read the skill, then followed its `agent status` and
+`agent done` advice on top of the one required `agent claim`.
+
 Coordination itself was one `agent claim` per agent (one agent re-ran it
 while waiting). The other extra commands came from the machine's global
 Codex instructions and an installed `feanorfs-collaboration` skill from an
