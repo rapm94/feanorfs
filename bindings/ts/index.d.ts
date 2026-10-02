@@ -49,15 +49,15 @@ export declare function conflictsKeep(root: string, path: string, keep: number, 
 export declare function coordinationStatus(root: string, agent?: string | undefined | null): Promise<string>
 
 /**
- * Evaluate whether an agent may write workspace paths now.
- * JSON in: `GuardInput`; JSON out: `GuardResult`.
- */
-/**
  * Finish in one call (wait for edits to land, settle, complete).
  * JSON in: `DoneInput`; JSON out: `DoneResult`.
  */
 export declare function done(root: string, inputJson: string): Promise<string>
 
+/**
+ * Evaluate whether an agent may write workspace paths now.
+ * JSON in: `GuardInput`; JSON out: `GuardResult`.
+ */
 export declare function guard(root: string, inputJson: string): Promise<string>
 
 export declare function historyLog(root: string, limit?: number | undefined | null): Promise<string>
@@ -69,16 +69,16 @@ export declare function historyLog(root: string, limit?: number | undefined | nu
 export declare function integratorAssign(root: string, inputJson: string): Promise<string>
 
 /**
- * Resume dispatcher observation after a restart.
- * Options JSON: object with optional `ack_timeout_ms` and `fallback_on_blocked`;
- * JSON out: `IntegratorObserveResult`.
- */
-/**
  * Send one typed candidate-side integrator reply.
  * JSON in: `IntegratorReplyInput`; JSON out: `IntegratorReplyResult`.
  */
 export declare function integratorReply(root: string, inputJson: string): Promise<string>
 
+/**
+ * Resume dispatcher observation after a restart.
+ * Options JSON: object with optional `ack_timeout_ms` and `fallback_on_blocked`;
+ * JSON out: `IntegratorObserveResult`.
+ */
 export declare function integratorResume(root: string, optionsJson?: string | undefined | null): Promise<string>
 
 /**
