@@ -29,9 +29,9 @@ pub struct IntegrateCli {
     #[arg(long, global = true)]
     force: bool,
 
-    /// Also register `feanorfs agent guard --hook` as a Claude Code
-    /// PreToolUse hook so edits inside another agent's accepted scope are
-    /// blocked before they happen (Claude only; opt-in).
+    /// Also register `feanorfs agent guard --hook` as a PreToolUse hook so
+    /// edits inside another agent's accepted scope are blocked before they
+    /// happen (Claude Code and Codex; opt-in).
     #[arg(long, global = true)]
     guard_hook: bool,
 
@@ -512,13 +512,12 @@ pub(super) async fn run(_current_dir: &Path, cli: IntegrateCli, json: bool) -> R
                 let installed = install_host_integration(&paths, &exe_path, cli.force)
                     .await
                     .and_then(|done| {
-                        if (cli.guard_hook || cli.auto_claim) && matches!(host, HostKind::Claude) {
-                            install_guard_hook(
-                                &claude_settings_path(&env, cli.project.as_deref()),
-                                &exe_path,
-                                cli.auto_claim,
-                            )?;
-                            report.installed.push("claude: Guard hook=true".to_string());
+                        let hooks = hook_settings_path(host, &env, cli.project.as_deref());
+                        if let Some(hooks) = hooks.filter(|_| cli.guard_hook || cli.auto_claim) {
+                            install_guard_hook(&hooks, &exe_path, cli.auto_claim)?;
+                            report
+                                .installed
+                                .push(format!("{}: Guard hook=true", host.id()));
                         }
                         Ok(done)
                     });
@@ -557,13 +556,15 @@ pub(super) async fn run(_current_dir: &Path, cli: IntegrateCli, json: bool) -> R
                 }
             }
             IntegrateSubcommand::Uninstall => {
-                if matches!(host, HostKind::Claude) {
-                    match remove_guard_hook(&claude_settings_path(&env, cli.project.as_deref())) {
-                        Ok(true) => report.removed.push("claude: Guard hook=true".to_string()),
+                if let Some(hooks) = hook_settings_path(host, &env, cli.project.as_deref()) {
+                    match remove_guard_hook(&hooks) {
+                        Ok(true) => report
+                            .removed
+                            .push(format!("{}: Guard hook=true", host.id())),
                         Ok(false) => {}
                         Err(err) => report
                             .warnings
-                            .push(format!("claude: failed to remove guard hook: {err}")),
+                            .push(format!("{}: failed to remove guard hook: {err}", host.id())),
                     }
                 }
                 if !detected
@@ -882,12 +883,20 @@ const DONE_HOOK_ARGS: &str = "agent done --hook";
 const COORDINATION_HOOK_TIMEOUT_SECONDS: u64 = 300;
 const HOOK_EVENTS: [&str; 2] = ["PreToolUse", "Stop"];
 
-/// Claude Code settings file for the scope (`.claude/settings.json`).
-fn claude_settings_path(env: &EnvironmentContext, project: Option<&Path>) -> PathBuf {
-    project
-        .unwrap_or(&env.home_dir)
-        .join(".claude")
-        .join("settings.json")
+/// File holding the host's hooks for the scope: Claude Code's
+/// `.claude/settings.json` or Codex's `.codex/hooks.json` (same schema;
+/// Codex matches `apply_patch` edits as `Edit`/`Write`).
+fn hook_settings_path(
+    host: HostKind,
+    env: &EnvironmentContext,
+    project: Option<&Path>,
+) -> Option<PathBuf> {
+    let root = project.unwrap_or(&env.home_dir);
+    match host {
+        HostKind::Claude => Some(root.join(".claude").join("settings.json")),
+        HostKind::Codex => Some(root.join(".codex").join("hooks.json")),
+        HostKind::Cursor | HostKind::Gemini | HostKind::OpenCode => None,
+    }
 }
 
 fn hook_command(exe_path: &Path, args: &str) -> Result<String> {
@@ -1353,6 +1362,46 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&paths.mcp_config_path).unwrap()).unwrap();
         assert_eq!(preserved, config);
     }
+    #[test]
+    fn hooks_install_into_claude_settings_and_codex_hooks_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = EnvironmentContext::mock(temp.path());
+        let project = temp.path().join("ws");
+        assert_eq!(
+            hook_settings_path(HostKind::Codex, &env, Some(&project)),
+            Some(project.join(".codex").join("hooks.json"))
+        );
+        assert_eq!(
+            hook_settings_path(HostKind::Claude, &env, None),
+            Some(temp.path().join(".claude").join("settings.json"))
+        );
+        assert_eq!(hook_settings_path(HostKind::Cursor, &env, None), None);
+
+        // A Codex hooks.json keeps the user's other hooks.
+        let hooks = hook_settings_path(HostKind::Codex, &env, None).unwrap();
+        std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hooks,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"headroom hook"}]}]}}"#,
+        )
+        .unwrap();
+        let exe = Path::new("/opt/feanorfs/bin/feanorfs");
+        assert!(install_guard_hook(&hooks, exe, true).unwrap());
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+        let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre[0]["hooks"][0]["command"], "headroom hook");
+        assert_eq!(pre[1]["matcher"], GUARD_HOOK_MATCHER);
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/opt/feanorfs/bin/feanorfs agent done --hook"
+        );
+        assert!(remove_guard_hook(&hooks).unwrap());
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+        assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn guard_hook_install_is_idempotent_preserves_settings_and_uninstalls() {
         let dir = tempfile::tempdir().unwrap();

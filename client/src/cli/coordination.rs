@@ -400,10 +400,15 @@ pub async fn run_done(current_dir: &Path, args: DoneArgs, json: bool) -> anyhow:
     .await;
     match outcome {
         Ok(done) if json => output_json(&done),
-        Ok(done) => {
-            if !args.hook || !done.completed.is_empty() {
-                println!("Completed {} task(s) for '{agent}'.", done.completed.len());
+        // Hook stdout must stay empty or JSON: Codex parses it.
+        Ok(done) if args.hook => {
+            if !done.completed.is_empty() {
+                eprintln!("Completed {} task(s) for '{agent}'.", done.completed.len());
             }
+            Ok(())
+        }
+        Ok(done) => {
+            println!("Completed {} task(s) for '{agent}'.", done.completed.len());
             Ok(())
         }
         Err(error) if args.hook && !retrying => {
@@ -492,9 +497,15 @@ fn paths_from_hook_payload(input: &str) -> Vec<String> {
     let Some(tool_input) = payload.get("tool_input") else {
         return Vec::new();
     };
+    // Codex edits through `apply_patch`, whose paths live in the patch text.
+    let patch = (payload.get("tool_name").and_then(|name| name.as_str()) == Some("apply_patch"))
+        .then(|| tool_input.get("command").and_then(|value| value.as_str()))
+        .flatten()
+        .unwrap_or_default();
     ["file_path", "path", "notebook_path"]
         .iter()
         .filter_map(|key| tool_input.get(*key).and_then(|value| value.as_str()))
+        .chain(patch_paths(patch))
         .map(|path| match cwd {
             Some(cwd) if Path::new(path).is_relative() => {
                 Path::new(cwd).join(path).to_string_lossy().into_owned()
@@ -502,6 +513,23 @@ fn paths_from_hook_payload(input: &str) -> Vec<String> {
             _ => path.to_string(),
         })
         .collect()
+}
+
+/// Paths an `apply_patch` envelope adds, updates, deletes, or moves to.
+fn patch_paths(patch: &str) -> impl Iterator<Item = &str> {
+    const HEADERS: [&str; 4] = [
+        "*** Add File: ",
+        "*** Update File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
+    patch.lines().filter_map(|line| {
+        HEADERS
+            .iter()
+            .find_map(|header| line.strip_prefix(header))
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    })
 }
 
 /// Converts a raw path to a canonical workspace-relative path under one of
@@ -548,6 +576,7 @@ fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn hook_payload_paths_resolve_against_cwd() {
@@ -565,6 +594,25 @@ mod tests {
             vec!["/w/n.ipynb".to_string()]
         );
         assert!(paths_from_hook_payload("not json").is_empty());
+        // Codex: the edited paths are the patch's file headers.
+        let patch = json!({
+            "cwd": "/w",
+            "tool_name": "apply_patch",
+            "tool_input": { "command": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** Add File: docs/new.md\n+hi\n*** Delete File: old.txt\n*** Update File: src/b.rs\n*** Move to: src/c.rs\n*** End Patch" }
+        })
+        .to_string();
+        let expected: Vec<String> = ["src/a.rs", "docs/new.md", "old.txt", "src/b.rs", "src/c.rs"]
+            .iter()
+            .map(|path| Path::new("/w").join(path).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths_from_hook_payload(&patch), expected);
+        // Only `apply_patch` commands are patches; a shell command is not.
+        let shell = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "*** Update File: src/a.rs" }
+        })
+        .to_string();
+        assert!(paths_from_hook_payload(&shell).is_empty());
         assert!(paths_from_hook_payload(r#"{"tool_input":{"command":"ls"}}"#).is_empty());
     }
 
