@@ -234,6 +234,97 @@ const char *ffs_integrator_status(const char *root,
                                   const char *assignment_id);
 
 /**
+ * Unified coordination lifecycle and prefilled next actions. JSON out:
+ * `CoordinationStatus`. Pass NULL `agent` for `FEANORFS_AGENT`/`human`.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_coordination_status(const char *root,
+                                    const char *agent);
+
+/**
+ * Send one typed candidate-side integrator reply. JSON in:
+ * `IntegratorReplyInput`; JSON out: `IntegratorReplyResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_integrator_reply(const char *root,
+                                 const char *input_json);
+
+/**
+ * Announce capabilities (when `announce` is set) and read the capability
+ * roster. JSON in: `CapabilitiesInput`; JSON out: `CapabilityRoster`.
+ * NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_capabilities(const char *root,
+                             const char *input_json);
+
+/**
+ * Claim scope in one call (propose and wait for the decision). JSON in:
+ * `ClaimInput`; JSON out: `ClaimResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_claim(const char *root,
+                      const char *input_json);
+
+/**
+ * Finish in one call (wait for edits to land, settle, complete). JSON in:
+ * `DoneInput`; JSON out: `DoneResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_done(const char *root,
+                     const char *input_json);
+
+/**
+ * Evaluate whether an agent may write workspace paths now. JSON in:
+ * `GuardInput`; JSON out: `GuardResult`. NULL on error.
+ *
+ * Returns an owned NUL-terminated UTF-8 string. The caller owns the
+ * allocation and must release it with `ffs_string_free` (never with libc
+ * `free`). NULL means an error; read `ffs_last_error` for the
+ * thread-local diagnostic.
+ *
+ * # Safety
+ * Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+ */
+const char *ffs_guard(const char *root,
+                      const char *input_json);
+
+/**
  * Explicitly revoke the active integrator assignment. JSON out:
  * `IntegratorStatusResult`. NULL on error.
  *

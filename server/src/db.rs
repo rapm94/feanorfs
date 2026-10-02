@@ -6,7 +6,7 @@ use feanorfs_common::{
 };
 use sqlx::{
     pool::PoolConnection,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     Connection, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool,
 };
 use std::collections::HashSet;
@@ -127,6 +127,10 @@ impl Db {
 
         let options = SqliteConnectOptions::new()
             .filename(db_path.as_ref())
+            // Durable publication acknowledgements outweigh WAL write throughput.
+            // Connect options apply this policy to every pooled connection.
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full)
             .busy_timeout(Duration::from_secs(5))
             // SQLx otherwise queues up to 50 rows from SQLite's worker. Some
             // rows contain bounded-but-large manifests, so keep backpressure
@@ -143,12 +147,6 @@ impl Db {
     }
 
     async fn init_schema(&self) -> Result<()> {
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous=NORMAL")
-            .execute(&self.pool)
-            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS files (
                 workspace_id TEXT NOT NULL,
@@ -533,16 +531,6 @@ impl Db {
         token: &str,
     ) -> Result<MigrationWriteOutcome> {
         let mut transaction = self.pool.begin().await?;
-        let format = sqlx::query_scalar::<_, i64>(
-            "SELECT format_version FROM workspace_formats WHERE workspace_id = ?",
-        )
-        .bind(workspace_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .unwrap_or(2);
-        if format >= 3 {
-            return Ok(MigrationWriteOutcome::Acquired);
-        }
         sqlx::query(
             "INSERT INTO migration_fences (workspace_id, token) VALUES (?, ?)
              ON CONFLICT(workspace_id) DO NOTHING",
@@ -557,7 +545,7 @@ impl Db {
         .bind(workspace_id)
         .fetch_one(&mut *transaction)
         .await?;
-        if current != token {
+        if !constant_time_eq::constant_time_eq(current.as_bytes(), token.as_bytes()) {
             return Ok(MigrationWriteOutcome::LockedByOther);
         }
         transaction.commit().await?;
@@ -848,6 +836,28 @@ impl Db {
 #[cfg(test)]
 mod manifest_capacity_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_pooled_connection_uses_full_wal_durability() {
+        let data = tempfile::tempdir().unwrap();
+        let db = Db::new(data.path().join("db.sqlite")).await.unwrap();
+        let mut connections = Vec::new();
+        // Hold all five at once to force distinct physical connections.
+        for _ in 0..5 {
+            let mut connection = db.pool.acquire().await.unwrap();
+            let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert_eq!(journal, "wal");
+            assert_eq!(synchronous, 2, "FULL must apply to every connection");
+            connections.push(connection);
+        }
+    }
 
     #[test]
     fn manifest_storage_capacity_is_bounded_per_workspace_and_globally() {

@@ -43,8 +43,12 @@ async fn sweep_blob_batch(
             continue;
         }
         let size = meta.len();
-        if let Err(error) = fs::remove_file(&path).await {
-            tracing::warn!("failed to remove orphan blob {}: {error}", path.display());
+        // Do not offload unlink to tokio::fs: dropping its future does not
+        // cancel the blocking syscall, which could then outlive the publication
+        // and hub-runtime guards. This single synchronous syscall cannot be
+        // detached by async cancellation. It may briefly block this worker.
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::warn!(?error, "failed to remove orphan blob");
             continue;
         }
         stats.blobs_deleted += 1;

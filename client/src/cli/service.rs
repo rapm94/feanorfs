@@ -331,9 +331,9 @@ pub(crate) fn stop_for_start(workspace: &Path) -> anyhow::Result<bool> {
 }
 
 pub(crate) fn restore_after_failed_start(workspace: &Path) -> anyhow::Result<()> {
-    let spec = ServiceSpec::load(workspace)?;
-    let _ = supervisor::start_workspace(&spec.workspace)?;
-    Ok(())
+    // Restore desired state first, even if the failure was unreadable config.
+    // The existing supervisor will retry opening the worker after repair.
+    supervisor::restore_suspended_workspace(workspace)
 }
 
 pub(crate) fn status_for_workspace(workspace: &Path) -> anyhow::Result<BackgroundStatus> {

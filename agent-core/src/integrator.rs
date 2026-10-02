@@ -351,7 +351,8 @@ async fn send_assignment_request(
     Ok(result.message_id)
 }
 
-/// Assigns one batch to a randomly ranked integrator (INT-3..INT-7).
+/// Assigns one batch to a randomly ranked integrator (INT-3..INT-7). An
+/// empty candidate list uses the capability roster.
 ///
 /// Persists the draw before the offer is considered active, then publishes
 /// the `ffint1` assignment request and records its message id. Fails closed
@@ -363,8 +364,24 @@ async fn send_assignment_request(
 /// snapshots, lock contention, or failed signal publication.
 pub async fn integrator_assign(
     ctx: &SyncCtx<'_>,
-    input: IntegratorAssignInput,
+    mut input: IntegratorAssignInput,
 ) -> Result<IntegratorAssignResult> {
+    if input.candidates.is_empty() {
+        // No explicit roster: offer to every agent that advertised
+        // capabilities (announcements or work intents); `required_capabilities`
+        // then routes the batch to capable machines only.
+        input.candidates = crate::coordination::capability_roster(ctx)
+            .await?
+            .agents
+            .into_iter()
+            .map(|entry| feanorfs_common::IntegratorCandidate {
+                name: entry.agent,
+                capabilities: entry.capabilities,
+                enabled: true,
+                available: true,
+            })
+            .collect();
+    }
     let eligibility = filter_eligible(&input)?;
     if let Some(reason) = &eligibility.no_candidate_reason {
         bail!("cannot assign an integrator: {reason}");
@@ -572,6 +589,15 @@ pub async fn integrator_status(
             .context("no active integrator assignment")?,
     };
     Ok(status_result(assignment))
+}
+
+/// Reads the active dispatcher assignment on this machine, if any.
+///
+/// # Errors
+/// Returns an error for corrupt or unsupported dispatcher state.
+pub async fn active_integrator_status(ctx: &SyncCtx<'_>) -> Result<Option<IntegratorStatusResult>> {
+    let state = IntegratorStore::open(ctx.base)?.load()?;
+    Ok(state.active.as_ref().map(status_result))
 }
 
 /// Explicitly revokes the active assignment (INT-5). An accepted integrator
@@ -2060,6 +2086,325 @@ fn strictly_oldest_author<'a>(
     oldest
 }
 
+/// Candidate-side view of every `ffint1` offer addressed to `agent`, newest
+/// first. The bool is true when the bounded signal scan was truncated, so an
+/// absent supersession cannot be proven.
+///
+/// # Errors
+/// Returns an error for invalid names or unreadable workspace history.
+pub async fn integrator_offers(
+    ctx: &SyncCtx<'_>,
+    agent: &str,
+) -> Result<(Vec<feanorfs_common::IntegratorOffer>, bool)> {
+    validate_name(agent)?;
+    let signals = signals_since(ctx, None, INTEGRATOR_OBSERVE_LIMIT).await?;
+    Ok((
+        offers_from_messages(agent, &signals.messages),
+        signals.cursor_reset,
+    ))
+}
+
+/// One observed assignment request.
+struct OfferedAttempt {
+    selected: String,
+    dispatcher: String,
+    request: String,
+    about: String,
+    task: String,
+}
+
+/// Pure projection of offers to `agent` from one signal window.
+pub(crate) fn offers_from_messages(
+    agent: &str,
+    messages: &[feanorfs_common::AgentMessage],
+) -> Vec<feanorfs_common::IntegratorOffer> {
+    let mut attempts: HashMap<(String, u32), OfferedAttempt> = HashMap::new();
+    // (assignment, attempt) -> (accepted, terminal) replies sent by `agent`
+    let mut replies: HashMap<(String, u32), (bool, bool)> = HashMap::new();
+    for message in messages {
+        let Some(profile) = parse_integrator_profile(&message.body) else {
+            continue;
+        };
+        match profile {
+            IntegratorProfile::Assignment {
+                assignment_id,
+                attempt,
+                selected,
+                about_snapshot,
+                task,
+                ..
+            } if message.to == selected => {
+                attempts.insert(
+                    (assignment_id, attempt),
+                    OfferedAttempt {
+                        selected,
+                        dispatcher: message.from.clone(),
+                        request: message.message_id.clone(),
+                        about: about_snapshot,
+                        task,
+                    },
+                );
+            }
+            IntegratorProfile::Accepted {
+                assignment_id,
+                attempt,
+                ..
+            } if message.from == agent => {
+                replies.entry((assignment_id, attempt)).or_default().0 = true;
+            }
+            IntegratorProfile::Result {
+                assignment_id,
+                attempt,
+                ..
+            }
+            | IntegratorProfile::Blocked {
+                assignment_id,
+                attempt,
+                ..
+            } if message.from == agent => {
+                replies.entry((assignment_id, attempt)).or_default().1 = true;
+            }
+            _ => {}
+        }
+    }
+    let mut latest: HashMap<&str, (u32, &str)> = HashMap::new();
+    let mut mine: HashMap<&str, u32> = HashMap::new();
+    for ((assignment_id, attempt), offered) in &attempts {
+        let entry = latest
+            .entry(assignment_id.as_str())
+            .or_insert((*attempt, offered.selected.as_str()));
+        if *attempt > entry.0 {
+            *entry = (*attempt, offered.selected.as_str());
+        }
+        if offered.selected == agent {
+            let entry = mine.entry(assignment_id.as_str()).or_insert(*attempt);
+            *entry = (*entry).max(*attempt);
+        }
+    }
+    let mut offers: Vec<_> = mine
+        .into_iter()
+        .filter_map(|(assignment_id, attempt)| {
+            let key = (assignment_id.to_string(), attempt);
+            let offered = attempts.get(&key)?;
+            let (accepted, terminal) = replies.get(&key).copied().unwrap_or_default();
+            let superseded_by = latest
+                .get(assignment_id)
+                .filter(|(newest, _)| *newest > attempt)
+                .map(|(newest, selected)| (*newest, (*selected).to_string()));
+            Some(feanorfs_common::IntegratorOffer {
+                assignment_id: assignment_id.to_string(),
+                attempt,
+                dispatcher: offered.dispatcher.clone(),
+                about_snapshot: offered.about.clone(),
+                request_message_id: offered.request.clone(),
+                task: offered.task.clone(),
+                accepted,
+                terminal,
+                superseded_by,
+            })
+        })
+        .collect();
+    // Signal windows are newest first; keep offers in that order.
+    let order: HashMap<&str, usize> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.message_id.as_str(), index))
+        .collect();
+    offers.sort_by_key(|offer| order.get(offer.request_message_id.as_str()).copied());
+    offers
+}
+
+/// Sends one typed candidate reply (accept, result, or blocker). Every
+/// binding field comes from the observed offer, and a superseded, already
+/// terminal, or out-of-order reply fails closed before publication.
+///
+/// # Errors
+/// Returns an error when no open offer matches, the attempt was superseded,
+/// the scan was truncated, or the reply fields are invalid.
+pub async fn integrator_reply(
+    ctx: &SyncCtx<'_>,
+    agent: &str,
+    input: feanorfs_common::IntegratorReplyInput,
+) -> Result<feanorfs_common::IntegratorReplyResult> {
+    use feanorfs_common::IntegratorReplyKind as Kind;
+    let (offers, incomplete) = integrator_offers(ctx, agent).await?;
+    ensure!(
+        !incomplete,
+        "signal history exceeds the scan bound; supersession cannot be proven, so the reply is refused"
+    );
+    let offer = match input.assignment_id.as_deref() {
+        Some(id) => offers.iter().find(|offer| offer.assignment_id == id),
+        None => offers.iter().find(|offer| offer.is_open()),
+    }
+    .with_context(|| format!("no integrator offer to {agent} matches"))?;
+    if let Some((attempt, selected)) = &offer.superseded_by {
+        bail!(
+            "integrator attempt {} was superseded by attempt {attempt} offered to {selected}; stop work on assignment {}",
+            offer.attempt,
+            offer.assignment_id
+        );
+    }
+    ensure!(
+        !offer.terminal,
+        "attempt {} of assignment {} already has a terminal reply",
+        offer.attempt,
+        offer.assignment_id
+    );
+    let base = (
+        offer.assignment_id.clone(),
+        offer.attempt,
+        offer.about_snapshot.clone(),
+    );
+    let (profile, kind) = match input.kind {
+        Kind::Accept => {
+            ensure!(!offer.accepted, "this attempt is already accepted");
+            (
+                IntegratorProfile::Accepted {
+                    assignment_id: base.0,
+                    attempt: base.1,
+                    about_snapshot: base.2,
+                },
+                AgentMessageKind::Status,
+            )
+        }
+        Kind::Blocked => {
+            let reason = input
+                .reason
+                .filter(|reason| !reason.trim().is_empty())
+                .context("a blocked reply requires a reason")?;
+            (
+                IntegratorProfile::Blocked {
+                    assignment_id: base.0,
+                    attempt: base.1,
+                    about_snapshot: base.2,
+                    reason,
+                },
+                AgentMessageKind::Blocked,
+            )
+        }
+        Kind::Result => {
+            ensure!(
+                offer.accepted,
+                "accept the assignment before sending a result"
+            );
+            let inspected = match input.inspected_snapshot {
+                Some(snapshot) => snapshot,
+                None => ctx
+                    .api
+                    .get_head(ctx.workspace_id())
+                    .await?
+                    .context("workspace has no head to report as inspected")?,
+            };
+            let digest = IntegratorDigest {
+                assignment_id: base.0.clone(),
+                integrator: agent.to_string(),
+                about_snapshot: base.2.clone(),
+                inspected_snapshot: inspected,
+                state: input.state.unwrap_or(IntegratorOutcomeState::Completed),
+                landed_paths: input.landed_paths,
+                resolved_conflicts: input.resolved_conflicts,
+                remaining_conflicts: input.remaining_conflicts,
+                verification: input
+                    .verification
+                    .context("a result reply requires verification evidence")?,
+                outcome: input
+                    .outcome
+                    .context("a result reply requires an outcome summary")?,
+                risks: input.risks,
+                decision_required: input.decision_required,
+            };
+            feanorfs_common::validate_integrator_digest(&digest)?;
+            (
+                IntegratorProfile::Result {
+                    assignment_id: base.0,
+                    attempt: base.1,
+                    about_snapshot: base.2,
+                    digest: Box::new(digest),
+                },
+                AgentMessageKind::Result,
+            )
+        }
+    };
+    let sent = send_message(
+        ctx,
+        AgentMessageInput {
+            to: offer.dispatcher.clone(),
+            kind,
+            body: encode_integrator_profile(&profile)?,
+            about_snapshot: Some(offer.about_snapshot.clone()),
+            reply_to: Some(offer.request_message_id.clone()),
+            from: Some(agent.to_string()),
+        },
+    )
+    .await?;
+    Ok(feanorfs_common::IntegratorReplyResult {
+        message_id: sent.message_id,
+        assignment_id: offer.assignment_id.clone(),
+        attempt: offer.attempt,
+        dispatcher: offer.dispatcher.clone(),
+        kind: input.kind,
+    })
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::offers_from_messages;
+    use feanorfs_common::{
+        encode_integrator_profile, AgentMessage, AgentMessageKind, IntegratorProfile,
+    };
+
+    fn message(id: u8, from: &str, to: &str, profile: &IntegratorProfile) -> AgentMessage {
+        AgentMessage {
+            message_id: std::iter::repeat_n(char::from(b'a' + id), 64).collect(),
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: AgentMessageKind::Request,
+            body: encode_integrator_profile(profile).unwrap(),
+            about_snapshot: "b".repeat(64),
+            reply_to: None,
+            created_at_ms: i64::from(id),
+        }
+    }
+
+    fn assignment(attempt: u32, selected: &str) -> IntegratorProfile {
+        IntegratorProfile::Assignment {
+            assignment_id: "0".repeat(32),
+            attempt,
+            selected: selected.to_string(),
+            about_snapshot: "b".repeat(64),
+            roster_fingerprint: "c".repeat(64),
+            neutral_integrator: true,
+            task: "integrate batch".to_string(),
+        }
+    }
+
+    #[test]
+    fn open_offer_becomes_superseded_by_a_newer_attempt() {
+        let first = message(1, "human", "mac", &assignment(0, "mac"));
+        let offers = offers_from_messages("mac", std::slice::from_ref(&first));
+        assert_eq!(offers.len(), 1);
+        assert!(offers[0].is_open());
+        assert_eq!(offers[0].dispatcher, "human");
+
+        let accepted = message(
+            2,
+            "mac",
+            "human",
+            &IntegratorProfile::Accepted {
+                assignment_id: "0".repeat(32),
+                attempt: 0,
+                about_snapshot: "b".repeat(64),
+            },
+        );
+        let second = message(3, "human", "linux", &assignment(1, "linux"));
+        let offers = offers_from_messages("mac", &[second, accepted, first]);
+        assert!(offers[0].accepted);
+        assert_eq!(offers[0].superseded_by, Some((1, "linux".to_string())));
+        assert!(!offers[0].is_open());
+        assert!(offers_from_messages("other", &[]).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3093,6 +3438,8 @@ mod tests {
                     verified_at_ms: None,
                     result: None,
                     question_generation: 0,
+                    human_answer: None,
+                    answer_message_id: None,
                 });
                 Ok(())
             })

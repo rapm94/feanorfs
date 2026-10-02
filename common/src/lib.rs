@@ -23,6 +23,8 @@
 //! existed in the workspace.
 
 pub mod agent_contract;
+pub mod coordination_contract;
+pub mod git_baseline;
 pub mod hub_contract;
 pub mod integrator_contract;
 pub mod invite;
@@ -46,6 +48,14 @@ pub use agent_contract::{
     AGENT_INBOX_DEFAULT_LIMIT, AGENT_INBOX_MAX_LIMIT, AGENT_MESSAGE_DISCRIMINATOR,
     AGENT_MESSAGE_MAX_BODY_BYTES, AGENT_MESSAGE_MAX_ENCODED_BYTES, AGENT_NAME_MAX_BYTES,
     CONTINUOUS_STATUS_SCHEMA_VERSION,
+};
+pub use coordination_contract::{
+    encode_capability_announcement, parse_capability_announcement, CapabilitiesInput,
+    CapabilityRoster, ClaimInput, ClaimOutcome, ClaimResult, CoordinatePass, CoordinationStatus,
+    DoneInput, DoneResult, GuardFinding, GuardInput, GuardResult, GuardVerdict, IntegratorOffer,
+    IntegratorReplyInput, IntegratorReplyKind, IntegratorReplyResult, LifecycleItem, LifecycleKind,
+    LifecycleStage, NextAction, RosterEntry, CAPABILITY_RECIPIENT_PREFIX,
+    COORDINATION_SCHEMA_VERSION,
 };
 pub use invite::{
     decode_hub_invite, decode_invite, encode_hub_invite, encode_invite, hub_ca_fingerprint,

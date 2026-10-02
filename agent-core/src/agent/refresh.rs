@@ -78,6 +78,17 @@ pub(super) async fn refresh_agent_impl(
     let diff = compute_agent_diff(&ctx, name).await?;
     let agent_path = agent_dir(base, name)?;
     let snapshots = SnapshotEngine::new(&ctx);
+    if !options.replace
+        && !snapshots
+            .load_state(&diff.current_head)
+            .await?
+            .conflicts
+            .is_empty()
+    {
+        return Err(super::continuous::conflict_failure(
+            "Shared conflicts need explicit resolution before refreshing agent files",
+        ));
+    }
     let base_snapshot = snapshots.read_agent_base(name).await?;
     let mut refreshed_base = snapshots.load_files(&base_snapshot).await?;
     if options.replace {

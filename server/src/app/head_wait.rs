@@ -7,6 +7,7 @@
 //! and waiters are notified only after a head swap is durably accepted.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
@@ -21,10 +22,15 @@ const MAX_GLOBAL_WAITERS: usize = 256;
 /// Per-workspace concurrent waiter bound.
 pub(super) const MAX_WORKSPACE_WAITERS: usize = 16;
 
+// Never recycle an identity while an old notified handle can still be dropped.
+// Exhaustion fails admission rather than wrapping into a live registration.
+static NEXT_WAITER_ID: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Default)]
 struct WorkspaceWaiters {
-    next_id: u64,
     senders: HashMap<u64, oneshot::Sender<()>>,
+    #[cfg(test)]
+    waiting: std::collections::HashSet<u64>,
 }
 
 /// In-memory notification registry for opaque head waiters.
@@ -54,8 +60,13 @@ impl HeadWaiters {
             Ok(permit) => permit,
             Err(_) => return None,
         };
+        // `try_update` (the rename) is newer than the 1.88 MSRV.
+        #[allow(deprecated)]
+        let waiter_id = NEXT_WAITER_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()?;
         let (sender, receiver) = oneshot::channel();
-        let waiter_id = {
+        {
             let mut inner = match self.inner.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -64,11 +75,8 @@ impl HeadWaiters {
             if entry.senders.len() >= MAX_WORKSPACE_WAITERS {
                 return None;
             }
-            let waiter_id = entry.next_id;
-            entry.next_id = entry.next_id.wrapping_add(1);
             entry.senders.insert(waiter_id, sender);
-            waiter_id
-        };
+        }
         Some(RegisteredWaiter {
             receiver,
             _permit: permit,
@@ -87,11 +95,23 @@ impl HeadWaiters {
         let mut remove = false;
         if let Some(entry) = inner.get_mut(workspace_id) {
             entry.senders.remove(&waiter_id);
+            #[cfg(test)]
+            entry.waiting.remove(&waiter_id);
             remove = entry.senders.is_empty();
         }
         if remove {
             inner.remove(workspace_id);
         }
+    }
+
+    /// Test synchronization observes actual receiver polling, after the route's
+    /// post-registration head recheck, rather than merely a queued request.
+    #[cfg(test)]
+    pub(super) fn waiting_count(&self, workspace_id: &str) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .get(workspace_id)
+            .map_or(0, |entry| entry.waiting.len())
     }
 
     /// Wakes every waiter for `workspace_id` after a durable head swap.
@@ -121,6 +141,18 @@ pub(super) struct RegisteredWaiter {
 
 impl RegisteredWaiter {
     pub(super) fn receiver(&mut self) -> &mut oneshot::Receiver<()> {
+        #[cfg(test)]
+        if let Some(entry) = self
+            .registry
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(&self.workspace_id)
+        {
+            if entry.senders.contains_key(&self.waiter_id) {
+                entry.waiting.insert(self.waiter_id);
+            }
+        }
         &mut self.receiver
     }
 }
@@ -181,6 +213,22 @@ mod tests {
             b.receiver().try_recv().is_err(),
             "workspace b waiter untouched"
         );
+    }
+
+    #[test]
+    fn dropping_notified_waiter_preserves_new_registration() {
+        let registry = Arc::new(HeadWaiters::new());
+        let old = registry.register("ws-a").unwrap();
+        registry.notify("ws-a");
+        let mut new = registry.register("ws-a").unwrap();
+        drop(old);
+        assert_eq!(
+            new.receiver().try_recv(),
+            Err(oneshot::error::TryRecvError::Empty),
+            "old drop must not close the new sender"
+        );
+        registry.notify("ws-a");
+        assert_eq!(new.receiver().try_recv(), Ok(()));
     }
 
     #[test]

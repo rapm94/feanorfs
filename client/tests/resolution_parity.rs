@@ -252,6 +252,197 @@ static RESOLUTION_PARITY_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[tokio::test]
+async fn reviewed_candidate_answer_rejects_stale_question_then_runs_engine_verification() {
+    let _serial = RESOLUTION_PARITY_SERIAL.lock().await;
+    let server = spawn_test_server().await;
+    let main = spawn_test_client_with_server(&server).await;
+    let second = spawn_test_client_with_server(&server).await;
+    make_v3(&main);
+    make_v3(&second);
+    let home = PathBuf::from(std::env::var_os("FEANORFS_HOME").unwrap());
+    let head = publish_conflict(&main, &second, &server, "review-resolver").await;
+    let config = load_config(main.workspace.path()).unwrap();
+    let ctx = ctx_from(&server.api, &main.db, main.workspace.path(), &config);
+    assert_eq!(
+        stdout_json(
+            &run_cli(
+                main.workspace.path(),
+                &home,
+                &["--json", "agent", "resolution", "review"]
+            )
+            .await,
+        ),
+        serde_json::Value::Null,
+        "review without a pending job must report none"
+    );
+    feanorfs_agent_core::materialize_conflicts(&ctx, &head, &[])
+        .await
+        .unwrap();
+    seed_accepted(&ctx, CONFLICT);
+    let job = prepare_resolution_job(
+        &ctx,
+        CONFLICT,
+        PreventionReason::Exhausted {
+            detail: "human decision required".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut result = result_for(&job, CANDIDATE);
+    let human = resolution_fixtures::human_result();
+    result.outcome = human.outcome;
+    result.candidate = None;
+    result.question = human.question;
+    result.human_reason = human.human_reason;
+    result.safe_options = human.safe_options;
+    result
+        .safe_options
+        .push(feanorfs_common::HumanResolutionOption::SubmitCandidate);
+    let submitted = feanorfs_agent_core::submit_resolution_result(&ctx, &job.job_id, result)
+        .await
+        .unwrap();
+    let review = stdout_json(
+        &run_cli(
+            main.workspace.path(),
+            &home,
+            &["--json", "agent", "resolution", "review", &job.job_id],
+        )
+        .await,
+    );
+    assert_eq!(review["job"]["conflict"]["path"], CONFLICT);
+    assert_eq!(review["question_generation"], submitted.question_generation);
+    assert_eq!(
+        stdout_json(
+            &run_cli(
+                main.workspace.path(),
+                &home,
+                &["--json", "agent", "resolution", "review"]
+            )
+            .await,
+        ),
+        review,
+        "default review selects the pending human question"
+    );
+    assert_eq!(
+        review["result"]["question"],
+        submitted.question.clone().unwrap()
+    );
+    let source = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), CANDIDATE).unwrap();
+    let stale = (submitted.question_generation + 1).to_string();
+    let refused = run_cli(
+        main.workspace.path(),
+        &home,
+        &[
+            "--json",
+            "agent",
+            "resolution",
+            "answer",
+            &job.job_id,
+            "--question-generation",
+            &stale,
+            "--candidate",
+            source.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(!refused.status.success());
+    let state = ensure_workspace_state(main.workspace.path()).unwrap();
+    assert!(
+        !state.join(&job.candidate_destination.path).exists(),
+        "stale review must be refused before staging a candidate"
+    );
+    let generation = submitted.question_generation.to_string();
+    let accepted = run_cli(
+        main.workspace.path(),
+        &home,
+        &[
+            "--json",
+            "agent",
+            "resolution",
+            "answer",
+            &job.job_id,
+            "--question-generation",
+            &generation,
+            "--candidate",
+            source.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+    let answer = stdout_json(&accepted);
+    assert_eq!(answer["verification"]["status"], "unknown");
+    let records = feanorfs_agent_core::ResolutionStore::open(main.workspace.path())
+        .unwrap()
+        .load()
+        .unwrap();
+    let recorded = records
+        .jobs
+        .iter()
+        .find(|record| record.job.job_id == job.job_id)
+        .unwrap();
+    let result = recorded.result.as_ref().unwrap();
+    assert_eq!(result.outcome, ResolutionOutcome::CandidateReady);
+    assert_eq!(result.verification.status, VerificationStatus::Passed);
+    assert_eq!(
+        result.candidate.as_ref().unwrap().hash,
+        hash_bytes(CANDIDATE)
+    );
+    assert!(
+        main.db.is_conflict_fingerprinted(CONFLICT).await.unwrap(),
+        "answer must not apply the resolution implicitly"
+    );
+    let publication = stdout_json(
+        &run_cli(
+            main.workspace.path(),
+            &home,
+            &["--json", "agent", "resolution", "apply", &job.job_id],
+        )
+        .await,
+    );
+    assert_eq!(publication["outcome"], "published");
+    let published_head = publication["head"].as_str().unwrap();
+    let second_config = load_config(second.workspace.path()).unwrap();
+    let second_ctx = ctx_from(
+        &server.api,
+        &second.db,
+        second.workspace.path(),
+        &second_config,
+    );
+    for (recipient, recipient_ctx) in [("review-resolver", &ctx), ("other-agent", &second_ctx)] {
+        let inbox = feanorfs_agent_core::inbox(
+            recipient_ctx,
+            feanorfs_common::AgentInboxQuery {
+                recipient: recipient.to_string(),
+                after: Some(head.clone()),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!inbox.cursor_reset);
+        let notice = inbox
+            .messages
+            .iter()
+            .find(|message| message.message_id == published_head)
+            .expect("both participants see the notice in the publication itself");
+        assert_eq!(notice.kind, feanorfs_common::AgentMessageKind::Status);
+        assert_eq!(notice.about_snapshot, head);
+        assert!(notice.body.contains(&job.conflict_fingerprint));
+        assert!(notice.body.contains(CONFLICT));
+    }
+    assert_eq!(
+        server
+            .api
+            .get_head(&config.workspace_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(published_head),
+        "notification must not append a second snapshot"
+    );
+}
+
+#[tokio::test]
 async fn full_lifecycle_is_equivalent_inline_cli_and_mcp_with_fixture_parity() {
     let _serial = RESOLUTION_PARITY_SERIAL.lock().await;
     let server = spawn_test_server().await;
@@ -320,19 +511,19 @@ async fn full_lifecycle_is_equivalent_inline_cli_and_mcp_with_fixture_parity() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(responses.len(), 3);
-    let tool_names: Vec<&str> = responses[0]["result"]["tools"]
+    // The compact `resolve` tool advertises every operation; the calls
+    // below use the legacy names, which stay callable.
+    let resolve = responses[0]["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|tool| tool["name"].as_str().unwrap())
-        .collect();
-    for name in [
-        "resolution_prepare",
-        "resolution_status",
-        "resolution_submit",
-        "resolution_apply",
-    ] {
-        assert!(tool_names.contains(&name), "MCP must declare {name}");
+        .find(|tool| tool["name"] == "resolve")
+        .expect("MCP must declare the resolve tool");
+    let ops = resolve["inputSchema"]["properties"]["op"]["enum"]
+        .as_array()
+        .unwrap();
+    for op in ["prepare", "status", "submit", "apply"] {
+        assert!(ops.contains(&json!(op)), "resolve must route {op}");
     }
     assert_eq!(
         responses[1]["result"]["structuredContent"]["jobs"],

@@ -30,41 +30,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: read
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      release_id: ${{ steps.release.outputs.release_id }}
+      release_target: ${{ steps.release.outputs.release_target }}
     steps:
-      - name: Require matching tag and release
+      - name: Require trusted dispatch source
+        env:
+          INVOCATION_REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$REPOSITORY" = rapm94/feanorfs
+          test "$INVOCATION_REF" = refs/heads/main
+      - name: Checkout exact workflow source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require matching tag and prerelease
+        id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           REPOSITORY: ${{ github.repository }}
-        run: |
-          case "$RELEASE_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::Invalid stable release tag $RELEASE_TAG"; exit 1 ;;
-          esac
-          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
-          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
-          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
-          if [ "$tag_type" = tag ]; then
-            tag_sha="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
-          fi
-          release_target="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.target_commitish')"
-          release_sha="$(gh api "repos/$REPOSITORY/commits/$release_target" --jq '.sha')"
-          test "$tag_sha" = "$release_sha"
+        run: bash scripts/check-unsigned-release.sh "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
       - name: Require trusted main CI and Security for the release commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+          EXPECTED_SHA: ${{ steps.release.outputs.sha }}
+          INVOCATION_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag_object="$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")"
-          tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
-          tag_type="$(jq -r '.object.type' <<<"$tag_object")"
-          if [ "$tag_type" = tag ]; then
-            annotated="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")"
-            tag_sha="$(jq -r '.object.sha' <<<"$annotated")"
-          fi
 
           trusted_run_id() {
             local workflow_file="$1"
@@ -92,6 +91,7 @@ jobs:
               )] | first | .id // empty' <<<"$runs"
           }
 
+          for tag_sha in "$EXPECTED_SHA" "$INVOCATION_SHA"; do
           ci_run_id="$(trusted_run_id ci.yml CI "$tag_sha")"
           if [ -z "$ci_run_id" ]; then
             echo "::error::No successful trusted main-push CI run exists for $tag_sha."
@@ -112,6 +112,14 @@ jobs:
             echo "::error::Security success did not pass for $tag_sha."
             exit 1
           fi
+          done
+      - name: Retain exact validated upload guard
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unsigned-release-guard-${{ github.sha }}
+          path: scripts/check-unsigned-release.sh
+          if-no-files-found: error
+          retention-days: 1
 
   build-macos:
     needs: validate-release
@@ -127,14 +135,14 @@ jobs:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
     steps:
-      - name: Checkout release tag
+      - name: Checkout verified release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: refs/tags/${{ inputs.release_tag }}
+          ref: ${{ needs.validate-release.outputs.sha }}
           persist-credentials: false
           submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -170,15 +178,17 @@ jobs:
     name: Publish attested unsigned universal macOS installers
     runs-on: macos-latest
     timeout-minutes: 45
+    environment: prod
     permissions:
+      actions: read
       contents: write
       attestations: write
       id-token: write
     steps:
-      - name: Checkout release tag
+      - name: Checkout verified release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: refs/tags/${{ inputs.release_tag }}
+          ref: ${{ needs.validate-release.outputs.sha }}
           persist-credentials: false
           submodules: recursive
       - name: Download arm64 binaries
@@ -243,38 +253,49 @@ jobs:
             FeanorFS-macOS-unsigned.dmg
             FeanorFS-macOS-unsigned.dmg.sha256
             FeanorFS-macOS-UNSIGNED.txt
+      - name: Download validated upload guard
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: unsigned-release-guard-${{ github.sha }}
+          path: upload-guard
       - name: Upload unsigned macOS release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           REPOSITORY: ${{ github.repository }}
-        run: >-
-          gh release upload "$RELEASE_TAG"
-          FeanorFS-macOS-unsigned.pkg
-          FeanorFS-macOS-unsigned.pkg.sha256
-          FeanorFS-macOS-unsigned.dmg
-          FeanorFS-macOS-unsigned.dmg.sha256
-          FeanorFS-macOS-UNSIGNED.txt
-          --repo "$REPOSITORY"
-          --clobber
+          EXPECTED_SHA: ${{ needs.validate-release.outputs.sha }}
+          RELEASE_ID: ${{ needs.validate-release.outputs.release_id }}
+          RELEASE_TARGET: ${{ needs.validate-release.outputs.release_target }}
+        run: |
+          set -euo pipefail
+          bash upload-guard/check-unsigned-release.sh "$RELEASE_TAG" "$EXPECTED_SHA" "$RELEASE_ID" "$RELEASE_TARGET"
+          gh release upload "$RELEASE_TAG" \
+            FeanorFS-macOS-unsigned.pkg \
+            FeanorFS-macOS-unsigned.pkg.sha256 \
+            FeanorFS-macOS-unsigned.dmg \
+            FeanorFS-macOS-unsigned.dmg.sha256 \
+            FeanorFS-macOS-UNSIGNED.txt \
+            --repo "$REPOSITORY"
 
   publish-windows:
     needs: validate-release
     name: Publish attested unsigned Windows installer
     runs-on: windows-latest
     timeout-minutes: 45
+    environment: prod
     permissions:
+      actions: read
       contents: write
       attestations: write
       id-token: write
     steps:
-      - name: Checkout release tag
+      - name: Checkout verified release commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: refs/tags/${{ inputs.release_tag }}
+          ref: ${{ needs.validate-release.outputs.sha }}
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
       - name: Build CLI and tray

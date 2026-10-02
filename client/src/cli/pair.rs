@@ -456,14 +456,18 @@ async fn offer_via_relay(
 ) -> anyhow::Result<()> {
     ensure_internet_hub(invite)?;
     let code = PairCode::generate_relay(relay_url)?;
-    let mut first = Some(connect_relay(&code, "offer").await?);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut first = Some(
+        tokio::time::timeout_at(deadline, connect_relay(&code, "offer"))
+            .await
+            .context("Pairing capability expired while connecting to the relay")??,
+    );
     present_code(&code, timeout, presentation)?;
     copy_to_clipboard(code.as_str());
     if presentation == PairPresentation::Human {
         println!("Copied pairing capability to clipboard. Waiting through the relay…");
     }
 
-    let deadline = tokio::time::Instant::now() + timeout;
     for attempt in 1..=MAX_ATTEMPTS {
         let channel = match first.take() {
             Some(channel) => channel,

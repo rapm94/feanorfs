@@ -61,6 +61,14 @@ enum Commands {
 }
 
 fn logging_mode(command: &Commands) -> LoggingMode {
+    // The guard hook runs on every edit in arbitrary projects: log globally
+    // and never probe (or lease) workspace state for the current folder.
+    if let Commands::Agent {
+        action: Some(AgentAction::Guard { hook: true, .. } | AgentAction::Done { hook: true, .. }),
+    } = command
+    {
+        return LoggingMode::TrayGlobal;
+    }
     let Commands::Workspace(WorkspaceAction::Tray { action }) = command else {
         return LoggingMode::Standard;
     };

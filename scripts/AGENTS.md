@@ -43,6 +43,8 @@ tests used by local verification and GitHub release workflows.
 
 ## Verification
 
+- `sh scripts/test-acceptance-matrix.sh` — proves the local acceptance matrix exits nonzero on check failures while reporting required field work as skipped; the matrix itself also runs the Git workflow recipe.
+- `sh scripts/test-git-workflow.sh` — executes the publication guard extracted from `docs/usage.md` in disposable local clones; checks staging/WIP/divergence refusal, file-preserving advancement, and independent worktree indexes. No FeanorFS runtime or cross-machine claims.
 - `shellcheck scripts/*.sh`
 - `scripts/test-install-routing.sh`
 - `scripts/smoke-upgrade.sh OLD_BIN NEW_BIN` (CI: `upgrade-smoke` job builds the previous release tag as OLD_BIN)

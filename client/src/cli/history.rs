@@ -34,15 +34,15 @@ pub async fn log(current_dir: &Path, limit: usize, json: bool) -> anyhow::Result
                 terminal_line(&payload.body)
             );
         } else {
+            let note = match feanorfs_common::git_baseline::GitBaseline::parse(&message) {
+                Some(baseline) => format!(" (git {})", terminal_line(&baseline.short())),
+                None if message.is_empty() => String::new(),
+                None => format!(" — {}", terminal_line(&message)),
+            };
             println!(
-                "{id} {age} {} {} path(s){}",
+                "{id} {age} {} {} path(s){note}",
                 author,
                 entry.changed_paths.len(),
-                if message.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {}", terminal_line(&message))
-                }
             );
         }
     }

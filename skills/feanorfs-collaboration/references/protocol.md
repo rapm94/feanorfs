@@ -126,11 +126,17 @@ Global `--json` emits `AgentSendResult` and `AgentInboxResult`.
 
 ## MCP
 
-- `agent_send(from?, to, kind, body, about_snapshot?, reply_to?)`
-- `agent_inbox(for?, after?, limit?)`
+`feanorfs mcp` lists nine compact tools: `status` (sync state plus the
+unified lifecycle and `next_actions`), `send`, `inbox`, and the `op`-routed
+`agent`, `work`, `conflicts`, `resolve`, `integrator`, and `history`.
 
-Tool descriptions explain that all workspace participants can read messages,
-identity is advisory, and requests/results should carry exact snapshot context.
+- `send(from?, to, kind, body, about_snapshot?, reply_to?)`
+- `inbox(for?, after?, limit?)`
+
+The legacy per-operation names (`agent_send`, `agent_inbox`, …) stay callable;
+`FEANORFS_MCP_LEGACY_TOOLS=1` lists them instead. Tool descriptions explain
+that all workspace participants can read messages, identity is advisory, and
+requests/results should carry exact snapshot context.
 
 ## Events
 
@@ -198,3 +204,63 @@ value length-prefixed; ascending 32-byte score, agent-name tie-break).
 `roster_fingerprint` = Blake3 of the canonical JSON array of the sorted final
 pool. Only the dispatcher draws; terminal replies reference the assignment
 request via `reply_to`. Unknown `ffint` versions remain ordinary message text.
+
+Candidates never write these profiles by hand: `feanorfs agent integrator
+reply accept|result|blocked` builds them from the observed offer and refuses
+a superseded attempt.
+
+## Coordination procedures
+
+`feanorfs agent next` turns the rules below into prefilled actions; they are
+listed here so an agent can reason about edge cases.
+
+### Work intent (`ffwork1`): scope before mutation
+
+- Propose before editing a scope others may touch (`feanorfs agent work
+  propose`); paths are exact canonical paths or `dir/**` globs, sorted and
+  unique. A proposal is `proposed`, never accepted, until the reducer observes
+  a decision from the named coordinator (default `human`). Silence and
+  timeouts never imply acceptance or yield.
+- Re-propose with a higher `--sequence` after a rejection. Change accepted
+  scope only through `feanorfs agent work amend`; hand overlap back with
+  `feanorfs agent work yield`. Never edit outside accepted scope.
+- Finish with `feanorfs agent work settle --inspected <snapshot>` (evidence
+  names the snapshot actually inspected), then `feanorfs agent work complete`
+  or `feanorfs agent work block`, each referencing the exact intent id.
+- Ownership comes from causal references and observed decisions, never from
+  clocks. A `projection_incomplete` result means acceptance is not provable.
+
+### Integrator (`ffint1`): one temporary integrator per batch
+
+- Act only when the newest open offer selects you. Verify the requested file
+  tree, then `feanorfs agent integrator reply accept`.
+- Work in an isolated agent workspace; `feanorfs conflicts materialize`
+  writes encrypted legs read-only under private state without moving the head.
+- Reconcile only when every leg is available, intents are compatible, and
+  verification passes; apply through `feanorfs conflicts keep <path> --file
+  <reconciled>` (or `--local`/`--cloud`/`--both`).
+- Send exactly one terminal: `feanorfs agent integrator reply result` with the
+  outcome and verification, or `feanorfs agent integrator reply blocked`.
+- A newer attempt offered to another candidate supersedes you: stop. The
+  guard denies your edits and the reply command refuses to publish.
+
+### Resolution (`ffres1`): last resort after scoping
+
+- `feanorfs agent resolution prepare <path> --reason exhausted|violated
+  --detail <text>` only for a real current fingerprinted conflict whose
+  prevention failed. Prepare is read-only and designates the owner. Legacy
+  path-only conflicts stay on manual `feanorfs conflicts keep`.
+- The owner writes the candidate only to the job's create-new destination
+  (`feanorfs agent resolution put`), submits one validated result
+  (`feanorfs agent resolution submit`; submission never applies), and
+  publishes with `feanorfs agent resolution apply`, which revalidates every
+  identity field before one compare-and-swap. A typed stale outcome means the
+  conflict survived unchanged: re-inspect and re-prepare, never retry blindly.
+- `requires_human` carries exactly one bounded question and one typed reason.
+  Humans answer with `feanorfs agent resolution answer` (bound to the
+  reviewed question generation), retry publication with `feanorfs agent
+  resolution publish-answer`, or `feanorfs agent resolution defer`.
+- Status (`feanorfs agent resolution status`, `feanorfs agent resolution
+  protocol-status`) is metadata only: ids, states, counts. Cross-machine
+  profiles are published with `feanorfs agent resolution assign`, `reply`,
+  and `revoke`.

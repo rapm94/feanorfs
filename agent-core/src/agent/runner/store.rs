@@ -241,13 +241,16 @@ impl RunnerStore {
         Ok(store)
     }
 
-    /// Updates trusted argv/timeout while preserving all runtime state.
+    /// Updates trusted argv/timeout/scope mode while preserving runtime state.
+    /// Explicit scope changes are allowed in either direction when no active
+    /// request would lose its original admission contract.
     pub fn reconfigure(
         base: &Path,
         agent: &str,
         canonical_absolute_program: &Path,
         fixed_args: Vec<String>,
         timeout_secs: u64,
+        scope_mode: RunnerScopeMode,
     ) -> Result<Self> {
         validate_name(agent)?;
         validate_program(canonical_absolute_program)?;
@@ -283,7 +286,10 @@ impl RunnerStore {
         let now = now_ms();
         let generation_id = new_generation_id()?;
         state.generation_id.clone_from(&generation_id);
-        let scope_mode = state.config.scope_mode;
+        ensure!(
+            state.config.scope_mode == scope_mode || state.runtime.active.is_none(),
+            "cannot change scope mode while an active or ambiguous request retains its admission contract; reset with explicit discard first"
+        );
         state.config = RunnerConfig {
             agent: agent.to_string(),
             program: canonical_absolute_program.to_path_buf(),

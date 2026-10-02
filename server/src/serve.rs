@@ -71,6 +71,74 @@ impl Default for ServeOptions {
     }
 }
 
+#[derive(Debug)]
+struct GcDurationOverflow {
+    option: &'static str,
+}
+
+impl std::fmt::Display for GcDurationOverflow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} exceeds the supported duration", self.option)
+    }
+}
+
+impl std::error::Error for GcDurationOverflow {}
+
+fn gc_duration(count: u64, seconds_per_unit: u64, option: &'static str) -> Result<Duration> {
+    count
+        .checked_mul(seconds_per_unit)
+        .map(Duration::from_secs)
+        .ok_or_else(|| GcDurationOverflow { option }.into())
+}
+
+struct GcDurations {
+    grace: Duration,
+    tombstone_retention: Duration,
+    snapshot_retention: Duration,
+}
+
+impl GcDurations {
+    fn from_options(opts: &ServeOptions) -> Result<Self> {
+        Ok(Self {
+            grace: gc_duration(opts.gc_grace_minutes, 60, "gc_grace_minutes")?,
+            tombstone_retention: gc_duration(
+                opts.tombstone_retention_days,
+                86400,
+                "tombstone_retention_days",
+            )?,
+            snapshot_retention: gc_duration(
+                opts.snapshot_retention_days,
+                86400,
+                "snapshot_retention_days",
+            )?,
+        })
+    }
+}
+
+// Also abort on cancellation of the enclosing server future. Normal returns
+// additionally await termination before releasing the hub runtime guard.
+struct GcTask(tokio::task::JoinHandle<()>);
+
+impl GcTask {
+    fn spawn(
+        runtime: std::sync::Arc<crate::HubRuntimeGuard>,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self(tokio::spawn(async move {
+            // Aborting a task is a request, not proof that it has stopped.
+            // Retain runtime ownership inside the worker until it really exits.
+            let _runtime = runtime;
+            work.await;
+        }))
+    }
+}
+
+impl Drop for GcTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub fn resolve_or_create_auth_token(
     data_dir: &Path,
     token: Option<String>,
@@ -274,14 +342,17 @@ async fn register_mdns(port: u16, tls: Option<&crate::TlsIdentity>) -> Result<Md
 }
 
 pub async fn run_http_server(opts: ServeOptions) -> Result<()> {
+    GcDurations::from_options(&opts)?;
     let guard = crate::acquire_hub_runtime(&opts.data_dir)?;
     run_http_server_guarded(opts, guard).await
 }
 
 pub async fn run_http_server_guarded(
     mut opts: ServeOptions,
-    _guard: crate::HubRuntimeGuard,
+    guard: crate::HubRuntimeGuard,
 ) -> Result<()> {
+    let runtime = std::sync::Arc::new(guard);
+    let durations = GcDurations::from_options(&opts)?;
     crate::ensure_recovery_complete(&opts.data_dir)?;
     let tls = crate::prepare_tls(&mut opts)?;
     let token = resolve_or_create_auth_token(&opts.data_dir, opts.token.take(), opts.allow_open)?;
@@ -326,16 +397,31 @@ pub async fn run_http_server_guarded(
         tracing::info!("Opaque pairing and inner-TLS tunnel relay enabled");
     }
 
-    if opts.gc_interval_secs > 0 {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let server: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> =
+        if let Some(identity) = tls {
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                identity.cert_path,
+                identity.key_path,
+            )
+            .await
+            .context("load TLS server identity")?;
+            let server = axum_server::from_tcp_rustls(listener.into_std()?, config)?;
+            Box::pin(server.serve(app.into_make_service()))
+        } else {
+            Box::pin(async move { axum::serve(listener, app).await })
+        };
+
+    let gc_task = if opts.gc_interval_secs > 0 {
         let data_dir = opts.data_dir.clone();
         let db = gc_db.clone();
         let publication_lock = publication_lock.clone();
-        let grace = Duration::from_secs(opts.gc_grace_minutes * 60);
-        let retention = Duration::from_secs(opts.tombstone_retention_days * 86400);
-        let snapshot_retention = Duration::from_secs(opts.snapshot_retention_days * 86400);
+        let grace = durations.grace;
+        let retention = durations.tombstone_retention;
+        let snapshot_retention = durations.snapshot_retention;
         let snapshot_keep_last = opts.snapshot_keep_last;
         let interval = Duration::from_secs(opts.gc_interval_secs);
-        tokio::spawn(async move {
+        Some(GcTask::spawn(runtime.clone(), async move {
             loop {
                 tokio::time::sleep(interval).await;
                 match crate::gc::run_gc(
@@ -358,27 +444,21 @@ pub async fn run_http_server_guarded(
                     Err(e) => tracing::error!("GC failed: {e}"),
                 }
             }
-        });
-    }
-
-    if let Some(identity) = tls {
-        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            identity.cert_path,
-            identity.key_path,
-        )
-        .await
-        .context("load TLS server identity")?;
-        axum_server::bind_rustls(addr, config)
-            .serve(app.into_make_service())
-            .await?;
+        }))
     } else {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        None
+    };
+
+    let result = server.await;
+    if let Some(mut task) = gc_task {
+        task.0.abort();
+        let _ = (&mut task.0).await;
     }
-    Ok(())
+    result.map_err(Into::into)
 }
 
 pub async fn run_gc(opts: &ServeOptions) -> Result<crate::gc::GcStats> {
+    let durations = GcDurations::from_options(opts)?;
     let _guard = crate::acquire_hub_runtime(&opts.data_dir)?;
     crate::ensure_recovery_complete(&opts.data_dir)?;
     let db = crate::db::Db::new(opts.data_dir.join("db.sqlite")).await?;
@@ -386,9 +466,9 @@ pub async fn run_gc(opts: &ServeOptions) -> Result<crate::gc::GcStats> {
     crate::gc::run_gc(
         &db,
         &opts.data_dir,
-        Duration::from_secs(opts.gc_grace_minutes * 60),
-        Duration::from_secs(opts.tombstone_retention_days * 86400),
-        Duration::from_secs(opts.snapshot_retention_days * 86400),
+        durations.grace,
+        durations.tombstone_retention,
+        durations.snapshot_retention,
         opts.snapshot_keep_last,
         &publication_lock,
     )
@@ -398,6 +478,122 @@ pub async fn run_gc(opts: &ServeOptions) -> Result<crate::gc::GcStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_duration_checks_zero_boundary_and_overflow() {
+        for unit in [60, 86400] {
+            assert_eq!(gc_duration(0, unit, "test").unwrap(), Duration::ZERO);
+            assert_eq!(
+                gc_duration(u64::MAX / unit, unit, "test")
+                    .unwrap()
+                    .as_secs(),
+                (u64::MAX / unit) * unit
+            );
+            let error = gc_duration(u64::MAX / unit + 1, unit, "test").unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<GcDurationOverflow>().unwrap().option,
+                "test"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_option_overflow_rejects_before_creating_server_state() {
+        let data = tempfile::tempdir().unwrap();
+        for option in [
+            "gc_grace_minutes",
+            "tombstone_retention_days",
+            "snapshot_retention_days",
+        ] {
+            let mut opts = ServeOptions {
+                data_dir: data.path().join(option),
+                allow_http: true,
+                ..ServeOptions::default()
+            };
+            match option {
+                "gc_grace_minutes" => opts.gc_grace_minutes = u64::MAX,
+                "tombstone_retention_days" => opts.tombstone_retention_days = u64::MAX,
+                _ => opts.snapshot_retention_days = u64::MAX,
+            }
+            let serve_error = run_http_server(opts.clone()).await.unwrap_err();
+            assert_eq!(
+                serve_error
+                    .downcast_ref::<GcDurationOverflow>()
+                    .unwrap()
+                    .option,
+                option
+            );
+            let gc_error = run_gc(&opts).await.unwrap_err();
+            assert_eq!(
+                gc_error
+                    .downcast_ref::<GcDurationOverflow>()
+                    .unwrap()
+                    .option,
+                option
+            );
+            assert!(
+                !opts.data_dir.exists(),
+                "validation must precede runtime state writes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_gc_task_aborts_background_work() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = GcTask(tokio::spawn(async move {
+            let _done = done_tx;
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        ready_rx.await.unwrap();
+        drop(task);
+        assert!(tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gc_cancellation_retains_runtime_lock_until_critical_section_finishes() {
+        let data = tempfile::tempdir().unwrap();
+        let runtime = std::sync::Arc::new(crate::acquire_hub_runtime(data.path()).unwrap());
+        let publication = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        let worker_publication = publication.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = GcTask::spawn(runtime.clone(), async move {
+            let _publication = worker_publication.write().await;
+            entered_tx.send(()).unwrap();
+            // Model the non-yielding unlink critical section. A finite receive
+            // avoids wedging test shutdown even if an assertion fails.
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut task = task;
+        task.0.abort();
+        drop(runtime);
+        let runtime_still_locked = crate::acquire_hub_runtime(data.path()).is_err();
+        let publication_still_locked = publication.try_read().is_err();
+        release_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), &mut task.0)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
+        assert!(
+            runtime_still_locked,
+            "runtime lock released before GC critical section ended"
+        );
+        assert!(publication_still_locked);
+        assert!(crate::acquire_hub_runtime(data.path()).is_ok());
+        assert!(publication.try_read().is_ok());
+    }
 
     #[test]
     fn generated_auth_token_is_durable_and_rotatable() {

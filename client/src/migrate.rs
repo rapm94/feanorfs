@@ -27,6 +27,15 @@ struct MigrationJournal {
     fence_token: String,
     phase: MigrationPhase,
     resealed: u32,
+    /// Present only after synchronization, even when the captured head is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication: Option<MigrationPublication>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct MigrationPublication {
+    source_head: Option<String>,
+    candidate_id: Option<String>,
 }
 
 /// Migrates one legacy workspace to encrypted format-v3 snapshots.
@@ -35,10 +44,28 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
 
     let mut config = load_config(base)?;
     if config.format_version >= 3 {
+        if let Some(journal) = load_journal(base).await? {
+            anyhow::ensure!(
+                journal.workspace_id == config.workspace_id,
+                "migration journal belongs to another workspace"
+            );
+            // A crash after saving the final config can leave only cleanup.
+            // Never remove a journal while it still owns an uncommitted key.
+            if matches!(journal.phase, MigrationPhase::Stamped)
+                && config.encryption_password.as_deref() == Some(journal.target_key.as_str())
+            {
+                remove_journal(base).await?;
+                println!("Migration finalization complete. Workspace is format v3.");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                rekey,
+                "an unfinished migration journal remains; resume with 'feanorfs migrate --rekey' before continuing"
+            );
+        }
         if rekey {
             return rekey_format_v3(base, config).await;
         }
-        remove_journal(base).await?;
         println!("Workspace is already format v3.");
         return Ok(());
     }
@@ -87,6 +114,7 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
                 fence_token: feanorfs_common::generate_password()?,
                 phase: MigrationPhase::Pulling,
                 resealed: 0,
+                publication: None,
             };
             write_journal(base, &journal).await?;
             journal
@@ -98,7 +126,9 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
     let api = crate::open_api_client(base, &config)
         .await?
         .with_migration_token(journal.fence_token.clone());
-    api.begin_migration(&config.workspace_id).await?;
+    if !matches!(journal.phase, MigrationPhase::Stamped) {
+        api.begin_migration(&config.workspace_id).await?;
+    }
 
     if matches!(journal.phase, MigrationPhase::Pulling) {
         println!("Pulling latest from mirror...");
@@ -106,6 +136,10 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
         source.encryption_password = Some(journal.old_key.clone());
         do_pull_only_with_config(&api, &db, base, &source, false).await?;
         ensure_hydrated(&db).await?;
+        journal.publication = Some(MigrationPublication {
+            source_head: api.get_head(&config.workspace_id).await?,
+            candidate_id: None,
+        });
         journal.phase = MigrationPhase::Resealing;
         write_journal(base, &journal).await?;
     }
@@ -114,6 +148,10 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
     target.encryption_password = Some(journal.target_key.clone());
     target.format_version = 2;
     if matches!(journal.phase, MigrationPhase::Resealing) {
+        anyhow::ensure!(
+            journal.publication.is_some(),
+            "older migration journal lacks a source-head binding; preserving recovery state for manual recovery"
+        );
         let entries = db.get_cache_entries().await?;
         journal.resealed = 0;
         for (path, entry) in entries {
@@ -136,7 +174,7 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
         if journal.target_key == journal.old_key {
             snapshots.publish_server_view(&files, "migrate").await?;
         } else {
-            snapshots.publish_rekeyed_view(&files, "migrate").await?;
+            publish_journaled_rekey(base, &mut journal, &snapshots, &files).await?;
         }
         journal.phase = MigrationPhase::HeadPublished;
         write_journal(base, &journal).await?;
@@ -151,6 +189,7 @@ pub async fn migrate_workspace(base: &Path, rekey: bool) -> Result<()> {
         write_journal(base, &journal).await?;
     }
 
+    migration_failpoint(base, "after_format_stamp").await?;
     db.drop_legacy_snapshot_tables().await?;
     config.encryption_password = Some(journal.target_key.clone());
     config.format_version = 3;
@@ -200,6 +239,7 @@ async fn rekey_format_v3(base: &Path, mut config: Config) -> Result<()> {
                 fence_token: feanorfs_common::generate_password()?,
                 phase: MigrationPhase::Pulling,
                 resealed: 0,
+                publication: None,
             };
             write_journal(base, &journal).await?;
             journal
@@ -208,7 +248,9 @@ async fn rekey_format_v3(base: &Path, mut config: Config) -> Result<()> {
 
     ensure_no_agent_workspaces(base).await?;
     let api = api.with_migration_token(journal.fence_token.clone());
-    api.begin_migration(&config.workspace_id).await?;
+    if !matches!(journal.phase, MigrationPhase::Stamped) {
+        api.begin_migration(&config.workspace_id).await?;
+    }
 
     if matches!(journal.phase, MigrationPhase::Pulling) {
         println!("Synchronizing latest workspace state...");
@@ -228,6 +270,10 @@ async fn rekey_format_v3(base: &Path, mut config: Config) -> Result<()> {
             "resolve workspace conflicts before rekeying"
         );
         ensure_hydrated(&db).await?;
+        journal.publication = Some(MigrationPublication {
+            source_head: api.get_head(&config.workspace_id).await?,
+            candidate_id: None,
+        });
         journal.phase = MigrationPhase::Resealing;
         write_journal(base, &journal).await?;
     }
@@ -235,6 +281,10 @@ async fn rekey_format_v3(base: &Path, mut config: Config) -> Result<()> {
     let mut target = config.clone();
     target.encryption_password = Some(journal.target_key.clone());
     if matches!(journal.phase, MigrationPhase::Resealing) {
+        anyhow::ensure!(
+            journal.publication.is_some(),
+            "older migration journal lacks a source-head binding; preserving recovery state for manual recovery"
+        );
         let entries = db.get_cache_entries().await?;
         journal.resealed = 0;
         for (path, entry) in entries {
@@ -253,9 +303,8 @@ async fn rekey_format_v3(base: &Path, mut config: Config) -> Result<()> {
     if matches!(journal.phase, MigrationPhase::Resealed) {
         let files = scan_rekeyed_view(&db, base, &target).await?;
         let ctx = feanorfs_agent_core::SyncCtx::from_config(&api, &db, base, &target)?;
-        feanorfs_agent_core::SnapshotEngine::new(&ctx)
-            .publish_rekeyed_view(&files, "migrate")
-            .await?;
+        let snapshots = feanorfs_agent_core::SnapshotEngine::new(&ctx);
+        publish_journaled_rekey(base, &mut journal, &snapshots, &files).await?;
         journal.phase = MigrationPhase::HeadPublished;
         write_journal(base, &journal).await?;
     }
@@ -268,6 +317,7 @@ async fn rekey_format_v3(base: &Path, mut config: Config) -> Result<()> {
         write_journal(base, &journal).await?;
     }
 
+    migration_failpoint(base, "after_format_stamp").await?;
     db.drop_legacy_snapshot_tables().await?;
     config.encryption_password = Some(journal.target_key.clone());
     save_config(base, &config)?;
@@ -279,6 +329,31 @@ async fn rekey_format_v3(base: &Path, mut config: Config) -> Result<()> {
         "Rekey complete. Workspace remains format v3. Re-sealed {} file(s).",
         journal.resealed
     );
+    Ok(())
+}
+
+async fn publish_journaled_rekey(
+    base: &Path,
+    journal: &mut MigrationJournal,
+    snapshots: &feanorfs_agent_core::SnapshotEngine<'_, '_>,
+    files: &HashMap<String, feanorfs_common::FileState>,
+) -> Result<()> {
+    let publication = journal.publication.as_ref().context(
+        "older migration journal lacks a source-head binding; preserving recovery state for manual recovery",
+    )?;
+    if publication.candidate_id.is_none() {
+        let id = snapshots.prepare_rekeyed_view(files, "migrate").await?;
+        journal.publication.as_mut().unwrap().candidate_id = Some(id);
+        write_journal(base, journal).await?;
+    }
+    let publication = journal.publication.as_ref().unwrap();
+    snapshots
+        .publish_prepared_rekeyed_view(
+            publication.source_head.as_deref(),
+            publication.candidate_id.as_deref().unwrap(),
+        )
+        .await?;
+    migration_failpoint(base, "after_head_publish").await?;
     Ok(())
 }
 
@@ -421,7 +496,7 @@ async fn migration_failpoint(base: &Path, point: &str) -> Result<()> {
         .await
         .is_ok_and(|configured| configured.trim() == point)
     {
-        anyhow::bail!("injected migration failure after re-seal upload");
+        anyhow::bail!("injected migration failure at {point}");
     }
     Ok(())
 }

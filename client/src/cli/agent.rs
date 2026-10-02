@@ -76,6 +76,10 @@ pub enum AgentAction {
     /// Run a command with the agent workspace as its working directory.
     Run {
         name: String,
+        /// Announce a capability of this machine for the agent before the
+        /// command starts (repeatable), e.g. `--capability ios-build`.
+        #[arg(long = "capability", value_name = "CAPABILITY")]
+        capabilities: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -110,7 +114,104 @@ pub enum AgentAction {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Random integrator assignment (dispatcher-side orchestration).
+    /// Show what is in flight across work intent, integrator assignment,
+    /// and conflict resolution, with the exact next command for each actor.
+    Next {
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Block until your own next actions change (a decision arrives,
+        /// your edits land), up to `--timeout` seconds. Use instead of
+        /// polling when nothing is yours to do.
+        #[arg(long)]
+        wait: bool,
+        /// Seconds to wait with `--wait` (default 300, maximum 600).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
+    /// Show which agents advertise which capabilities, or announce this
+    /// agent's complete capability set with `--set` (repeatable). Route a
+    /// request to the capable agent with `agent send cap:<capability>`.
+    Capabilities {
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Capability to announce (repeatable; replaces the previous set).
+        #[arg(long = "set", value_name = "CAPABILITY")]
+        set: Vec<String>,
+    },
+    /// Claim scope in one call: propose the paths and wait for the
+    /// coordinator's decision. Exits 0 when held or accepted, 3 when still
+    /// pending, 1 when rejected.
+    Claim {
+        /// Workspace paths or `dir/**` globs you are about to edit.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Coordinator whose decision to wait for (default human).
+        #[arg(long)]
+        coordinator: Option<String>,
+        /// Seconds to wait for a decision (default 300, maximum 600).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
+    /// Finish in one call: wait for your edits to land, then settle and
+    /// complete every task you hold.
+    Done {
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// One-line outcome.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Verification you actually ran: passed, failed, or skipped (default).
+        #[arg(long)]
+        verification: Option<String>,
+        /// Seconds to wait for edits to land (default 300, maximum 600).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Run as a harness Stop hook (reads its JSON payload from stdin).
+        #[arg(long)]
+        hook: bool,
+    },
+    /// Act as an automatic coordinator: accept proposals addressed to you
+    /// whose scope overlaps no other agent's live scope; overlapping ones
+    /// wait until that scope finishes. Nothing is ever rejected.
+    Coordinate {
+        /// Coordinator identity to decide for (default human).
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Keep coordinating until interrupted.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Check whether paths may be edited now (other agents' accepted scope,
+    /// pending conflicts, superseded integrator attempts). Exits 2 on deny.
+    Guard {
+        /// Workspace paths (absolute or relative) about to be written.
+        paths: Vec<String>,
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Also deny paths outside your own accepted scope.
+        #[arg(long)]
+        require_scope: bool,
+        /// Read a harness PreToolUse JSON payload from stdin (Claude Code
+        /// hooks); internal errors allow the edit.
+        #[arg(long)]
+        hook: bool,
+        /// Claim unclaimed paths first and wait for the decision, so agents
+        /// never run claim themselves.
+        #[arg(long)]
+        claim: bool,
+        /// Seconds a claim may wait (default 240; keep below the hook timeout).
+        #[arg(long, default_value_t = 240)]
+        claim_timeout: u64,
+    },
+    /// Random integrator assignment (dispatcher assign/status/revoke/resume
+    /// and candidate reply).
     Integrator {
         #[command(subcommand)]
         action: super::integrator::IntegratorAction,
@@ -143,8 +244,86 @@ pub enum AgentAction {
 
 pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow::Result<()> {
     match action {
+        // Read-only views resolve the shared root so live agents (whose cwd is
+        // their worktree) can read their own status, as the skill instructs.
         AgentAction::Status { name: Some(name) } | AgentAction::Check { name } => {
-            run_agent_check(current_dir, &name, json).await?
+            run_agent_check(&control_workspace_root(current_dir)?, &name, json).await?
+        }
+        AgentAction::Next {
+            for_agent,
+            wait,
+            timeout,
+        } => {
+            let wait = wait.then(|| std::time::Duration::from_secs(timeout));
+            super::coordination::run_next(current_dir, for_agent.as_deref(), wait, json).await?
+        }
+        AgentAction::Guard {
+            paths,
+            for_agent,
+            require_scope,
+            hook,
+            claim,
+            claim_timeout,
+        } => {
+            super::coordination::run_guard(
+                current_dir,
+                super::coordination::GuardArgs {
+                    paths,
+                    agent: for_agent,
+                    require_scope,
+                    hook,
+                    claim: claim.then(|| feanorfs_client::bounded_wait(Some(claim_timeout))),
+                },
+                json,
+            )
+            .await?
+        }
+        AgentAction::Claim {
+            paths,
+            for_agent,
+            coordinator,
+            timeout,
+        } => {
+            super::coordination::run_claim(
+                current_dir,
+                for_agent.as_deref(),
+                paths,
+                coordinator.as_deref(),
+                feanorfs_client::bounded_wait(Some(timeout)),
+                json,
+            )
+            .await?
+        }
+        AgentAction::Done {
+            for_agent,
+            summary,
+            verification,
+            timeout,
+            hook,
+        } => {
+            let verification = verification
+                .map(|value| {
+                    serde_json::from_value(serde_json::Value::String(value.clone())).map_err(|_| {
+                        anyhow::anyhow!("--verification must be passed, failed, or skipped")
+                    })
+                })
+                .transpose()?;
+            super::coordination::run_done(
+                current_dir,
+                super::coordination::DoneArgs {
+                    agent: for_agent,
+                    summary,
+                    verification,
+                    wait: feanorfs_client::bounded_wait(Some(timeout)),
+                    hook,
+                },
+                json,
+            )
+            .await?
+        }
+        AgentAction::Coordinate { for_agent, watch } => {
+            super::coordination::run_coordinate(current_dir, for_agent.as_deref(), watch, json)
+                .await?
         }
         AgentAction::Integrator { action } => {
             super::integrator::run(current_dir, action, json).await?
@@ -157,7 +336,9 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             let control_root = control_workspace_root(current_dir)?;
             super::runner::run(&control_root, action, json).await?
         }
-        AgentAction::Status { name: None } => run_agent_status_list(current_dir, json).await?,
+        AgentAction::Status { name: None } => {
+            run_agent_status_list(&control_workspace_root(current_dir)?, json).await?
+        }
         AgentAction::List => run_agent_list_legacy(current_dir, json).await?,
         AgentAction::Spawn {
             name,
@@ -252,11 +433,27 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 println!("Agent '{name}' removed.");
             }
         }
-        AgentAction::Run { name, command } => {
+        AgentAction::Capabilities { for_agent, set } => {
+            super::coordination::run_capabilities(
+                current_dir,
+                for_agent.as_deref(),
+                (!set.is_empty()).then_some(set),
+                json,
+            )
+            .await?
+        }
+        AgentAction::Run {
+            name,
+            capabilities,
+            command,
+        } => {
             if command.is_empty() {
                 anyhow::bail!("`agent run` requires a command after `--`");
             }
             feanorfs_client::agent::validate_name(&name)?;
+            if !capabilities.is_empty() {
+                super::coordination::announce_quietly(current_dir, &name, capabilities).await?;
+            }
             let workspace_root = current_dir.canonicalize().map_err(|error| {
                 anyhow::anyhow!(
                     "Could not resolve shared workspace root '{}': {error}",
@@ -281,6 +478,13 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                 output_json(&outcome)?;
             } else {
                 eprintln!("{}", render_live_outcome(&name, &outcome));
+            }
+            if outcome.child_exit == Some(0)
+                && outcome.settled
+                && !outcome.offline
+                && outcome.attention.is_none()
+            {
+                super::coordination::finish_quietly(current_dir, &name).await;
             }
             if let Some(code) = outcome.child_exit {
                 if code != 0 {

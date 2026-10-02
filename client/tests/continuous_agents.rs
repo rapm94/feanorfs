@@ -356,6 +356,88 @@ async fn overlapping_edits_preserve_legs_and_pause() {
         classify_continuous_error(&error),
         ContinuousErrorClass::Attention(_)
     ));
+    let probe = feanorfs_agent_core::probe_agent_state(
+        client_b.workspace.path(),
+        &client_b.db,
+        &server.api,
+        "agent-b",
+    )
+    .await
+    .unwrap();
+    assert!(
+        probe.conflicts > 0,
+        "published conflict still pauses a restarted controller"
+    );
+    assert_eq!(
+        probe.local_changes, 0,
+        "the published local leg is the new comparison base"
+    );
+    assert!(
+        refresh_agent_continuous(
+            client_b.workspace.path(),
+            &client_b.db,
+            &server.api,
+            &config_b.workspace_id,
+            "agent-b",
+            config_b.encryption_password.as_deref(),
+            &lock_b,
+        )
+        .await
+        .is_err(),
+        "an unresolved tree must not replace the captured local leg"
+    );
+
+    // A later edit is not part of the user's resolution decision.
+    write_workspace_file(
+        &agent_worktree(&client_b, "agent-b"),
+        "same.rs",
+        b"later-edit",
+    )
+    .await;
+    let ctx = agent_ctx(&client_b, &server).await;
+    feanorfs_agent_core::resolve_conflict(
+        &ctx,
+        "same.rs",
+        feanorfs_agent_core::ResolveKeep::Cloud,
+        None,
+    )
+    .await
+    .unwrap();
+    let refresh = refresh_agent_continuous(
+        client_b.workspace.path(),
+        &client_b.db,
+        &server.api,
+        &config_b.workspace_id,
+        "agent-b",
+        config_b.encryption_password.as_deref(),
+        &lock_b,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refresh.deferred, ["same.rs"]);
+    assert_eq!(
+        std::fs::read(agent_worktree(&client_b, "agent-b").join("same.rs")).unwrap(),
+        b"later-edit"
+    );
+    // Once only the captured leg remains, safe refresh accepts the explicit
+    // resolution without replacing any newer edit or releasing ownership.
+    write_workspace_file(&agent_worktree(&client_b, "agent-b"), "same.rs", b"from-b").await;
+    let refresh = refresh_agent_continuous(
+        client_b.workspace.path(),
+        &client_b.db,
+        &server.api,
+        &config_b.workspace_id,
+        "agent-b",
+        config_b.encryption_password.as_deref(),
+        &lock_b,
+    )
+    .await
+    .unwrap();
+    assert!(refresh.deferred.is_empty());
+    assert_eq!(
+        std::fs::read(agent_worktree(&client_b, "agent-b").join("same.rs")).unwrap(),
+        b"from-a"
+    );
     drop(lock_b);
 }
 
@@ -607,6 +689,368 @@ fn continuous_idle_child_helper() {
     );
     std::fs::write(ready, b"ready").unwrap();
     std::thread::sleep(Duration::from_millis(1800));
+}
+
+#[test]
+#[ignore]
+fn continuous_journey_child_helper() {
+    let ready = std::env::var_os("FEANORFS_TEST_READY_PATH").unwrap();
+    let stop = PathBuf::from(std::env::var_os("FEANORFS_TEST_STOP_PATH").unwrap());
+    std::fs::write(ready, b"ready").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while stop.parent().unwrap().exists() && !stop.exists() && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        stop.exists() || !stop.parent().unwrap().exists(),
+        "journey parent must stop the child within its bound"
+    );
+}
+
+async fn wait_for_journey(label: &str, condition: impl Fn() -> bool) -> Result<(), String> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("journey timed out: {label}"))
+}
+
+#[tokio::test]
+async fn two_active_agents_resume_after_resolution_and_continue_work() {
+    let _serial = REAL_PROCESS_SERIAL.lock().await;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let online = Arc::new(AtomicBool::new(true));
+    let server = support::spawn_test_server_with_gate(Some(online.clone())).await;
+    let a = spawn_test_client_with_server(&server).await;
+    let b = spawn_test_client_with_server(&server).await;
+    require_format_v3(a.workspace.path());
+    require_format_v3(b.workspace.path());
+    seed_and_push(&server, &a).await;
+    spawn_test_agent(&a, &server, "journey-a").await;
+    spawn_test_agent(&b, &server, "journey-b").await;
+    let controls = tempfile::tempdir().unwrap();
+    let helper = std::env::current_exe().unwrap();
+    let start_agent = |client: &TestClient, name: &str| {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_feanorfs"))
+            .args([
+                "agent",
+                "run",
+                name,
+                "--",
+                helper.to_str().unwrap(),
+                "--ignored",
+                "--exact",
+                "continuous_journey_child_helper",
+                "--nocapture",
+            ])
+            .env("FEANORFS_TEST_READY_PATH", controls.path().join(name))
+            .env(
+                "FEANORFS_TEST_STOP_PATH",
+                controls.path().join(format!("{name}.stop")),
+            )
+            .current_dir(client.workspace.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let mut children = vec![start_agent(&a, "journey-a"), start_agent(&b, "journey-b")];
+    wait_for_journey("both controllers ready", || {
+        controls.path().join("journey-a").exists() && controls.path().join("journey-b").exists()
+    })
+    .await
+    .unwrap();
+    let tree_a = agent_worktree(&a, "journey-a");
+    let tree_b = agent_worktree(&b, "journey-b");
+    online.store(false, Ordering::SeqCst);
+    std::fs::write(tree_a.join("offline-a.txt"), b"offline-a").unwrap();
+    std::fs::write(tree_b.join("offline-b.txt"), b"offline-b").unwrap();
+    wait_for_journey("both controllers retain offline work", || {
+        [(&a, "journey-a"), (&b, "journey-b")]
+            .iter()
+            .all(|(client, name)| {
+                feanorfs_agent_core::read_continuous_status(client.workspace.path(), name)
+                    .unwrap()
+                    .is_some_and(|status| {
+                        status.phase == ContinuousPhase::Offline && status.pending_local
+                    })
+            })
+    })
+    .await
+    .unwrap();
+    online.store(true, Ordering::SeqCst);
+    wait_for_journey("offline edits converge after reconnection", || {
+        [&tree_a, &tree_b].iter().all(|tree| {
+            std::fs::read(tree.join("offline-a.txt")).ok().as_deref() == Some(b"offline-a")
+                && std::fs::read(tree.join("offline-b.txt")).ok().as_deref() == Some(b"offline-b")
+        })
+    })
+    .await
+    .unwrap();
+    // Both writes precede the quiet-period debounce; neither needs a transfer command.
+    std::fs::write(tree_a.join("seed.txt"), b"version-a").unwrap();
+    std::fs::write(tree_b.join("seed.txt"), b"version-b").unwrap();
+    let paused = |client: &TestClient, name: &str| {
+        feanorfs_agent_core::read_continuous_status(client.workspace.path(), name)
+            .unwrap()
+            .is_some_and(|status| status.active && status.attention.is_some())
+    };
+    wait_for_journey("both agents preserve the conflict", || {
+        paused(&a, "journey-a") && paused(&b, "journey-b")
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(tree_a.join("seed.txt")).unwrap(),
+        b"version-a"
+    );
+    assert_eq!(
+        std::fs::read(tree_b.join("seed.txt")).unwrap(),
+        b"version-b"
+    );
+    // Resolve on the participant that registered the conflict; both owners
+    // keep running throughout this ordinary human action.
+    let resolver = if a
+        .db
+        .get_conflict_record("seed.txt")
+        .await
+        .unwrap()
+        .is_some()
+    {
+        &a
+    } else {
+        &b
+    };
+    let replacement = controls.path().join("replacement");
+    std::fs::write(&replacement, b"resolved").unwrap();
+    let ctx = agent_ctx(resolver, &server).await;
+    feanorfs_agent_core::resolve_conflict(
+        &ctx,
+        "seed.txt",
+        feanorfs_agent_core::ResolveKeep::File,
+        Some(&replacement),
+    )
+    .await
+    .unwrap();
+    let resolution_head = server.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+    let engine = SnapshotEngine::new(&ctx);
+    assert_eq!(
+        engine.load_files(&resolution_head).await.unwrap()["seed.txt"].size,
+        8
+    );
+    let resumed_at = std::time::Instant::now();
+    let resumed = wait_for_journey("published resolution reaches both active agents", || {
+        [&tree_a, &tree_b]
+            .iter()
+            .all(|tree| std::fs::read(tree.join("seed.txt")).ok().as_deref() == Some(b"resolved"))
+            && !paused(&a, "journey-a")
+            && !paused(&b, "journey-b")
+    })
+    .await;
+    if resumed.is_err() {
+        let short = |id: &str| id[..8].to_string();
+        eprintln!(
+            "resolution={} after {:?}",
+            short(&resolution_head),
+            resumed_at.elapsed()
+        );
+        let mut id = server.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+        for _ in 0..8 {
+            let snapshot = engine.load_snapshot(&id).await.unwrap();
+            let seed = engine
+                .load_files(&id)
+                .await
+                .unwrap()
+                .get("seed.txt")
+                .cloned();
+            eprintln!(
+                "head={} parents={:?} author={} message={:?} seed={:?}",
+                short(&id),
+                snapshot
+                    .parents
+                    .iter()
+                    .map(|p| short(p))
+                    .collect::<Vec<_>>(),
+                snapshot.author,
+                snapshot.message,
+                seed.map(|file| (short(&file.hash), file.size)),
+            );
+            let Some(parent) = snapshot.parents.first() else {
+                break;
+            };
+            id = parent.clone();
+        }
+        for (client, name, tree) in [(&a, "journey-a", &tree_a), (&b, "journey-b", &tree_b)] {
+            let status =
+                feanorfs_agent_core::read_continuous_status(client.workspace.path(), name).unwrap();
+            eprintln!(
+                "{name}: worktree seed={:?} status={:?}",
+                std::fs::read_to_string(tree.join("seed.txt")).ok(),
+                status.map(|s| (
+                    s.phase,
+                    s.attention,
+                    s.pending_local,
+                    s.observed_head.map(|h| short(&h)),
+                    s.settled_snapshot.map(|h| short(&h)),
+                )),
+            );
+        }
+    }
+    resumed.unwrap();
+    std::fs::write(tree_a.join("a.txt"), b"continued-a").unwrap();
+    std::fs::write(tree_b.join("b.txt"), b"continued-b").unwrap();
+    wait_for_journey("independent work converges after resolution", || {
+        [&tree_a, &tree_b].iter().all(|tree| {
+            std::fs::read(tree.join("a.txt")).ok().as_deref() == Some(b"continued-a")
+                && std::fs::read(tree.join("b.txt")).ok().as_deref() == Some(b"continued-b")
+        })
+    })
+    .await
+    .unwrap();
+    eprintln!(
+        "journey: resolution_to_continued_work_ms={} manual_resolutions=1 resolution_watcher_restarts=0",
+        resumed_at.elapsed().as_millis()
+    );
+    // Restart one controller without recreating its agent or losing its base.
+    std::fs::write(controls.path().join("journey-a.stop"), b"stop").unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        children.remove(0).wait_with_output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(output.status.success());
+    std::fs::remove_file(controls.path().join("journey-a.stop")).unwrap();
+    std::fs::remove_file(controls.path().join("journey-a")).unwrap();
+    children.push(start_agent(&a, "journey-a"));
+    wait_for_journey("restarted controller ready", || {
+        controls.path().join("journey-a").exists()
+    })
+    .await
+    .unwrap();
+    std::fs::write(tree_b.join("after-restart.txt"), b"still-working").unwrap();
+    wait_for_journey("restarted controller receives continued work", || {
+        std::fs::read(tree_a.join("after-restart.txt"))
+            .ok()
+            .as_deref()
+            == Some(b"still-working")
+    })
+    .await
+    .unwrap();
+    wait_for_journey("both agents settled before handoff", || {
+        [(&a, "journey-a"), (&b, "journey-b")]
+            .iter()
+            .all(|(client, name)| {
+                feanorfs_agent_core::read_continuous_status(client.workspace.path(), name)
+                    .unwrap()
+                    .is_some_and(|status| {
+                        status.active
+                            && status.phase == ContinuousPhase::Idle
+                            && !status.pending_local
+                            && status.settled_snapshot.is_some()
+                    })
+            })
+    })
+    .await
+    .unwrap();
+    let tested = feanorfs_agent_core::read_continuous_status(b.workspace.path(), "journey-b")
+        .unwrap()
+        .unwrap()
+        .settled_snapshot
+        .unwrap();
+    let ctx_a = agent_ctx(&a, &server).await;
+    let ctx_b = agent_ctx(&b, &server).await;
+    let request = feanorfs_agent_core::send_message(
+        &ctx_a,
+        AgentMessageInput {
+            from: Some("journey-a".into()),
+            to: "journey-b".into(),
+            kind: AgentMessageKind::Request,
+            body: "Verify the recovered workspace".into(),
+            about_snapshot: Some(tested.clone()),
+            reply_to: None,
+        },
+    )
+    .await
+    .unwrap();
+    let inspected = snapshot_worktree_files(&tree_b).await;
+    assert_eq!(snapshot_worktree_files(&tree_a).await, inspected);
+    assert_eq!(
+        feanorfs_agent_core::read_continuous_status(b.workspace.path(), "journey-b")
+            .unwrap()
+            .unwrap()
+            .settled_snapshot
+            .as_deref(),
+        Some(tested.as_str())
+    );
+    let report = serde_json::json!({
+        "changed_paths": ["seed.txt", "offline-a.txt", "offline-b.txt", "a.txt", "b.txt", "after-restart.txt"],
+        "reported_verification": {"check": "compared both complete worktrees", "status": "passed"},
+        "worktree_digest": feanorfs_common::hash_bytes(&serde_json::to_vec(&inspected).unwrap()),
+        "limitations": "loopback source binaries; no installed-product or LAN timing claim"
+    });
+    let result = feanorfs_agent_core::send_message(
+        &ctx_b,
+        AgentMessageInput {
+            from: Some("journey-b".into()),
+            to: "journey-a".into(),
+            kind: AgentMessageKind::Result,
+            body: report.to_string(),
+            about_snapshot: Some(tested.clone()),
+            reply_to: Some(request.message_id.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    let delivered = feanorfs_agent_core::inbox(
+        &ctx_a,
+        feanorfs_common::AgentInboxQuery {
+            recipient: "journey-a".into(),
+            after: Some(request.message_id.clone()),
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!delivered.cursor_reset);
+    let reply = delivered
+        .messages
+        .iter()
+        .find(|message| message.message_id == result.message_id)
+        .unwrap();
+    assert_eq!(reply.reply_to.as_deref(), Some(request.message_id.as_str()));
+    assert_eq!(reply.about_snapshot, tested);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reply.body).unwrap(),
+        report
+    );
+    for name in ["journey-a", "journey-b"] {
+        std::fs::write(controls.path().join(format!("{name}.stop")), b"stop").unwrap();
+    }
+    for child in children {
+        let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        snapshot_worktree_files(&tree_a).await,
+        snapshot_worktree_files(&tree_b).await
+    );
+    eprintln!("journey: forced_outages=1 controlled_restarts=1 handoff_received=true identical_worktrees=true");
 }
 
 #[tokio::test]
@@ -1138,4 +1582,88 @@ async fn events_loop_wakes_on_signals_and_projects_reconcile_events() {
     assert!(!leaked, "events must never carry message bodies");
     let _ = events.kill().await;
     drop(lock);
+}
+
+async fn land_test_agent(
+    client: &TestClient,
+    server: &TestServer,
+    name: &str,
+) -> feanorfs_common::AgentLandResult {
+    let config = load_config(client.workspace.path()).unwrap();
+    feanorfs_client::land_agent(
+        client.workspace.path(),
+        &client.db,
+        &server.api,
+        &config.workspace_id,
+        name,
+        config.encryption_password.as_deref(),
+        false,
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+/// Regression (CI, 2026-10-02): a no-op land made a head that still carried
+/// an unresolved shared conflict the agent's base. Against that base the
+/// agent's own published leg read as a fresh edit, so after the conflict was
+/// resolved refresh kept the leg and the next land published it over the
+/// resolution.
+#[tokio::test]
+async fn a_no_op_land_never_adopts_an_unresolved_conflict_as_the_agent_base() {
+    let server = spawn_test_server().await;
+    let a = spawn_test_client_with_server(&server).await;
+    let b = spawn_test_client_with_server(&server).await;
+    require_format_v3(a.workspace.path());
+    require_format_v3(b.workspace.path());
+    seed_and_push(&server, &a).await;
+    spawn_test_agent(&a, &server, "edit-a").await;
+    spawn_test_agent(&b, &server, "edit-b").await;
+    let tree_a = agent_worktree(&a, "edit-a");
+    let tree_b = agent_worktree(&b, "edit-b");
+
+    std::fs::write(tree_b.join("seed.txt"), b"version-b").unwrap();
+    assert!(land_test_agent(&b, &server, "edit-b")
+        .await
+        .conflicts
+        .is_empty());
+    std::fs::write(tree_a.join("seed.txt"), b"version-a").unwrap();
+    assert_eq!(
+        land_test_agent(&a, &server, "edit-a").await.conflicts.len(),
+        1
+    );
+    // Nothing new to publish while the shared head is conflicted.
+    land_test_agent(&b, &server, "edit-b").await;
+
+    let replacement = a.workspace.path().join("..").join("replacement");
+    std::fs::write(&replacement, b"resolved").unwrap();
+    let ctx = agent_ctx(&a, &server).await;
+    feanorfs_agent_core::resolve_conflict(
+        &ctx,
+        "seed.txt",
+        feanorfs_agent_core::ResolveKeep::File,
+        Some(&replacement),
+    )
+    .await
+    .unwrap();
+
+    let config = load_config(b.workspace.path()).unwrap();
+    feanorfs_client::refresh_agent(
+        b.workspace.path(),
+        &b.db,
+        &server.api,
+        &config.workspace_id,
+        "edit-b",
+        config.encryption_password.as_deref(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(tree_b.join("seed.txt")).unwrap(), b"resolved");
+    land_test_agent(&b, &server, "edit-b").await;
+    let head = server.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+    let engine = SnapshotEngine::new(&ctx);
+    assert_eq!(
+        engine.load_files(&head).await.unwrap()["seed.txt"].size,
+        b"resolved".len() as u64
+    );
 }

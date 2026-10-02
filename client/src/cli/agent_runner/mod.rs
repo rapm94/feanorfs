@@ -592,6 +592,7 @@ mod tests {
                     feanorfs_common::AgentSendResult {
                         message_id: id('d'),
                         about_snapshot: expected_fallback_about.clone(),
+                        routed_to: None,
                     },
                 )))
             },
@@ -653,6 +654,7 @@ mod tests {
                     1 => HeadConditionalSendResult::Sent(feanorfs_common::AgentSendResult {
                         message_id: id('e'),
                         about_snapshot: about_snapshot.clone(),
+                        routed_to: None,
                     }),
                     _ => panic!("unexpected fallback retry"),
                 };

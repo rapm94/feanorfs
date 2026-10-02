@@ -4,7 +4,6 @@ use std::time::Duration;
 
 pub(crate) const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 pub(crate) const BINDING_REQUEST: u16 = 0x0001;
-pub(crate) const DEFAULT_PRIMARY_PORT: u16 = 19302;
 const BINDING_SUCCESS: u16 = 0x0101;
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
@@ -22,42 +21,31 @@ const DEFAULT_SERVERS: [&str; 3] = [
 ];
 
 /// Discovers the NAT-reflexive UDP address seen by the public internet.
-/// All well-known servers are raced concurrently; the first verified reply
-/// wins and the rest are abandoned, so the total wait never exceeds one
-/// server timeout even when every server is unreachable.
+/// One socket preserves the requested port across serial attempts. The overall
+/// deadline includes binding, DNS, and responses; each server also has a budget.
 pub async fn discover_reflexive(bind_port: Option<u16>) -> Result<SocketAddr> {
-    let bind = match bind_port {
-        Some(port) => format!("0.0.0.0:{port}"),
-        None => "0.0.0.0:0".to_string(),
-    };
-    let mut attempts = tokio::task::JoinSet::new();
-    for server in DEFAULT_SERVERS {
-        let bind = bind.clone();
-        attempts.spawn(async move { query_server(&bind, server).await });
-    }
-    let attempted = attempts.len();
-    while let Some(result) = attempts.join_next().await {
-        if let Ok(Ok(address)) = result {
-            attempts.abort_all();
-            return Ok(address);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let socket =
+            tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, bind_port.unwrap_or(0)))
+                .await?;
+        for server in DEFAULT_SERVERS {
+            let attempt = async {
+                let target = resolve_server(server).await?;
+                query_reflexive_over(&socket, target).await
+            };
+            if let Ok(Ok(address)) = tokio::time::timeout(SERVER_TIMEOUT, attempt).await {
+                return Ok(address);
+            }
         }
-    }
-    anyhow::bail!("none of {attempted} STUN servers reported a reflexive address")
-}
-
-async fn query_server(bind: &str, server: &str) -> Result<SocketAddr> {
-    let target = resolve_server(server).await?;
-    let socket = tokio::net::UdpSocket::bind(bind).await?;
-    query_reflexive_over(&socket, target).await
+        anyhow::bail!("no STUN server reported a reflexive address")
+    })
+    .await
+    .context("STUN discovery timed out")?
 }
 
 pub(crate) async fn resolve_server(server: &str) -> Result<SocketAddr> {
-    let server = server.to_string();
-    let resolved = tokio::task::spawn_blocking(move || to_socket_addrs_vec(&server))
-        .await
-        .context("join STUN address resolution")??;
-    resolved
-        .into_iter()
+    tokio::net::lookup_host(server)
+        .await?
         .find(|address| address.is_ipv4())
         .context("STUN server has no IPv4 address")
 }
@@ -69,38 +57,45 @@ pub(crate) async fn query_reflexive_over(
     socket: &tokio::net::UdpSocket,
     target: SocketAddr,
 ) -> Result<SocketAddr> {
-    socket.connect(target).await?;
-
-    let mut request = [0_u8; HEADER_BYTES];
-    request[..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
-    request[2..4].copy_from_slice(&(TRANSACTION_ID_BYTES as u16).to_be_bytes());
-    request[4..8].copy_from_slice(&MAGIC_COOKIE);
-    getrandom::fill(&mut request[8..])?;
-
-    socket.send(&request).await?;
-    let mut response = vec![0_u8; MAX_RESPONSE_BYTES];
-    let received = tokio::time::timeout(SERVER_TIMEOUT, socket.recv(&mut response)).await??;
-    response.truncate(received);
-    ensure!(
-        response.len() >= HEADER_BYTES && response[8..].starts_with(&request[8..]),
-        "STUN reply transaction does not match the request"
-    );
-    parse_reflexive_address(&response)
+    let request = binding_request()?;
+    socket.send_to(&request, target).await?;
+    tokio::time::timeout(SERVER_TIMEOUT, async {
+        let mut response = [0_u8; MAX_RESPONSE_BYTES];
+        loop {
+            let (received, source) = socket.recv_from(&mut response).await?;
+            if source != target
+                || response
+                    .get(8..HEADER_BYTES)
+                    .filter(|_| received >= HEADER_BYTES)
+                    != Some(&request[8..])
+            {
+                continue;
+            }
+            return parse_reflexive_address(&response[..received]);
+        }
+    })
+    .await
+    .context("STUN response timed out")?
 }
 
-fn to_socket_addrs_vec(server: &str) -> std::io::Result<Vec<SocketAddr>> {
-    use std::net::ToSocketAddrs as _;
-    server.to_socket_addrs().map(|iter| iter.collect())
+fn binding_request() -> Result<[u8; HEADER_BYTES]> {
+    let mut request = [0_u8; HEADER_BYTES];
+    request[..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+    request[4..8].copy_from_slice(&MAGIC_COOKIE);
+    getrandom::fill(&mut request[8..8 + TRANSACTION_ID_BYTES])?;
+    Ok(request)
 }
 
 pub(crate) fn parse_reflexive_address(response: &[u8]) -> Result<SocketAddr> {
+    ensure!(response.len() >= HEADER_BYTES, "truncated STUN header");
+    ensure!(response[4..8] == MAGIC_COOKIE, "invalid STUN magic cookie");
     ensure!(
         u16::from_be_bytes([response[0], response[1]]) == BINDING_SUCCESS,
         "STUN server rejected the binding request"
     );
     let length = usize::from(u16::from_be_bytes([response[2], response[3]]));
     ensure!(
-        HEADER_BYTES + length <= response.len(),
+        length % 4 == 0 && HEADER_BYTES + length == response.len(),
         "STUN reply header exceeds the datagram"
     );
     let mut cursor = HEADER_BYTES;
@@ -114,7 +109,7 @@ pub(crate) fn parse_reflexive_address(response: &[u8]) -> Result<SocketAddr> {
             .get(cursor + 4..cursor + 4 + size)
             .context("STUN attribute exceeds the datagram")?;
         match attribute {
-            ATTR_XOR_MAPPED_ADDRESS => return decode_xor_mapped(value),
+            ATTR_XOR_MAPPED_ADDRESS => return decode_xor_mapped(value, &response[8..20]),
             ATTR_MAPPED_ADDRESS => return decode_mapped(value),
             _ => {}
         }
@@ -123,10 +118,10 @@ pub(crate) fn parse_reflexive_address(response: &[u8]) -> Result<SocketAddr> {
     anyhow::bail!("STUN reply carries no mapped-address attribute")
 }
 
-fn decode_xor_mapped(value: &[u8]) -> Result<SocketAddr> {
+fn decode_xor_mapped(value: &[u8], transaction: &[u8]) -> Result<SocketAddr> {
     ensure!(value.len() >= 8, "truncated XOR-MAPPED-ADDRESS");
     let port = u16::from_be_bytes([value[2], value[3]])
-        ^ u16::from_be_bytes([MAGIC_COOKIE[2], MAGIC_COOKIE[3]]);
+        ^ u16::from_be_bytes([MAGIC_COOKIE[0], MAGIC_COOKIE[1]]);
     let address = match value[1] {
         0x01 => {
             ensure!(value.len() >= 8, "truncated XOR-MAPPED-ADDRESS");
@@ -143,7 +138,10 @@ fn decode_xor_mapped(value: &[u8]) -> Result<SocketAddr> {
             for (slot, byte) in octets.iter_mut().zip(value[4..20].iter()) {
                 *slot = *byte;
             }
-            for (slot, mask) in octets.iter_mut().zip(MAGIC_COOKIE.iter().cycle()) {
+            for (slot, mask) in octets
+                .iter_mut()
+                .zip(MAGIC_COOKIE.iter().chain(transaction))
+            {
                 *slot ^= mask;
             }
             std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
@@ -177,7 +175,7 @@ mod tests {
         response[4..8].copy_from_slice(&MAGIC_COOKIE);
         let mut attribute = vec![0_u8; 8];
         attribute[1] = 0x01;
-        attribute[2..4].copy_from_slice(&(port ^ 0xA442).to_be_bytes());
+        attribute[2..4].copy_from_slice(&(port ^ 0x2112).to_be_bytes());
         attribute[4] = ip[0] ^ MAGIC_COOKIE[0];
         attribute[5] = ip[1] ^ MAGIC_COOKIE[1];
         attribute[6] = ip[2] ^ MAGIC_COOKIE[2];
@@ -186,6 +184,40 @@ mod tests {
         response.extend_from_slice(&(attribute.len() as u16).to_be_bytes());
         response.extend_from_slice(&attribute);
         response
+    }
+
+    #[test]
+    fn rfc5769_xor_address_vectors_and_header_validation() {
+        // RFC 5769 section 2.2: 192.0.2.1:32853.
+        assert_eq!(
+            decode_xor_mapped(&[0, 1, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43], &[0; 12]).unwrap(),
+            "192.0.2.1:32853".parse::<SocketAddr>().unwrap()
+        );
+        let transaction = [
+            0xb7, 0xe7, 0xa7, 1, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
+        ];
+        // RFC 5769 section 2.3.
+        let value = [
+            0, 2, 0xa1, 0x47, 1, 0x13, 0xa9, 0xfa, 0xa5, 0xd3, 0xf1, 0x79, 0xbc, 0x25, 0xf4, 0xb5,
+            0xbe, 0xd2, 0xb9, 0xd9,
+        ];
+        assert_eq!(
+            decode_xor_mapped(&value, &transaction).unwrap(),
+            "[2001:db8:1234:5678:11:2233:4455:6677]:32853"
+                .parse::<SocketAddr>()
+                .unwrap()
+        );
+        let request = binding_request().unwrap();
+        assert_eq!(&request[2..4], &[0, 0]);
+        for length in 0..HEADER_BYTES {
+            assert!(parse_reflexive_address(&request[..length]).is_err());
+        }
+        let mut response = xor_mapped_response(32853, [192, 0, 2, 1]);
+        response[4] ^= 1;
+        assert!(parse_reflexive_address(&response).is_err());
+        response[4] ^= 1;
+        response[3] = 8;
+        assert!(parse_reflexive_address(&response).is_err());
     }
 
     #[test]

@@ -20,8 +20,8 @@ use super::materialize::portable::same_file_identity;
 use super::materialize::unix::{
     inspect_backup_recovery, open_materialization_anchors, portable_component,
     remove_created_descendants_for_backup, remove_created_directories_at,
-    remove_current_regular_no_follow, remove_recovered_publication_no_follow,
-    restore_backup_no_follow, unlink_regular_at, BackupRecoveryState,
+    remove_recovered_publication_no_follow, restore_backup_no_follow, unlink_regular_at,
+    BackupRecoveryState,
 };
 #[cfg(windows)]
 use super::materialize::windows::{
@@ -229,6 +229,10 @@ async fn quarantine_unreadable_materialization_stage(
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+#[path = "rollback_tests.rs"]
+mod tests;
+
 async fn recover_activating_materialization(
     ctx: &SyncCtx<'_>,
     stage: &Path,
@@ -246,7 +250,12 @@ async fn recover_activating_materialization(
                 continue;
             }
             if !remove_recovered_publication_no_follow(&anchors, &item.file.path).await? {
-                let _ = remove_current_regular_no_follow(&anchors, &item.file.path).await?;
+                return Err(crate::agent::continuous::retryable_volatility_failure(
+                    format!(
+                        "local path {} no longer matches its retained publication; refusing automatic recovery",
+                        item.file.path
+                    ),
+                ));
             }
         }
         for path in journal.original_paths.iter().rev() {

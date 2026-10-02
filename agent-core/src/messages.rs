@@ -1,11 +1,13 @@
 //! Encrypted agent signals: message-only snapshots and reachability-delta inbox.
 //!
-//! A signal is an ordinary encrypted format-v3 snapshot with no file-tree
+//! A standalone signal is an ordinary encrypted format-v3 snapshot with no file-tree
 //! changes: it reuses the latest head's tree root, keeps the latest head as
 //! its parent, stores the sender in `Snapshot.author`, and stores the
 //! `ffmsg1:` envelope in `Snapshot.message`. Publication uses the existing
 //! workspace-head compare-and-swap operation; every CAS retry reloads both the
 //! latest head and its tree root so a retry can never roll back files.
+//! Guarded resolution snapshots may carry a status envelope alongside their
+//! file change; inbox traversal reads both through the same contract.
 
 use crate::history::traversal;
 use crate::paths::validate_name;
@@ -41,8 +43,22 @@ pub enum HeadConditionalSendResult {
 /// # Errors
 /// Returns an error for invalid names/ids/bodies, unreachable snapshot
 /// references, offline transport, or repeated concurrent head changes.
-pub async fn send_message(ctx: &SyncCtx<'_>, input: AgentMessageInput) -> Result<AgentSendResult> {
+pub async fn send_message(
+    ctx: &SyncCtx<'_>,
+    mut input: AgentMessageInput,
+) -> Result<AgentSendResult> {
     ensure_signal_format(ctx)?;
+    let routed_to = match input
+        .to
+        .strip_prefix(feanorfs_common::CAPABILITY_RECIPIENT_PREFIX)
+    {
+        Some(capability) => {
+            let agent = crate::coordination::resolve_capability(ctx, capability).await?;
+            input.to.clone_from(&agent);
+            Some(agent)
+        }
+        None => None,
+    };
     let engine = SnapshotEngine::new(ctx);
     let initial_head = ctx.api.get_head(ctx.workspace_id()).await?;
     let prepared = prepare_message(ctx, input, initial_head.as_deref()).await?;
@@ -70,6 +86,7 @@ pub async fn send_message(ctx: &SyncCtx<'_>, input: AgentMessageInput) -> Result
                 return Ok(AgentSendResult {
                     message_id: candidate,
                     about_snapshot: prepared.about_snapshot,
+                    routed_to,
                 })
             }
             SwapHeadResult::Conflict(current) => expected = current,
@@ -119,6 +136,7 @@ pub async fn send_message_if_head(
         SwapHeadResult::Swapped => Ok(HeadConditionalSendResult::Sent(AgentSendResult {
             message_id: candidate,
             about_snapshot: prepared.about_snapshot,
+            routed_to: None,
         })),
         SwapHeadResult::Conflict(current) => Ok(HeadConditionalSendResult::Conflict(current)),
     }

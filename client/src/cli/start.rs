@@ -149,6 +149,27 @@ pub(crate) async fn finish_sync_watch(
     } else {
         false
     };
+    finish_sync_watch_with_restore(work_dir, watch_mode, managed_was_running).await
+}
+
+async fn finish_sync_watch_with_restore(
+    work_dir: &Path,
+    watch_mode: WatchMode,
+    managed_was_running: bool,
+) -> anyhow::Result<()> {
+    let result = finish_sync_watch_suspended(work_dir, watch_mode).await;
+    if result.is_err() && managed_was_running {
+        if let Err(restart_error) = super::service::restore_after_failed_start(work_dir) {
+            eprintln!(
+                "Warning: automatic sync could not be restored after the failed start: {restart_error}"
+            );
+        }
+    }
+    result
+}
+
+// Keep every fallible operation after suspension inside the compensation boundary.
+async fn finish_sync_watch_suspended(work_dir: &Path, watch_mode: WatchMode) -> anyhow::Result<()> {
     let config = load_config(work_dir)?;
     if config.format_version < 3 {
         eprintln!("Note: run `feanorfs migrate` to upgrade this workspace to format v3.");
@@ -181,13 +202,6 @@ pub(crate) async fn finish_sync_watch(
     let sync_result = match sync_result {
         Ok(result) => result,
         Err(error) => {
-            if managed_was_running {
-                if let Err(restart_error) = super::service::restore_after_failed_start(work_dir) {
-                    eprintln!(
-                        "Warning: automatic sync could not be restored after the failed start: {restart_error}"
-                    );
-                }
-            }
             let message = format!(
                 "Initial sync did not complete. This folder's encrypted FeanorFS setup is saved, and rerunning `feanorfs start -- {}` will resume it without pairing again or changing its workspace identity. Details: {error:#}",
                 work_dir.display()
@@ -752,6 +766,34 @@ pub async fn run_start(current_dir: &Path, mut opts: StartOptions) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn config_failure_restores_suspended_desired_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            server_url: "http://127.0.0.1:1".into(),
+            workspace_id: "start-restore-test".into(),
+            encryption_password: Some("e".repeat(64)),
+            server_password: None,
+            tls_ca_pem: None,
+            format_version: 3,
+            hub_local: false,
+            relay: None,
+            mesh: None,
+        };
+        feanorfs_client::save_config(dir.path(), &config).unwrap();
+        super::super::supervisor::add_workspace(dir.path()).unwrap();
+        super::super::supervisor::stop_workspace_in_registry(dir.path()).unwrap();
+        let state = feanorfs_agent_core::workspace_state_path(dir.path()).unwrap();
+        std::fs::write(state.join("config.json"), "invalid-json").unwrap();
+        let result = finish_sync_watch_with_restore(dir.path(), WatchMode::Background, true).await;
+        assert!(result.is_err());
+        let canonical = dir.path().canonicalize().unwrap();
+        assert!(super::super::supervisor::registered_workspaces()
+            .unwrap()
+            .contains(&canonical.to_str().unwrap().to_string()));
+        super::super::supervisor::remove_workspace_from_registry(dir.path()).unwrap();
+    }
 
     #[test]
     fn parse_invite_target() {

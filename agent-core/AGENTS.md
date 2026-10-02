@@ -2,125 +2,79 @@
 
 ## Purpose
 
-Embeddable Rust SDK for snapshot sync and agent workspace isolation. Owns encrypted objects, snapshot heads, log/undo, spawn/status/refresh/land/clean, unattended runner lifecycle state, conflict resolution, encrypted agent signals, and randomized integrator assignment over in-process or HTTP transport. No CLI, watcher, summary, or predictive hydration. Consumers include `feanorfs-client`, `feanorfs-ffi`, and `feanorfs-agent-node`.
+Embeddable Rust engine (`feanorfs-agent-core`) for snapshot sync, agent workspaces, and coordination over in-process or HTTP transport: encrypted objects and heads, log/undo, spawn/status/refresh/land/clean, continuous reconciliation, runner state, signals, work intent, integrator assignment, conflict resolution, capability routing, and the unified coordination view. No CLI, watcher, summary, or predictive hydration. Consumers: `feanorfs-client`, `feanorfs-ffi`, `feanorfs-agent-node`.
 
 ## Ownership
 
-- Crate: `feanorfs-agent-core` (`agent-core/`).
-- Public blocking API: [`Runtime`](src/lib.rs), [`Workspace`](src/lib.rs), [`SpawnOptions`](src/lib.rs), [`LandOptions`](src/lib.rs), and [`RefreshOptions`](src/agent.rs).
-- Internal modules:
-  - `agent.rs` + `agent/` — thin facade plus three-way diff, spawn, land phases, refresh, proposals, and focused tests. `agent/runner/` owns runner lifecycle state/leases split into `contract.rs`, `store.rs`, `ownership.rs`, `admission.rs`, `session.rs`, and `test_hooks.rs` (re-exported paths unchanged).
-  - `conflicts.rs` / `conflict_artifacts.rs` — workspace conflict gate and artifact layout.
-  - `local.rs` + `local/` — thin local-state facade with config, cache, conflicts, access log, workspace walking, scanning, and focused tests.
-  - `state.rs` + `state/` — schema-versioned `LocalStateV1`, lock-protected `DurableState`, and focused model/persistence tests.
-  - `api.rs` / `hub.rs` + `hub/` — HTTPS/HTTP and in-process `ApiClient`; private hub CA certificates extend normal reqwest/Rustls trust without accepting invalid certificates. Embedded routes operate directly against `HubDb` and blob files without importing `feanorfs_server`.
-  - `tunnel.rs` — opaque relay transport. A remote client binds an ephemeral loopback bridge but retains the hub hostname for TLS SNI/verification; an owned hub maintains outbound offers and forwards only the existing Rustls byte stream. Legacy fallback only (D6).
-  - `mesh/` — direct-P2P mesh transport: `identity.rs` (protected Ed25519 machine identity via the OS credential store with `0600` fallback), `dial.rs` (`PeerDialer` racing ≤16 TCP candidates with per-attempt deadlines where only authenticated TLS probes win), `nat.rs` (bounded UPnP/NAT-PMP/PCP mapping → `mapped` candidates), `stun.rs` (RFC 5389 binding raced against a fixed server list from an optional bound port → `reflexive` QUIC candidates), `quic.rs` (hub-side punch listener bridging to the local TLS port + client-side loopback bridge after Ed25519 node authentication), and `state.rs` (bounded local-only attempt counters and winning-path cache in `mesh-state.json`). Decisions D1–D7: [docs/mesh-transport.md](../docs/mesh-transport.md).
-  - `hub_state.rs` + `hub_state/` — `HubDb`, `HubStateV1`, workspace metadata, heads, manifests, migration fences, and migration projection.
-  - `sync_pass/` — sync orchestration plus fail-closed structural planning (split into `negotiate.rs`, `download.rs`, `rollback.rs`, and `materialize/{model,unix,windows,portable}.rs`; re-exported paths unchanged) and the same-filesystem staged materializer. Verified downloads activate through rollback backups, one atomic cache update, and a bounded crash-recovery journal; untracked/symlink content is never removed.
-  - `large_file.rs` — format-v3 authenticated chunk manifests and fixed-size encrypted chunks over the existing opaque CAS, including streaming materialization and retained-manifest reachability.
-  - `objects.rs` / `prepared_tree.rs` / `snapshot.rs` / `snapshot_diff.rs` — encrypted immutable objects, refs, linear-time tree preparation, bounded object reads, and budgeted iterative/hash-pruned traversal.
-  - `history.rs` — bounded reachable history and append-only undo; target bytes are authenticated and staged before its head CAS.
-  - `messages.rs` — encrypted agent signals: `send_message` (no-file-change snapshots with fresh-root CAS retry) and `inbox` (reachability-delta traversal with cursors, 10k scan bound, zero limit rejected); wire types in `feanorfs_common::agent_contract`.
-  - `signal_index.rs` — pure durable cache of walked snapshot records (`signals-index.json`, bounded, schema-reset-on-corruption) so inbox walks and cursor-reset rebuilds skip hub refetches of already-walked snapshots. Never authority: a miss only costs a refetch.
-  - `integrator.rs` — randomized integrator assignment: neutral-only ranked pools when possible, dispatcher state machine, `orchestrator/integrator-state.json` crash-safe persistence, exact request-snapshot cursors, recovery adoption of a published-but-unrecorded offer (selection work runs under the dispatcher lock so contended dispatchers fail fast), context-bound and causally staged `ffint1` replies, persisted pre-acceptance timeout/fallback, revocation, cursor-reset fail-closed, and bounded read-only cross-machine conflict materialization. Canonical types/ranking in `feanorfs_common::integrator_contract`; `lock.rs::DispatcherLock` enforces the single-dispatcher invariant.
-  - `work.rs` — deterministic `ffwork1` reducer over the existing encrypted signal stream: (task, agent, sequence) author keys, coordinator decisions keyed by exact proposal message id, causal dominance, canonical-id tie-breaks with losing branches retained as evidence, and a schema-versioned bounded `orchestrator/work-state.json` projection (advisory lock, atomic replacement, cursor-reset rebuild with explicit `projection_incomplete`).
-  - `resolution.rs` — exact fingerprinted conflict resolution: `ConflictIdentity` fingerprints, private bounded `ResolutionJob`/candidate stores, causally-behind owner designation with `ffint1` fallback evidence, guarded publication that revalidates every identity field and the immutable candidate immediately before one CAS from the reloaded head, publication-uncertain crash recovery, engine-executed inline verification evidence, typed `put_candidate`/`materialize_resolution_legs`, and typed human `answer`/`defer` ops.
-  - `resolution_protocol.rs` — cross-machine `ffres1` protocol: pure deterministic reducer over encrypted assignment/result/revoke/human-answer profiles with bounded pending state (order-independent convergence), durable private projection, job import by ID and fingerprint, and bounded metadata-only status.
-  - `traversal.rs` — one bounded iterative snapshot-DAG walk (node/parent/depth/byte budgets, typed exhaustion) shared by messages, history, and integrator reachability scans.
-  - `tree_reconcile.rs` — last-synced tree reconciliation for sync conflict gating.
-  - `object_gc.rs` — local object-cache pruning from retained manifests and refs (throttled).
-  - `upload_registry.rs` — bounded durable per-workspace copy of the latest accepted reachability closure, used to skip redundant uploads without accumulating all historical objects.
-  - `paths.rs` — owning-workspace agent worktree/state paths, conflicts dir, and name validation (breaks agent↔conflicts cycle).
-  - `workspace_read.rs` — descriptor-anchored workspace reads. Unix traversal retains the root directory descriptor and opens every component with `openat`/`O_NOFOLLOW`; portable checked fallbacks reject aliases, symlinks, and non-regular files.
-  - `workspace_layout.rs` + `workspace_state_registry.rs` — global workspace-state slots: platform-stable identity (`macos-v2`/`linux-v2`/`windows-v2`/`-weak`), one-time provenance-recorded adoption of legacy path-only slots, the crash-safe identity index, full-lifetime per-slot state leases, and tombstone grace/quarantine/verified-deletion retirement.
-  - `ctx.rs`, `crypto.rs`, `fs_util.rs`, `lock.rs` — shared helpers.
-
-Wire types and semver JSON contract live in `feanorfs_common::agent_contract` — see [docs/agent-api.md](../docs/agent-api.md).
+- Public blocking API: `Runtime`, `Workspace` (one method per operation), `SpawnOptions`, `LandOptions`, `RefreshOptions`. Wire types live in `feanorfs_common`; JSON shapes follow [docs/agent-api.md](../docs/agent-api.md).
+- Modules:
+  - `objects.rs`, `prepared_tree.rs`, `snapshot.rs`, `snapshot_diff.rs`, `traversal.rs`, `history.rs`, `object_gc.rs`, `upload_registry.rs` — encrypted CAS objects, refs, bounded traversal, log/undo, GC, latest accepted reachability closure.
+  - `sync_pass/` — sync orchestration, negotiation, verified downloads, staged materializer with rollback and crash journal.
+  - `large_file.rs` — 8 MiB AEAD chunks plus authenticated manifests.
+  - `local/`, `state/`, `workspace_read.rs`, `workspace_layout.rs`, `workspace_state_registry.rs` — `ClientDb` over `local_state.json`, scanning, descriptor-anchored reads, workspace-state identity, leases, and retirement.
+  - `agent/` — spawn, land, refresh, proposals, continuous leases (`continuous.rs`), runner lifecycle (`runner/`).
+  - `conflicts.rs`, `conflict_artifacts.rs`, `tree_reconcile.rs` — conflict gate, artifacts, identity sidecars.
+  - `messages.rs`, `signal_index.rs` — `ffmsg1` send/inbox (resolves `cap:<capability>` recipients), cached walked snapshots (never authority).
+  - `work.rs` — `ffwork1` reducer and `orchestrator/work-state.json` projection.
+  - `integrator.rs` — `ffint1` dispatcher state machine, offers seen by candidates, typed candidate replies, owner designation, conflict materialization.
+  - `resolution.rs`, `resolution_protocol.rs` — exact-fingerprint jobs, guarded publication, `ffres1` reducer.
+  - `coordination.rs` — pure lifecycle derivation (`agent next`, `--wait`), edit guard, capability roster and `ffcap1` announcements, `agent_identity`.
+  - `claim.rs` — one-call protocol: `claim_scope` (propose + wait), `finish_work` (wait for landing, settle + complete), `coordinate_pass` (auto-accept non-overlapping scope); pure policies `claim_covered` and `auto_decisions`.
+  - `git_baseline.rs` — read-only `.git/HEAD` baseline and `ffbase1` mismatch detection.
+  - `api.rs`, `hub.rs` + `hub/`, `hub_state/`, `tunnel.rs`, `mesh/`, `head.rs` — transports, embedded hub, opaque relay, mesh dialing/NAT/STUN/QUIC, bounded head waits.
+  - `ctx.rs`, `crypto.rs`, `fs_util.rs`, `durable.rs`, `lock.rs`, `paths.rs` — shared helpers; path helpers live in `paths.rs` to avoid agent ↔ conflicts cycles.
 
 ## Local Contracts
 
-- Blocking facade: `Runtime::new()` owns a multi-thread Tokio runtime; all public methods use `block_on`. Calls and final runtime drop remain valid inside current- or multi-thread Tokio contexts by moving nested blocking work/drop to a scoped ordinary thread.
-- Agent names are portable single path components capped at 255 UTF-8 bytes. `ffmsg1` validation reuses the common contract (8-KiB body, 64-KiB total canonical envelope) before publication or parsing.
-- Integrator reply envelopes must match the selected candidate, dispatcher recipient, kind, original request, assignment/attempt, and about snapshot. Result digests additionally bind the selected integrator and a reachable inspected snapshot. Inbox batches apply acceptance before terminal replies.
-- Unit and integration test crate roots link `feanorfs-test-support` once. Its pre-main process profile replaces test-local HOME mutation; subprocesses inherit it and parallel tests never change profile environment variables.
-- JSON shapes returned to FFI/Node/CLI `--json` MUST match `docs/agent-api.md`; snapshot tests in `client/tests/contract_snapshots.rs`.
-- Tray JSON shapes live in `feanorfs_common::tray_contract` with fixtures + snapshots in `client/tests/tray_contract_snapshots.rs`.
-- `ResolveKeep::Cloud` on `edit_delete` conflicts: when the cloud artifact is the deletion sentinel, remove the local file and upload a tombstone (`is_cloud_deleted_sentinel` in `conflict_artifacts.rs`).
-- A missing local leg classified as `delete_edit` uses the `deleted-locally` artifact sentinel; never describe an actual local deletion as “no local changes.”
-- Agent workspaces isolate data, not processes — never claim sandboxing.
-- Each agent base is one atomic private-state `base-snapshot` ref. Per-path `agent_snapshots` rows are forbidden.
-- Land uploads immutable blobs and objects and prefetches/fsyncs every clean landed file before compare-and-swap. The head swap is the commit point; worktree and legacy projections happen afterward through the rollback-capable materializer. A post-CAS interruption is recovered idempotently from its journal or by the existing committed-land retry path.
-- Format-v3 conflict identity and last-synced state come from trees and refs, never `last_synced_files` rows.
-- Bulk local or cloud conflict resolution validates every selected artifact before mutation, materializes the explicit policy (including cloud deletions), publishes one resolution snapshot, and updates the registry plus resolution history in one durable-state commit. Format-v2 retains the same flat-server-view projection as single-path resolution.
-- `undo` acquires the sync lock, validates the complete target projection, authenticates and fsyncs target bytes before CAS, then appends a two-parent snapshot that retains both previous head and pre-operation worktree state.
-- Sync-lock stale detection uses native process-liveness checks on Unix and Windows. Never treat every Windows PID as dead: that can break a live worker's lock and misreport tray watcher state. A lock owned by a live process is never broken by the age cap (24 h floor as a PID-reuse guard), so long-running syncs are not broken out; same-pid re-acquire refreshes the lock timestamp.
-- Server-published snapshots must upload every referenced file blob before their reachability manifest. Working-copy refs may use local-only manifests until they become publishable state. Published reachability walks the complete bounded parent-snapshot DAG (snapshots, trees, files, conflict legs, chunks); a typed missing-blob rejection clears the upload registry and runs exactly one repair pass from hash-verified local cache before one manifest retry. Manual single/bulk conflict resolution acquires the sync lock before any read or mutation.
-- `SyncCtx::state_dir` resolves and caches the workspace-state path once per operation context. It holds the per-context mutex through first resolution, caches only success, and never uses a process-global path cache; a fresh context after relocation re-runs identity lookup and updates `location`. Agent-worktree contexts explicitly pin `agents/<name>/state/runtime` instead, so they never create another top-level workspace registration. Preferred path-hash slots are accepted only when their stored filesystem identity matches; a legacy slot without a recorded identity is adopted exactly once (with provenance) only when its recorded `location` proves the exact path. Moved lookup prefers the verified crash-safe identity index and falls back to a bounded scan (duplicate identity matches fail closed); the index is trusted only while the workspaces directory mtime has not advanced past it, so slot mutations always re-verify. Same-path folder replacement fails closed instead of inheriting credentials/state.
-- Workspace-state identity is platform-stable (`macos-v2`, `linux-v2`, `windows-v2` volume/file-index/creation-time, explicit `-weak` identities on filesystems without birth times). `workspace_state_registry.rs` owns the crash-safe identity index, full-lifetime per-slot state leases (shared for every resolver, exclusive for path-hash migration and retirement), prospective provenance records, and the tombstone lifecycle: explicit `retire_workspace_state` records the authenticated identity/location binding, grace expires before quarantine, quarantine retention expires before deletion, and every move/delete re-verifies identity and the recorded folder under an exclusive lease. State is never deleted by age, missing location, registry absence, or name inference; unauthenticated path-only slots can never be retired.
-- Format-v3 files above 64 MiB use deterministic 8 MiB AEAD chunks plus an authenticated, path-bound encrypted manifest. The file's tree hash names the manifest ciphertext; every chunk is ciphertext-hash verified, index/path-bound during decryption, and included in server reachability before publication. Files above the former 100 MiB body limit therefore never create an oversized request. Format-v1/v2 reports at most five exact examples and requires migration instead of attempting an oversized upload.
-- Rekey publishes a parentless root because old-key snapshot parents are intentionally unreadable under the new key.
-- Sync and agent conflict identity is hash/deletion/executable-intent based. Cross-machine mtime can indicate a possible server rollback, but never decides whether content changed.
-- Workspace and agent-worktree content reads are descriptor anchored. On Unix, scanners, uploads, large-file hashing/streaming, spawn copies, undo, and conflict-local choices retain a no-follow root and traverse every component with `openat`; bytes and before/after metadata come from one opened regular-file descriptor. Small uploads must reproduce the scanned encrypted hash before any network write. Large uploads plan and stream the same descriptor, authenticate even registry-known chunks, and retain at most four pending encrypted chunks. Portable checked fallbacks reject noncanonical aliases, reserved/device spellings, symlinks, and non-regular files before opening.
-- Downloads guard against clobbering any touched file, ancestor, deletion, or lazy placeholder by revalidating the scan-time state after staging. A canonical target is checked before mutation; every replacement is authenticated/fsynced first, worktree/stage directory entries are fsynced in commit order, Unix publication traverses already-open no-follow directory handles and applies mode/fsync through the published file descriptor (other platforms fail closed on checked ancestors), staged hard links remain until cache commit for inode-exact crash recovery, originals move to same-filesystem rollback backups, transaction-created directories are rolled back only when proven empty, and cache deletes/upserts commit once after all deterministic renames and mode changes. `.feanorfs-tmp-materialize-*` journals recover `preparing`, `activating`, or `activated` crashes without deleting changed/untracked/symlink content; journal-less empty preparations are removable and unreadable new-only preparations are quarantined outside the active recovery namespace. `upload_registry.rs` may skip objects only from the latest bounded reachability closure the hub accepted. Only an HTTP 412 missing-blob response proves that registry stale and may clear it for a forced reupload; other failures preserve it.
-- Format-v3 conflict trees preserve executable intent independently for base/ours/theirs. Zero-mode conflicts remain byte-exact FTR1; executable conflict metadata uses FTR2, and artifacts, integrator legs, single/bulk keep policies, and resolved snapshots apply the selected authoritative mode.
-- Object, reachability, prepared-tree, snapshot-diff, and history processing share bounded object/work/output/path budgets. HTTP and embedded success/error responses plus object reads are length-bounded before body growth; cache entries are metadata-checked and read through a bounded stream.
-- `atomic_write_visible`/`atomic_write_durable` (and `durable::atomic_overwrite*` for state) own a collision-safe temp file under the destination directory, flush and sync it before rename, and remove it on every failed path. Destination bytes and cache state remain untouched after a failed write; `*_durable` adds a parent-directory sync after rename (crash-durable on POSIX), while `*_visible` and hot-path caches intentionally skip it.
-- Workspace walkers never follow symlinks and prune nested directories with a valid `CACHEDIR.TAG`; a workspace-root tag is deliberately exempt to prevent accidental mass deletion.
-- `LocalHub::open` caches by canonical data-dir path plus auth token so a token change always opens a fresh instance. Metadata mutations are serialized through `hub_state.json` with `fs2` exclusive lock and `AtomicWriteFile::commit`. Blobs remain in `blobs/<hash>`. 100 MiB body and 64 MiB manifest limits, root-bound immutable manifest closures, unconditional manifested-head publication, and valid-hash path-traversal defense are enforced in parity with the server. Server SQLite code is untouched.
-- Agent spawn, status, and land build their base-workspace `SyncCtx` from the loaded workspace `Config`; never replace that with the fallback constructor, which intentionally defaults to legacy format 2 when no config exists.
-- `ClientDb` stores its cache, conflict registry, conflict resolution history, session keys, and access log in the private global workspace `local_state.json`, serialized as a schema-versioned BTreeMap-based JSON document. Canonical serialization borrows the large maps and sorts only vectors of references; durable commits stream this view through a bounded writer directly into the `AtomicWriteFile` temporary file, never restoring a full state clone or allocating a complete intermediate JSON string. Construction acquires an exclusive lock on the sibling `local_state.lock` before checking or initializing state — two racing first-opens cannot both see a missing file and overwrite data. After construction, reads and writes treat a missing state file as corruption. Every mutable operation follows lock exclusive → reload → mutate → `AtomicWriteFile::commit` → parent directory sync. Pre-commit failures, including size-limit or serialization errors, preserve prior bytes; post-commit directory-sync failures return committed-but-durability-uncertain and treat the new state as authoritative. Input is capped at 128 MiB before read/parse, collection cardinalities are bounded, and schema probing avoids a duplicate generic JSON tree. Malformed JSON and unknown future schema versions are rejected by `ClientDb::new`. Directory scans use `bulk_upsert_cache_entries` for a single commit per scan. A legacy project-local `local_cache.db` without `local_state.json` returns `run 'feanorfs migrate' from the workspace root` without mutation.
-- Access log is deterministically bounded: max 10 000 entries, minimum absolute weight 0.001. `record_access_pair` rejects non-finite `weight_delta`. After insertion, update, or decay, entries below the threshold are pruned; when over the cap, entries are evicted by ascending weight, ascending `updated_at`, then path/sibling keys. `from_json` validates all loaded weights are finite.
-- Workspace/global config writes are atomic. Secure onboarding stores keys/tokens in macOS Keychain for signed releases, Windows Credential Manager, or Linux Secret Service and writes only a random `fsc1` reference to JSON. Unsigned macOS/source builds and unavailable stores fall back to Unix `0700`/`0600` protected files; an existing OS-backed config fails closed and never spills secrets back to JSON. Background services resolve credentials in-process and never receive them in argv, environment variables, or logs. Optional `tls_ca_pem` is public trust material delivered by a secure capability and persisted beside the endpoint.
-- `ApiClient::new_with_tls_resolved` may override address lookup for a hostname, but it must preserve the URL hostname as TLS SNI/name verification and retain the pinned CA. It exists for CA-correlated mDNS reachability, never certificate bypass.
-- Relay routes are exactly 256-bit lowercase hex and relay URLs require WSS outside loopback tests. The readiness Ping/Pong must complete before reading the local TLS ClientHello. Never log the route or put it in worker argv; never terminate inner TLS at the relay.
+### Storage, sync, and state
+
+- `Runtime::new()` owns a multi-thread Tokio runtime; public methods `block_on` and stay valid inside existing Tokio contexts.
+- Land uploads blobs/objects and fsyncs landed files before head CAS; the CAS is the commit point; worktree projection follows through the rollback-capable materializer and recovers from its journal.
+- Published snapshots upload every referenced blob before their manifest; only an HTTP 412 missing-blob response clears the upload registry for one repair pass.
+- Downloads never clobber touched files, ancestors, deletions, or placeholders: revalidate after staging, authenticate and fsync replacements, publish through no-follow handles, keep rollback backups, commit cache changes once. Recovery never deletes changed, untracked, or symlink content.
+- Workspace and worktree reads are descriptor-anchored (`openat`/`O_NOFOLLOW` on Unix, checked fallbacks elsewhere); small uploads must reproduce the scanned hash before any network write.
+- Object, reachability, prepared-tree, diff, and history work share bounded object/work/output/path budgets; all response and object reads are length-bounded before allocation.
+- `ClientDb`: exclusive `local_state.lock` → reload → mutate → atomic commit → parent sync; missing state after construction is corruption; input capped at 128 MiB; canonical serialization streams without full clones; unknown schemas are rejected; legacy `local_cache.db` requires `feanorfs migrate`.
+- Access log: ≤10 000 entries, weights finite and ≥0.001, deterministic eviction.
+- `atomic_write_visible`/`_durable` write a temp file in the destination directory, sync, rename, and clean up on failure; `_durable` also syncs the parent.
+- Sync-lock ownership is the kernel lock, never the diagnostic PID or age. The activity probe reports any held sync lock as active except those this process holds (`SyncLock` registers itself process-locally), because Windows locks are mandatory and hide the PID from other handles.
+- Exclusive workspace-state leases retry contention for at most 500 ms (a child forked by another thread briefly inherits descriptors), then fail closed.
+- `SyncCtx::state_dir` resolves once per context and never caches globally; identity mismatches, duplicate identity matches, and same-path folder replacement fail closed. Workspace state is retired only through explicit tombstone → grace → quarantine → re-verified deletion.
+- Config writes are atomic; keys/tokens go to the OS credential store with a protected-file fallback and never spill back after migration. `ApiClient::new_with_tls_resolved` may change address lookup but keeps SNI, name verification, and the pinned CA.
+- Rekey publishes a parentless root and retries only the recorded candidate from the recorded source head.
+- `LocalHub` caches by canonical data dir plus token, serializes metadata through a locked atomic `hub_state.json`, and matches server bounds (100 MiB body, 64 MiB manifest, valid-hash paths).
+- Relay routes are 256-bit lowercase hex, WSS outside loopback tests, never logged or placed in argv; inner TLS is never terminated at the relay.
+- Sync snapshots carry `ffbase1:<commit>:<branch>` from `read_git_baseline(ctx.base)`, which reads only `HEAD` and the ref it names (validated `refs/` path, loose or packed). Never write `.git`; a missing or unborn baseline is `None`.
+
+### Agents, conflicts, and coordination
+
+- Agent workspaces isolate data, not processes; never claim sandboxing. Each agent base is one atomic `base-snapshot` ref. Agent spawn/status/land build the base `SyncCtx` from the loaded `Config`, never the legacy fallback constructor.
+- Conflict identity is hash/deletion/executable-intent based; mtime never decides content changes. Executable intent is preserved per leg (FTR2 only when needed). `ResolveKeep::Cloud` on a deletion sentinel removes the local file and uploads a tombstone. Bulk resolution validates every artifact before mutation and commits once.
+- Continuous agents: lease per (workspace, agent); guarded land (`clean=false, propose=false`) and refresh (never `--replace`); bounded `continuous-status.json`; activation is explicit (`agent run` or an enabled runner); manual land/refresh is refused while an owner is active.
+- `ffmsg1` names ≤255 bytes, bodies ≤8 KiB, envelopes ≤64 KiB. Integrator replies must match candidate, dispatcher, kind, request, assignment/attempt, and snapshot; `integrator_reply` binds all of them from the observed offer and refuses superseded, terminal, out-of-order, or scan-truncated replies.
+- Resolution publication embeds its broadcast status in the same CAS as the resolved tree; a prepared job may cross at most 64 single-parent signal-only snapshots with the same tree root; leg materialization reuses only byte-identical regular files.
+- Work, integrator, resolution, and capability senders default to `FEANORFS_AGENT`, then `human`.
+- `coordination_status` reads every projection once and fails soft: a source error becomes a warning plus `projection_incomplete`. `derive_coordination` and `evaluate_guard` stay pure and unit-tested. Items ≤64, actions ≤8, warnings ≤16, text ≤512 bytes.
+- `claim_scope` never sends a signal for covered paths and reuses an identical pending proposal; `finish_work` settles only with a snapshot proven landed (controller idle or stopped after its final flush, no unlanded changes) and defaults verification to `skipped`; `agent run` calls it after a clean, settled child exit; `coordinate_pass` only accepts (never rejects or narrows) proposals addressed to its identity that overlap no other agent's live scope.
+- Capability roster = newest `ffcap1` announcement per sender plus work-intent capabilities. `cap:` routing resolves to exactly one agent or errors; `integrator_assign` with no candidates uses the roster.
+- Keep this crate free of `clap`, `notify`, and `tracing-subscriber`. New agent-facing operations land here first and on every surface in the operation matrix.
 
 ## Work Guidance
 
-- Keep this crate free of `clap`, `notify`, and `tracing-subscriber`.
-- New agent-facing operations go here first; `feanorfs-client` re-exports thin wrappers.
-- Path helpers belong in `paths.rs` — do not reintroduce `agent` ↔ `conflicts` module cycles.
+- Unit and integration test roots link `feanorfs-test-support` once; never mutate HOME in tests.
+- Prefer extending existing reducers and projections over new persisted state; derived views (like `coordination.rs`) compute on read.
 
 ## Verification
 
-- `cargo test -p feanorfs-agent-core`
-- `cargo test -p feanorfs-ffi` (C ABI smoke)
-- `cargo test -p feanorfs-client contract_snapshots`
-- `cargo test -p feanorfs-client tray_contract_snapshots`
-- `cargo test -p feanorfs-agent-core --release -- --ignored --nocapture scan_profile_10k` — opt-in 10k scanner profile; normal suites skip it.
-- `cargo test -p feanorfs-agent-core --release local_state_serialization_profile_100k -- --ignored --nocapture` — opt-in 100k-entry serialization profile; normal suites skip it.
-- `cargo test -p feanorfs-agent-core --release 'state::tests::persistence::local_state_persistence_profile_100k' --locked -- --ignored --nocapture --exact` — opt-in streaming persistence profile; normal suites skip it.
+- `cargo test -p feanorfs-agent-core`, `cargo test -p feanorfs-ffi`, `cargo test -p feanorfs-client --test contract_snapshots --test tray_contract_snapshots --test coordination_cli`.
+- Opt-in profiles: `cargo test -p feanorfs-agent-core --release -- --ignored --nocapture scan_profile_10k` (and `local_state_serialization_profile_100k`, `state::tests::persistence::local_state_persistence_profile_100k`).
 
 ## Child DOX Index
 
 | Child | Purpose |
 | :--- | :--- |
-| [`src/agent/`](src/agent/AGENTS.md) | Agent diff, spawn, land phases, refresh, runner lifecycle, proposal generation, and validation tests. |
-| [`src/hub/`](src/hub/AGENTS.md) | Embedded hub request dispatch, HTTP helpers, and route groups. |
-| [`src/hub_state/`](src/hub_state/AGENTS.md) | JSON hub persistence, blob storage, and SQLite migration projection. |
-| [`src/local/`](src/local/AGENTS.md) | Local configuration, JSON-backed `ClientDb` operations, workspace walking/scanning, and focused tests. |
-| [`src/state/`](src/state/AGENTS.md) | Local-state durable persistence and focused schema/atomicity tests. |
-
-## Continuous reconciliation
-
-- `agent/continuous.rs` — process-lifetime ownership and the shared continuous
-  contract: `ContinuousOwnerLock` (nonblocking fs2 lease, released by the OS
-  on exit), guarded `land_agent_continuous` /
-  `refresh_agent_continuous` / `land_agent_runner_owned` /
-  `refresh_agent_runner_owned` entries (clean=false, propose=false, never
-  `--replace`), the table-driven `classify_continuous_error` retry/attention
-  contract, bounded `continuous-status.json` persistence with lease-verified
-  reads, `probe_agent_state` startup reconciliation, and the
-  `live_reconciliation_health` aggregation. Activation is explicit; dormant
-  agents never mutate.
-- `head.rs` — `wait_for_head_change` over the extended authenticated
-  `GET /api/head` (bounded wait, capability advertisement via
-  `wait_supported`) plus the reusable `HeadObserver` shared by the workspace
-  watcher, events loop, runner, and controller. Unsupported old hubs and
-  retryable transport failures degrade to bounded jittered polling inside the
-  requested window — never a busy loop. LocalHub implements the same wait
-  semantics in-process via `tokio::sync::Notify`.
-- `agent/runner.rs` — `RunnerOwnership` (owned identity token for controller
-  tasks that cannot borrow the worker session) and the `RunnerOwned`
-  operation-guard variant; manual land/refresh on an agent with an active
-  interactive owner fails before mutation.
+| [`src/agent/`](src/agent/AGENTS.md) | Agent diff, spawn, land, refresh, runner lifecycle, proposals. |
+| [`src/hub/`](src/hub/AGENTS.md) | Embedded hub dispatch and routes. |
+| [`src/hub_state/`](src/hub_state/AGENTS.md) | JSON hub persistence, blobs, SQLite projection. |
+| [`src/local/`](src/local/AGENTS.md) | Config, `ClientDb` operations, walking, scanning. |
+| [`src/state/`](src/state/AGENTS.md) | Durable local-state persistence and schema tests. |

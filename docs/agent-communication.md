@@ -6,13 +6,22 @@ never become project files, never dirty Git, and require no new hub endpoint.
 
 ## Mental model
 
-A signal is an ordinary encrypted format-v3 snapshot with **no file-tree
+A standalone signal is an ordinary encrypted format-v3 snapshot with **no file-tree
 changes**:
 
 - the latest workspace tree root;
 - the latest workspace head as its parent;
 - the sender name in `Snapshot.author`;
 - the signal envelope in `Snapshot.message`.
+
+Guarded conflict publication also embeds a broadcast `status` envelope in
+the snapshot that resolves the conflict. This notice and the file change
+share one compare-and-swap: neither can publish without the other. Its
+`about_snapshot` is the conflicted head; its `message_id` is the resolved
+snapshot. Both participants can read the notice through their existing
+inboxes. Publication proves availability, not that either agent has read
+or acted on it. Consumers must compare tree roots to detect file changes;
+the presence of an envelope alone does not imply a signal-only head.
 
 The hub observes only ordinary ciphertext objects, object sizes, manifests,
 head changes, and timing — never plaintext routing, bodies, or snapshot
@@ -26,6 +35,24 @@ orchestrator may monitor events or poll an inbox and decide what to invoke.
 Separately, an operator may explicitly configure a local agent runner; it
 invokes only that runner's fixed local command and only for direct requests to
 its configured agent. See [the operator runbook](usage.md#agent-runner).
+
+### One lifecycle over three protocols
+
+Work intent (`ffwork1`), integrator assignment (`ffint1`), and conflict
+resolution (`ffres1`) stay separate versioned profiles with their own
+reducers, but agents read them as one state machine through
+`feanorfs agent next` (MCP `status`):
+
+```text
+task:         proposed → accepted → settled → done
+conflict:     conflicted → assigned → resolving → (awaiting_human) → done
+integration:  assigned → resolving → (awaiting_human) → done
+```
+
+Each projection item names its current owner, and `next_actions` carries a
+prefilled command per actor, so agents never assemble protocol ids or JSON by
+hand. `feanorfs agent guard` applies the same projection before an edit.
+Field-level contracts: [agent-api.md](agent-api.md#unified-coordination-sdk-1-additive).
 
 ## Envelope
 
@@ -232,7 +259,7 @@ Human output is concise. Global `--json` emits the stable result types below.
   take and return JSON strings (see `feanorfs.h`).
 - TypeScript: `sendMessage(root, input)` and `inbox(root, query)` in
   `@feanorfs/agent` (see `contract.d.ts`).
-- MCP: `agent_send` and `agent_inbox` tools with bounded schemas. Tool
+- MCP: `send` and `inbox` (legacy `agent_send` / `agent_inbox`) with bounded schemas. Tool
   descriptions explain that all workspace participants can read messages,
   identity is advisory, and requests/results should carry exact snapshot
   context.
@@ -275,6 +302,13 @@ code snapshot S1
   snapshot from `agent status` (the bounded `live` projection) before
   replying, and the configured runner flushes the final file generation
   before delivering its terminal reply.
+  Capture `live.settled_snapshot` before checking the files and confirm it
+  again afterward. If it changes or becomes unsettled, retest or send
+  `blocked`. Include changed paths, checks actually run, their reported
+  outcomes, and remaining limitations in the bounded body. Check results are
+  consumer evidence; transport does not certify them. The requester reads
+  the correlated reply from its inbox rather than treating process exit as
+  delivery.
 - Old hubs ignore the wait parameters; clients detect the unsupported
   response and keep bounded periodic polling with jitter — never a busy
   loop. Mixed versions degrade to the previous safe behavior.

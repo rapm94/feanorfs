@@ -8,12 +8,15 @@ feanorfs_test_support::isolate_test_process!();
 
 pub mod agent;
 pub mod api;
+pub mod claim;
 pub mod conflict_artifacts;
 pub mod conflicts;
+pub mod coordination;
 pub mod crypto;
 pub mod ctx;
 mod durable;
 pub mod fs_util;
+pub mod git_baseline;
 pub mod head;
 pub mod history;
 pub mod hub;
@@ -60,8 +63,13 @@ pub use agent::{
     ACCEPTED_WORK_SCHEMA_VERSION,
 };
 pub use api::{ApiClient, MIN_SUPPORTED_SERVER_VERSION};
+pub use claim::{bounded_wait, claim_scope, coordinate_pass, finish_work};
 pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
 pub use conflicts::{resolve_conflict, ResolveKeep};
+pub use coordination::{
+    agent_identity, capabilities, capability_roster, coordination_status, coordination_status_wait,
+    guard_paths,
+};
 pub use ctx::SyncCtx;
 pub use feanorfs_common::{
     decode_invite, encode_invite, looks_like_invite, AgentCheckResult, AgentCleanResult,
@@ -76,13 +84,14 @@ pub use head::{
 pub use history::{log, undo};
 pub use hub::LocalHub;
 pub use integrator::{
-    designate_conflict_owner, DesignationRefusal, DesignationRefusalKind, OwnerDesignation,
-    OwnerDesignationEvidence, OwnerDesignationMethod,
-};
-pub use integrator::{
-    integrator_assign, integrator_observe, integrator_resume, integrator_revoke, integrator_status,
+    active_integrator_status, integrator_assign, integrator_observe, integrator_offers,
+    integrator_reply, integrator_resume, integrator_revoke, integrator_status,
     materialize_conflicts, IntegratorObserveOptions, IntegratorStateFile, IntegratorStore,
     PersistedIntegratorAssignment,
+};
+pub use integrator::{
+    designate_conflict_owner, DesignationRefusal, DesignationRefusalKind, OwnerDesignation,
+    OwnerDesignationEvidence, OwnerDesignationMethod,
 };
 pub use local::{
     load_config, load_global_config, load_workspace_id, load_workspace_id_from_state, save_config,
@@ -117,8 +126,9 @@ pub use work::{
     work_yield,
 };
 pub use workspace_layout::{
-    ensure_workspace_state, global_state_root, maintain_workspace_state, workspace_is_configured,
-    workspace_state_id, workspace_state_path,
+    ensure_workspace_state, global_state_root, maintain_workspace_state,
+    workspace_has_preferred_state, workspace_is_configured, workspace_state_id,
+    workspace_state_path,
 };
 
 use anyhow::{Context, Result};
@@ -408,6 +418,88 @@ impl Workspace {
         let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
         self.rt
             .block_on(integrator::integrator_resume(&ctx, options))
+    }
+
+    /// Sends one typed candidate-side integrator reply (accept, result, or
+    /// blocker); the engine binds every protocol field from the offer.
+    pub fn integrator_reply(
+        &self,
+        input: feanorfs_common::IntegratorReplyInput,
+    ) -> Result<feanorfs_common::IntegratorReplyResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        let agent = coordination::agent_identity(input.agent.as_deref());
+        self.rt
+            .block_on(integrator::integrator_reply(&ctx, &agent, input))
+    }
+
+    /// Unified coordination lifecycle and prefilled next actions for one
+    /// agent identity (defaults to `FEANORFS_AGENT`, then `human`).
+    pub fn coordination_status(
+        &self,
+        agent: Option<&str>,
+    ) -> Result<feanorfs_common::CoordinationStatus> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        let agent = coordination::agent_identity(agent);
+        self.rt
+            .block_on(coordination::coordination_status(&ctx, &agent))
+    }
+
+    /// Announces an agent's capability set (when `input.announce` is set)
+    /// and returns the capability roster.
+    pub fn capabilities(
+        &self,
+        input: feanorfs_common::CapabilitiesInput,
+    ) -> Result<feanorfs_common::CapabilityRoster> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        let agent = coordination::agent_identity(input.agent.as_deref());
+        self.rt
+            .block_on(coordination::capabilities(&ctx, &agent, input.announce))
+    }
+
+    /// Claims scope in one call: returns at once when already covered,
+    /// otherwise proposes and waits for the coordinator's decision.
+    pub fn claim(
+        &self,
+        input: feanorfs_common::ClaimInput,
+    ) -> Result<feanorfs_common::ClaimResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        let agent = coordination::agent_identity(input.agent.as_deref());
+        self.rt.block_on(claim::claim_scope(
+            &ctx,
+            &agent,
+            &input.paths,
+            input.coordinator.as_deref(),
+            claim::bounded_wait(input.wait_seconds),
+        ))
+    }
+
+    /// Finishes in one call: waits for the agent's edits to land, then
+    /// settles and completes every task it holds.
+    pub fn done(&self, input: feanorfs_common::DoneInput) -> Result<feanorfs_common::DoneResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        let agent = coordination::agent_identity(input.agent.as_deref());
+        self.rt.block_on(claim::finish_work(
+            &ctx,
+            &agent,
+            input.summary.as_deref(),
+            input.verification_status,
+            claim::bounded_wait(input.wait_seconds),
+        ))
+    }
+
+    /// Evaluates whether an agent may write the given workspace paths.
+    pub fn guard(
+        &self,
+        input: feanorfs_common::GuardInput,
+    ) -> Result<feanorfs_common::GuardResult> {
+        let ctx = SyncCtx::from_config(&self.api, &self.db, &self.root, &self.config)?;
+        let agent = coordination::agent_identity(input.agent.as_deref());
+        self.rt.block_on(coordination::guard_paths(
+            &ctx,
+            &agent,
+            &input.paths,
+            input.require_scope,
+        ))
     }
 
     /// Materializes the encrypted conflict triple for a snapshot (read-only).

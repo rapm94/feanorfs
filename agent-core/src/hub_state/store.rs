@@ -236,11 +236,15 @@ impl HubDb {
         let token = token.to_string();
         self.state.with_write(|state| {
             let workspace = state.workspaces.entry(workspace_id).or_default();
-            if workspace.format_version >= 3 {
-                return Ok(MigrationWriteOutcome::Acquired);
-            }
             match &workspace.migration_fence {
-                Some(existing) if *existing == token => Ok(MigrationWriteOutcome::Acquired),
+                Some(existing)
+                    if constant_time_eq::constant_time_eq(
+                        existing.as_bytes(),
+                        token.as_bytes(),
+                    ) =>
+                {
+                    Ok(MigrationWriteOutcome::Acquired)
+                }
                 Some(_) => Ok(MigrationWriteOutcome::LockedByOther),
                 None => {
                     workspace.migration_fence = Some(token);

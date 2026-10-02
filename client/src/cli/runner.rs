@@ -214,7 +214,14 @@ async fn setup_locked(
 
     let store = if configured.is_some() {
         stop_locked(workspace)?;
-        RunnerStore::reconfigure(workspace, agent, &program, fixed_args, timeout_secs)?
+        RunnerStore::reconfigure(
+            workspace,
+            agent,
+            &program,
+            fixed_args,
+            timeout_secs,
+            scope_mode,
+        )?
     } else {
         let config = feanorfs_client::load_config(workspace)?;
         let api = feanorfs_client::open_api_client(workspace, &config).await?;

@@ -21,7 +21,7 @@ Canonical fixtures live in `common/src/agent_contract.rs`. Snapshot tests in `cl
 | Resolve | `conflicts keep <path> …` | `resolve(path, keep, file?)` | exit 0 / FFI `-1` / TS throw |
 | History | `log [--limit N]` | `log(limit)` | `LogResult` |
 | Undo | `undo <snapshot_id>` | `undo(snapshot_id)` | `UndoResult` |
-| Send signal | `agent send <to> --kind <k> [--about <id>] [--reply-to <id>] [--from <name>] <body>` | `send_message(AgentMessageInput)` | `AgentSendResult` |
+| Send signal | `agent send <to\|cap:capability> --kind <k> [--about <id>] [--reply-to <id>] [--from <name>] <body>` | `send_message(AgentMessageInput)` | `AgentSendResult` |
 | Inbox | `agent inbox [--for <name>] [--after <head>] [--limit <n>]` | `inbox(AgentInboxQuery)` | `AgentInboxResult` |
 | Local runner control (CLI-only) | `agent runner setup|start|stop|status|reset|remove` | — | current redacted control JSON; not an SDK-1 contract |
 
@@ -395,7 +395,30 @@ live in `contract.d.ts`; shapes match this document and
 
 ## MCP
 
-`agent_send` and `agent_inbox` delegate to agent-core:
+`feanorfs mcp` lists nine compact tools. Multi-operation tools take a
+required `op`; after `op` is removed, each call is parsed by the same strict
+per-operation contract (unknown fields → JSON-RPC `-32602`).
+
+| Tool | `op` values | Routes to |
+|------|-------------|-----------|
+| `status` | — | sync status + `CoordinationStatus` (`{sync, coordination}`) |
+| `send` | — | `agent_send` |
+| `inbox` | — | `agent_inbox` |
+| `agent` | `spawn`, `status`, `refresh`, `land` | `agent_spawn`, `agent_check`, `agent_refresh`, `agent_land` |
+| `work` | `propose`, `decide`, `amend`, `yield`, `settle`, `complete`, `block`, `status`, `guard` | `work_*`, guard |
+| `conflicts` | `list`, `keep`, `materialize` | `conflicts_list`, `conflicts_keep`, `conflict_materialize` |
+| `resolve` | `prepare`, `status`, `materialize`, `put`, `submit`, `apply`, `answer`, `defer`, `assign`, `reply`, `revoke`, `publish_answer`, `protocol_status` | `resolution_*` |
+| `integrator` | `assign`, `status`, `revoke`, `resume`, `reply` | `integrator_*` |
+| `history` | `log`, `undo` | `workspace_log`, `workspace_undo` |
+
+Every `next_actions` entry in `status` is a ready `tools/call`: pass its
+`tool` and `args` (after replacing `<placeholders>`). `work` `decide` accepts
+the flat form `{"kind":"accept","reason":…}` as well as the nested
+`WorkDecisionKind` object. The original per-operation tool names stay
+callable; set `FEANORFS_MCP_LEGACY_TOOLS=1` to list them instead of the
+compact tools (for clients whose permissions name them).
+
+`send` and `inbox` (legacy `agent_send` / `agent_inbox`) delegate to agent-core:
 
 - `agent_send(from?, to, kind, body, about_snapshot?, reply_to?)` with
   `kind` restricted to `request | status | result | blocked` and `body`
@@ -451,12 +474,21 @@ canonical implementation.
 | Revoke | `agent integrator revoke <id> --reason <summary>` | `integrator_revoke(id, reason)` | `IntegratorStatusResult` |
 | Resume | `agent integrator resume [--ack-timeout <d>] [--fallback-on-blocked]` | `integrator_resume(IntegratorObserveOptions)` | `IntegratorObserveResult` |
 | Materialize | `conflicts materialize [--about <id>] [--path <p>]…` | `materialize_conflicts(about, paths)` | `ConflictMaterializeResult` |
+| Reply (candidate) | `agent integrator reply accept\|result\|blocked [--assignment <id>] [--for <agent>] [--outcome <s> --verification passed\|failed\|unknown --summary <s>] [--reason <s>]` | `integrator_reply(IntegratorReplyInput)` | `IntegratorReplyResult` |
 
-MCP tools: `integrator_assign`, `integrator_status`, `integrator_revoke`,
-`integrator_resume`, `conflict_materialize`. FFI: `ffs_integrator_assign`,
+MCP: `integrator` with `op` `assign`, `status`, `revoke`, `resume`, `reply`,
+and `conflicts` with `op: materialize`. FFI: `ffs_integrator_assign`,
 `ffs_integrator_status`, `ffs_integrator_revoke`, `ffs_integrator_resume`,
-`ffs_conflict_materialize`. TypeScript: `integratorAssign`, `integratorStatus`,
-`integratorRevoke`, `integratorResume`, `conflictMaterialize`.
+`ffs_integrator_reply`, `ffs_conflict_materialize`. TypeScript:
+`integratorAssign`, `integratorStatus`, `integratorRevoke`, `integratorResume`,
+`integratorReply`, `conflictMaterialize`.
+
+`agent integrator reply` is the candidate side: the engine reads the offer
+from the signal stream and binds assignment id, attempt, `about_snapshot`,
+dispatcher, and the request id (`reply_to`), so callers never write `ffint1`
+JSON. It refuses a superseded attempt (a newer attempt offered to another
+candidate), a second terminal reply, a result before acceptance, and any
+reply when the bounded signal scan was truncated.
 
 ### `IntegratorAssignInput`
 
@@ -618,6 +650,149 @@ assignment request through `reply_to`. Unknown `ffint` versions remain
 ordinary signal text and cannot break typed inbox reads.
 
 ---
+
+## Unified coordination (SDK-1 additive)
+
+`ffwork1`, `ffint1`, and `ffres1` keep their versioned profiles and reducers.
+`agent next` projects them, plus the local conflict registry, into one
+lifecycle and computes the next action for each actor. Types live in
+`common/src/coordination_contract.rs`; derivation in
+`agent-core/src/coordination.rs` is pure and unit-tested.
+
+| Operation | CLI | Rust (`Workspace`) | JSON result type |
+|-----------|-----|-------------------|------------------|
+| Next | `agent next [--for <agent>] [--wait [--timeout <secs>]]` | `coordination_status(Option<&str>)` | `CoordinationStatus` |
+| Guard | `agent guard [<path>…] [--for <agent>] [--require-scope] [--hook]` | `guard(GuardInput)` | `GuardResult` |
+| Capabilities | `agent capabilities [--for <agent>] [--set <cap>…]`, `agent run <name> --capability <cap> -- …` | `capabilities(CapabilitiesInput)` | `CapabilityRoster` |
+| Claim | `agent claim <path>… [--for <agent>] [--coordinator <id>] [--timeout <secs>]` | `claim(ClaimInput)` | `ClaimResult` |
+| Done | `agent done [--for <agent>] [--summary <s>] [--verification passed\|failed\|skipped] [--timeout <secs>] [--hook]` | `done(DoneInput)` | `DoneResult` |
+| Coordinate (CLI-only) | `agent coordinate [--for <id>] [--watch]` | — | `CoordinatePass` |
+
+MCP: `status` (next), `work` with `op: guard`, `claim`, or `done`, and
+`agent` with `op: capabilities`. FFI: `ffs_coordination_status`,
+`ffs_guard`, `ffs_capabilities`, `ffs_claim`, `ffs_done`. TypeScript:
+`coordinationStatus`, `guard`, `capabilities`, `claim`, `done`.
+
+### One-call protocol: claim, done, coordinate
+
+Every agent turn re-sends the harness's full context (about 35–40k cached
+tokens for Claude Code), so cost tracks turns. The fine-grained protocol
+(`propose`, `next`, `guard`, `settle`, `complete`) takes about eight turns
+per task; these commands take two, and the hooks take none.
+
+- `agent claim` returns `covered` at once when the paths are already inside
+  the caller's live accepted scope; otherwise it proposes (or reuses an
+  identical pending proposal) to the coordinator (default `human`) and blocks
+  until the proposal is accepted, then until a live agent's worktree reflects
+  the current head. Exit 0 for `covered`/`accepted`, 3 for `pending` (with
+  the scopes it waits on), 1 for `rejected`.
+- `agent done` waits until the agent's edits have landed (controller idle
+  or stopped after its final flush, no unlanded changes), then settles every
+  task it holds with that snapshot and completes it. Verification defaults to
+  `skipped`: nothing is claimed that was not reported. As a `Stop` hook
+  (`--hook`), a failure blocks stopping once so the agent can fix it, and
+  never loops. `agent run` does the same after its command exits 0 with every
+  edit settled; on failure the claim stays open for an explicit `agent done`.
+- `agent coordinate` decides for an identity (default `human`): it accepts
+  proposals addressed to it whose scope overlaps no other agent's live scope
+  and leaves overlapping ones waiting until that scope finishes. It never
+  rejects or narrows; those stay human decisions. Run one coordinator per
+  workspace (`--watch` keeps it running).
+- `agent guard --hook --claim` claims unclaimed paths before allowing a
+  write (waiting up to `--claim-timeout`, default 240 s). With
+  `feanorfs integrate --host claude --auto-claim` (or `--host codex`, which
+  writes `.codex/hooks.json`), the harness runs that guard before every write
+  and `agent done --hook` when it stops, so agents spend no turns on
+  coordination. The guard reads paths from `tool_input.file_path`, `path`,
+  `notebook_path`, or an `apply_patch` envelope's file headers; hook stdout
+  stays empty because Codex parses it as JSON.
+
+### Capability routing
+
+An agent announces its machine's complete capability set as a broadcast
+`status` signal whose body is an `ffcap1` profile:
+
+```text
+ffcap1:{"capabilities":["ios-build","xcode"]}
+```
+
+Capabilities use the integrator identifier rules (lowercase, at most 32 bytes,
+at most 64, sorted and unique). The newest announcement per sender replaces
+older ones; capabilities in that agent's work intents are added. Routing is
+advisory like every other route.
+
+- `agent send cap:<capability> …` resolves to the single agent advertising
+  the capability (`AgentSendResult.routed_to` names it). Zero or several
+  capable agents is an error that names them, never a guess.
+- `agent integrator assign` without `--candidate` (or an empty `candidates`
+  list) offers the batch to the whole roster; `--require <cap>` keeps only
+  capable agents. A bare `--candidate <name>` uses that agent's advertised
+  capabilities; `--candidate <name>=<cap>,<cap>` states them.
+- `CoordinationStatus.roster` and `CapabilityRoster.agents` list
+  `{agent, capabilities}`; `projection_incomplete` means older announcements
+  may be missing.
+
+Lifecycle (`LifecycleStage`, one per `LifecycleItem`):
+
+```text
+task:         proposed → accepted → settled → done
+conflict:     conflicted → assigned → resolving → (awaiting_human) → done
+integration:  assigned → resolving → (awaiting_human) → done
+exits:        blocked | stopped
+```
+
+### `CoordinationStatus`
+
+```json
+{
+  "schema_version": 1,
+  "agent": "linux",
+  "items": [{"kind":"task","id":"parser:linux","stage":"accepted","owner":"linux","detail":"scope accepted: src/**"}],
+  "next_actions": [{
+    "actor": "linux",
+    "tool": "work",
+    "args": {"op":"settle","task_id":"parser","intent_message_id":"<64 hex>","sequence":2,
+             "inspected_snapshot":"<snapshot you verified>",
+             "verification":{"status":"passed","summary":"<checks you ran>"}},
+    "cli": "feanorfs agent work settle --task parser …",
+    "reason": "edit only inside the accepted scope, verify, then settle"
+  }],
+  "warnings": [],
+  "projection_incomplete": false
+}
+```
+
+`--wait` (MCP `status` with `wait_seconds`, at most 600) returns at once
+when the caller has an action it can take now; otherwise it blocks until the
+caller's own next actions change (a decision arrives, its edits land), so an
+agent spends one call, not one turn per poll. The settle action's `inspected_snapshot` is prefilled with
+the agent's live settled snapshot once its controller is idle with no pending
+local edits; until then it stays a placeholder.
+
+Items are sorted by urgency (`awaiting_human` first, terminal stages last)
+and capped at 64; the caller's own actions come first and the list is capped
+at 8. A source projection that fails becomes a warning and sets
+`projection_incomplete`, so a missing item is never proof that nothing is
+pending.
+
+### `GuardResult`
+
+```json
+{"schema_version":1,"agent":"codex","verdict":"deny",
+ "findings":[{"path":"src/lib.rs","verdict":"deny","reason":"inside linux's accepted scope for task parser; propose overlap or ask the coordinator"}]}
+```
+
+Per path: `deny` inside another agent's accepted/settled scope (unless your
+accepted proposal records that overlap), `deny` for every path while your
+accepted integrator attempt is superseded, `deny` outside your own accepted
+scope with `require_scope`; `warn` for a pending conflict or another agent's
+unaccepted proposal. The CLI exits `2` on `deny`. With `--hook` it reads a
+harness PreToolUse payload from stdin (`tool_input.file_path`, `path`, or
+`notebook_path`), resolves paths against the agent worktree
+(`FEANORFS_AGENT_DIR`) or the shared root, ignores paths outside them, exits
+0 without creating workspace state in folders that are not FeanorFS
+workspaces, and allows the edit on any internal error: the guard is advisory
+coordination, not access control.
 
 ## Live continuous status (SDK-1 additive)
 
@@ -829,6 +1004,7 @@ harness produces a candidate, and only the engine validates/publishes it.
 |-----------|-----|-------------------|------------------|
 | Prepare | `agent resolution prepare <path> --reason exhausted\|violated --detail <text>` | `resolution_prepare(path, PreventionReason)` | `ResolutionJob` |
 | Status | `agent resolution status [<job-id>]` | `resolution_status(Option<&str>)` | `ResolutionStatusProjection` |
+| Review | `agent resolution review [<job-id>]` | CLI projection of `ResolutionStore` | `PersistedResolutionJob` or `null` |
 | Submit | `agent resolution submit <job-id> --result <file-or->` | `resolution_submit(job_id, ResolutionResult)` | `ResolutionResult` |
 | Apply | `agent resolution apply <job-id>` | `resolution_apply(job_id)` | `ResolutionApplyOutcome` |
 | Materialize | `agent resolution materialize <job-id>` | `resolution_materialize_legs(job_id)` | `[{"role","path"}]` |
@@ -840,6 +1016,21 @@ harness produces a candidate, and only the engine validates/publishes it.
 | Reply | `agent resolution reply <job-id>` | `resolution_reply(job_id)` | `{"message_id"}` |
 | Revoke | `agent resolution revoke <job-id> [--superseded]` | `resolution_revoke(job_id, superseded)` | `{"message_id"}` |
 | Publish answer | `agent resolution publish-answer <job-id> --defer\|--keep-unresolved\|--candidate <file>` | `resolution_publish_answer(&HumanResolutionAnswer)` | `{"message_id"}` |
+| Retry saved answer | `agent resolution publish-answer <job-id>` | `resolution::publish_saved_human_answer(ctx, job_id, generation)` (async engine function) | `{"message_id"}` |
+
+Guarded apply embeds a broadcast `status` envelope in the published snapshot.
+The notice's `about_snapshot` is the conflicted head and its inbox `message_id`
+is the resolved head. This uses the same CAS as the file change, so crash
+recovery cannot leave a published resolution without its notice. The notice
+is available to both participants; it is not a read acknowledgement or an
+`ffres1` reducer completion event.
+
+Assignment/result/answer signals do not invalidate a job when the engine can
+prove a chain of at most 64 valid `ffmsg1` snapshots, each with one parent and
+the exact prepared tree root, back to its captured snapshot. The original
+identity and fingerprint remain unchanged; publication uses the latest proven
+head for its CAS. Any changed tree, unknown history message, disconnected head,
+or exhausted bound remains stale and requires a new review.
 
 MCP tools: `resolution_prepare`, `resolution_status`, `resolution_submit`,
 `resolution_apply`, `resolution_materialize`, `resolution_put`,
@@ -1014,11 +1205,14 @@ current conflict and its evidence untouched.
 Materializes the authenticated base/ours/theirs legs of one job into the
 engine-owned job directory (create-new, no-follow, fsync'd) so a designated
 machine can reconstruct the conflict context by ID and fingerprint.
+Repeated inspection reuses only regular files whose bytes still match the
+authenticated versions. Modified files or symlink aliases are refused without
+replacement; save reconciled content separately.
 Read-only: never changes the worktree, conflict registry, artifacts, or
 head. JSON out is an array of `{role, path}` with absolute paths:
 
 ```json
-[{"role": "original", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/legs/original"}, {"role": "local", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/legs/local"}, {"role": "cloud", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/legs/cloud"}]
+[{"role": "original", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/leg-original.bin"}, {"role": "local", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/leg-local.bin"}, {"role": "cloud", "path": "<state-root>/orchestrator/resolution/jobs/fedcba9876543210fedcba9876543210/leg-cloud.bin"}]
 ```
 
 `role` is `original`, `local`, or `cloud`. Adapter `put` inputs are bounded:
@@ -1044,12 +1238,19 @@ takes base64 directly; MCP `resolution_put` takes `{job_id, base64}`.
 
 ### `resolution answer` and `resolution publish-answer`
 
+Use `feanorfs agent resolution review [job-id]` to inspect the question and
+preserved-version descriptors explicitly. With no ID it selects a pending
+question or result; JSON returns one engine record, or `null` when none is
+waiting. Routine `status` remains metadata-only.
+
 Both commands build one typed `HumanResolutionAnswer` bound to the exact
 current escalation. Every identity field (job, assignment, attempt,
 fingerprint, and the exact `question_generation`) is read from the bounded
-`resolution status` projection — the caller never supplies them, so stale
-answers are impossible by construction (the engine re-validates the full
-binding, including the generation). `--candidate <file>` reads the file
+`resolution status` projection. Pass `--question-generation <reviewed-generation>`
+to refuse a question changed while the human was deciding, before any candidate
+write. Native UI always supplies this value; legacy calls without it bind to
+the current question at invocation. The engine revalidates the full binding
+when recording the answer. `--candidate <file>` reads the file
 bounded (64 MiB cap) and records the engine-owned candidate via
 `put_resolution_candidate` first.
 
@@ -1059,11 +1260,20 @@ bounded (64 MiB cap) and records the engine-owned candidate via
 
 `chosen_option` is `defer`, `keep_unresolved`, or `submit_candidate`; a
 `submit_candidate` answer carries the engine-validated candidate descriptor
-and (for the local `answer` op) verification evidence produced by the
-engine's inline verification path. `answer` records the terminal local state
+and explicit Unknown verification at the CLI boundary. The local `answer`
+operation runs inline verification and stores its evidence on the resulting
+candidate-ready result; the returned answer retains the original input evidence.
+`answer` records the terminal local state
 or a `candidate_ready` result without any publication; `publish-answer`
 validates the answer (`validate_human_resolution_answer`) and sends it as an
-`ffres1` profile — the local store is never mutated by publication, and a
+`ffres1` profile. With no answer option, the CLI instead calls
+`resolution::publish_saved_human_answer`: it sends the exact durably saved
+local answer and records its signal message ID. Failed or uncertain sends
+remain retryable after restart; retries can emit duplicate signals, which the
+reducer treats as the same answer. Pending answers cannot be evicted from the
+bounded job store. Confirmed publication avoids another send but does not
+acknowledge peer consumption. The explicit-answer API retains its original
+publication-only behavior, and a
 published `submit_candidate` answer carries an explicit `Unknown`
 verification status unless the caller supplies real evidence. FFI:
 `ffs_resolution_answer(root, answer_json)` /

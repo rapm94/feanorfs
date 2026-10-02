@@ -15,6 +15,202 @@ use zeroize::Zeroizing;
 
 const PAIR_EXPIRES_SECONDS: &str = "300";
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ResolutionReview {
+    pub job: feanorfs_common::ResolutionJob,
+    pub result: Option<feanorfs_common::ResolutionResult>,
+    pub question_generation: u32,
+    pub assignment_state: String,
+    #[serde(default)]
+    pub human_answer: Option<feanorfs_common::HumanResolutionAnswer>,
+    #[serde(default)]
+    pub answer_message_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ResolutionDecision {
+    Inspect,
+    Answer(feanorfs_common::HumanResolutionOption, Option<PathBuf>),
+    Apply,
+    PublishAnswer,
+}
+
+fn resolution_command(workspace: &Path, args: Vec<OsString>) -> Result<CapturedOutput, String> {
+    let output = CapturedCommand::new(feanorfs_bin())
+        .args(["--json", "agent", "resolution"])
+        .args(args)
+        .cwd(workspace)
+        .timeout(Duration::from_secs(90))
+        .capture()
+        .map_err(|error| {
+            truncate_error(&format!(
+                "Resolution action failed: {error}. Review the job again before retrying."
+            ))
+        })?;
+    if !output.status.success() {
+        return Err("The resolution action did not complete. Review the job again before retrying; its question or conflict may have changed.".into());
+    }
+    Ok(output)
+}
+
+fn validate_resolution_review(review: &ResolutionReview, expected_job: &str) -> Result<(), String> {
+    feanorfs_common::validate_resolution_job(&review.job)
+        .map_err(|_| "Resolution job is invalid.".to_string())?;
+    let result = review
+        .result
+        .as_ref()
+        .ok_or("The resolution has no result to review.")?;
+    feanorfs_common::validate_resolution_result(result)
+        .map_err(|_| "Resolution result is invalid.".to_string())?;
+    if (review.assignment_state != "active" && review.human_answer.is_none())
+        || review.job.job_id != expected_job
+        || result.job_id != review.job.job_id
+        || result.assignment_id != review.job.assignment_id
+        || result.attempt != review.job.attempt
+        || result.conflict_fingerprint != review.job.conflict_fingerprint
+        || result.owner != review.job.owner
+        || (result.outcome == feanorfs_common::ResolutionOutcome::RequiresHuman
+            && result.question_generation != review.question_generation)
+    {
+        return Err("The resolution changed. Review the current job before answering.".into());
+    }
+    if let Some(answer) = &review.human_answer {
+        feanorfs_common::validate_human_resolution_answer(answer)
+            .map_err(|_| "The saved answer is invalid.".to_string())?;
+        if answer.job_id != review.job.job_id
+            || answer.assignment_id != review.job.assignment_id
+            || answer.attempt != review.job.attempt
+            || answer.conflict_fingerprint != review.job.conflict_fingerprint
+            || answer.question_generation != review.question_generation
+        {
+            return Err("The saved answer does not match this job.".into());
+        }
+    }
+    Ok(())
+}
+
+/// Explicit review only: ordinary polling never fetches questions or paths.
+pub(crate) fn review_resolution(workspace: &Path) -> Result<Option<ResolutionReview>, String> {
+    let review: Option<ResolutionReview> = resolution_command(workspace, vec!["review".into()])?
+        .decode_json()
+        .map_err(|_| "Resolution review could not be read.".to_string())?;
+    let Some(review) = review else {
+        return Ok(None);
+    };
+    validate_resolution_review(&review, &review.job.job_id)?;
+    Ok(Some(review))
+}
+
+pub(crate) fn submit_resolution_review(
+    workspace: &Path,
+    review: &ResolutionReview,
+    decision: ResolutionDecision,
+) -> Result<String, String> {
+    if matches!(&decision, ResolutionDecision::PublishAnswer) {
+        resolution_command(
+            workspace,
+            vec![
+                "publish-answer".into(),
+                review.job.job_id.clone().into(),
+                "--question-generation".into(),
+                review.question_generation.to_string().into(),
+            ],
+        )?;
+        return Ok("The saved answer was published. Peer receipt is not yet confirmed.".into());
+    }
+    if matches!(&decision, ResolutionDecision::Inspect) {
+        #[derive(Deserialize)]
+        struct Leg {
+            path: PathBuf,
+        }
+        let legs: Vec<Leg> = resolution_command(
+            workspace,
+            vec!["materialize".into(), review.job.job_id.clone().into()],
+        )?
+        .decode_json()
+        .map_err(|_| "Preserved version paths could not be read.".to_string())?;
+        if legs.len() > 3 {
+            return Err("Unexpected preserved-version count.".into());
+        }
+        let Some(first) = legs.first() else {
+            return Ok("This conflict has no file bytes to inspect.".into());
+        };
+        let folder = first
+            .path
+            .parent()
+            .ok_or("Preserved-version folder is missing.")?;
+        if !folder.is_absolute()
+            || folder.file_name().and_then(|name| name.to_str()) != Some(review.job.job_id.as_str())
+            || legs.iter().any(|leg| leg.path.parent() != Some(folder))
+        {
+            return Err("Preserved-version paths do not match this job.".into());
+        }
+        open::that(folder)
+            .map_err(|_| "The preserved-version folder could not be opened.".to_string())?;
+        return Ok("Opened the preserved versions. Save any reconciled replacement as a separate file, then choose Review Resolutions again.".into());
+    }
+    let applying = matches!(&decision, ResolutionDecision::Apply);
+    let args = match decision {
+        ResolutionDecision::Inspect => unreachable!("inspection returned above"),
+        ResolutionDecision::PublishAnswer => unreachable!("answer publication returned above"),
+        ResolutionDecision::Apply => vec!["apply".into(), review.job.job_id.clone().into()],
+        ResolutionDecision::Answer(option, candidate) => {
+            let mut args: Vec<OsString> = vec![
+                "answer".into(),
+                review.job.job_id.clone().into(),
+                "--question-generation".into(),
+                review.question_generation.to_string().into(),
+            ];
+            match option {
+                feanorfs_common::HumanResolutionOption::Defer => args.push("--defer".into()),
+                feanorfs_common::HumanResolutionOption::KeepUnresolved => {
+                    args.push("--keep-unresolved".into())
+                }
+                feanorfs_common::HumanResolutionOption::SubmitCandidate => {
+                    args.push("--candidate".into());
+                    args.push(
+                        candidate
+                            .ok_or("Choose a replacement file first.")?
+                            .into_os_string(),
+                    );
+                }
+            }
+            args
+        }
+    };
+    let output = resolution_command(workspace, args)?;
+    let result: serde_json::Value = output.decode_json().map_err(|_| {
+        "Resolution outcome could not be read. Review the job before retrying.".to_string()
+    })?;
+    if applying && result["outcome"] == "stale" {
+        return Err(
+            "The conflict changed. Review it again; this candidate was not published.".into(),
+        );
+    }
+    if applying && result["outcome"] != "published" {
+        return Err("Publication could not be confirmed. Review the job before retrying.".into());
+    }
+    if !applying {
+        let answer: feanorfs_common::HumanResolutionAnswer = serde_json::from_value(result)
+            .map_err(|_| "The recorded answer could not be confirmed.".to_string())?;
+        feanorfs_common::validate_human_resolution_answer(&answer)
+            .map_err(|_| "The recorded answer is invalid.".to_string())?;
+        if answer.job_id != review.job.job_id
+            || answer.question_generation != review.question_generation
+        {
+            return Err("The recorded answer does not match the reviewed question.".into());
+        }
+        resolution_command(workspace, vec![
+            "publish-answer".into(), review.job.job_id.clone().into(),
+            "--question-generation".into(), review.question_generation.to_string().into(),
+        ]).map_err(|_| format!(
+            "Your answer is saved locally, but its publication could not be confirmed. Retry with: feanorfs agent resolution publish-answer {}",
+            review.job.job_id
+        ))?;
+    }
+    Ok("The engine recorded the outcome. Review Resolutions again for remaining questions or a candidate awaiting publication.".into())
+}
+
 /// Default bound for captured stdout of ordinary JSON commands.
 const DEFAULT_STDOUT_LIMIT: usize = 256 * 1024;
 /// Bound for captured stderr of every subprocess.
@@ -64,6 +260,104 @@ impl BoundedBytes {
     pub fn as_str_lossy(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.bytes)
     }
+}
+
+// A single owner polls both pipes. No reader thread may remain blocked after
+// timeout/cancellation, including when a descendant escapes the process group.
+trait CapturePipe: std::io::Read {
+    fn prepare_capture(&self) -> std::io::Result<()>;
+    fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<usize>;
+}
+
+#[cfg(unix)]
+impl<T: std::io::Read + std::os::fd::AsRawFd> CapturePipe for T {
+    fn prepare_capture(&self) -> std::io::Result<()> {
+        let fd = self.as_raw_fd();
+        // SAFETY: fd remains owned by self throughout both calls.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.read(buffer)
+    }
+}
+
+#[cfg(windows)]
+impl<T: std::io::Read + std::os::windows::io::AsRawHandle> CapturePipe for T {
+    fn prepare_capture(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_available(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn PeekNamedPipe(
+                pipe: *mut std::ffi::c_void,
+                buffer: *mut std::ffi::c_void,
+                size: u32,
+                read: *mut u32,
+                available: *mut u32,
+                left: *mut u32,
+            ) -> i32;
+        }
+        let mut available = 0;
+        // SAFETY: self owns a live child pipe; only available is written.
+        let ok = unsafe {
+            PeekNamedPipe(
+                self.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(109) {
+                Ok(0)
+            } else {
+                Err(error)
+            };
+        }
+        if available == 0 {
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        // This adapter is the sole reader. Reading only available bytes cannot
+        // wait for a writer that keeps an otherwise empty pipe open.
+        let count = buffer.len().min(available as usize);
+        self.read(&mut buffer[..count])
+    }
+}
+
+fn drain_capture_pipe(
+    pipe: &mut impl CapturePipe,
+    output: &mut BoundedBytes,
+    limit: usize,
+) -> std::io::Result<bool> {
+    let mut buffer = [0_u8; 4096];
+    // Bound each turn so a continuously writing child cannot starve cancel,
+    // the other stream, or the deadline check.
+    for _ in 0..16 {
+        match pipe.read_available(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                let remaining = limit.saturating_sub(output.bytes.len());
+                output.truncated |= count > remaining;
+                output
+                    .bytes
+                    .extend_from_slice(&buffer[..count.min(remaining)]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 /// Captured outcome of one bounded subprocess run.
@@ -271,63 +565,93 @@ impl CapturedCommand {
         // the end of the write closure, so the child sees EOF on its input.
         // `self.stdin` (the zeroized secret) drops when this builder ends.
 
-        let stdout = child.stdout.take().expect("captured stdout is piped");
-        let stderr = child.stderr.take().expect("captured stderr is piped");
-        let stdout_limit = self.stdout_limit;
-        let stderr_limit = self.stderr_limit;
-        let stdout_thread = std::thread::spawn(move || BoundedBytes::read(stdout, stdout_limit));
-        let stderr_thread = std::thread::spawn(move || BoundedBytes::read(stderr, stderr_limit));
-
+        let mut stdout_pipe = child.stdout.take().expect("captured stdout is piped");
+        let mut stderr_pipe = child.stderr.take().expect("captured stderr is piped");
+        if let Err(error) = stdout_pipe
+            .prepare_capture()
+            .and_then(|()| stderr_pipe.prepare_capture())
+        {
+            stop_child(&mut child);
+            return Err(CapturedError::Wait(format!(
+                "prepare output capture: {error}"
+            )));
+        }
+        let mut stdout = BoundedBytes::default();
+        let mut stderr = BoundedBytes::default();
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        let mut status = None;
+        let mut drain_deadline = None;
         let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let stdout = stdout_thread.join().unwrap_or_default();
-                    let stderr = stderr_thread.join().unwrap_or_default();
+            let drained = (|| -> std::io::Result<()> {
+                if !stdout_done {
+                    stdout_done =
+                        drain_capture_pipe(&mut stdout_pipe, &mut stdout, self.stdout_limit)?;
+                }
+                if !stderr_done {
+                    stderr_done =
+                        drain_capture_pipe(&mut stderr_pipe, &mut stderr, self.stderr_limit)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = drained {
+                stop_child(&mut child);
+                return Err(CapturedError::Wait(format!("read command output: {error}")));
+            }
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(Some(exited)) => {
+                        status = Some(exited);
+                        drain_deadline = Some(Instant::now() + Duration::from_secs(1));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        stop_child(&mut child);
+                        return Err(CapturedError::Wait(format!("{error}")));
+                    }
+                }
+            }
+            if let Some(status) = status {
+                if stdout_done && stderr_done {
                     return Ok(CapturedOutput {
                         status,
                         stdout,
                         stderr,
                     });
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    stop_child(&mut child);
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    return Err(CapturedError::Wait(format!("{error}")));
-                }
             }
-            if let Some(cancel) = cancel {
-                if cancel.try_recv().is_ok() {
-                    stop_child(&mut child);
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    return Err(CapturedError::Canceled);
-                }
+            if cancel.is_some_and(|cancel| cancel.try_recv().is_ok()) {
+                stop_child(&mut child);
+                return Err(CapturedError::Canceled);
             }
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    stop_child(&mut child);
-                    let stdout = stdout_thread.join().unwrap_or_default();
-                    let stderr = stderr_thread.join().unwrap_or_default();
-                    return Err(CapturedError::Timeout { stdout, stderr });
-                }
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline)
+                || drain_deadline.is_some_and(|deadline| now >= deadline)
+            {
+                stop_child(&mut child);
+                return Err(CapturedError::Timeout { stdout, stderr });
             }
+            // Both handles are dropped on every return; no detached readers.
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
 
-/// Spawn a child as a new process-group leader on Unix so cancellation and
-/// timeout can stop its whole process tree, never just the direct child.
-fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
+/// Spawn a child as a new process-group leader on Unix (same contract as the
+/// captured-command adapter) so group-based termination can stop its whole
+/// tree. Legacy watch children must use this or `stop_child` misses them.
+pub(crate) fn spawn_process_group(command: &mut Command) -> std::io::Result<Child> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
     command.spawn()
+}
+
+fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
+    spawn_process_group(command)
 }
 
 /// Stop a child and its process tree: SIGTERM to the group, a short grace
@@ -1414,6 +1738,83 @@ pub fn background_service_start(workspace: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use feanorfs_common::tray_contract::{SetupRecovery, SetupStage};
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_watch_spawn_owns_its_process_group() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut child = spawn_process_group(&mut command).expect("spawn test child");
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: getpgid only queries the process just spawned by this test.
+        let group = unsafe { libc::getpgid(pid) };
+        // Ensure cleanup even if the group assertion fails.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(group, pid, "group termination must target the owned child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_deadline_survives_child_exit_with_inherited_pipes() {
+        let started = Instant::now();
+        // Finite sleep also bounds the regression on the old implementation,
+        // whose unconditional reader joins wait four seconds for EOF.
+        let result = CapturedCommand::new("/bin/sh")
+            .args([
+                "-c",
+                "sleep 4 & printf ready; printf diagnostic >&2; exit 0",
+            ])
+            .timeout(Duration::from_millis(150))
+            .capture();
+        let elapsed = started.elapsed();
+        let CapturedError::Timeout { stdout, stderr } =
+            result.expect_err("inherited pipes must not bypass the deadline")
+        else {
+            panic!("expected capture timeout");
+        };
+        assert_eq!(stdout.bytes, b"ready");
+        assert_eq!(stderr.bytes, b"diagnostic");
+        assert!(elapsed < Duration::from_secs(2), "capture took {elapsed:?}");
+    }
+
+    #[test]
+    fn resolution_review_rejects_changed_question_binding_and_terminal_jobs() {
+        use feanorfs_common::resolution_contract::resolution_fixtures;
+        let mut review = ResolutionReview {
+            job: resolution_fixtures::job(),
+            result: Some(resolution_fixtures::human_result()),
+            question_generation: 1,
+            assignment_state: "active".into(),
+            human_answer: None,
+            answer_message_id: None,
+        };
+        assert!(validate_resolution_review(&review, &review.job.job_id).is_ok());
+        review.question_generation = 2;
+        assert!(validate_resolution_review(&review, &review.job.job_id).is_err());
+        review.question_generation = 1;
+        review.assignment_state = "completed".into();
+        assert!(validate_resolution_review(&review, &review.job.job_id).is_err());
+        review.assignment_state = "deferred".into();
+        review.human_answer = Some(feanorfs_common::HumanResolutionAnswer {
+            schema_version: feanorfs_common::RESOLUTION_SCHEMA_VERSION,
+            job_id: review.job.job_id.clone(),
+            assignment_id: review.job.assignment_id.clone(),
+            attempt: review.job.attempt,
+            conflict_fingerprint: review.job.conflict_fingerprint.clone(),
+            question_generation: 1,
+            chosen_option: feanorfs_common::HumanResolutionOption::Defer,
+            candidate: None,
+            verification: None,
+        });
+        assert!(validate_resolution_review(&review, &review.job.job_id).is_ok());
+        review.human_answer.as_mut().unwrap().question_generation = 2;
+        assert!(validate_resolution_review(&review, &review.job.job_id).is_err());
+        review.human_answer = None;
+        review.assignment_state = "active".into();
+        review.result.as_mut().unwrap().conflict_fingerprint = "f".repeat(64);
+        assert!(validate_resolution_review(&review, &review.job.job_id).is_err());
+    }
 
     #[test]
     fn cli_discovery_prefers_override_then_colocated_then_packaged_binary() {

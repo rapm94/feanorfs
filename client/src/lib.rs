@@ -37,18 +37,20 @@ pub use conflict_artifacts::{resolve_artifact, ArtifactRole};
 pub use conflicts::{resolve_conflict, ResolveKeep};
 pub use ctx::SyncCtx;
 pub use feanorfs_agent_core::{
-    answer_resolution, apply_resolution_job, check_agent, clean_agent, commit_agent,
-    defer_resolution, integrator_assign, integrator_observe, integrator_resume, integrator_revoke,
-    integrator_status, land_agent, list_agents, materialize_conflicts, materialize_resolution_legs,
-    prepare_resolution_job, put_resolution_candidate, refresh_agent, refresh_agent_with_options,
-    resolution_protocol_status, resolution_status, retire_workspace_state, send_human_answer,
-    send_resolution_assignment, send_resolution_result, send_resolution_revoke, spawn_agent,
-    submit_resolution_result, sweep_retired_state, work_amend, work_block, work_complete,
-    work_decide, work_propose, work_settle, work_status, work_yield, IntegratorObserveOptions,
-    LandOptions, ProtocolAssignmentState, RefreshOptions, ResolutionApplyOutcome,
-    ResolutionJobStatus, ResolutionProtocolEntryStatus, ResolutionProtocolStatus,
-    ResolutionStatusProjection, RetirementSweep, Runtime, SpawnOptions, TombstoneRecord, Workspace,
-    MIN_SUPPORTED_SERVER_VERSION,
+    agent_identity, answer_resolution, apply_resolution_job, bounded_wait, capabilities,
+    capability_roster, check_agent, claim_scope, clean_agent, commit_agent, coordinate_pass,
+    coordination_status, coordination_status_wait, defer_resolution, finish_work, guard_paths,
+    integrator_assign, integrator_observe, integrator_offers, integrator_reply, integrator_resume,
+    integrator_revoke, integrator_status, land_agent, list_agents, materialize_conflicts,
+    materialize_resolution_legs, prepare_resolution_job, put_resolution_candidate, refresh_agent,
+    refresh_agent_with_options, resolution_protocol_status, resolution_status,
+    retire_workspace_state, send_human_answer, send_resolution_assignment, send_resolution_result,
+    send_resolution_revoke, spawn_agent, submit_resolution_result, sweep_retired_state, work_amend,
+    work_block, work_complete, work_decide, work_propose, work_settle, work_status, work_yield,
+    IntegratorObserveOptions, LandOptions, ProtocolAssignmentState, RefreshOptions,
+    ResolutionApplyOutcome, ResolutionJobStatus, ResolutionProtocolEntryStatus,
+    ResolutionProtocolStatus, ResolutionStatusProjection, RetirementSweep, Runtime, SpawnOptions,
+    TombstoneRecord, Workspace, MIN_SUPPORTED_SERVER_VERSION,
 };
 pub use feanorfs_common::{
     decode_invite, encode_invite, looks_like_invite, WorkspaceInvite, INVITE_PREFIX,

@@ -74,6 +74,36 @@ export async function integratorRevoke(root, assignmentId, reason) {
   return JSON.parse(await native.integratorRevoke(root, assignmentId, reason))
 }
 
+/** Candidate side: accept, report a result, or report a blocker; the engine binds every protocol id. */
+export async function integratorReply(root, input) {
+  return JSON.parse(await native.integratorReply(root, JSON.stringify(input)))
+}
+
+/** Unified coordination lifecycle with prefilled next actions for one agent. */
+export async function coordinationStatus(root, agent) {
+  return JSON.parse(await native.coordinationStatus(root, agent ?? null))
+}
+
+/** Announce this agent's capabilities (`announce`) and read who can do what. */
+export async function capabilities(root, input = {}) {
+  return JSON.parse(await native.capabilities(root, JSON.stringify(input)))
+}
+
+/** Claim scope in one call: propose the paths and wait for the decision. */
+export async function claim(root, input) {
+  return JSON.parse(await native.claim(root, JSON.stringify(input)))
+}
+
+/** Finish in one call: wait for edits to land, then settle and complete. */
+export async function done(root, input = {}) {
+  return JSON.parse(await native.done(root, JSON.stringify(input)))
+}
+
+/** Whether an agent may write these workspace paths now (advisory). */
+export async function guard(root, input) {
+  return JSON.parse(await native.guard(root, JSON.stringify(input)))
+}
+
 /** Resume dispatcher observation after a restart. */
 export async function integratorResume(root, options = {}) {
   return JSON.parse(await native.integratorResume(root, JSON.stringify(options)))

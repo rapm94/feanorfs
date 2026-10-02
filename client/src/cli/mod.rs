@@ -2,6 +2,7 @@ pub mod agent;
 pub mod agent_live;
 pub mod agent_runner;
 pub mod conflicts;
+pub mod coordination;
 pub mod events;
 pub mod history;
 pub mod hub_service;

@@ -55,6 +55,9 @@ pub enum ResolutionAction {
         /// Restrict the projection to one job.
         job_id: Option<String>,
     },
+    /// Inspect one job, its preserved-version descriptors, and its exact question.
+    /// Unlike status, this explicit review includes paths and resolver text.
+    Review { job_id: Option<String> },
     /// Submit one resolution result. Submission NEVER applies: it validates
     /// the result and records it without mutating the worktree, registry,
     /// artifacts, or head. Apply is a separate explicit command.
@@ -83,13 +86,16 @@ pub enum ResolutionAction {
     Put { job_id: String, file: String },
     /// Record one typed human answer bound to the exact current escalation.
     /// The answer is bound to the live projection's
-    /// job/assignment/attempt/fingerprint/question generation — the caller
-    /// never supplies identity fields, so stale answers are impossible by
-    /// construction (the engine re-validates). Never publishes; use
+    /// job/assignment/attempt/fingerprint/question generation. Pin the
+    /// reviewed generation to refuse a question changed during user input;
+    /// the engine revalidates the binding. Never publishes; use
     /// publish-answer to emit the `ffres1` profile.
     Answer {
         /// Job id carrying the outstanding question.
         job_id: String,
+        /// Refuse if the question changed since review. Always pass this from a UI.
+        #[arg(long)]
+        question_generation: Option<u32>,
         /// Record the terminal `Deferred` state without publication.
         #[arg(long)]
         defer: bool,
@@ -123,13 +129,17 @@ pub enum ResolutionAction {
         #[arg(long)]
         superseded: bool,
     },
-    /// Publish one typed human answer as an `ffres1` profile. The answer is
+    /// With no option, publish/retry the exact saved local answer. Otherwise
+    /// publish one typed human answer as an `ffres1` profile. The answer is
     /// built exactly like `answer` (bound to the live projection), then
-    /// validated and sent for remote observation; the local store is never
-    /// mutated by publication.
+    /// validated and sent for remote observation without changing the local
+    /// answer. Saved-answer retries also retain a publication receipt.
     PublishAnswer {
         /// Job id carrying the outstanding question.
         job_id: String,
+        /// Refuse if the question changed since review. Always pass this from a UI.
+        #[arg(long)]
+        question_generation: Option<u32>,
         /// Publish the `Defer` option.
         #[arg(long)]
         defer: bool,
@@ -216,16 +226,17 @@ fn pick_answer_option(
 ///
 /// Every identity field (job, assignment, attempt, fingerprint, question
 /// generation) is read from the bounded `resolution_status` projection — the
-/// caller never supplies them — so a stale answer is impossible by
-/// construction. `--candidate <path>` reads the file bounded (64 MiB cap)
+/// caller can pin the question generation observed during review. The engine
+/// revalidates that binding when applying the answer. `--candidate <path>` reads the file bounded (64 MiB cap)
 /// and records the engine-owned candidate via `put_resolution_candidate`
-/// first; verification evidence is left `None` and the engine's answer path
-/// runs the inline verification.
+/// first; verification starts as Unknown and the engine's answer path runs
+/// the inline verification before recording a candidate-ready result.
 async fn bind_human_answer(
     ctx: &feanorfs_client::SyncCtx<'_>,
     job_id: &str,
     chosen_option: HumanResolutionOption,
     candidate_source: Option<&str>,
+    question_generation: Option<u32>,
 ) -> anyhow::Result<HumanResolutionAnswer> {
     let projection = resolution_status(ctx, Some(job_id)).await?;
     let job = projection
@@ -233,6 +244,12 @@ async fn bind_human_answer(
         .iter()
         .find(|job| job.job_id == job_id)
         .with_context(|| format!("unknown resolution job {job_id}; answer refused"))?;
+    if let Some(expected) = question_generation {
+        anyhow::ensure!(
+            job.question_generation == expected,
+            "the resolution question changed; review it again before answering"
+        );
+    }
     let candidate = match candidate_source {
         Some(source) => {
             let bytes = read_candidate_bytes(source)?;
@@ -249,7 +266,11 @@ async fn bind_human_answer(
         question_generation: job.question_generation,
         chosen_option,
         candidate,
-        verification: None,
+        verification: candidate_source.map(|_| VerificationSummary {
+            status: VerificationStatus::Unknown,
+            summary: "human candidate; engine verification pending".to_string(),
+            ..VerificationSummary::default()
+        }),
     })
 }
 
@@ -335,6 +356,79 @@ pub async fn run(current_dir: &Path, action: ResolutionAction, json: bool) -> an
                 }
             }
         }
+        ResolutionAction::Review { job_id } => {
+            // Recover uncertain publication through the existing status path,
+            // then read one bounded, validated engine record explicitly.
+            resolution_status(&ctx, job_id.as_deref()).await?;
+            let record = feanorfs_agent_core::ResolutionStore::open(&control_root)?
+                .load()?
+                .jobs
+                .into_iter()
+                .find(|record| match &job_id {
+                    Some(id) => record.job.job_id == *id,
+                    None => {
+                        if record.human_answer.is_some() && record.answer_message_id.is_none() {
+                            return true;
+                        }
+                        record.assignment_state
+                            == feanorfs_agent_core::ResolutionAssignmentState::Active
+                            && record.result.as_ref().is_some_and(|result| {
+                                matches!(
+                                    result.outcome,
+                                    feanorfs_common::ResolutionOutcome::RequiresHuman
+                                        | feanorfs_common::ResolutionOutcome::CandidateReady
+                                        | feanorfs_common::ResolutionOutcome::NoChangeRequired
+                                )
+                            })
+                    }
+                });
+            let Some(record) = record else {
+                if let Some(job_id) = job_id {
+                    anyhow::bail!("unknown resolution job {job_id}");
+                }
+                if json {
+                    output_json(&serde_json::Value::Null)?;
+                } else {
+                    println!("No resolution is waiting for an answer or publication.");
+                }
+                return Ok(());
+            };
+            let job_id = &record.job.job_id;
+            if json {
+                output_json(&record)?;
+            } else {
+                println!(
+                    "{} — resolver {}",
+                    record.job.conflict.path, record.job.owner
+                );
+                println!(
+                    "Job {} · state {:?}",
+                    record.job.job_id, record.assignment_state
+                );
+                if record.human_answer.is_some() && record.answer_message_id.is_none() {
+                    println!("Your answer is saved locally; publication is not confirmed. Retry: feanorfs agent resolution publish-answer {job_id}");
+                    return Ok(());
+                }
+                if let Some(result) = &record.result {
+                    if let Some(question) = &result.question {
+                        println!("Question {}: {question}", record.question_generation);
+                        println!(
+                            "Available answers: {}",
+                            result
+                                .safe_options
+                                .iter()
+                                .map(|option| option.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        println!("Answer with --question-generation {} to preserve this question's identity.", record.question_generation);
+                    } else {
+                        println!("Result: {}", result.outcome.as_str());
+                    }
+                }
+                println!("Use `feanorfs agent resolution materialize {job_id}` to inspect the preserved versions.");
+            }
+        }
         ResolutionAction::Submit { job_id, result } => {
             let result_json = read_result_json(&result)?;
             let result: ResolutionResult = serde_json::from_str(&result_json)
@@ -385,12 +479,20 @@ pub async fn run(current_dir: &Path, action: ResolutionAction, json: bool) -> an
         }
         ResolutionAction::Answer {
             job_id,
+            question_generation,
             defer,
             keep_unresolved,
             candidate,
         } => {
             let option = pick_answer_option(defer, keep_unresolved, candidate.is_some())?;
-            let answer = bind_human_answer(&ctx, &job_id, option, candidate.as_deref()).await?;
+            let answer = bind_human_answer(
+                &ctx,
+                &job_id,
+                option,
+                candidate.as_deref(),
+                question_generation,
+            )
+            .await?;
             let recorded = answer_resolution(&ctx, answer).await?;
             if json {
                 output_json(&recorded)?;
@@ -475,26 +577,35 @@ pub async fn run(current_dir: &Path, action: ResolutionAction, json: bool) -> an
         }
         ResolutionAction::PublishAnswer {
             job_id,
+            question_generation,
             defer,
             keep_unresolved,
             candidate,
         } => {
-            let option = pick_answer_option(defer, keep_unresolved, candidate.is_some())?;
-            let mut answer = bind_human_answer(&ctx, &job_id, option, candidate.as_deref()).await?;
-            if matches!(answer.chosen_option, HumanResolutionOption::SubmitCandidate) {
-                // The `ffres1` profile requires verification evidence; the
-                // answering machine cannot fabricate engine evidence, so the
-                // published answer carries an explicit Unknown status (the
-                // candidate descriptor itself was engine-validated by the
-                // `put` step above).
-                answer.verification = Some(VerificationSummary {
-                    status: VerificationStatus::Unknown,
-                    summary: "human submit_candidate answer; engine inline verification \
-                              not executed on this machine"
-                        .to_string(),
-                    ..VerificationSummary::default()
-                });
+            if !defer && !keep_unresolved && candidate.is_none() {
+                let message_id = feanorfs_agent_core::resolution::publish_saved_human_answer(
+                    &ctx,
+                    &job_id,
+                    question_generation,
+                )
+                .await?;
+                print_message_id(
+                    json,
+                    "Published saved human answer for resolution job",
+                    &job_id,
+                    &message_id,
+                )?;
+                return Ok(());
             }
+            let option = pick_answer_option(defer, keep_unresolved, candidate.is_some())?;
+            let answer = bind_human_answer(
+                &ctx,
+                &job_id,
+                option,
+                candidate.as_deref(),
+                question_generation,
+            )
+            .await?;
             validate_human_resolution_answer(&answer)?;
             let message_id = send_human_answer(&ctx, &answer).await?;
             print_message_id(

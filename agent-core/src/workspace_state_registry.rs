@@ -172,6 +172,13 @@ pub(crate) fn ensure_shared_state_lease(root: &Path, slot: &str) -> Result<()> {
     Ok(())
 }
 
+/// A child forked by any thread of this process holds copies of every
+/// descriptor until it execs, so a shared hold this process just released can
+/// linger for that instant. Exclusive acquisition retries contention for at
+/// most this window; a live holder in another process outlasts it.
+const EXCLUSIVE_LEASE_ATTEMPTS: u32 = 25;
+const EXCLUSIVE_LEASE_RETRY: Duration = Duration::from_millis(20);
+
 /// A successful exclusive workspace-state lease. The caller may move or delete
 /// the slot's bytes while this guard lives. Acquiring drops this process's own
 /// shared hold first (advisory locks cannot be upgraded), so any other live
@@ -204,7 +211,20 @@ impl ExclusiveStateLease {
                 return Err(error);
             }
         };
-        match FileExt::try_lock_exclusive(&file) {
+        let contended = fs2::lock_contended_error().raw_os_error();
+        let mut attempt = 1;
+        let locked = loop {
+            match FileExt::try_lock_exclusive(&file) {
+                Err(error)
+                    if error.raw_os_error() == contended && attempt < EXCLUSIVE_LEASE_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(EXCLUSIVE_LEASE_RETRY);
+                }
+                result => break result,
+            }
+        };
+        match locked {
             Ok(()) => Ok(Self {
                 file: Some(file),
                 root: root.to_path_buf(),
@@ -446,7 +466,7 @@ pub(crate) struct SlotProvenance {
 /// excluded from the identity index, skipped by resolution scans, quarantined
 /// after the grace period, and deleted only after re-verifying that the
 /// recorded folder no longer matches the recorded identity.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub(crate) struct SlotTombstone {
     pub(crate) version: u32,
     pub(crate) requested_unix_ns: u64,
@@ -854,25 +874,12 @@ fn sweep_tombstoned_slots(root: &Path, now: u64, sweep: &mut RetirementSweep) ->
             continue;
         };
         // Revalidate under the exclusive lease; never move live or changed state.
-        let Some(current) = read_slot_tombstone(&state)? else {
-            continue;
-        };
-        if current.identity != tombstone.identity {
-            sweep.retained.push(slot.to_string());
-            continue;
-        }
-        match folder_matches_recorded_identity(&current.canonical_path, &current.identity) {
-            Ok(true) => {
-                // The recorded folder is live again: fail closed and keep the
-                // bytes until a human decides.
-                tracing::warn!(
-                    "Retired workspace state for {} is live again; retained in place",
-                    current.canonical_path
-                );
+        match retirement_binding_unchanged(&state, &tombstone) {
+            Ok(true) => {}
+            Ok(false) => {
                 sweep.retained.push(slot.to_string());
                 continue;
             }
-            Ok(false) => {}
             Err(error) => {
                 tracing::warn!(
                     "Could not revalidate retired workspace state at {}: {error:#}; retained",
@@ -882,10 +889,29 @@ fn sweep_tombstoned_slots(root: &Path, now: u64, sweep: &mut RetirementSweep) ->
                 continue;
             }
         }
-        quarantine_slot(root, slot, &state, &current)?;
+        quarantine_slot(root, slot, &state, &tombstone)?;
         sweep.quarantined.push(slot.to_string());
     }
     Ok(())
+}
+
+/// Called only under the slot's exclusive lease. Compare the entire request
+/// (including phase/timing), then bind it to the actual slot's identity and
+/// location, not just to a previously scanned tombstone. Unproven state stays.
+fn retirement_binding_unchanged(state: &Path, expected: &SlotTombstone) -> Result<bool> {
+    if expected.version != 1 || !state_directory_exists(state)? {
+        return Ok(false);
+    }
+    if read_slot_tombstone(state)?.as_ref() != Some(expected)
+        || read_workspace_identity(state)?.as_deref() != Some(expected.identity.as_str())
+        || read_location(state)?.as_deref() != Some(expected.canonical_path.as_str())
+    {
+        return Ok(false);
+    }
+    Ok(!folder_matches_recorded_identity(
+        &expected.canonical_path,
+        &expected.identity,
+    )?)
 }
 
 /// Extract the 64-hex slot name from a `workspace-<slot>-<stamp>` quarantine
@@ -945,8 +971,8 @@ fn sweep_quarantine(root: &Path, now: u64, sweep: &mut RetirementSweep) -> Resul
             sweep.retained.push(slot);
             continue;
         };
-        match folder_matches_recorded_identity(&tombstone.canonical_path, &tombstone.identity) {
-            Ok(false) => {
+        match retirement_binding_unchanged(&directory, &tombstone) {
+            Ok(true) => {
                 fs::remove_dir_all(&directory).with_context(|| {
                     format!(
                         "delete quarantined workspace state at {}",
@@ -959,9 +985,9 @@ fn sweep_quarantine(root: &Path, now: u64, sweep: &mut RetirementSweep) -> Resul
                 );
                 sweep.deleted.push(slot);
             }
-            Ok(true) => {
+            Ok(false) => {
                 tracing::warn!(
-                    "Quarantined workspace state for {} is live again; retained",
+                    "Quarantined workspace state for {} is live or changed; retained",
                     tombstone.canonical_path
                 );
                 sweep.retained.push(slot);
@@ -1192,6 +1218,85 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_retains_changed_slot_identity_or_location() {
+        for field in ["identity", "location"] {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let (_, slot) = prepare_slot(root.path(), workspace.path());
+            fs::remove_dir_all(workspace.path()).unwrap();
+            retire_workspace_state_in(root.path(), workspace.path(), Duration::ZERO).unwrap();
+            let directory = fs::read_dir(root.path().join("quarantine"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            fs::write(directory.join(field), "changed-binding").unwrap();
+            let mut sweep = RetirementSweep::default();
+            sweep_quarantine(root.path(), u64::MAX, &mut sweep).unwrap();
+            assert!(sweep.deleted.is_empty());
+            assert_eq!(sweep.retained, vec![slot]);
+            assert_eq!(
+                fs::read(directory.join("config.json")).unwrap(),
+                b"capability"
+            );
+        }
+    }
+
+    #[test]
+    fn replaced_tombstone_is_rejected_under_lease_in_both_phases() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (state, slot) = prepare_slot(root.path(), workspace.path());
+        fs::remove_dir_all(workspace.path()).unwrap();
+        retire_workspace_state_in(root.path(), workspace.path(), Duration::from_secs(3600))
+            .unwrap();
+        let exclusive = ExclusiveStateLease::try_acquire(root.path(), &slot).unwrap();
+        let scanned = read_slot_tombstone(&state).unwrap().unwrap();
+        let mut replacement = scanned.clone();
+        replacement.grace_seconds += 1;
+        write_slot_tombstone(&state, &replacement).unwrap();
+        assert!(!retirement_binding_unchanged(&state, &scanned).unwrap());
+        assert!(state.join("config.json").exists());
+        write_slot_tombstone(&state, &scanned).unwrap();
+        drop(exclusive);
+        let mut sweep = RetirementSweep::default();
+        sweep_tombstoned_slots(root.path(), u64::MAX, &mut sweep).unwrap();
+        assert_eq!(sweep.quarantined, vec![slot.clone()]);
+        let directory = fs::read_dir(root.path().join("quarantine"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let _exclusive = ExclusiveStateLease::try_acquire(root.path(), &slot).unwrap();
+        let scanned = read_slot_tombstone(&directory).unwrap().unwrap();
+        let mut replacement = scanned.clone();
+        replacement.quarantined_unix_ns = Some(u64::MAX);
+        write_slot_tombstone(&directory, &replacement).unwrap();
+        assert!(!retirement_binding_unchanged(&directory, &scanned).unwrap());
+        assert!(directory.join("config.json").exists());
+    }
+
+    #[test]
+    fn grace_sweep_retains_changed_slot_identity_or_location() {
+        for field in ["identity", "location"] {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let (state, slot) = prepare_slot(root.path(), workspace.path());
+            fs::remove_dir_all(workspace.path()).unwrap();
+            retire_workspace_state_in(root.path(), workspace.path(), Duration::from_secs(3600))
+                .unwrap();
+            fs::write(state.join(field), "changed-binding").unwrap();
+            let mut sweep = RetirementSweep::default();
+            sweep_tombstoned_slots(root.path(), u64::MAX, &mut sweep).unwrap();
+            assert!(sweep.quarantined.is_empty());
+            assert_eq!(sweep.retained, vec![slot]);
+            assert!(state.join("config.json").exists());
+        }
+    }
+
+    #[test]
     fn tombstoned_slots_are_invisible_to_resolution_and_revivable_by_live_identity() {
         let root = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1241,6 +1346,23 @@ mod tests {
             .contains_key(&key));
         let contender = open_lease_file(&workspaces, "slot").unwrap();
         assert!(FileExt::try_lock_exclusive(&contender).is_err());
+    }
+
+    #[test]
+    fn exclusive_lease_outlasts_a_momentary_inherited_hold() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_shared_state_lease(root.path(), "slot").unwrap();
+        // A child forked by another thread holds a copy of the shared lease
+        // until it execs; model that copy releasing shortly after the attempt.
+        let inherited = open_lease_file(&root.path().join("workspaces"), "slot").unwrap();
+        FileExt::lock_shared(&inherited).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(inherited);
+        });
+        let exclusive = ExclusiveStateLease::try_acquire(root.path(), "slot").unwrap();
+        release.join().unwrap();
+        drop(exclusive);
     }
 
     #[test]

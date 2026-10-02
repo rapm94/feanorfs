@@ -328,7 +328,13 @@ fn inspect_backup_recovery_blocking(
         }
         Err(error) => return Err(error),
     };
-    let source = open_regular_at(&backup.parent, &backup.final_name, false)?;
+    let source = match open_regular_at(&backup.parent, &backup.final_name, false) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BackupRecoveryState::Missing)
+        }
+        Err(error) => return Err(error),
+    };
     let original = match open_relative_parent_at(&base, relative, false) {
         Ok(original) => original,
         Err(error)
@@ -442,42 +448,6 @@ pub(crate) async fn restore_backup_no_follow(
         .await
         .context("join no-follow backup restoration task")?
         .with_context(|| format!("restore materialization backup {display}"))
-}
-
-#[cfg(unix)]
-fn remove_current_regular_no_follow_blocking(
-    base: std::fs::File,
-    relative: &str,
-) -> std::io::Result<bool> {
-    let destination = match open_relative_parent_at(&base, relative, false) {
-        Ok(destination) => destination,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(false)
-        }
-        Err(error) => return Err(error),
-    };
-    let current = open_regular_at(&destination.parent, &destination.final_name, false)?;
-    unlink_regular_at(&destination.parent, &destination.final_name, &current)?;
-    Ok(true)
-}
-
-#[cfg(unix)]
-pub(crate) async fn remove_current_regular_no_follow(
-    anchors: &MaterializationAnchors,
-    relative: &str,
-) -> Result<bool> {
-    let base = anchors.base.try_clone()?;
-    let relative = relative.to_string();
-    let display = relative.clone();
-    tokio::task::spawn_blocking(move || remove_current_regular_no_follow_blocking(base, &relative))
-        .await
-        .context("join no-follow current-file removal task")?
-        .with_context(|| format!("remove interrupted materialization {display}"))
 }
 
 #[cfg(unix)]

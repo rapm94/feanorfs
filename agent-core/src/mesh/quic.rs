@@ -2,15 +2,17 @@ use crate::mesh::identity::MachineIdentity;
 use anyhow::{ensure, Context as _, Result};
 use feanorfs_common::NodeId;
 use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt as _;
+use tokio::sync::Semaphore;
 
 const AUTH_DOMAIN: &[u8] = b"feanorfs-mesh-auth-v1";
 const AUTH_OK: &[u8; 2] = b"ok";
 const PUNCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-const MAX_AUTH_MESSAGE_BYTES: usize = 256;
+const MAX_AUTH_MESSAGE_BYTES: usize = 96;
+const MAX_CONNECTIONS: usize = 64;
+const MAX_STREAMS: usize = 64;
 
 #[derive(Clone)]
 pub struct PunchPeer {
@@ -89,14 +91,17 @@ pub async fn serve_punch_bridge(
     _peer: PunchPeer,
     upstream: SocketAddr,
 ) -> Result<PunchBridgeHandle> {
-    let std_socket = std::net::UdpSocket::bind(bind).context("bind QUIC punch listener")?;
-    let local = std_socket.local_addr()?;
+    let socket = tokio::net::UdpSocket::bind(bind)
+        .await
+        .context("bind QUIC punch listener")?;
+    let local = socket.local_addr()?;
     let started = std::time::Instant::now();
     // One bounded blocking probe keeps the pre-listen window short and stays
     // entirely in std-land. send_to/recv_from deliberately avoid connect():
     // an AF_UNSPEC dissociation afterwards leaves Linux UDP sockets unable to
     // serve quinn, while a lingering connect() would weld quinn to one peer.
-    let reflexive = probe_reflexive(&std_socket);
+    let reflexive = probe_reflexive(&socket).await;
+    let std_socket = socket.into_std()?;
     tracing::info!(
         "STUN probe finished in {:?}: {}",
         started.elapsed(),
@@ -113,6 +118,7 @@ pub async fn serve_punch_bridge(
     )
     .context("start QUIC punch endpoint")?;
     eprintln!("DBG endpoint-live");
+    let auth_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let connection = match incoming.await {
@@ -122,24 +128,34 @@ pub async fn serve_punch_bridge(
                     continue;
                 }
             };
-            if let Err(error) = authenticate_inbound(&connection).await {
-                tracing::debug!("mesh punch authentication failed: {error:#}");
-                continue;
-            }
-            let upstream = upstream;
+            let auth = auth_slots.clone();
             tokio::spawn(async move {
-                while let Ok((send, mut recv)) = connection.accept_bi().await {
-                    let mut send = send;
-                    let Ok(tcp) = tokio::net::TcpStream::connect(upstream).await else {
-                        break;
-                    };
-                    tokio::spawn(async move {
-                        let (mut read_half, mut write_half) = tokio::io::split(tcp);
-                        let upstream_to_peer = tokio::io::copy(&mut read_half, &mut send);
-                        let peer_to_upstream = tokio::io::copy(&mut recv, &mut write_half);
-                        let _ = tokio::join!(upstream_to_peer, peer_to_upstream);
-                        let _ = send.finish();
-                    });
+                // Bounded concurrent authentication keeps slow peers from
+                // consuming unbounded accept capacity.
+                let Ok(_permit) = auth.acquire_owned().await else {
+                    return;
+                };
+                if let Err(error) = authenticate_inbound(&connection).await {
+                    tracing::debug!("mesh punch authentication failed: {error:#}");
+                } else {
+                    let upstream = upstream;
+                    let streams = Arc::new(Semaphore::new(MAX_STREAMS));
+                    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                        let Ok(permit) = streams.clone().acquire_owned().await else {
+                            break;
+                        };
+                        let Ok(tcp) = tokio::net::TcpStream::connect(upstream).await else {
+                            break;
+                        };
+                        tokio::spawn(async move {
+                            let (mut read_half, mut write_half) = tokio::io::split(tcp);
+                            let upstream_to_peer = tokio::io::copy(&mut read_half, &mut send);
+                            let peer_to_upstream = tokio::io::copy(&mut recv, &mut write_half);
+                            let _ = tokio::join!(upstream_to_peer, peer_to_upstream);
+                            let _ = send.finish();
+                            drop(permit);
+                        });
+                    }
                 }
             });
         }
@@ -154,41 +170,22 @@ pub struct PunchBridgeHandle {
     pub reflexive: Option<SocketAddr>,
 }
 
-/// One blocking STUN binding request through `socket` with a hard read
-/// deadline. Uses send_to/recv_from so the socket never gains a connected
-/// peer; quinn inherits it untouched apart from non-blocking mode.
-fn probe_reflexive(socket: &std::net::UdpSocket) -> Option<SocketAddr> {
-    (|| -> anyhow::Result<SocketAddr> {
-        let target: SocketAddr = (
-            crate::mesh::stun::DEFAULT_PRIMARY_SERVER,
-            crate::mesh::stun::DEFAULT_PRIMARY_PORT,
-        )
-            .to_socket_addrs()
-            .context("resolve STUN server")?
-            .find(|address| address.is_ipv4())
-            .context("STUN server has no IPv4 address")?;
-        let mut request = [0_u8; 20];
-        request[..2].copy_from_slice(&crate::mesh::stun::BINDING_REQUEST.to_be_bytes());
-        request[2..4].copy_from_slice(&12_u16.to_be_bytes());
-        request[4..8].copy_from_slice(&crate::mesh::stun::MAGIC_COOKIE);
-        getrandom::fill(&mut request[8..])?;
-        socket.send_to(&request, target)?;
-        socket.set_read_timeout(Some(Duration::from_millis(750)))?;
-        let mut response = vec![0_u8; 548];
-        let (_, responder) = socket.recv_from(&mut response)?;
-        ensure!(
-            responder == target,
-            "STUN reply came from an unexpected source"
-        );
-        let address = crate::mesh::stun::parse_reflexive_address(&response)?;
+/// Probe the exact punch socket without connecting it to one peer. DNS and
+/// receive share a deadline; quinn inherits the same unconnected socket.
+async fn probe_reflexive(socket: &tokio::net::UdpSocket) -> Option<SocketAddr> {
+    tokio::time::timeout(Duration::from_millis(750), async {
+        let target =
+            crate::mesh::stun::resolve_server(crate::mesh::stun::DEFAULT_PRIMARY_SERVER).await?;
+        let address = crate::mesh::stun::query_reflexive_over(socket, target).await?;
         ensure!(
             !address.ip().is_loopback() && !address.ip().is_unspecified(),
             "reflexive address is not remotely reachable"
         );
-        Ok(address)
-    })()
-    .map_err(|error| tracing::info!("punch-socket STUN probe failed: {error:#}"))
+        Ok::<_, anyhow::Error>(address)
+    })
+    .await
     .ok()
+    .and_then(Result::ok)
 }
 
 async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
@@ -199,13 +196,13 @@ async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
         .context("mesh auth stream timed out")?
         .context("accept mesh auth stream")?;
 
-    let mut buffer = vec![0_u8; MAX_AUTH_MESSAGE_BYTES];
-    let received = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buffer))
-        .await
-        .context("mesh auth reply timed out")?
-        .context("read mesh auth reply")?
-        .context("mesh auth peer closed early")?;
-    ensure!(received == 96, "mesh auth message has the wrong length");
+    let buffer = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv.read_to_end(MAX_AUTH_MESSAGE_BYTES),
+    )
+    .await
+    .context("mesh auth reply timed out")?
+    .context("read bounded mesh auth reply")?;
     let _claimed = decode_auth_message(&buffer)?;
     send.write_all(AUTH_OK).await?;
     send.finish()?;
@@ -213,6 +210,10 @@ async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
 }
 
 fn decode_auth_message(message: &[u8]) -> Result<NodeId> {
+    ensure!(
+        message.len() == MAX_AUTH_MESSAGE_BYTES,
+        "mesh auth message has the wrong length"
+    );
     let signature: [u8; 64] = message[..64].try_into().expect("exact signature slice");
     let claimed = NodeId::from_public_key(message[64..96].try_into().expect("32 bytes"));
     ensure!(
@@ -239,8 +240,7 @@ async fn authenticate_outbound(connection: &quinn::Connection, peer: &PunchPeer)
     message.extend_from_slice(&signature);
     message.extend_from_slice(peer.identity.node_id().as_bytes());
     send.write_all(&message).await?;
-    send.flush().await?;
-    drop(send);
+    send.finish()?;
     let mut ack = [0_u8; 2];
     tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut ack))
         .await
@@ -331,7 +331,7 @@ async fn conn_open(
 mod tests {
     use super::*;
     use crate::mesh::identity::MachineIdentity;
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     async fn pem_material(dir: &std::path::Path) -> (String, String, String) {
         use rcgen::{CertificateParams, KeyPair};

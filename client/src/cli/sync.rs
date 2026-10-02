@@ -5,6 +5,8 @@ use feanorfs_client::ClientDb;
 use feanorfs_client::{commands, load_config, watch};
 use std::path::Path;
 
+use super::util::terminal_line;
+
 use super::util::output_json;
 
 const MAX_SYMLINK_EXAMPLES: usize = 5;
@@ -141,8 +143,25 @@ async fn run_status(current_dir: &Path, json: bool) -> anyhow::Result<()> {
     if let Some(ref warn) = result.server_rollback_warning {
         println!("  Warning: {warn}");
     }
+    if let Some(mismatch) = &result.git_baseline_mismatch {
+        println!(
+            "  Warning: this clone is on git {} but the shared work was published on {}. \
+             Align branches before editing (see `feanorfs status` docs: Changing Git branches).",
+            terminal_line(&mismatch.local.short()),
+            terminal_line(&mismatch.shared.short())
+        );
+    }
     if !result.skipped_symlinks.is_empty() {
         println!("  {}", skipped_symlink_summary(&result.skipped_symlinks));
+    }
+    for line in feanorfs_common::tray_contract::activity_lines(result.continuous, result.resolution)
+    {
+        println!("{line}");
+    }
+    for command in
+        feanorfs_common::tray_contract::activity_commands(result.continuous, result.resolution)
+    {
+        println!("Next: {command}");
     }
     Ok(())
 }

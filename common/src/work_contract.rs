@@ -563,7 +563,7 @@ pub fn encode_scope_change_request(profile: &ScopeChangeRequestProfile) -> Resul
     validate_scope_change_request(profile)?;
     let bytes = serde_json::to_vec(profile).context("serialize scope change request profile")?;
     ensure!(
-        bytes.len() <= WORK_MAX_PROFILE_BYTES,
+        bytes.len() < WORK_MAX_PROFILE_BYTES - SCOPE_CHANGE_REQUEST_DISCRIMINATOR.len(),
         "scope change request profile exceeds the signal body bound"
     );
     let mut body =
@@ -578,6 +578,9 @@ pub fn encode_scope_change_request(profile: &ScopeChangeRequestProfile) -> Resul
 /// other discriminator, malformed JSON, unknown fields, or unsafe entries.
 #[must_use]
 pub fn parse_scope_change_request(body: &str) -> Option<ScopeChangeRequestProfile> {
+    if body.len() > WORK_MAX_PROFILE_BYTES {
+        return None;
+    }
     let rest = body.strip_prefix(SCOPE_CHANGE_REQUEST_DISCRIMINATOR)?;
     let payload = rest.strip_prefix(':')?;
     let profile: ScopeChangeRequestProfile = serde_json::from_str(payload).ok()?;
@@ -2378,6 +2381,38 @@ mod tests {
             partition_scope_paths(&[], &scope),
             ScopePathPartition::default()
         );
+    }
+
+    #[test]
+    fn scope_change_request_complete_body_boundary() {
+        let mut profile = ScopeChangeRequestProfile {
+            task_id: "parser-impl".into(),
+            intent_message_id: work_fixtures::hex64(b'c'),
+            operations: vec![ScopeChangeOperation::Modify],
+            paths: vec!["src/lib.rs".into()],
+            concerns: vec!["x".repeat(256); 28],
+            reason: String::new(),
+        };
+        let initial = encode_scope_change_request(&profile).unwrap().len();
+        // Extend reason using JSON escapes, whose encoded size is twice the
+        // decoded size, to reach the complete-body limit exactly.
+        let padding = WORK_MAX_PROFILE_BYTES - initial;
+        profile.reason = "\n".repeat(padding / 2);
+        if !padding.is_multiple_of(2) {
+            profile.reason.push('x');
+        }
+        let body = encode_scope_change_request(&profile).unwrap();
+        assert_eq!(body.len(), WORK_MAX_PROFILE_BYTES);
+        assert_eq!(parse_scope_change_request(&body), Some(profile.clone()));
+        profile.reason.push('x');
+        validate_scope_change_request(&profile).unwrap();
+        let oversized = format!(
+            "{SCOPE_CHANGE_REQUEST_DISCRIMINATOR}:{}",
+            serde_json::to_string(&profile).unwrap()
+        );
+        assert_eq!(oversized.len(), WORK_MAX_PROFILE_BYTES + 1);
+        assert!(encode_scope_change_request(&profile).is_err());
+        assert!(parse_scope_change_request(&oversized).is_none());
     }
 
     #[test]

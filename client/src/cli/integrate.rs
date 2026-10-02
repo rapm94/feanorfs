@@ -28,6 +28,18 @@ pub struct IntegrateCli {
     /// Overwrite conflicting user-owned entries instead of skipping them.
     #[arg(long, global = true)]
     force: bool,
+
+    /// Also register `feanorfs agent guard --hook` as a PreToolUse hook so
+    /// edits inside another agent's accepted scope are blocked before they
+    /// happen (Claude Code and Codex; opt-in).
+    #[arg(long, global = true)]
+    guard_hook: bool,
+
+    /// Like `--guard-hook`, but the hook also claims scope before each new
+    /// path and a Stop hook finishes the work, so agents spend no turns on
+    /// coordination. Needs a coordinator (`feanorfs agent coordinate`).
+    #[arg(long, global = true)]
+    auto_claim: bool,
 }
 
 #[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
@@ -497,7 +509,19 @@ pub(super) async fn run(_current_dir: &Path, cli: IntegrateCli, json: bool) -> R
                     continue;
                 }
 
-                match install_host_integration(&paths, &exe_path, cli.force).await {
+                let installed = install_host_integration(&paths, &exe_path, cli.force)
+                    .await
+                    .and_then(|done| {
+                        let hooks = hook_settings_path(host, &env, cli.project.as_deref());
+                        if let Some(hooks) = hooks.filter(|_| cli.guard_hook || cli.auto_claim) {
+                            install_guard_hook(&hooks, &exe_path, cli.auto_claim)?;
+                            report
+                                .installed
+                                .push(format!("{}: Guard hook=true", host.id()));
+                        }
+                        Ok(done)
+                    });
+                match installed {
                     Ok((mcp_done, skill_done)) => {
                         let configured_str =
                             format!("{}: MCP={}, Skill={}", host.id(), mcp_done, skill_done);
@@ -532,6 +556,17 @@ pub(super) async fn run(_current_dir: &Path, cli: IntegrateCli, json: bool) -> R
                 }
             }
             IntegrateSubcommand::Uninstall => {
+                if let Some(hooks) = hook_settings_path(host, &env, cli.project.as_deref()) {
+                    match remove_guard_hook(&hooks) {
+                        Ok(true) => report
+                            .removed
+                            .push(format!("{}: Guard hook=true", host.id())),
+                        Ok(false) => {}
+                        Err(err) => report
+                            .warnings
+                            .push(format!("{}: failed to remove guard hook: {err}", host.id())),
+                    }
+                }
                 if !detected
                     && !paths.mcp_config_path.exists()
                     && !paths.skill_dir.join("feanorfs-collaboration").exists()
@@ -668,11 +703,19 @@ fn check_mcp_registered(paths: &HostPaths) -> std::result::Result<bool, String> 
     }
 }
 
+/// Installed and identical to this binary's copy: a skill left by an older
+/// release still teaches the old protocol, so status asks to reinstall it.
 fn check_skill_installed(paths: &HostPaths) -> bool {
     let skill_root = paths.skill_dir.join("feanorfs-collaboration");
-    let skill_md = skill_root.join("SKILL.md");
-    let protocol_md = skill_root.join("references").join("protocol.md");
-    skill_md.exists() && protocol_md.exists()
+    let current = |path: PathBuf, expected: &str| {
+        std::fs::metadata(&path).is_ok_and(|meta| meta.len() == expected.len() as u64)
+            && std::fs::read(&path).is_ok_and(|bytes| bytes == expected.as_bytes())
+    };
+    current(skill_root.join("SKILL.md"), SKILL_MD)
+        && current(
+            skill_root.join("references").join("protocol.md"),
+            PROTOCOL_MD,
+        )
 }
 
 async fn install_host_integration(
@@ -830,6 +873,158 @@ pub(super) async fn install_detected_hosts_quiet() -> Result<()> {
     Ok(())
 }
 
+/// Tools whose writes the guard hook checks.
+const GUARD_HOOK_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
+const GUARD_HOOK_ARGS: &str = "agent guard --hook";
+const CLAIM_HOOK_ARGS: &str = "agent guard --hook --claim";
+const DONE_HOOK_ARGS: &str = "agent done --hook";
+/// Seconds Claude Code allows a claiming or finishing hook; their own waits
+/// stay below it (claims 240 s).
+const COORDINATION_HOOK_TIMEOUT_SECONDS: u64 = 300;
+const HOOK_EVENTS: [&str; 2] = ["PreToolUse", "Stop"];
+
+/// File holding the host's hooks for the scope: Claude Code's
+/// `.claude/settings.json` or Codex's `.codex/hooks.json` (same schema;
+/// Codex matches `apply_patch` edits as `Edit`/`Write`).
+fn hook_settings_path(
+    host: HostKind,
+    env: &EnvironmentContext,
+    project: Option<&Path>,
+) -> Option<PathBuf> {
+    let root = project.unwrap_or(&env.home_dir);
+    match host {
+        HostKind::Claude => Some(root.join(".claude").join("settings.json")),
+        HostKind::Codex => Some(root.join(".codex").join("hooks.json")),
+        HostKind::Cursor | HostKind::Gemini | HostKind::OpenCode => None,
+    }
+}
+
+fn hook_command(exe_path: &Path, args: &str) -> Result<String> {
+    let exe = exe_path
+        .to_str()
+        .with_context(|| format!("executable path is not valid UTF-8: {}", exe_path.display()))?;
+    Ok(if exe.contains(char::is_whitespace) {
+        format!("\"{exe}\" {args}")
+    } else {
+        format!("{exe} {args}")
+    })
+}
+
+/// Whether a hook entry is one FeanorFS installed (guard or done).
+fn is_feanorfs_hook(entry: &serde_json::Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|hooks| hooks.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|command| command.as_str())
+                    .is_some_and(|command| {
+                        command.contains("feanorfs")
+                            && (command.contains(GUARD_HOOK_ARGS)
+                                || command.contains(DONE_HOOK_ARGS))
+                    })
+            })
+        })
+}
+
+fn read_settings(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    match serde_json::from_str(&content)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?
+    {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => bail!("{} is not a JSON object", path.display()),
+    }
+}
+
+fn hook_array<'a>(
+    root: &'a mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    settings_path: &Path,
+) -> Result<&'a mut Vec<serde_json::Value>> {
+    root.entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .with_context(|| format!("'hooks' in {} is not an object", settings_path.display()))?
+        .entry(event)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .with_context(|| {
+            format!(
+                "'hooks.{event}' in {} is not an array",
+                settings_path.display()
+            )
+        })
+}
+
+/// Installs the guard PreToolUse hook (with `auto_claim`, a claiming guard
+/// plus a Stop hook that finishes the agent's work), replacing earlier
+/// FeanorFS hooks and preserving every other setting.
+fn install_guard_hook(settings_path: &Path, exe_path: &Path, auto_claim: bool) -> Result<bool> {
+    let mut root = read_settings(settings_path)?;
+    for event in HOOK_EVENTS {
+        hook_array(&mut root, event, settings_path)?.retain(|entry| !is_feanorfs_hook(entry));
+    }
+    let guard = if auto_claim {
+        serde_json::json!({
+            "type": "command",
+            "command": hook_command(exe_path, CLAIM_HOOK_ARGS)?,
+            "timeout": COORDINATION_HOOK_TIMEOUT_SECONDS
+        })
+    } else {
+        serde_json::json!({ "type": "command", "command": hook_command(exe_path, GUARD_HOOK_ARGS)? })
+    };
+    hook_array(&mut root, "PreToolUse", settings_path)?
+        .push(serde_json::json!({ "matcher": GUARD_HOOK_MATCHER, "hooks": [guard] }));
+    if auto_claim {
+        hook_array(&mut root, "Stop", settings_path)?.push(serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": hook_command(exe_path, DONE_HOOK_ARGS)?,
+                "timeout": COORDINATION_HOOK_TIMEOUT_SECONDS
+            }]
+        }));
+    }
+    atomic_write_file(
+        settings_path,
+        serde_json::to_string_pretty(&root)?.as_bytes(),
+    )?;
+    Ok(true)
+}
+
+/// Removes only FeanorFS guard and done hook entries.
+fn remove_guard_hook(settings_path: &Path) -> Result<bool> {
+    if !settings_path.exists() {
+        return Ok(false);
+    }
+    let mut root = read_settings(settings_path)?;
+    let mut changed = false;
+    for event in HOOK_EVENTS {
+        let Some(entries) = root
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut(event))
+            .and_then(|entries| entries.as_array_mut())
+        else {
+            continue;
+        };
+        let before = entries.len();
+        entries.retain(|entry| !is_feanorfs_hook(entry));
+        changed |= entries.len() != before;
+    }
+    if changed {
+        atomic_write_file(
+            settings_path,
+            serde_json::to_string_pretty(&root)?.as_bytes(),
+        )?;
+    }
+    Ok(changed)
+}
+
 fn is_feanorfs_command(command: &str) -> bool {
     Path::new(command)
         .file_stem()
@@ -937,6 +1132,11 @@ mod tests {
             assert!(skill_done);
             assert!(check_skill_installed(&paths));
             assert!(check_mcp_registered(&paths).unwrap());
+
+            // A copy from an older release is not the installed skill.
+            let skill_md = paths.skill_dir.join("feanorfs-collaboration/SKILL.md");
+            std::fs::write(&skill_md, "older release\n").unwrap();
+            assert!(!check_skill_installed(&paths));
 
             let (mcp_second, skill_second) = install_host_integration(&paths, &fake_exe, false)
                 .await
@@ -1161,5 +1361,97 @@ mod tests {
         let preserved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&paths.mcp_config_path).unwrap()).unwrap();
         assert_eq!(preserved, config);
+    }
+    #[test]
+    fn hooks_install_into_claude_settings_and_codex_hooks_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = EnvironmentContext::mock(temp.path());
+        let project = temp.path().join("ws");
+        assert_eq!(
+            hook_settings_path(HostKind::Codex, &env, Some(&project)),
+            Some(project.join(".codex").join("hooks.json"))
+        );
+        assert_eq!(
+            hook_settings_path(HostKind::Claude, &env, None),
+            Some(temp.path().join(".claude").join("settings.json"))
+        );
+        assert_eq!(hook_settings_path(HostKind::Cursor, &env, None), None);
+
+        // A Codex hooks.json keeps the user's other hooks.
+        let hooks = hook_settings_path(HostKind::Codex, &env, None).unwrap();
+        std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hooks,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"headroom hook"}]}]}}"#,
+        )
+        .unwrap();
+        let exe = Path::new("/opt/feanorfs/bin/feanorfs");
+        assert!(install_guard_hook(&hooks, exe, true).unwrap());
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+        let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre[0]["hooks"][0]["command"], "headroom hook");
+        assert_eq!(pre[1]["matcher"], GUARD_HOOK_MATCHER);
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/opt/feanorfs/bin/feanorfs agent done --hook"
+        );
+        assert!(remove_guard_hook(&hooks).unwrap());
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+        assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn guard_hook_install_is_idempotent_preserves_settings_and_uninstalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"model":"opus","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo hi"}]}]}}"#,
+        )
+        .unwrap();
+        let exe = Path::new("/opt/feanorfs/bin/feanorfs");
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap()
+        };
+        assert!(install_guard_hook(&settings, exe, false).unwrap());
+        assert!(install_guard_hook(&settings, exe, false).unwrap());
+        let value = read();
+        assert_eq!(value["model"], "opus");
+        let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[1]["matcher"], GUARD_HOOK_MATCHER);
+        assert_eq!(
+            pre[1]["hooks"][0]["command"],
+            "/opt/feanorfs/bin/feanorfs agent guard --hook"
+        );
+        assert!(value["hooks"]["Stop"].as_array().unwrap().is_empty());
+
+        // Upgrading to auto-claim replaces the guard and adds the Stop hook.
+        assert!(install_guard_hook(&settings, exe, true).unwrap());
+        let value = read();
+        let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(
+            pre[1]["hooks"][0]["command"],
+            "/opt/feanorfs/bin/feanorfs agent guard --hook --claim"
+        );
+        assert_eq!(pre[1]["hooks"][0]["timeout"], 300);
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/opt/feanorfs/bin/feanorfs agent done --hook"
+        );
+
+        assert!(remove_guard_hook(&settings).unwrap());
+        assert!(!remove_guard_hook(&settings).unwrap());
+        let value = read();
+        assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert!(value["hooks"]["Stop"].as_array().unwrap().is_empty());
+        assert_eq!(
+            hook_command(Path::new("/Program Files/feanorfs"), GUARD_HOOK_ARGS).unwrap(),
+            "\"/Program Files/feanorfs\" agent guard --hook"
+        );
     }
 }

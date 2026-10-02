@@ -207,6 +207,15 @@ async fn publish_ab_conflict(
 
 #[tokio::test]
 async fn cross_machine_assignment_reconstruction_and_result_round_trip() {
+    cross_machine_resolution_round_trip(false).await;
+}
+
+#[tokio::test]
+async fn cross_machine_signals_do_not_invalidate_guarded_apply() {
+    cross_machine_resolution_round_trip(true).await;
+}
+
+async fn cross_machine_resolution_round_trip(apply: bool) {
     let _serial = RESOLUTION_PROTOCOL_SERIAL.lock().await;
     let server = spawn_test_server().await;
     let main = spawn_test_client_with_server(&server).await;
@@ -296,6 +305,41 @@ async fn cross_machine_assignment_reconstruction_and_result_round_trip() {
     assert_eq!(leg_bytes("original"), b"base");
     assert_eq!(leg_bytes("local"), b"agent-b edit");
     assert_eq!(leg_bytes("cloud"), b"agent-a edit");
+    assert_eq!(
+        materialize_resolution_legs(&ctx_b, &job.job_id)
+            .await
+            .unwrap(),
+        legs,
+        "reopening preserved versions must be idempotent"
+    );
+    let original = &legs
+        .iter()
+        .find(|(role, _)| role.as_str() == "original")
+        .unwrap()
+        .1;
+    std::fs::write(original, b"edit").unwrap();
+    assert!(materialize_resolution_legs(&ctx_b, &job.job_id)
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read(original).unwrap(),
+        b"edit",
+        "inspection must not overwrite user edits"
+    );
+    std::fs::write(original, b"base").unwrap();
+    #[cfg(unix)]
+    {
+        let target = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(target.path(), b"base").unwrap();
+        std::fs::remove_file(original).unwrap();
+        std::os::unix::fs::symlink(target.path(), original).unwrap();
+        assert!(materialize_resolution_legs(&ctx_b, &job.job_id)
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(target.path()).unwrap(), b"base");
+        std::fs::remove_file(original).unwrap();
+        std::fs::write(original, b"base").unwrap();
+    }
 
     // B produces a candidate through the typed engine API and returns the
     // same authenticated job via the ffres1 result profile.
@@ -343,6 +387,30 @@ async fn cross_machine_assignment_reconstruction_and_result_round_trip() {
         "both machines must converge to the identical projection"
     );
 
+    if apply {
+        let outcome = feanorfs_agent_core::apply_resolution_job(&ctx_b, &job.job_id)
+            .await
+            .unwrap();
+        let feanorfs_agent_core::ResolutionApplyOutcome::Published { head } = outcome else {
+            panic!("signal-only assignment/result publication invalidated the job: {outcome:?}");
+        };
+        for (recipient, ctx) in [(AGENT_A, &ctx_a), (AGENT_B, &ctx_b)] {
+            let inbox = feanorfs_agent_core::inbox(
+                ctx,
+                feanorfs_common::AgentInboxQuery {
+                    recipient: recipient.into(),
+                    after: Some(result_message.clone()),
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!inbox.cursor_reset);
+            assert!(inbox.messages.iter().any(|notice| notice.message_id == head
+                && notice.body.contains(&job.conflict_fingerprint)));
+        }
+        return;
+    }
     // Deterministic revoke round trip.
     let revoke_message = send_resolution_revoke(&ctx_a, &job.job_id, false)
         .await
@@ -359,8 +427,22 @@ async fn cross_machine_assignment_reconstruction_and_result_round_trip() {
 
 #[tokio::test]
 async fn human_answer_round_trips_and_defer_stays_local() {
+    human_answer_round_trip(false).await;
+}
+
+#[tokio::test]
+async fn saved_human_answer_survives_outage_and_retries_without_rebinding() {
+    human_answer_round_trip(true).await;
+}
+
+async fn human_answer_round_trip(retry_saved: bool) {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     let _serial = RESOLUTION_PROTOCOL_SERIAL.lock().await;
-    let server = spawn_test_server().await;
+    let online = Arc::new(AtomicBool::new(true));
+    let server = support::spawn_test_server_with_gate(Some(online.clone())).await;
     let main = spawn_test_client_with_server(&server).await;
     let second = spawn_test_client_with_server(&server).await;
     make_v3(&main);
@@ -435,6 +517,93 @@ async fn human_answer_round_trips_and_defer_stays_local() {
         candidate: None,
         verification: None,
     };
+    if retry_saved {
+        use feanorfs_agent_core::{
+            answer_resolution, resolution::publish_saved_human_answer, ResolutionStore,
+        };
+        answer_resolution(&ctx_b, answer.clone()).await.unwrap();
+        online.store(false, Ordering::SeqCst);
+        assert!(
+            publish_saved_human_answer(&ctx_b, &job.job_id, Some(generation))
+                .await
+                .is_err()
+        );
+        let record = ResolutionStore::open(ctx_b.base)
+            .unwrap()
+            .load()
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|record| record.job.job_id == job.job_id)
+            .unwrap();
+        assert_eq!(record.human_answer.as_ref(), Some(&answer));
+        assert!(record.answer_message_id.is_none());
+        online.store(true, Ordering::SeqCst);
+        assert!(
+            publish_saved_human_answer(&ctx_b, &job.job_id, Some(generation + 1))
+                .await
+                .is_err()
+        );
+        // A fresh CLI process must recover the exact saved answer from disk.
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_feanorfs"))
+            .current_dir(second.workspace.path())
+            .args([
+                "--json",
+                "agent",
+                "resolution",
+                "publish-answer",
+                &job.job_id,
+                "--question-generation",
+                &generation.to_string(),
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = receipt["message_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            publish_saved_human_answer(&ctx_b, &job.job_id, None)
+                .await
+                .unwrap(),
+            message
+        );
+        assert_eq!(
+            server
+                .api
+                .get_head(ctx_b.workspace_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(message.as_str())
+        );
+        let status = resolution_protocol_status(&ctx_a, false).await.unwrap();
+        let entry = status
+            .entries
+            .iter()
+            .find(|entry| entry.job_id == job.job_id)
+            .unwrap();
+        assert_eq!(entry.state, ProtocolAssignmentState::HumanAnswered);
+        let projection =
+            feanorfs_agent_core::resolution_protocol::ResolutionProtocolStore::open(ctx_a.base)
+                .unwrap()
+                .load()
+                .unwrap();
+        assert_eq!(
+            projection
+                .entries
+                .get(&job.conflict_fingerprint)
+                .unwrap()
+                .answer
+                .as_ref(),
+            Some(&answer)
+        );
+        return;
+    }
     let answer_message = send_human_answer(&ctx_a, &answer).await.unwrap();
     assert_eq!(answer_message.len(), 64);
 

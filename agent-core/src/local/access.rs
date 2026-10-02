@@ -78,6 +78,12 @@ impl ClientDb {
             anyhow::bail!("non-finite decay factor {factor}");
         }
         self.state.with_write(|state| {
+            // Validate the whole batch before changing even one entry.
+            for entry in &state.file_access_log {
+                if !(entry.weight * factor).is_finite() {
+                    anyhow::bail!("overflow: access weight multiplied by decay factor {factor}");
+                }
+            }
             for entry in &mut state.file_access_log {
                 entry.weight *= factor;
             }

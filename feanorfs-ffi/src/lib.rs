@@ -849,6 +849,174 @@ pub unsafe extern "C" fn ffs_integrator_status(
     })
 }
 
+/// Parses one required JSON input and runs `op` against the workspace.
+fn run_json_op<I, O>(
+    root: *const c_char,
+    input_json: *const c_char,
+    label: &str,
+    op: impl FnOnce(&Workspace, I) -> anyhow::Result<O>,
+) -> *const c_char
+where
+    I: serde::de::DeserializeOwned,
+    O: serde::Serialize,
+{
+    clear_error();
+    let input_json = match cstr_req(input_json) {
+        Ok(value) => value,
+        Err(error) => {
+            set_error(error);
+            return ptr::null();
+        }
+    };
+    let input: I = match serde_json::from_str(&input_json) {
+        Ok(value) => value,
+        Err(error) => {
+            set_error(format!("invalid {label} input: {error}"));
+            return ptr::null();
+        }
+    };
+    match workspace(root).and_then(|ws| op(&ws, input).map_err(|error| error.to_string())) {
+        Ok(result) => ok_json(&result),
+        Err(error) => {
+            set_error(error);
+            ptr::null()
+        }
+    }
+}
+
+/// Unified coordination lifecycle and prefilled next actions. JSON out:
+/// `CoordinationStatus`. Pass NULL `agent` for `FEANORFS_AGENT`/`human`.
+///
+/// Returns an owned NUL-terminated UTF-8 string. The caller owns the
+/// allocation and must release it with `ffs_string_free` (never with libc
+/// `free`). NULL means an error; read `ffs_last_error` for the
+/// thread-local diagnostic.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ffs_coordination_status(
+    root: *const c_char,
+    agent: *const c_char,
+) -> *const c_char {
+    catch_ptr(|| {
+        clear_error();
+        let agent = match cstr_opt(agent) {
+            Ok(value) => value,
+            Err(error) => {
+                set_error(error);
+                return ptr::null();
+            }
+        };
+        match workspace(root).and_then(|ws| {
+            ws.coordination_status(agent.as_deref())
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => ok_json(&result),
+            Err(error) => {
+                set_error(error);
+                ptr::null()
+            }
+        }
+    })
+}
+
+/// Send one typed candidate-side integrator reply. JSON in:
+/// `IntegratorReplyInput`; JSON out: `IntegratorReplyResult`. NULL on error.
+///
+/// Returns an owned NUL-terminated UTF-8 string. The caller owns the
+/// allocation and must release it with `ffs_string_free` (never with libc
+/// `free`). NULL means an error; read `ffs_last_error` for the
+/// thread-local diagnostic.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ffs_integrator_reply(
+    root: *const c_char,
+    input_json: *const c_char,
+) -> *const c_char {
+    catch_ptr(|| {
+        run_json_op(root, input_json, "integrator_reply", |ws, input| {
+            ws.integrator_reply(input)
+        })
+    })
+}
+
+/// Announce capabilities (when `announce` is set) and read the capability
+/// roster. JSON in: `CapabilitiesInput`; JSON out: `CapabilityRoster`.
+/// NULL on error.
+///
+/// Returns an owned NUL-terminated UTF-8 string. The caller owns the
+/// allocation and must release it with `ffs_string_free` (never with libc
+/// `free`). NULL means an error; read `ffs_last_error` for the
+/// thread-local diagnostic.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ffs_capabilities(
+    root: *const c_char,
+    input_json: *const c_char,
+) -> *const c_char {
+    catch_ptr(|| {
+        run_json_op(root, input_json, "capabilities", |ws, input| {
+            ws.capabilities(input)
+        })
+    })
+}
+
+/// Claim scope in one call (propose and wait for the decision). JSON in:
+/// `ClaimInput`; JSON out: `ClaimResult`. NULL on error.
+///
+/// Returns an owned NUL-terminated UTF-8 string. The caller owns the
+/// allocation and must release it with `ffs_string_free` (never with libc
+/// `free`). NULL means an error; read `ffs_last_error` for the
+/// thread-local diagnostic.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ffs_claim(
+    root: *const c_char,
+    input_json: *const c_char,
+) -> *const c_char {
+    catch_ptr(|| run_json_op(root, input_json, "claim", |ws, input| ws.claim(input)))
+}
+
+/// Finish in one call (wait for edits to land, settle, complete). JSON in:
+/// `DoneInput`; JSON out: `DoneResult`. NULL on error.
+///
+/// Returns an owned NUL-terminated UTF-8 string. The caller owns the
+/// allocation and must release it with `ffs_string_free` (never with libc
+/// `free`). NULL means an error; read `ffs_last_error` for the
+/// thread-local diagnostic.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ffs_done(root: *const c_char, input_json: *const c_char) -> *const c_char {
+    catch_ptr(|| run_json_op(root, input_json, "done", |ws, input| ws.done(input)))
+}
+
+/// Evaluate whether an agent may write workspace paths now. JSON in:
+/// `GuardInput`; JSON out: `GuardResult`. NULL on error.
+///
+/// Returns an owned NUL-terminated UTF-8 string. The caller owns the
+/// allocation and must release it with `ffs_string_free` (never with libc
+/// `free`). NULL means an error; read `ffs_last_error` for the
+/// thread-local diagnostic.
+///
+/// # Safety
+/// Every non-NULL string input must point to valid UTF-8 readable through its terminating NUL for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ffs_guard(
+    root: *const c_char,
+    input_json: *const c_char,
+) -> *const c_char {
+    catch_ptr(|| run_json_op(root, input_json, "guard", |ws, input| ws.guard(input)))
+}
+
 /// Explicitly revoke the active integrator assignment. JSON out:
 /// `IntegratorStatusResult`. NULL on error.
 ///
