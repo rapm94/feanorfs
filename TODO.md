@@ -67,9 +67,6 @@ Local evidence (real Claude Code eval, guard hook, local fuzzing) is in
 - [ ] Route a real request with `agent send cap:ios-build` from the Linux
   machine to the Mac and verify the Git baseline warning when the two clones
   sit on different commits.
-- [ ] Record green `fuzz` (security.yml) and `agent-eval` (ci.yml) runs on
-  GitHub runners; keep any crashing input as a seed in
-  `common/tests/parser_fuzz.rs`.
 - [ ] Regenerate `bindings/ts/index.js` and `index.d.ts` with `npm run build`
   (extended by hand for `coordinationStatus`, `guard`, `integratorReply`,
   `capabilities`; the Node parity test passes and CI's `sdk` job rebuilds).
@@ -98,6 +95,17 @@ before editing; false positives and compatibility constraints need evidence.
   reported idle on Windows (mandatory locks hide the PID), and exclusive
   workspace-state leases failed on Linux while a parallel spawn briefly
   inherited the shared lease descriptor.
+- [ ] Find why a continuous agent can land a stale leg over a published
+  resolution. `client/tests/continuous_agents.rs`
+  `two_active_agents_resume_after_resolution_and_continue_work` (this batch)
+  failed twice on Linux in CI run 36999194960 (Test, Source smoke) and in
+  2 of 5 heavily loaded macOS runs (0 of 12 otherwise): after the head with
+  `seed.txt` = `resolved` was observed, the head became a `journey-b` land
+  whose first parent is `journey-a`'s `version-a` land and whose `seed.txt`
+  is `version-a`. Land parents are `[agent_base, current_head]`, so the
+  candidate tree replaced the resolution. Done when the race is explained,
+  fixed so a land never replaces a path the head changed since the agent's
+  base, and the test passes repeatedly under load.
 - [ ] Finish compatibility acceptance for source-bound rekey publication.
   Independent static review approved the publication lifecycle. Local-drift
   test review was cancelled. The proposed local-overwrite finding was not
