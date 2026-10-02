@@ -54,10 +54,22 @@ coordination. In `worktrees` mode the prompt is the bare task and
 python3 eval/run.py eval/scenarios/overlap.json --timeout 900 --hooks \
   --agent-cmd "claude -p {prompt} --output-format json --settings {settings} --setting-sources project --strict-mcp-config --permission-mode acceptEdits --allowedTools 'Bash(python3 -m unittest:*)'"
 
-# Explicit claim/done calls.
+# No hooks: the agent runs `agent claim`; `agent run` finishes on exit.
 python3 eval/run.py eval/scenarios/overlap.json --timeout 900 \
   --agent-cmd "claude -p {prompt} --output-format json --setting-sources project --strict-mcp-config --permission-mode acceptEdits --allowedTools 'Bash(feanorfs:*)' 'Bash(python3 -m unittest:*)'"
+
+# Codex: loopback network reaches the eval hub.
+python3 eval/run.py eval/scenarios/overlap.json --timeout 900 --keep \
+  --agent-cmd "codex exec --json --ephemeral --ignore-user-config --disable shell_snapshot --skip-git-repo-check -s workspace-write -c sandbox_workspace_write.network_access=true {prompt}"
 ```
+
+Codex runs commands in a login shell and, with `shell_snapshot`, replays
+your interactive shell's `PATH`, which can put an older installed `feanorfs`
+ahead of the binary under test; `--disable shell_snapshot` prevents that.
+Codex still loads your global `AGENTS.md` and user-scope skills (including an
+installed `feanorfs-collaboration` copy), so refresh that copy with
+`feanorfs integrate` before measuring. Codex signed in with ChatGPT reports
+no price: compare `tokens` (input plus output; cached input counted once).
 
 `--setting-sources project --strict-mcp-config` keeps your personal hooks,
 command rewriters, and MCP servers out of the agents, so runs are comparable.

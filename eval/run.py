@@ -124,6 +124,12 @@ def cost_from(output):
     return round(total, 4)
 
 
+# Disjoint usage counters only: OpenAI-style `cached_input_tokens` and
+# `reasoning_output_tokens` are already inside `input_tokens`/`output_tokens`.
+TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
+              "cache_read_input_tokens")
+
+
 def tokens_from(output):
     """Sums token counts from a harness's JSON stdout, when it reports them."""
     total = 0
@@ -135,7 +141,8 @@ def tokens_from(output):
         if isinstance(value, dict):
             total += value.get("tokens", 0)
             usage = value.get("usage") or {}
-            total += sum(v for k, v in usage.items() if k.endswith("tokens") and isinstance(v, int))
+            total += sum(usage.get(key, 0) for key in TOKEN_KEYS
+                         if isinstance(usage.get(key), int))
     return total
 
 
@@ -304,6 +311,9 @@ def run_worktrees(args, scenario, scenario_path, tmp):
         if args.agent_cmd:
             result = subprocess.run(agent_command(args, scenario_path, agent, plain=True), cwd=path,
                                     capture_output=True, text=True, timeout=args.timeout)
+            log = tmp / f"agent-{agent['name']}"
+            Path(f"{log}.out").write_text(result.stdout, encoding="utf-8")
+            Path(f"{log}.err").write_text(result.stderr, encoding="utf-8")
             stats["tokens"] += tokens_from(result.stdout)
             stats["cost_usd"] = round(stats.get("cost_usd", 0) + cost_from(result.stdout), 4)
             stats["agents_failed"] += result.returncode != 0

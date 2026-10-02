@@ -73,9 +73,10 @@ Local evidence (real Claude Code eval, guard hook, local fuzzing) is in
 - [ ] Regenerate `bindings/ts/index.js` and `index.d.ts` with `npm run build`
   (extended by hand for `coordinationStatus`, `guard`, `integratorReply`,
   `capabilities`; the Node parity test passes and CI's `sdk` job rebuilds).
-- [ ] Measure Codex (no Claude Code hooks) on both scenarios and record it.
-  Claude Code without hooks now costs 1.09–1.17× the worktree baseline
-  (hooks: 1.06–1.14×) because `agent run` finishes claims on clean exit.
+- [ ] Re-measure Codex once the founder machine's installed skills are
+  refreshed (`feanorfs integrate`): with an older-release skill it used
+  1.32–1.67× the worktree baseline's weighted tokens, against Claude Code's
+  1.09–1.17× without hooks.
 
 Done when each item has recorded evidence.
 
