@@ -63,6 +63,16 @@ python3 eval/run.py eval/scenarios/overlap.json --timeout 900 --keep \
   --agent-cmd "codex exec --json --ephemeral --ignore-user-config --disable shell_snapshot --skip-git-repo-check -s workspace-write -c sandbox_workspace_write.network_access=true {prompt}"
 ```
 
+With `--hooks`, `{codex_hooks}` expands to Codex `-c` flags that define the
+same claiming guard and Stop hook for one session and trust exactly them
+(Codex records trust as a sha256 of each hook's normalized identity); outside
+`--hooks` and in worktrees mode it expands to nothing:
+
+```bash
+python3 eval/run.py eval/scenarios/overlap.json --timeout 900 --hooks \
+  --agent-cmd "codex exec --json --ephemeral --ignore-user-config --enable hooks --disable shell_snapshot --skip-git-repo-check -s workspace-write -c sandbox_workspace_write.network_access=true {codex_hooks} {prompt}"
+```
+
 Codex runs commands in a login shell and, with `shell_snapshot`, replays
 your interactive shell's `PATH`, which can put an older installed `feanorfs`
 ahead of the binary under test; `--disable shell_snapshot` prevents that.

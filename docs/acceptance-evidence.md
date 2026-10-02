@@ -152,6 +152,24 @@ partially configured. The first attempt lost both edits safely: Codex's
 `shell_snapshot` replayed a `PATH` whose older `feanorfs` lacked `claim`, so
 the agents refused to edit unclaimed files (`--disable shell_snapshot`).
 
+### Codex with hooks (2026-10-02)
+
+Same scenarios with `--hooks` and the bare task prompt; `{codex_hooks}`
+defined FeanorFS's claiming guard and `agent done` Stop hook for each Codex
+session and trusted exactly those two (Codex's trust hash, checked against
+the 10 hashes Codex had recorded for the machine's own hooks; no user config
+read or written, personal hooks untrusted):
+
+| Scenario | Mode | Shell commands | Coordinator decisions | Conflicts | Lost edits | Total tokens | vs worktrees |
+|---|---|---|---|---|---|---|---|
+| overlap | feanorfs, hooks | 7 | 2 | 0 | 0 | 192k | 1.02× |
+| overlap | worktrees | 7 | — | 1 | 1 | 189k | 1× |
+| disjoint | feanorfs, hooks | 8 | 2 | 0 | 0 | 192k | 1.02× |
+| disjoint | worktrees | 7 | — | 0 | 0 | 189k | 1× |
+
+With hooks, Codex agents spend no commands on coordination, matching Claude
+Code's hooks result.
+
 ### Guard hook in real Claude Code
 
 A scratch workspace with `linux`'s accepted scope `src/**` and `feanorfs
