@@ -855,19 +855,52 @@ async fn two_active_agents_resume_after_resolution_and_continue_work() {
     })
     .await;
     if resumed.is_err() {
+        let short = |id: &str| id[..8].to_string();
+        eprintln!(
+            "resolution={} after {:?}",
+            short(&resolution_head),
+            resumed_at.elapsed()
+        );
         let mut id = server.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
-        for _ in 0..5 {
+        for _ in 0..8 {
             let snapshot = engine.load_snapshot(&id).await.unwrap();
+            let seed = engine
+                .load_files(&id)
+                .await
+                .unwrap()
+                .get("seed.txt")
+                .cloned();
             eprintln!(
-                "head={id} author={} message={:?} seed={:?}",
+                "head={} parents={:?} author={} message={:?} seed={:?}",
+                short(&id),
+                snapshot
+                    .parents
+                    .iter()
+                    .map(|p| short(p))
+                    .collect::<Vec<_>>(),
                 snapshot.author,
                 snapshot.message,
-                engine.load_files(&id).await.unwrap().get("seed.txt")
+                seed.map(|file| (short(&file.hash), file.size)),
             );
             let Some(parent) = snapshot.parents.first() else {
                 break;
             };
             id = parent.clone();
+        }
+        for (client, name, tree) in [(&a, "journey-a", &tree_a), (&b, "journey-b", &tree_b)] {
+            let status =
+                feanorfs_agent_core::read_continuous_status(client.workspace.path(), name).unwrap();
+            eprintln!(
+                "{name}: worktree seed={:?} status={:?}",
+                std::fs::read_to_string(tree.join("seed.txt")).ok(),
+                status.map(|s| (
+                    s.phase,
+                    s.attention,
+                    s.pending_local,
+                    s.observed_head.map(|h| short(&h)),
+                    s.settled_snapshot.map(|h| short(&h)),
+                )),
+            );
         }
     }
     resumed.unwrap();
@@ -1549,4 +1582,88 @@ async fn events_loop_wakes_on_signals_and_projects_reconcile_events() {
     assert!(!leaked, "events must never carry message bodies");
     let _ = events.kill().await;
     drop(lock);
+}
+
+async fn land_test_agent(
+    client: &TestClient,
+    server: &TestServer,
+    name: &str,
+) -> feanorfs_common::AgentLandResult {
+    let config = load_config(client.workspace.path()).unwrap();
+    feanorfs_client::land_agent(
+        client.workspace.path(),
+        &client.db,
+        &server.api,
+        &config.workspace_id,
+        name,
+        config.encryption_password.as_deref(),
+        false,
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+/// Regression (CI, 2026-10-02): a no-op land made a head that still carried
+/// an unresolved shared conflict the agent's base. Against that base the
+/// agent's own published leg read as a fresh edit, so after the conflict was
+/// resolved refresh kept the leg and the next land published it over the
+/// resolution.
+#[tokio::test]
+async fn a_no_op_land_never_adopts_an_unresolved_conflict_as_the_agent_base() {
+    let server = spawn_test_server().await;
+    let a = spawn_test_client_with_server(&server).await;
+    let b = spawn_test_client_with_server(&server).await;
+    require_format_v3(a.workspace.path());
+    require_format_v3(b.workspace.path());
+    seed_and_push(&server, &a).await;
+    spawn_test_agent(&a, &server, "edit-a").await;
+    spawn_test_agent(&b, &server, "edit-b").await;
+    let tree_a = agent_worktree(&a, "edit-a");
+    let tree_b = agent_worktree(&b, "edit-b");
+
+    std::fs::write(tree_b.join("seed.txt"), b"version-b").unwrap();
+    assert!(land_test_agent(&b, &server, "edit-b")
+        .await
+        .conflicts
+        .is_empty());
+    std::fs::write(tree_a.join("seed.txt"), b"version-a").unwrap();
+    assert_eq!(
+        land_test_agent(&a, &server, "edit-a").await.conflicts.len(),
+        1
+    );
+    // Nothing new to publish while the shared head is conflicted.
+    land_test_agent(&b, &server, "edit-b").await;
+
+    let replacement = a.workspace.path().join("..").join("replacement");
+    std::fs::write(&replacement, b"resolved").unwrap();
+    let ctx = agent_ctx(&a, &server).await;
+    feanorfs_agent_core::resolve_conflict(
+        &ctx,
+        "seed.txt",
+        feanorfs_agent_core::ResolveKeep::File,
+        Some(&replacement),
+    )
+    .await
+    .unwrap();
+
+    let config = load_config(b.workspace.path()).unwrap();
+    feanorfs_client::refresh_agent(
+        b.workspace.path(),
+        &b.db,
+        &server.api,
+        &config.workspace_id,
+        "edit-b",
+        config.encryption_password.as_deref(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(tree_b.join("seed.txt")).unwrap(), b"resolved");
+    land_test_agent(&b, &server, "edit-b").await;
+    let head = server.api.get_head(WORKSPACE_ID).await.unwrap().unwrap();
+    let engine = SnapshotEngine::new(&ctx);
+    assert_eq!(
+        engine.load_files(&head).await.unwrap()["seed.txt"].size,
+        b"resolved".len() as u64
+    );
 }

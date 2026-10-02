@@ -207,51 +207,61 @@ pub(super) async fn land_agent_with_ctx(
     if clean_after {
         clean_agent_with_runner_guard(ctx.base, name, runner_guard).await?;
     } else {
-        let base_snapshot = if diff.their_changes.is_empty() && diff.conflicts.is_empty() {
-            // The committed head exactly describes the agent worktree's new
-            // agreed view, so retain the ordinary fast path.
-            snapshot_id.clone()
-        } else {
-            // The shared head may include disjoint remote paths that are not
-            // in this agent worktree yet. Advancing the agent base straight
-            // to that head would make those absent paths look like agent-local
-            // deletions on the next pass. Record a local-only working-copy
-            // base instead: old base plus the agent changes committed to the
-            // head. Those paths already describe the agent worktree even when
-            // shared-folder materialization was safely diverted. Ordinary
-            // refresh can then see and materialize every still-inbound remote
-            // path.
-            let mut base_state = snapshots.load_state(&agent_base).await?;
-            for change in &diff.our_changes {
-                if change.deleted {
-                    base_state.files.remove(&change.path);
-                } else {
-                    base_state.files.insert(change.path.clone(), change.clone());
-                }
-            }
-            // The local conflict leg was published too. Remember exactly
-            // those bytes so a later explicit resolution is an inbound
-            // change, while edits made after this land remain local edits.
-            for (conflict, _) in &diff.conflicts {
-                match conflict.ours.as_ref().filter(|file| !file.deleted) {
-                    Some(file) => {
-                        base_state.files.insert(conflict.path.clone(), file.clone());
-                    }
-                    None => {
-                        base_state.files.remove(&conflict.path);
+        // A committed head that still carries unresolved shared conflicts is
+        // not an agreed view. Against it, the agent's own published leg reads
+        // as a fresh edit once the conflict is resolved, and the next land
+        // would publish that leg over the resolution.
+        let shared_conflicts = !snapshots
+            .load_state(&snapshot_id)
+            .await?
+            .conflicts
+            .is_empty();
+        let base_snapshot =
+            if diff.their_changes.is_empty() && diff.conflicts.is_empty() && !shared_conflicts {
+                // The committed head exactly describes the agent worktree's new
+                // agreed view, so retain the ordinary fast path.
+                snapshot_id.clone()
+            } else {
+                // The shared head may include disjoint remote paths that are not
+                // in this agent worktree yet. Advancing the agent base straight
+                // to that head would make those absent paths look like agent-local
+                // deletions on the next pass. Record a local-only working-copy
+                // base instead: old base plus the agent changes committed to the
+                // head. Those paths already describe the agent worktree even when
+                // shared-folder materialization was safely diverted. Ordinary
+                // refresh can then see and materialize every still-inbound remote
+                // path.
+                let mut base_state = snapshots.load_state(&agent_base).await?;
+                for change in &diff.our_changes {
+                    if change.deleted {
+                        base_state.files.remove(&change.path);
+                    } else {
+                        base_state.files.insert(change.path.clone(), change.clone());
                     }
                 }
-            }
-            snapshots
-                .write_local(crate::snapshot::SnapshotInput {
-                    files: &base_state.files,
-                    conflicts: &base_state.conflicts,
-                    parents: vec![agent_base.clone()],
-                    author: name,
-                    message: Some("post-land working-copy base".to_string()),
-                })
-                .await?
-        };
+                // The local conflict leg was published too. Remember exactly
+                // those bytes so a later explicit resolution is an inbound
+                // change, while edits made after this land remain local edits.
+                for (conflict, _) in &diff.conflicts {
+                    match conflict.ours.as_ref().filter(|file| !file.deleted) {
+                        Some(file) => {
+                            base_state.files.insert(conflict.path.clone(), file.clone());
+                        }
+                        None => {
+                            base_state.files.remove(&conflict.path);
+                        }
+                    }
+                }
+                snapshots
+                    .write_local(crate::snapshot::SnapshotInput {
+                        files: &base_state.files,
+                        conflicts: &base_state.conflicts,
+                        parents: vec![agent_base.clone()],
+                        author: name,
+                        message: Some("post-land working-copy base".to_string()),
+                    })
+                    .await?
+            };
         snapshots.write_agent_base(name, &base_snapshot).await?;
     }
     let message = if landed.is_empty() && conflicts.is_empty() {
