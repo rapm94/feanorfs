@@ -13,13 +13,13 @@ async fn recover_case(hydrated: bool, replaced: bool) {
         .unwrap();
     let api = ApiClient::local(hub, None);
     let db = ClientDb::new(state.path()).await.unwrap();
-    let password = "recovery-test-key";
+    let password = feanorfs_common::generate_password().unwrap();
     let ctx = SyncCtx::new(
         &api,
         &db,
         workspace.path(),
         "recovery-test",
-        Some(password),
+        Some(&password),
         LegacyPolicy::Reject,
     );
     let stage = workspace
@@ -51,7 +51,7 @@ async fn recover_case(hydrated: bool, replaced: bool) {
         downloads: vec![JournalDownload {
             file: FileState {
                 path: "file.txt".into(),
-                hash: hash_bytes(&pack_bytes(bytes, password, "file.txt").unwrap()),
+                hash: hash_bytes(&pack_bytes(bytes, &password, "file.txt").unwrap()),
                 size: bytes.len() as u64,
                 mtime: 0,
                 deleted: false,

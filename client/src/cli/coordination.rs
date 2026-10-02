@@ -402,11 +402,7 @@ pub async fn run_done(current_dir: &Path, args: DoneArgs, json: bool) -> anyhow:
         Ok(done) if json => output_json(&done),
         Ok(done) => {
             if !args.hook || !done.completed.is_empty() {
-                println!(
-                    "Completed {} task(s) for '{}'.",
-                    done.completed.len(),
-                    done.agent
-                );
+                println!("Completed {} task(s) for '{agent}'.", done.completed.len());
             }
             Ok(())
         }
