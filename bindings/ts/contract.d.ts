@@ -420,6 +420,35 @@ export interface CapabilityRoster {
   projection_incomplete: boolean
 }
 
+export interface ClaimInput {
+  agent?: string | null
+  /** Canonical paths or `dir/**` globs. */
+  paths: string[]
+  coordinator?: string | null
+  wait_seconds?: number | null
+}
+export interface ClaimResult {
+  agent: string
+  outcome: 'covered' | 'accepted' | 'pending' | 'rejected'
+  task_id?: string
+  intent_message_id?: string
+  paths: string[]
+  reason?: string
+}
+export interface DoneInput {
+  agent?: string | null
+  summary?: string | null
+  verification_status?: 'passed' | 'failed' | 'skipped' | null
+  wait_seconds?: number | null
+}
+export interface DoneResult {
+  agent: string
+  completed: string[]
+  inspected_snapshot?: string
+}
+
+export declare function claim(root: string, input: ClaimInput): Promise<ClaimResult>
+export declare function done(root: string, input?: DoneInput): Promise<DoneResult>
 export declare function capabilities(root: string, input?: CapabilitiesInput): Promise<CapabilityRoster>
 export declare function coordinationStatus(root: string, agent?: string | null): Promise<CoordinationStatus>
 export declare function guard(root: string, input: GuardInput): Promise<GuardResult>

@@ -34,6 +34,12 @@ pub struct IntegrateCli {
     /// blocked before they happen (Claude only; opt-in).
     #[arg(long, global = true)]
     guard_hook: bool,
+
+    /// Like `--guard-hook`, but the hook also claims scope before each new
+    /// path and a Stop hook finishes the work, so agents spend no turns on
+    /// coordination. Needs a coordinator (`feanorfs agent coordinate`).
+    #[arg(long, global = true)]
+    auto_claim: bool,
 }
 
 #[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
@@ -506,10 +512,11 @@ pub(super) async fn run(_current_dir: &Path, cli: IntegrateCli, json: bool) -> R
                 let installed = install_host_integration(&paths, &exe_path, cli.force)
                     .await
                     .and_then(|done| {
-                        if cli.guard_hook && matches!(host, HostKind::Claude) {
+                        if (cli.guard_hook || cli.auto_claim) && matches!(host, HostKind::Claude) {
                             install_guard_hook(
                                 &claude_settings_path(&env, cli.project.as_deref()),
                                 &exe_path,
+                                cli.auto_claim,
                             )?;
                             report.installed.push("claude: Guard hook=true".to_string());
                         }
@@ -860,6 +867,12 @@ pub(super) async fn install_detected_hosts_quiet() -> Result<()> {
 /// Tools whose writes the guard hook checks.
 const GUARD_HOOK_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
 const GUARD_HOOK_ARGS: &str = "agent guard --hook";
+const CLAIM_HOOK_ARGS: &str = "agent guard --hook --claim";
+const DONE_HOOK_ARGS: &str = "agent done --hook";
+/// Seconds Claude Code allows a claiming or finishing hook; their own waits
+/// stay below it (claims 240 s).
+const COORDINATION_HOOK_TIMEOUT_SECONDS: u64 = 300;
+const HOOK_EVENTS: [&str; 2] = ["PreToolUse", "Stop"];
 
 /// Claude Code settings file for the scope (`.claude/settings.json`).
 fn claude_settings_path(env: &EnvironmentContext, project: Option<&Path>) -> PathBuf {
@@ -869,18 +882,19 @@ fn claude_settings_path(env: &EnvironmentContext, project: Option<&Path>) -> Pat
         .join("settings.json")
 }
 
-fn guard_hook_command(exe_path: &Path) -> Result<String> {
+fn hook_command(exe_path: &Path, args: &str) -> Result<String> {
     let exe = exe_path
         .to_str()
         .with_context(|| format!("executable path is not valid UTF-8: {}", exe_path.display()))?;
     Ok(if exe.contains(char::is_whitespace) {
-        format!("\"{exe}\" {GUARD_HOOK_ARGS}")
+        format!("\"{exe}\" {args}")
     } else {
-        format!("{exe} {GUARD_HOOK_ARGS}")
+        format!("{exe} {args}")
     })
 }
 
-fn is_guard_hook(entry: &serde_json::Value) -> bool {
+/// Whether a hook entry is one FeanorFS installed (guard or done).
+fn is_feanorfs_hook(entry: &serde_json::Value) -> bool {
     entry
         .get("hooks")
         .and_then(|hooks| hooks.as_array())
@@ -889,7 +903,9 @@ fn is_guard_hook(entry: &serde_json::Value) -> bool {
                 hook.get("command")
                     .and_then(|command| command.as_str())
                     .is_some_and(|command| {
-                        command.ends_with(GUARD_HOOK_ARGS) && command.contains("feanorfs")
+                        command.contains("feanorfs")
+                            && (command.contains(GUARD_HOOK_ARGS)
+                                || command.contains(DONE_HOOK_ARGS))
                     })
             })
         })
@@ -909,29 +925,54 @@ fn read_settings(path: &Path) -> Result<serde_json::Map<String, serde_json::Valu
     }
 }
 
-/// Adds the guard PreToolUse hook once, preserving every other setting.
-fn install_guard_hook(settings_path: &Path, exe_path: &Path) -> Result<bool> {
-    let mut root = read_settings(settings_path)?;
-    let hooks = root
-        .entry("hooks")
+fn hook_array<'a>(
+    root: &'a mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    settings_path: &Path,
+) -> Result<&'a mut Vec<serde_json::Value>> {
+    root.entry("hooks")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .with_context(|| format!("'hooks' in {} is not an object", settings_path.display()))?;
-    let pre = hooks
-        .entry("PreToolUse")
+        .with_context(|| format!("'hooks' in {} is not an object", settings_path.display()))?
+        .entry(event)
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .with_context(|| {
             format!(
-                "'hooks.PreToolUse' in {} is not an array",
+                "'hooks.{event}' in {} is not an array",
                 settings_path.display()
             )
-        })?;
-    pre.retain(|entry| !is_guard_hook(entry));
-    pre.push(serde_json::json!({
-        "matcher": GUARD_HOOK_MATCHER,
-        "hooks": [{ "type": "command", "command": guard_hook_command(exe_path)? }]
-    }));
+        })
+}
+
+/// Installs the guard PreToolUse hook (with `auto_claim`, a claiming guard
+/// plus a Stop hook that finishes the agent's work), replacing earlier
+/// FeanorFS hooks and preserving every other setting.
+fn install_guard_hook(settings_path: &Path, exe_path: &Path, auto_claim: bool) -> Result<bool> {
+    let mut root = read_settings(settings_path)?;
+    for event in HOOK_EVENTS {
+        hook_array(&mut root, event, settings_path)?.retain(|entry| !is_feanorfs_hook(entry));
+    }
+    let guard = if auto_claim {
+        serde_json::json!({
+            "type": "command",
+            "command": hook_command(exe_path, CLAIM_HOOK_ARGS)?,
+            "timeout": COORDINATION_HOOK_TIMEOUT_SECONDS
+        })
+    } else {
+        serde_json::json!({ "type": "command", "command": hook_command(exe_path, GUARD_HOOK_ARGS)? })
+    };
+    hook_array(&mut root, "PreToolUse", settings_path)?
+        .push(serde_json::json!({ "matcher": GUARD_HOOK_MATCHER, "hooks": [guard] }));
+    if auto_claim {
+        hook_array(&mut root, "Stop", settings_path)?.push(serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": hook_command(exe_path, DONE_HOOK_ARGS)?,
+                "timeout": COORDINATION_HOOK_TIMEOUT_SECONDS
+            }]
+        }));
+    }
     atomic_write_file(
         settings_path,
         serde_json::to_string_pretty(&root)?.as_bytes(),
@@ -939,29 +980,32 @@ fn install_guard_hook(settings_path: &Path, exe_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Removes only FeanorFS guard hook entries.
+/// Removes only FeanorFS guard and done hook entries.
 fn remove_guard_hook(settings_path: &Path) -> Result<bool> {
     if !settings_path.exists() {
         return Ok(false);
     }
     let mut root = read_settings(settings_path)?;
-    let Some(pre) = root
-        .get_mut("hooks")
-        .and_then(|hooks| hooks.get_mut("PreToolUse"))
-        .and_then(|pre| pre.as_array_mut())
-    else {
-        return Ok(false);
-    };
-    let before = pre.len();
-    pre.retain(|entry| !is_guard_hook(entry));
-    if pre.len() == before {
-        return Ok(false);
+    let mut changed = false;
+    for event in HOOK_EVENTS {
+        let Some(entries) = root
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut(event))
+            .and_then(|entries| entries.as_array_mut())
+        else {
+            continue;
+        };
+        let before = entries.len();
+        entries.retain(|entry| !is_feanorfs_hook(entry));
+        changed |= entries.len() != before;
     }
-    atomic_write_file(
-        settings_path,
-        serde_json::to_string_pretty(&root)?.as_bytes(),
-    )?;
-    Ok(true)
+    if changed {
+        atomic_write_file(
+            settings_path,
+            serde_json::to_string_pretty(&root)?.as_bytes(),
+        )?;
+    }
+    Ok(changed)
 }
 
 fn is_feanorfs_command(command: &str) -> bool {
@@ -1307,10 +1351,12 @@ mod tests {
         )
         .unwrap();
         let exe = Path::new("/opt/feanorfs/bin/feanorfs");
-        assert!(install_guard_hook(&settings, exe).unwrap());
-        assert!(install_guard_hook(&settings, exe).unwrap());
-        let value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap()
+        };
+        assert!(install_guard_hook(&settings, exe, false).unwrap());
+        assert!(install_guard_hook(&settings, exe, false).unwrap());
+        let value = read();
         assert_eq!(value["model"], "opus");
         let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2);
@@ -1319,13 +1365,30 @@ mod tests {
             pre[1]["hooks"][0]["command"],
             "/opt/feanorfs/bin/feanorfs agent guard --hook"
         );
+        assert!(value["hooks"]["Stop"].as_array().unwrap().is_empty());
+
+        // Upgrading to auto-claim replaces the guard and adds the Stop hook.
+        assert!(install_guard_hook(&settings, exe, true).unwrap());
+        let value = read();
+        let pre = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(
+            pre[1]["hooks"][0]["command"],
+            "/opt/feanorfs/bin/feanorfs agent guard --hook --claim"
+        );
+        assert_eq!(pre[1]["hooks"][0]["timeout"], 300);
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/opt/feanorfs/bin/feanorfs agent done --hook"
+        );
+
         assert!(remove_guard_hook(&settings).unwrap());
         assert!(!remove_guard_hook(&settings).unwrap());
-        let value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let value = read();
         assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert!(value["hooks"]["Stop"].as_array().unwrap().is_empty());
         assert_eq!(
-            guard_hook_command(Path::new("/Program Files/feanorfs")).unwrap(),
+            hook_command(Path::new("/Program Files/feanorfs"), GUARD_HOOK_ARGS).unwrap(),
             "\"/Program Files/feanorfs\" agent guard --hook"
         );
     }

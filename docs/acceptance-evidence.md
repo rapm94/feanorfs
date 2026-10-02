@@ -89,6 +89,28 @@ ready), and settle actions now carry the agent's settled snapshot. Running
 eval agents with personal hooks enabled let a command-rewriting hook break
 their shell calls; the harness documents the isolation flags.
 
+### Coordination overhead after the one-call protocol (2026-10-02)
+
+Turn-level traces (`--output-format stream-json`) showed cost tracks turns:
+each turn re-sends about 35–40k cached context tokens, and 8–9 of an
+agent's 11–17 tool calls were protocol bookkeeping (`next`, `propose`,
+`guard`, `settle`, `complete`). After `agent claim`/`agent done`, the
+automatic coordinator (`agent coordinate`), and the Claude Code hooks
+(`--hooks`: claiming PreToolUse guard plus a Stop hook running `agent done`):
+
+| Scenario | Mode | Turns per agent | Coordinator decisions | Human interruptions | Conflicts | Lost edits | Cost | vs worktrees |
+|---|---|---|---|---|---|---|---|---|
+| overlap | feanorfs, hooks | 4–5 | 2 | 0 | 0 | 0 | $0.24 | 1.14× |
+| overlap | feanorfs, claim/done prompt | 9–10 | 2 | 0 | 0 | 0 | $0.37 | ~1.8× |
+| overlap | worktrees | — | — | 1 | 1 | 1 | $0.21 | 1× |
+| disjoint | feanorfs, hooks | 4–8 | 2 | 0 | 0 | 0 | $0.27 | 1.06× |
+| disjoint | worktrees | — | — | 0 | 0 | 0 | $0.25 | 1× |
+
+Before these changes the same scenarios cost $0.58 (overlap) and $1.16
+(disjoint) under FeanorFS. Wall time remains higher (about 65 s vs 21–35 s)
+because hooks wait for decisions and for edits to land; that is waiting, not
+tokens.
+
 ### Guard hook in real Claude Code
 
 A scratch workspace with `linux`'s accepted scope `src/**` and `feanorfs

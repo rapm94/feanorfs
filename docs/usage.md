@@ -828,6 +828,9 @@ feanorfs agent clean <NAME>
 feanorfs agent run <NAME> -- <COMMAND> [ARGS...]
 feanorfs agent send <TO> --kind <request|status|result|blocked> [--about <SNAPSHOT>] [--reply-to <MSG-ID>] [--from <NAME>] "<BODY>"
 feanorfs agent inbox [--for <NAME>] [--after <HEAD>] [--limit <N>]
+feanorfs agent claim <PATH>...               # claim scope and wait for the decision
+feanorfs agent done [--verification passed] [--summary <S>]
+feanorfs agent coordinate [--watch]          # auto-accept non-overlapping scope for human
 feanorfs agent next [--for <NAME>]           # what is in flight + the next command per actor
 feanorfs agent guard <PATH>... [--for <NAME>] [--require-scope] [--hook]
 ```
@@ -863,10 +866,19 @@ feanorfs agent capabilities            # who advertises what
 guess when several do; `feanorfs agent integrator assign --require ios-build`
 (no `--candidate`) chooses fairly among every capable agent instead.
 
-Claude Code can run the guard before every edit:
-`feanorfs integrate --host claude --guard-hook` adds a PreToolUse hook
-(`Edit|Write|MultiEdit|NotebookEdit`) to `.claude/settings.json`; `feanorfs
-integrate uninstall --host claude` removes only that entry.
+Agents coordinate in two calls: `feanorfs agent claim <path>…` before
+editing (it waits until the paths are theirs) and `feanorfs agent done
+--verification passed --summary '<s>'` afterwards (it waits for the edits to
+land, then settles and completes). Run `feanorfs agent coordinate --watch` on
+one machine to accept non-overlapping scope automatically for `human`;
+overlapping claims wait their turn, and nothing is rejected without you.
+
+Claude Code can run all of it for the agent:
+`feanorfs integrate --host claude --auto-claim` adds a claiming PreToolUse
+hook (`Edit|Write|MultiEdit|NotebookEdit`) and a Stop hook that finishes the
+work to `.claude/settings.json`, so agents spend no turns on coordination.
+`--guard-hook` installs only the deny-only guard. `feanorfs integrate
+uninstall --host claude` removes only FeanorFS's entries.
 
 **Isolation caveat:** data isolation only — see [threat-model.md](threat-model.md).
 

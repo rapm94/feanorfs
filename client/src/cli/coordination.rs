@@ -3,9 +3,13 @@
 
 use feanorfs_client::{agent_identity, coordination_status, guard_paths, load_config};
 use feanorfs_common::CapabilityRoster;
-use feanorfs_common::{CoordinationStatus, GuardResult, GuardVerdict, LifecycleStage};
+use feanorfs_common::{
+    ClaimOutcome, ClaimResult, CoordinationStatus, DoneResult, GuardFinding, GuardResult,
+    GuardVerdict, LifecycleStage, WorkVerificationStatus, COORDINATION_SCHEMA_VERSION,
+};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use super::agent::control_workspace_root;
 use super::util::{output_json, terminal_line};
@@ -174,6 +178,8 @@ pub struct GuardArgs {
     pub agent: Option<String>,
     pub require_scope: bool,
     pub hook: bool,
+    /// Claim unclaimed paths first, waiting up to this long for a decision.
+    pub claim: Option<Duration>,
 }
 
 /// Runs the guard. Exits with status 2 on `deny` so harness hooks block the
@@ -245,9 +251,176 @@ async fn guard(current_dir: &Path, args: GuardArgs) -> anyhow::Result<Option<Gua
     let api = crate::open_api_client(&root, &config).await?;
     let ctx = feanorfs_client::SyncCtx::from_config(&api, &db, &root, &config)?;
     let agent = agent_identity(args.agent.as_deref());
+    if let Some(wait) = args.claim {
+        let claim = feanorfs_client::claim_scope(&ctx, &agent, &paths, None, wait).await?;
+        if !matches!(
+            claim.outcome,
+            ClaimOutcome::Covered | ClaimOutcome::Accepted
+        ) {
+            let reason = format!(
+                "scope claim {}: {}",
+                claim_label(claim.outcome),
+                claim.reason.as_deref().unwrap_or("no decision")
+            );
+            return Ok(Some(GuardResult {
+                schema_version: COORDINATION_SCHEMA_VERSION,
+                agent,
+                verdict: GuardVerdict::Deny,
+                findings: paths
+                    .iter()
+                    .map(|path| GuardFinding {
+                        path: path.clone(),
+                        verdict: GuardVerdict::Deny,
+                        reason: reason.clone(),
+                    })
+                    .collect(),
+            }));
+        }
+    }
     Ok(Some(
         guard_paths(&ctx, &agent, &paths, args.require_scope).await?,
     ))
+}
+
+fn claim_label(outcome: ClaimOutcome) -> &'static str {
+    match outcome {
+        ClaimOutcome::Covered => "already held",
+        ClaimOutcome::Accepted => "accepted",
+        ClaimOutcome::Pending => "still pending",
+        ClaimOutcome::Rejected => "rejected",
+    }
+}
+
+/// `agent claim`: one call to propose scope and wait for the decision.
+/// Exits 0 when held or accepted, 3 when still pending, 1 when rejected.
+pub async fn run_claim(
+    current_dir: &Path,
+    agent: Option<&str>,
+    paths: Vec<String>,
+    coordinator: Option<&str>,
+    wait: Duration,
+    json: bool,
+) -> anyhow::Result<()> {
+    let agent = agent_identity(agent);
+    let roots = guard_roots(&control_workspace_root(current_dir)?);
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|raw| {
+            if raw.ends_with("/**") {
+                Some(raw.clone())
+            } else {
+                workspace_relative(&roots, current_dir, raw)
+            }
+        })
+        .collect::<Option<_>>()
+        .ok_or_else(|| anyhow::anyhow!("every path must be inside the workspace"))?;
+    let claim: ClaimResult = with_ctx(current_dir, async |ctx| {
+        feanorfs_client::claim_scope(ctx, &agent, &paths, coordinator, wait).await
+    })
+    .await?;
+    if json {
+        output_json(&claim)?;
+    } else {
+        let detail = claim
+            .reason
+            .as_deref()
+            .map(|reason| format!(" ({})", terminal_line(reason)))
+            .unwrap_or_default();
+        println!(
+            "Claim {}: {}{detail}",
+            claim_label(claim.outcome),
+            terminal_line(&claim.paths.join(", "))
+        );
+    }
+    match claim.outcome {
+        ClaimOutcome::Covered | ClaimOutcome::Accepted => Ok(()),
+        ClaimOutcome::Pending => std::process::exit(3),
+        ClaimOutcome::Rejected => std::process::exit(1),
+    }
+}
+
+pub struct DoneArgs {
+    pub agent: Option<String>,
+    pub summary: Option<String>,
+    pub verification: Option<WorkVerificationStatus>,
+    pub wait: Duration,
+    pub hook: bool,
+}
+
+/// `agent done`: one call to wait for edits to land, then settle and
+/// complete. As a Stop hook (`--hook`), a failure blocks stopping once so
+/// the agent can fix it, and never loops (`stop_hook_active`).
+pub async fn run_done(current_dir: &Path, args: DoneArgs, json: bool) -> anyhow::Result<()> {
+    let retrying =
+        args.hook && hook_payload()?.get("stop_hook_active") == Some(&serde_json::json!(true));
+    let root = control_workspace_root(current_dir)?;
+    if args.hook && !feanorfs_agent_core::workspace_has_preferred_state(&root) {
+        return Ok(());
+    }
+    let agent = agent_identity(args.agent.as_deref());
+    let outcome: anyhow::Result<DoneResult> = with_ctx(current_dir, async |ctx| {
+        feanorfs_client::finish_work(
+            ctx,
+            &agent,
+            args.summary.as_deref(),
+            args.verification,
+            args.wait,
+        )
+        .await
+    })
+    .await;
+    match outcome {
+        Ok(done) if json => output_json(&done),
+        Ok(done) => {
+            if !args.hook || !done.completed.is_empty() {
+                println!(
+                    "Completed {} task(s) for '{}'.",
+                    done.completed.len(),
+                    done.agent
+                );
+            }
+            Ok(())
+        }
+        Err(error) if args.hook && !retrying => {
+            eprintln!("FeanorFS: work not finished: {error:#}");
+            std::process::exit(HOOK_BLOCK_EXIT);
+        }
+        Err(error) if args.hook => {
+            eprintln!("FeanorFS: work not finished: {error:#}");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `agent coordinate`: accept proposals addressed to `coordinator` whose
+/// scope overlaps no other agent's live scope; with `watch`, keep going.
+pub async fn run_coordinate(
+    current_dir: &Path,
+    coordinator: Option<&str>,
+    watch: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let coordinator = coordinator.unwrap_or("human").to_string();
+    loop {
+        let pass = with_ctx(current_dir, async |ctx| {
+            feanorfs_client::coordinate_pass(ctx, &coordinator).await
+        })
+        .await?;
+        if json {
+            output_json(&pass)?;
+        } else if !pass.accepted.is_empty() || !watch {
+            println!(
+                "Accepted {} proposal(s); {} waiting on overlapping scope.",
+                pass.accepted.len(),
+                pass.waiting.len()
+            );
+        }
+        if !watch {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// The agent worktree (inside `agent run`) first, then the shared root.
@@ -266,6 +439,10 @@ fn guard_roots(control_root: &Path) -> Vec<PathBuf> {
 /// Paths named by a harness PreToolUse payload (`tool_input.file_path`,
 /// `path`, or `notebook_path`), resolved against the payload `cwd`.
 fn hook_paths() -> anyhow::Result<Vec<String>> {
+    Ok(paths_from_hook_payload(&read_hook_input()?))
+}
+
+fn read_hook_input() -> anyhow::Result<String> {
     let mut input = String::new();
     std::io::stdin()
         .take(HOOK_INPUT_MAX_BYTES + 1)
@@ -274,7 +451,12 @@ fn hook_paths() -> anyhow::Result<Vec<String>> {
         input.len() as u64 <= HOOK_INPUT_MAX_BYTES,
         "hook payload exceeds 1 MiB"
     );
-    Ok(paths_from_hook_payload(&input))
+    Ok(input)
+}
+
+/// The harness hook payload as JSON (`null` when unparseable).
+fn hook_payload() -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::from_str(&read_hook_input()?).unwrap_or(serde_json::Value::Null))
 }
 
 fn paths_from_hook_payload(input: &str) -> Vec<String> {

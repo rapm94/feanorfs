@@ -27,6 +27,12 @@ export declare function agentStatus(root: string, name: string): Promise<string>
 export declare function capabilities(root: string, inputJson: string): Promise<string>
 
 /**
+ * Claim scope in one call (propose and wait for the decision).
+ * JSON in: `ClaimInput`; JSON out: `ClaimResult`.
+ */
+export declare function claim(root: string, inputJson: string): Promise<string>
+
+/**
  * Materialize the encrypted conflict triple for a snapshot.
  * JSON in: object with `about_snapshot` and exactly one of non-empty `paths` or `all: true`;
  * JSON out: `ConflictMaterializeResult`.
@@ -46,6 +52,12 @@ export declare function coordinationStatus(root: string, agent?: string | undefi
  * Evaluate whether an agent may write workspace paths now.
  * JSON in: `GuardInput`; JSON out: `GuardResult`.
  */
+/**
+ * Finish in one call (wait for edits to land, settle, complete).
+ * JSON in: `DoneInput`; JSON out: `DoneResult`.
+ */
+export declare function done(root: string, inputJson: string): Promise<string>
+
 export declare function guard(root: string, inputJson: string): Promise<string>
 
 export declare function historyLog(root: string, limit?: number | undefined | null): Promise<string>

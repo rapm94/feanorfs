@@ -51,10 +51,11 @@ pub use agent_contract::{
 };
 pub use coordination_contract::{
     encode_capability_announcement, parse_capability_announcement, CapabilitiesInput,
-    CapabilityRoster, CoordinationStatus, GuardFinding, GuardInput, GuardResult, GuardVerdict,
-    IntegratorOffer, IntegratorReplyInput, IntegratorReplyKind, IntegratorReplyResult,
-    LifecycleItem, LifecycleKind, LifecycleStage, NextAction, RosterEntry,
-    CAPABILITY_RECIPIENT_PREFIX, COORDINATION_SCHEMA_VERSION,
+    CapabilityRoster, ClaimInput, ClaimOutcome, ClaimResult, CoordinatePass, CoordinationStatus,
+    DoneInput, DoneResult, GuardFinding, GuardInput, GuardResult, GuardVerdict, IntegratorOffer,
+    IntegratorReplyInput, IntegratorReplyKind, IntegratorReplyResult, LifecycleItem, LifecycleKind,
+    LifecycleStage, NextAction, RosterEntry, CAPABILITY_RECIPIENT_PREFIX,
+    COORDINATION_SCHEMA_VERSION,
 };
 pub use invite::{
     decode_hub_invite, decode_invite, encode_hub_invite, encode_invite, hub_ca_fingerprint,

@@ -140,6 +140,53 @@ pub enum AgentAction {
         #[arg(long = "set", value_name = "CAPABILITY")]
         set: Vec<String>,
     },
+    /// Claim scope in one call: propose the paths and wait for the
+    /// coordinator's decision. Exits 0 when held or accepted, 3 when still
+    /// pending, 1 when rejected.
+    Claim {
+        /// Workspace paths or `dir/**` globs you are about to edit.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Coordinator whose decision to wait for (default human).
+        #[arg(long)]
+        coordinator: Option<String>,
+        /// Seconds to wait for a decision (default 300, maximum 600).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
+    /// Finish in one call: wait for your edits to land, then settle and
+    /// complete every task you hold.
+    Done {
+        /// Agent identity; defaults to FEANORFS_AGENT or human.
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// One-line outcome.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Verification you actually ran: passed, failed, or skipped (default).
+        #[arg(long)]
+        verification: Option<String>,
+        /// Seconds to wait for edits to land (default 300, maximum 600).
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Run as a harness Stop hook (reads its JSON payload from stdin).
+        #[arg(long)]
+        hook: bool,
+    },
+    /// Act as an automatic coordinator: accept proposals addressed to you
+    /// whose scope overlaps no other agent's live scope; overlapping ones
+    /// wait until that scope finishes. Nothing is ever rejected.
+    Coordinate {
+        /// Coordinator identity to decide for (default human).
+        #[arg(long = "for")]
+        for_agent: Option<String>,
+        /// Keep coordinating until interrupted.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Check whether paths may be edited now (other agents' accepted scope,
     /// pending conflicts, superseded integrator attempts). Exits 2 on deny.
     Guard {
@@ -155,6 +202,13 @@ pub enum AgentAction {
         /// hooks); internal errors allow the edit.
         #[arg(long)]
         hook: bool,
+        /// Claim unclaimed paths first and wait for the decision, so agents
+        /// never run claim themselves.
+        #[arg(long)]
+        claim: bool,
+        /// Seconds a claim may wait (default 240; keep below the hook timeout).
+        #[arg(long, default_value_t = 240)]
+        claim_timeout: u64,
     },
     /// Random integrator assignment (dispatcher assign/status/revoke/resume
     /// and candidate reply).
@@ -208,6 +262,8 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
             for_agent,
             require_scope,
             hook,
+            claim,
+            claim_timeout,
         } => {
             super::coordination::run_guard(
                 current_dir,
@@ -216,10 +272,58 @@ pub async fn run(current_dir: &Path, action: AgentAction, json: bool) -> anyhow:
                     agent: for_agent,
                     require_scope,
                     hook,
+                    claim: claim.then(|| feanorfs_client::bounded_wait(Some(claim_timeout))),
                 },
                 json,
             )
             .await?
+        }
+        AgentAction::Claim {
+            paths,
+            for_agent,
+            coordinator,
+            timeout,
+        } => {
+            super::coordination::run_claim(
+                current_dir,
+                for_agent.as_deref(),
+                paths,
+                coordinator.as_deref(),
+                feanorfs_client::bounded_wait(Some(timeout)),
+                json,
+            )
+            .await?
+        }
+        AgentAction::Done {
+            for_agent,
+            summary,
+            verification,
+            timeout,
+            hook,
+        } => {
+            let verification = verification
+                .map(|value| {
+                    serde_json::from_value(serde_json::Value::String(value.clone())).map_err(|_| {
+                        anyhow::anyhow!("--verification must be passed, failed, or skipped")
+                    })
+                })
+                .transpose()?;
+            super::coordination::run_done(
+                current_dir,
+                super::coordination::DoneArgs {
+                    agent: for_agent,
+                    summary,
+                    verification,
+                    wait: feanorfs_client::bounded_wait(Some(timeout)),
+                    hook,
+                },
+                json,
+            )
+            .await?
+        }
+        AgentAction::Coordinate { for_agent, watch } => {
+            super::coordination::run_coordinate(current_dir, for_agent.as_deref(), watch, json)
+                .await?
         }
         AgentAction::Integrator { action } => {
             super::integrator::run(current_dir, action, json).await?
