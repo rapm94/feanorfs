@@ -702,11 +702,19 @@ fn check_mcp_registered(paths: &HostPaths) -> std::result::Result<bool, String> 
     }
 }
 
+/// Installed and identical to this binary's copy: a skill left by an older
+/// release still teaches the old protocol, so status asks to reinstall it.
 fn check_skill_installed(paths: &HostPaths) -> bool {
     let skill_root = paths.skill_dir.join("feanorfs-collaboration");
-    let skill_md = skill_root.join("SKILL.md");
-    let protocol_md = skill_root.join("references").join("protocol.md");
-    skill_md.exists() && protocol_md.exists()
+    let current = |path: PathBuf, expected: &str| {
+        std::fs::metadata(&path).is_ok_and(|meta| meta.len() == expected.len() as u64)
+            && std::fs::read(&path).is_ok_and(|bytes| bytes == expected.as_bytes())
+    };
+    current(skill_root.join("SKILL.md"), SKILL_MD)
+        && current(
+            skill_root.join("references").join("protocol.md"),
+            PROTOCOL_MD,
+        )
 }
 
 async fn install_host_integration(
@@ -1115,6 +1123,11 @@ mod tests {
             assert!(skill_done);
             assert!(check_skill_installed(&paths));
             assert!(check_mcp_registered(&paths).unwrap());
+
+            // A copy from an older release is not the installed skill.
+            let skill_md = paths.skill_dir.join("feanorfs-collaboration/SKILL.md");
+            std::fs::write(&skill_md, "older release\n").unwrap();
+            assert!(!check_skill_installed(&paths));
 
             let (mcp_second, skill_second) = install_host_integration(&paths, &fake_exe, false)
                 .await
