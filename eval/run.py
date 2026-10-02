@@ -17,6 +17,7 @@ substituted, shell-quoted). Results are one JSON object per mode.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -92,23 +93,66 @@ def agent_command(args, scenario_path, agent, plain=False, settings=None):
     prompt = (PLAIN_PROMPT if plain else PROMPT).format(
         name=agent["name"], machine=agent["machine"], task=agent["prompt"],
     )
+    codex_hooks = codex_hook_flags(args.bin) if settings else []
     return shlex.split(args.agent_cmd.format(
         prompt=shlex.quote(prompt), name=agent["name"], machine=agent["machine"],
         settings=shlex.quote(str(settings or HERE / "empty-settings.json")),
+        codex_hooks=" ".join(shlex.quote(flag) for flag in codex_hooks),
     ))
 
 
+# The protocol as harness hooks: a claiming guard before every write and
+# `agent done` when the agent stops. (event, Codex key label, matcher, args)
+HOOKS = (
+    ("PreToolUse", "pre_tool_use", "Edit|Write|MultiEdit|NotebookEdit", "agent guard --hook --claim"),
+    ("Stop", "stop", None, "agent done --hook"),
+)
+HOOK_TIMEOUT_SECONDS = 300
+
+
+def hook_command(binary, args):
+    return f"{shlex.quote(str(binary))} {args}"
+
+
 def write_hook_settings(path, binary):
-    """Claude Code settings that run the protocol for the agent: a claiming
-    guard before every write and `agent done` when it stops."""
-    def hook(args):
-        return {"type": "command", "command": f"{shlex.quote(str(binary))} {args}", "timeout": 300}
-    path.write_text(json.dumps({"hooks": {
-        "PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
-                        "hooks": [hook("agent guard --hook --claim")]}],
-        "Stop": [{"hooks": [hook("agent done --hook")]}],
-    }}), encoding="utf-8")
+    """Claude Code settings running the protocol hooks."""
+    hooks = {}
+    for event, _, matcher, args in HOOKS:
+        group = {"hooks": [{"type": "command", "command": hook_command(binary, args),
+                            "timeout": HOOK_TIMEOUT_SECONDS}]}
+        if matcher:
+            group["matcher"] = matcher
+        hooks[event] = [group]
+    path.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
     return path
+
+
+def codex_hook_flags(binary):
+    """Codex `-c` flags that define the protocol hooks for one session and
+    trust exactly them. Codex trusts a hook by the sha256 of its key-sorted
+    JSON identity (event label, non-empty matcher, normalized handler), keyed
+    `<source>:<event>:<group>:<handler>`; session-flag hooks use the source
+    `/<session-flags>/config.toml`. No user config is read or written, and
+    personal hooks stay untrusted under `--ignore-user-config`."""
+    flags, trusted = [], []
+    for event, label, matcher, args in HOOKS:
+        command = hook_command(binary, args)
+        handler = {"type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECONDS,
+                   "async": False}
+        identity = {"event_name": label, "hooks": [handler]}
+        handler_toml = (f'{{type="command",command={json.dumps(command)},'
+                        f'timeout={HOOK_TIMEOUT_SECONDS}}}')
+        if matcher:
+            identity["matcher"] = matcher
+            group_toml = f'{{matcher={json.dumps(matcher)},hooks=[{handler_toml}]}}'
+        else:
+            group_toml = f'{{hooks=[{handler_toml}]}}'
+        flags += ["-c", f"hooks.{event}=[{group_toml}]"]
+        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        digest = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+        key = f"/<session-flags>/config.toml:{label}:0:0"
+        trusted.append(f"{json.dumps(key)}={{trusted_hash={json.dumps(digest)}}}")
+    return flags + ["-c", f"hooks.state={{{','.join(trusted)}}}"]
 
 
 def cost_from(output):

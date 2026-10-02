@@ -61,18 +61,13 @@ path stays: removing it would make unmigrated v1 workspaces unreadable.
 
 ### AI-11. Prove the agent-first coordination surface in the field
 
-Local evidence (real Claude Code eval, guard hook, local fuzzing) is in
-`docs/acceptance-evidence.md` (AI-11).
+Evidence (real Claude Code and Codex evals with and without hooks, guard
+hook, CI fuzzing and scripted eval) is in `docs/acceptance-evidence.md`
+(AI-11).
 
 - [ ] Route a real request with `agent send cap:ios-build` from the Linux
   machine to the Mac and verify the Git baseline warning when the two clones
   sit on different commits.
-- [ ] Measure Codex in hooks mode on the founder machine:
-  `feanorfs integrate --host codex --auto-claim`, trust the hooks once in
-  Codex, then run the eval without `--ignore-user-config` (an isolated run
-  cannot trust them without also running personal hooks). Without hooks,
-  Codex takes 14–15 commands vs 6–8 for worktrees (input tokens 1.9–2.4×;
-  the revised skill cut 17 commands and ~10% of input).
 
 Done when each item has recorded evidence.
 
