@@ -67,9 +67,6 @@ Local evidence (real Claude Code eval, guard hook, local fuzzing) is in
 - [ ] Route a real request with `agent send cap:ios-build` from the Linux
   machine to the Mac and verify the Git baseline warning when the two clones
   sit on different commits.
-- [ ] Regenerate `bindings/ts/index.js` and `index.d.ts` with `npm run build`
-  (extended by hand for `coordinationStatus`, `guard`, `integratorReply`,
-  `capabilities`; the Node parity test passes and CI's `sdk` job rebuilds).
 - [ ] Re-measure Codex after the founder machine installs a release with
   `agent claim` and runs `feanorfs integrate` (refreshing the skill earlier
   would teach commands the installed binary lacks): with an older-release
