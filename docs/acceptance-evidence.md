@@ -116,6 +116,29 @@ $1.16 (disjoint) under FeanorFS. Wall time remains higher (about 65 s vs 21–35
 because hooks wait for decisions and for edits to land; that is waiting, not
 tokens.
 
+### Codex without hooks (2026-10-02)
+
+codex-cli 0.154.0 (`codex exec`, ChatGPT sign-in, so no price), workspace-write
+sandbox with loopback network, same claim-only prompt. Tokens count input
+plus output once; "weighted" prices cached input at 0.1× and output at 8×
+input.
+
+| Scenario | Mode | Shell commands | Coordinator decisions | Conflicts | Lost edits | Tokens (uncached / cached / out) | Weighted vs worktrees |
+|---|---|---|---|---|---|---|---|
+| overlap | feanorfs | 18 | 2 | 0 | 0 | 63k / 394k / 1.7k | 1.67× |
+| overlap | worktrees | 6 | — | 1 | 1 | 49k / 139k / 0.8k | 1× |
+| disjoint | feanorfs | 15 | 2 | 0 | 0 | 49k / 261k / 1.3k | 1.32× |
+| disjoint | worktrees | 7 | — | 0 | 0 | 43k / 146k / 0.9k | 1× |
+
+Coordination itself was one `agent claim` per agent (one agent re-ran it
+while waiting). The other extra commands came from the machine's global
+Codex instructions and an installed `feanorfs-collaboration` skill from an
+older release (18.9 KB), which sent agents to `agent inbox` and
+`agent status`; `feanorfs integrate status` now reports such copies as
+partially configured. The first attempt lost both edits safely: Codex's
+`shell_snapshot` replayed a `PATH` whose older `feanorfs` lacked `claim`, so
+the agents refused to edit unclaimed files (`--disable shell_snapshot`).
+
 ### Guard hook in real Claude Code
 
 A scratch workspace with `linux`'s accepted scope `src/**` and `feanorfs
