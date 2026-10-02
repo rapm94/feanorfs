@@ -86,6 +86,35 @@ pub async fn announce_quietly(
     .map(|_| ())
 }
 
+/// Finishes the agent's claimed work after `agent run`'s command exits
+/// cleanly with every edit settled, so harnesses without a Stop hook need no
+/// `agent done` turn. A failure only leaves the claim open.
+pub async fn finish_quietly(current_dir: &Path, agent: &str) {
+    let finished = with_ctx(current_dir, async |ctx| {
+        feanorfs_client::finish_work(
+            ctx,
+            agent,
+            Some("finished when `agent run` exited; no verification reported"),
+            None,
+            Duration::from_secs(30),
+        )
+        .await
+    })
+    .await;
+    match finished {
+        Ok(done) if !done.completed.is_empty() => {
+            eprintln!(
+                "Completed {} claimed task(s) for '{agent}'.",
+                done.completed.len()
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "FeanorFS: claimed work left open ({error:#}); run `feanorfs agent done --for {agent}`."
+        ),
+    }
+}
+
 fn render_roster(roster: &CapabilityRoster) -> String {
     let mut out = String::new();
     if let Some(id) = &roster.announced {

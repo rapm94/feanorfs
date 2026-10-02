@@ -42,8 +42,8 @@ with scripted agents (`agent-eval` job) and uploads the JSON report.
 `--agent-cmd` replaces the scripted agent with any harness; `{prompt}`,
 `{name}`, `{machine}`, and `{settings}` are substituted and shell-quoted. In
 `feanorfs` mode the prompt tells the agent to `agent claim` before editing
-and `agent done` when finished, and `feanorfs` on the agent's `PATH` is the
-binary under test. With `--hooks`, agents instead get the bare task and a
+(`agent run` finishes the claim when the agent exits), and `feanorfs` on the
+agent's `PATH` is the binary under test. With `--hooks`, agents instead get the bare task and a
 settings file (`{settings}`) whose PreToolUse hook claims before every write
 and whose Stop hook runs `agent done`, so they spend no turns on
 coordination. In `worktrees` mode the prompt is the bare task and

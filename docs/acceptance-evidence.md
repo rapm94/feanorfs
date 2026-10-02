@@ -101,13 +101,18 @@ automatic coordinator (`agent coordinate`), and the Claude Code hooks
 | Scenario | Mode | Turns per agent | Coordinator decisions | Human interruptions | Conflicts | Lost edits | Cost | vs worktrees |
 |---|---|---|---|---|---|---|---|---|
 | overlap | feanorfs, hooks | 4–5 | 2 | 0 | 0 | 0 | $0.24 | 1.14× |
-| overlap | feanorfs, claim/done prompt | 9–10 | 2 | 0 | 0 | 0 | $0.37 | ~1.8× |
+| overlap | feanorfs, claim prompt (no hooks) | 4 | 2 | 0 | 0 | 0 | $0.22 | 1.09× |
 | overlap | worktrees | — | — | 1 | 1 | 1 | $0.21 | 1× |
 | disjoint | feanorfs, hooks | 4–8 | 2 | 0 | 0 | 0 | $0.27 | 1.06× |
+| disjoint | feanorfs, claim prompt (no hooks) | 4–5 | 2 | 0 | 0 | 0 | $0.24 | 1.17× |
 | disjoint | worktrees | — | — | 0 | 0 | 0 | $0.25 | 1× |
 
-Before these changes the same scenarios cost $0.58 (overlap) and $1.16
-(disjoint) under FeanorFS. Wall time remains higher (about 65 s vs 21–35 s)
+Without hooks, agents first also called `agent done` and took 9–10 turns
+($0.37, ~1.8×); `agent run` now finishes the claim when the agent exits
+cleanly, so the prompt asks only for `agent claim`. Worktree baselines in the
+no-hooks runs: $0.20 (overlap, again 1 conflict and 1 lost edit) and $0.21
+(disjoint). Before these changes the same scenarios cost $0.58 (overlap) and
+$1.16 (disjoint) under FeanorFS. Wall time remains higher (about 65 s vs 21–35 s)
 because hooks wait for decisions and for edits to land; that is waiting, not
 tokens.
 
