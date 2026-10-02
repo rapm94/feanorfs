@@ -9,6 +9,10 @@ Agents on one or many machines share one encrypted work-in-progress
 workspace. Scope, routing, and authorship are advisory coordination, never
 access control. FeanorFS never merges file content.
 
+A typical task needs one command: `feanorfs agent claim <path>…`, then edit,
+test, and exit. Use the rest of this skill only when someone asks you for
+something or a command tells you to.
+
 ## The loop
 
 1. **Know who you are.** Use `FEANORFS_AGENT` (set by `agent run` and runner
@@ -18,11 +22,11 @@ access control. FeanorFS never merges file content.
    it waits until the paths are yours (exit 3 means still waiting: run it
    again later; exit 1 means rejected). If your harness installed the
    FeanorFS hooks, claiming and finishing happen automatically: just work.
-3. **Finish in one call.** When your edits are done and verified, run
+3. **Finish.** Under `agent run` (`FEANORFS_AGENT_DIR` is set), exiting
+   cleanly finishes your claim (verification `skipped`). Otherwise, or to
+   record checks you actually ran, finish in one call:
    `feanorfs agent done --verification passed --summary '<what you did>'`
    (use `failed` or `skipped` honestly). It waits for your edits to land.
-   Under `agent run`, exiting cleanly finishes for you (verification
-   `skipped`); call `done` yourself to report verification.
 4. **For anything else, ask.** `feanorfs agent next` (MCP: `status`) lists
    integrator offers, conflicts, resolution jobs, and decisions owed by each
    actor as ready `tool` + `args` calls; `--wait` blocks until something is
@@ -49,11 +53,11 @@ reconciled continuously:
 1. Never run `feanorfs sync`, `push`, `pull`, `agent land`, or
    `agent refresh` yourself; the live controller lands saved changes after
    each quiet burst and refreshes untouched paths.
-2. Report verification only against a settled snapshot: read
-   `feanorfs --json agent status <name>` and use `live.settled_snapshot` as
-   the `--about` of a `result`. Capture it before your checks and re-read it
-   after; if it changed, retest or reply `blocked`. Never claim a snapshot you
-   did not inspect.
+2. When you answer a request with a `result`, report verification only
+   against a settled snapshot: read `feanorfs --json agent status <name>` and
+   use `live.settled_snapshot` as the `--about`. Capture it before your checks
+   and re-read it after; if it changed, retest or reply `blocked`. Never claim
+   a snapshot you did not inspect.
 3. Stop on `needs_attention`, `cursor_reset`, or `ambiguous_execution` and
    wait for explicit resolution.
 4. On exit FeanorFS makes one bounded final attempt; offline work is kept.
