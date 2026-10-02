@@ -155,5 +155,9 @@ exits 0 and creates no workspace state (`client/tests/coordination_cli.rs`).
 executions from empty corpora, no crashes. The stable mutation smoke
 (`common/tests/parser_fuzz.rs`) runs in every `cargo test`.
 
+On GitHub runners (`workflow_dispatch` at `3edc9f5`, 2026-10-02): Security
+run 36999197690 fuzzed all four targets for 120 s each without a crash, and
+CI run 36999194960 passed `Multi-agent eval (scripted)`.
+
 Not covered here: capability routing and Git-baseline warnings between two
-physical machines, and the CI `fuzz`/`agent-eval` jobs on GitHub runners.
+physical machines.
