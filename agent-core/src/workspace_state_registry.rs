@@ -172,6 +172,13 @@ pub(crate) fn ensure_shared_state_lease(root: &Path, slot: &str) -> Result<()> {
     Ok(())
 }
 
+/// A child forked by any thread of this process holds copies of every
+/// descriptor until it execs, so a shared hold this process just released can
+/// linger for that instant. Exclusive acquisition retries contention for at
+/// most this window; a live holder in another process outlasts it.
+const EXCLUSIVE_LEASE_ATTEMPTS: u32 = 25;
+const EXCLUSIVE_LEASE_RETRY: Duration = Duration::from_millis(20);
+
 /// A successful exclusive workspace-state lease. The caller may move or delete
 /// the slot's bytes while this guard lives. Acquiring drops this process's own
 /// shared hold first (advisory locks cannot be upgraded), so any other live
@@ -204,7 +211,20 @@ impl ExclusiveStateLease {
                 return Err(error);
             }
         };
-        match FileExt::try_lock_exclusive(&file) {
+        let contended = fs2::lock_contended_error().raw_os_error();
+        let mut attempt = 1;
+        let locked = loop {
+            match FileExt::try_lock_exclusive(&file) {
+                Err(error)
+                    if error.raw_os_error() == contended && attempt < EXCLUSIVE_LEASE_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(EXCLUSIVE_LEASE_RETRY);
+                }
+                result => break result,
+            }
+        };
+        match locked {
             Ok(()) => Ok(Self {
                 file: Some(file),
                 root: root.to_path_buf(),
@@ -1326,6 +1346,23 @@ mod tests {
             .contains_key(&key));
         let contender = open_lease_file(&workspaces, "slot").unwrap();
         assert!(FileExt::try_lock_exclusive(&contender).is_err());
+    }
+
+    #[test]
+    fn exclusive_lease_outlasts_a_momentary_inherited_hold() {
+        let root = tempfile::tempdir().unwrap();
+        ensure_shared_state_lease(root.path(), "slot").unwrap();
+        // A child forked by another thread holds a copy of the shared lease
+        // until it execs; model that copy releasing shortly after the attempt.
+        let inherited = open_lease_file(&root.path().join("workspaces"), "slot").unwrap();
+        FileExt::lock_shared(&inherited).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(inherited);
+        });
+        let exclusive = ExclusiveStateLease::try_acquire(root.path(), "slot").unwrap();
+        release.join().unwrap();
+        drop(exclusive);
     }
 
     #[test]

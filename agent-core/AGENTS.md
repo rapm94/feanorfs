@@ -37,7 +37,8 @@ Embeddable Rust engine (`feanorfs-agent-core`) for snapshot sync, agent workspac
 - `ClientDb`: exclusive `local_state.lock` → reload → mutate → atomic commit → parent sync; missing state after construction is corruption; input capped at 128 MiB; canonical serialization streams without full clones; unknown schemas are rejected; legacy `local_cache.db` requires `feanorfs migrate`.
 - Access log: ≤10 000 entries, weights finite and ≥0.001, deterministic eviction.
 - `atomic_write_visible`/`_durable` write a temp file in the destination directory, sync, rename, and clean up on failure; `_durable` also syncs the parent.
-- Sync-lock staleness uses native process liveness on Unix and Windows; a live owner's lock is never broken by age.
+- Sync-lock ownership is the kernel lock, never the diagnostic PID or age; a held lock whose PID is unreadable (Windows locks are mandatory) counts as active.
+- Exclusive workspace-state leases retry contention for at most 500 ms (a child forked by another thread briefly inherits descriptors), then fail closed.
 - `SyncCtx::state_dir` resolves once per context and never caches globally; identity mismatches, duplicate identity matches, and same-path folder replacement fail closed. Workspace state is retired only through explicit tombstone → grace → quarantine → re-verified deletion.
 - Config writes are atomic; keys/tokens go to the OS credential store with a protected-file fallback and never spill back after migration. `ApiClient::new_with_tls_resolved` may change address lookup but keeps SNI, name verification, and the pinned CA.
 - Rekey publishes a parentless root and retries only the recorded candidate from the recorded source head.

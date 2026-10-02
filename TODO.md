@@ -95,6 +95,10 @@ before editing; false positives and compatibility constraints need evidence.
   Independent static review approved that change. Broader verification pending.
 - [ ] Complete locking/registry/access-log, server GC/waiter/durability, and
   lifecycle batches; collect independent review and exact test results.
+  First PR CI found two lock bugs, both fixed with tests: the sync-lock probe
+  reported idle on Windows (mandatory locks hide the PID), and exclusive
+  workspace-state leases failed on Linux while a parallel spawn briefly
+  inherited the shared lease descriptor.
 - [ ] Finish compatibility acceptance for source-bound rekey publication.
   Independent static review approved the publication lifecycle. Local-drift
   test review was cancelled. The proposed local-overwrite finding was not

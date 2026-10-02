@@ -96,7 +96,9 @@ pub fn is_sync_lock_active_at_state(state: &Path) -> bool {
     if !path.exists() || is_stale(&path, STALE_SYNC_SECS) {
         return false;
     }
-    read_lock_meta(&path).is_some_and(|(pid, _)| pid != std::process::id())
+    // The kernel lock is held; its diagnostic PID only excludes this process.
+    // Windows locks are mandatory, so other handles cannot read the PID at all.
+    read_lock_meta(&path).is_none_or(|(pid, _)| pid != std::process::id())
 }
 
 pub fn is_sync_lock_active(base: &Path) -> bool {
@@ -296,10 +298,13 @@ mod tests {
         let path = state.path().join("sync.lock");
         fs::write(&path, format!("{}\n0\n", i32::MAX)).unwrap();
         assert!(!is_sync_lock_active_at_state(state.path()));
-        let held = try_acquire_lock_file(&path, "test").unwrap();
-        assert!(!is_sync_lock_active_at_state(state.path()));
+        let mut held = try_acquire_lock_file(&path, "test").unwrap();
+        // Only Unix can read this process's own PID through another handle.
+        assert_eq!(is_sync_lock_active_at_state(state.path()), cfg!(windows));
         // Diagnostic foreign PID retains the existing "other process" UI rule.
-        fs::write(&path, format!("{}\n0\n", i32::MAX)).unwrap();
+        held.set_len(0).unwrap();
+        std::io::Seek::rewind(&mut held).unwrap();
+        write!(held, "{}\n0\n", i32::MAX).unwrap();
         assert!(is_sync_lock_active_at_state(state.path()));
         drop(held);
         assert!(!is_sync_lock_active_at_state(state.path()));
