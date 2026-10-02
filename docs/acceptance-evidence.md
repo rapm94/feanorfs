@@ -190,5 +190,22 @@ On GitHub runners (`workflow_dispatch` at `3edc9f5`, 2026-10-02): Security
 run 36999197690 fuzzed all four targets for 120 s each without a crash, and
 CI run 36999194960 passed `Multi-agent eval (scripted)`.
 
-Not covered here: capability routing and Git-baseline warnings between two
-physical machines.
+### Linux → Mac capability routing and Git baseline (2026-10-02)
+
+A Linux `feanorfs` (built with the relay builder image, Rust 1.88, Debian
+bookworm, kernel 6.19 aarch64 in the Podman VM) joined a hub on the macOS host
+over the container network (`host.containers.internal`). The two Git clones
+sat on different commits (Mac `main@b96b487`, Linux `main@d0ddf61`, one commit
+ahead with an added file):
+
+- The Mac agent `mac-ios` announced `ios-build`; the Linux side ran
+  `agent send cap:ios-build --kind request …` as `linux-dev`, and the send
+  result reported `routed_to: mac-ios`.
+- `agent inbox --for mac-ios` on the Mac returned that request from
+  `linux-dev`, next to the `ffcap1` announcement.
+- After syncing, the Mac's `status` reported
+  `git_baseline_mismatch` (local `b96b487`, shared `d0ddf61`) and warned
+  "this clone is on git main@b96b487 but the shared work was published on
+  main@d0ddf61".
+
+The same check on two physical machines remains a founder field step (F6).

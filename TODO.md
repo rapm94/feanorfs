@@ -57,19 +57,14 @@ either safely.
 Done when the decision and its evidence are recorded. Until then the legacy
 path stays: removing it would make unmigrated v1 workspaces unreadable.
 
+### F6. Repeat cross-machine routing on physical hardware
+
+- [ ] From the physical Linux machine, `feanorfs agent send cap:ios-build`
+  to the Mac's agent and check the Mac's `feanorfs status` Git-baseline
+  warning with the two clones on different commits. A Linux container on
+  this Mac already passed the same check (`docs/acceptance-evidence.md`).
+
 ## AI tasks
-
-### AI-11. Prove the agent-first coordination surface in the field
-
-Evidence (real Claude Code and Codex evals with and without hooks, guard
-hook, CI fuzzing and scripted eval) is in `docs/acceptance-evidence.md`
-(AI-11).
-
-- [ ] Route a real request with `agent send cap:ios-build` from the Linux
-  machine to the Mac and verify the Git baseline warning when the two clones
-  sit on different commits.
-
-Done when each item has recorded evidence.
 
 ### AI-10. Finish confirmed review fixes and acceptance
 
