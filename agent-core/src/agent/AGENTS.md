@@ -34,7 +34,10 @@ Own agent workspace diffing, spawning, landing, refreshing, unattended runner li
 - After a conflict land, the agent base records its exact published local
   legs. Safe refresh refuses an unresolved shared tree, then accepts an
   explicitly resolved version only where the agent has not edited those
-  legs again. Continuous probes include shared-tree conflicts so restart
+  legs again. Land never adopts a committed head that still carries
+  unresolved shared conflicts as the agent base (it records the local
+  working-copy base instead); otherwise the agent's own leg would read as a
+  fresh edit after resolution and be published over it. Continuous probes include shared-tree conflicts so restart
   cannot bypass that pause.
 
 ## Work Guidance
