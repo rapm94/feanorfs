@@ -558,7 +558,10 @@ mod tests {
         let payload = r#"{"cwd":"/w","tool_name":"Edit","tool_input":{"file_path":"src/a.rs","old_string":"x"}}"#;
         assert_eq!(
             paths_from_hook_payload(payload),
-            vec!["/w/src/a.rs".to_string()]
+            vec![Path::new("/w")
+                .join("src/a.rs")
+                .to_string_lossy()
+                .into_owned()]
         );
         let notebook = r#"{"tool_input":{"notebook_path":"/w/n.ipynb"}}"#;
         assert_eq!(
