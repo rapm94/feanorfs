@@ -23,7 +23,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Checkout release source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -124,17 +124,17 @@ jobs:
             zig: false
     steps:
       - name: Checkout verified commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ needs.trust.outputs.sha }}
       - name: Install Rust target
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
       - name: Install Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           package-manager-cache: false
@@ -165,7 +165,7 @@ jobs:
           mkdir artifact
           cp "$ARTIFACT" artifact/
       - name: Upload immutable native artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: native-${{ matrix.id }}-${{ needs.trust.outputs.sha }}
           path: bindings/ts/artifact/${{ matrix.artifact }}
@@ -182,21 +182,21 @@ jobs:
       contents: read
     steps:
       - name: Checkout verified commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ needs.trust.outputs.sha }}
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - name: Install Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           package-manager-cache: false
       - name: Download native artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           merge-multiple: true
           path: bindings/ts/artifacts
@@ -244,7 +244,7 @@ jobs:
         working-directory: bindings/ts
         run: npm run publish-packages -- --tarball-dir dist/npm --dry-run
       - name: Upload immutable npm tarballs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: npm-tarballs-${{ needs.trust.outputs.sha }}
           path: bindings/ts/dist/npm/*.tgz
@@ -264,18 +264,18 @@ jobs:
       id-token: write
     steps:
       - name: Checkout verified commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ needs.trust.outputs.sha }}
       - name: Install Node with npm registry
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           package-manager-cache: false
           registry-url: https://registry.npmjs.org
       - name: Download verified npm tarballs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: npm-tarballs-${{ needs.trust.outputs.sha }}
           path: bindings/ts/dist/npm
