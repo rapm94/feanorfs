@@ -128,13 +128,13 @@ jobs:
           - x86_64-apple-darwin
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.release_tag }}
           persist-credentials: false
           submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -154,7 +154,7 @@ jobs:
           lipo "target/$TARGET/release/feanorfs" -verify_arch "$expected"
           lipo "target/$TARGET/release/feanorfs-tray" -verify_arch "$expected"
       - name: Upload native binaries
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: unsigned-macos-${{ matrix.target }}
           path: |
@@ -176,18 +176,18 @@ jobs:
       id-token: write
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.release_tag }}
           persist-credentials: false
           submodules: recursive
       - name: Download arm64 binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: unsigned-macos-aarch64-apple-darwin
           path: native/arm64
       - name: Download x86_64 binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: unsigned-macos-x86_64-apple-darwin
           path: native/x86_64
@@ -235,7 +235,7 @@ jobs:
           shasum -a 256 FeanorFS-macOS-unsigned.pkg > FeanorFS-macOS-unsigned.pkg.sha256
           shasum -a 256 FeanorFS-macOS-unsigned.dmg > FeanorFS-macOS-unsigned.dmg.sha256
       - name: Attest unsigned macOS assets
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             FeanorFS-macOS-unsigned.pkg
@@ -269,12 +269,12 @@ jobs:
       id-token: write
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.release_tag }}
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - name: Build CLI and tray
@@ -335,7 +335,7 @@ jobs:
             "Windows will display an untrusted-publisher warning until trusted signing is configured."
           ) | Set-Content -Encoding utf8NoBOM FeanorFS-windows-UNSIGNED.txt
       - name: Attest unsigned Windows assets
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             FeanorFS-windows-x86_64-unsigned-setup.exe
