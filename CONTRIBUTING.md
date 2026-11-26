@@ -9,6 +9,7 @@ Thank you for your interest in improving FeanorFS. This document describes the d
 - Rust 1.88 or later (`rustup default stable`)
 - No system SQLite install; the server and one-time legacy importer use bundled SQLx SQLite while the embeddable agent SDK uses JSON state.
 - `cargo-deny` (optional, for license/advisory audits): `cargo install cargo-deny`
+- [Kache](https://github.com/kunobi-ninja/kache) (optional compiler cache, the one CI uses): `cargo install kache --locked` (Rust 1.95+; [prebuilt packages](https://ninja.kunobi.com/docs/kache/getting-started/installation)), then `kache init`. It edits your global Cargo config, so preview first with `kache init --check`.
 
 ### Getting started
 
