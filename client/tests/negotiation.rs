@@ -2657,3 +2657,324 @@ async fn fresh_format_v3_workspace_syncs_without_flat_metadata() {
         b"snapshot transport"
     );
 }
+
+#[tokio::test]
+async fn v3_status_warns_when_hub_head_is_strict_ancestor_of_last_synced() {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let mut config = feanorfs_client::load_config(client.workspace.path()).unwrap();
+    config.format_version = 3;
+    feanorfs_client::save_config(client.workspace.path(), &config).unwrap();
+
+    // First sync: establish S1
+    write_workspace_file(client.workspace.path(), "file1.txt", b"content1").await;
+    do_sync(
+        &server.api,
+        &client.db,
+        client.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let s1 = server.api.get_head(WORKSPACE_ID).await.unwrap();
+    assert!(s1.is_some());
+
+    // Second sync: establish S2 (newer than S1)
+    write_workspace_file(client.workspace.path(), "file2.txt", b"content2").await;
+    do_sync(
+        &server.api,
+        &client.db,
+        client.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let s2 = server.api.get_head(WORKSPACE_ID).await.unwrap();
+    assert!(s2.is_some());
+    assert_ne!(s1, s2);
+
+    let s1_val = s1.unwrap();
+    let s2_val = s2.unwrap();
+
+    // Create new client and call do_status - should warn about rollback
+    let status_client = spawn_test_client_with_server(&server).await;
+    let mut status_config = feanorfs_client::load_config(status_client.workspace.path()).unwrap();
+    status_config.format_version = 3;
+    feanorfs_client::save_config(status_client.workspace.path(), &status_config).unwrap();
+
+    // Do an initial sync to establish last-synced = S2
+    do_sync(
+        &server.api,
+        &status_client.db,
+        status_client.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Roll the hub head back to S1 after this client recorded last-synced = S2.
+    server
+        .db
+        .swap_head(WORKSPACE_ID, Some(&s2_val), &s1_val)
+        .await
+        .unwrap();
+    assert_eq!(
+        server.api.get_head(WORKSPACE_ID).await.unwrap(),
+        Some(s1_val.clone())
+    );
+
+    // Now with hub head rolled back to S1 and last-synced = S2, status should warn
+    let result = do_status(
+        &server.api,
+        &status_client.db,
+        status_client.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.server_rollback_warning.is_some(),
+        "expected rollback warning when hub head is older than last-synced"
+    );
+    assert!(
+        result
+            .server_rollback_warning
+            .unwrap()
+            .contains("older than the snapshot this machine last synced"),
+        "rollback warning should mention snapshot age"
+    );
+
+    // Restore S2 as head and verify no warning
+    server
+        .db
+        .swap_head(WORKSPACE_ID, Some(&s1_val), &s2_val)
+        .await
+        .unwrap();
+
+    let result_no_warning = do_status(
+        &server.api,
+        &status_client.db,
+        status_client.workspace.path(),
+        WORKSPACE_ID,
+        Some(TEST_PASSWORD),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result_no_warning.server_rollback_warning.is_none(),
+        "no warning after hub head is restored to newer snapshot"
+    );
+}
+
+/// Edits made while a pass runs were never uploaded by it. Publishing their
+/// hashes made the hub reject the manifest, which forced a re-upload of every
+/// file in the workspace.
+#[tokio::test]
+async fn edits_during_an_upload_pass_wait_for_the_next_pass() {
+    edits_during_a_pass_wait_for_the_next_pass(false).await;
+}
+
+#[tokio::test]
+async fn edits_during_a_download_pass_wait_for_the_next_pass() {
+    edits_during_a_pass_wait_for_the_next_pass(true).await;
+}
+
+async fn edits_during_a_pass_wait_for_the_next_pass(remote_change: bool) {
+    let server = spawn_test_server().await;
+    let client = spawn_test_client_with_server(&server).await;
+    let peer = spawn_test_client_with_server(&server).await;
+    for workspace in [client.workspace.path(), peer.workspace.path()] {
+        let mut config = feanorfs_client::load_config(workspace).unwrap();
+        config.format_version = 3;
+        feanorfs_client::save_config(workspace, &config).unwrap();
+    }
+    let sync = async |side: &support::TestClient| {
+        do_sync(
+            &server.api,
+            &side.db,
+            side.workspace.path(),
+            WORKSPACE_ID,
+            Some(TEST_PASSWORD),
+            false,
+        )
+        .await
+        .unwrap()
+    };
+    let root = client.workspace.path().to_path_buf();
+    for path in ["edited.txt", "untouched.txt", "deleted.txt", "remote.txt"] {
+        write_workspace_file(&root, path, b"old").await;
+    }
+    sync(&client).await;
+    sync(&peer).await;
+    if remote_change {
+        write_workspace_file(peer.workspace.path(), "remote.txt", b"remote-new").await;
+        sync(&peer).await;
+    }
+    write_workspace_file(&root, "edited.txt", b"edited before the pass").await;
+
+    let state = state_path(&root);
+    tokio::fs::write(state.join("test-sync-pause"), b"after-negotiate")
+        .await
+        .unwrap();
+    let during_pass = async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.join("test-sync-pause-reached").exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        write_workspace_file(&root, "untouched.txt", b"edited during the pass").await;
+        write_workspace_file(&root, "created.txt", b"created during the pass").await;
+        tokio::fs::remove_file(root.join("deleted.txt"))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(state.join("test-sync-pause"))
+            .await
+            .unwrap();
+    };
+    let (first, ()) = tokio::join!(sync(&client), during_pass);
+    assert_eq!(first.uploads, 1, "only the pre-pass edit is uploaded");
+    assert!(
+        !state.join("manifest-recovery.stamp").exists(),
+        "the pass must not fall into the full re-upload recovery"
+    );
+    assert_eq!(
+        read_workspace_file(&root, "untouched.txt").await,
+        b"edited during the pass"
+    );
+
+    let second = sync(&client).await;
+    assert_eq!(second.uploads, 2, "both in-flight edits go out next");
+    sync(&peer).await;
+    for (path, expected) in [
+        ("edited.txt", &b"edited before the pass"[..]),
+        ("untouched.txt", b"edited during the pass"),
+        ("created.txt", b"created during the pass"),
+        (
+            "remote.txt",
+            if remote_change { b"remote-new" } else { b"old" },
+        ),
+    ] {
+        assert_eq!(
+            read_workspace_file(peer.workspace.path(), path).await,
+            expected,
+            "{path}"
+        );
+        assert_eq!(read_workspace_file(&root, path).await, expected, "{path}");
+    }
+    assert!(!peer.workspace.path().join("deleted.txt").exists());
+}
+
+/// A land runs a sync pass first. Folder edits made during that pass were not
+/// uploaded, so the land must neither record them as agreed (the next pass
+/// would replace them with the hub's version) nor let the agent's version
+/// replace them.
+#[tokio::test]
+async fn folder_edits_during_a_land_pass_are_never_lost() {
+    for edit_the_agents_file in [false, true] {
+        let server = spawn_test_server().await;
+        let client = spawn_test_client_with_server(&server).await;
+        let peer = spawn_test_client_with_server(&server).await;
+        for workspace in [client.workspace.path(), peer.workspace.path()] {
+            let mut config = feanorfs_client::load_config(workspace).unwrap();
+            config.format_version = 3;
+            feanorfs_client::save_config(workspace, &config).unwrap();
+        }
+        let sync = async |side: &support::TestClient| {
+            do_sync(
+                &server.api,
+                &side.db,
+                side.workspace.path(),
+                WORKSPACE_ID,
+                Some(TEST_PASSWORD),
+                false,
+            )
+            .await
+            .unwrap()
+        };
+        let root = client.workspace.path().to_path_buf();
+        for path in ["agent.txt", "human.txt"] {
+            write_workspace_file(&root, path, b"old").await;
+        }
+        sync(&client).await;
+        spawn_agent(
+            &root,
+            &client.db,
+            &server.api,
+            WORKSPACE_ID,
+            "a1",
+            Some(TEST_PASSWORD),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        write_workspace_file(&agent_path(&root, "a1"), "agent.txt", b"agent version").await;
+        let land = || {
+            land_agent(
+                &root,
+                &client.db,
+                &server.api,
+                WORKSPACE_ID,
+                "a1",
+                Some(TEST_PASSWORD),
+                false,
+                false,
+            )
+        };
+
+        let state = state_path(&root);
+        tokio::fs::write(state.join("test-sync-pause"), b"after-negotiate")
+            .await
+            .unwrap();
+        let edited = if edit_the_agents_file {
+            "agent.txt"
+        } else {
+            "human.txt"
+        };
+        let during_pass = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !state.join("test-sync-pause-reached").exists() {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            write_workspace_file(&root, edited, b"human edit").await;
+            tokio::fs::remove_file(state.join("test-sync-pause"))
+                .await
+                .unwrap();
+        };
+        let (first, ()) = tokio::join!(land(), during_pass);
+        let error = first.expect_err("a folder that changed during the pass is not a land base");
+        assert_eq!(
+            feanorfs_agent_core::classify_continuous_error(&error),
+            feanorfs_agent_core::ContinuousErrorClass::Retryable,
+            "{error:#}"
+        );
+        assert_eq!(read_workspace_file(&root, edited).await, b"human edit");
+
+        let retried = land().await.unwrap();
+        assert_eq!(read_workspace_file(&root, edited).await, b"human edit");
+        if edit_the_agents_file {
+            assert_eq!(retried.conflicts.len(), 1, "{retried:?}");
+            continue;
+        }
+        sync(&client).await;
+        sync(&peer).await;
+        for (path, expected) in [
+            ("agent.txt", &b"agent version"[..]),
+            ("human.txt", b"human edit"),
+        ] {
+            for workspace in [&root, peer.workspace.path()] {
+                assert_eq!(read_workspace_file(workspace, path).await, expected);
+            }
+        }
+    }
+}

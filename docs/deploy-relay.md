@@ -35,7 +35,7 @@ docker run -d \
   ghcr.io/rapm94/feanorfs-relay:<version>
 ```
 
-Podman accepts the same options. For a bind mount, make the host directory
+Kiri accepts the same options. For a bind mount, make the host directory
 writable only by container UID/GID `10001`; do not loosen it to a world-writable
 mode. The data volume preserves the generated hub authentication identity
 across restarts. Relay sessions and frames remain memory-only.
@@ -60,8 +60,10 @@ relay.example.com {
 ```
 
 Caddy obtains and renews the public certificate and forwards WebSocket upgrades
-without extra directives. Expose only ports 80/443 from the proxy. Other
-proxies must support long-lived WebSockets and must not buffer binary frames.
+without extra directives, and sets X-Forwarded-For by default for per-source relay
+connection limits. Expose only ports 80/443 from the proxy. Other proxies must
+support long-lived WebSockets, must not buffer binary frames, and should set
+X-Forwarded-For to enable per-source connection caps.
 
 Do not enable request-path access logs at the proxy. Pairing session IDs and
 tunnel routes are high-entropy reachability capabilities; FeanorFS deliberately

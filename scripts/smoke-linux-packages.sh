@@ -16,10 +16,10 @@ container_runtime="${FEANORFS_CONTAINER_RUNTIME:-}"
 if [ -z "$container_runtime" ]; then
     if command -v docker >/dev/null 2>&1; then
         container_runtime=docker
-    elif command -v podman >/dev/null 2>&1; then
-        container_runtime=podman
+    elif command -v kiri >/dev/null 2>&1; then
+        container_runtime=kiri
     else
-        echo "error: docker or podman is required for clean Linux package smoke" >&2
+        echo "error: docker or kiri is required for clean Linux package smoke" >&2
         exit 1
     fi
 fi

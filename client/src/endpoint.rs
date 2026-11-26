@@ -199,6 +199,7 @@ async fn try_mesh_quic(config: &Config, stable: &StableEndpoint) -> Option<ApiCl
     let mesh = config.mesh.as_ref()?;
     let ca_pem = config.tls_ca_pem.as_deref()?;
     let identity = feanorfs_agent_core::mesh::MachineIdentity::load_or_create().ok()?;
+    let token = std::sync::Arc::new(zeroize::Zeroizing::new(config.server_password.clone()?));
     let quic_candidates = mesh
         .candidates()
         .iter()
@@ -228,6 +229,7 @@ async fn try_mesh_quic(config: &Config, stable: &StableEndpoint) -> Option<ApiCl
             &stable.hostname,
             feanorfs_agent_core::mesh::PunchPeer {
                 identity: identity.clone(),
+                token: token.clone(),
             },
         )
         .await

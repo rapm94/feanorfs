@@ -810,6 +810,8 @@ feanorfs undo snapshot_id
 
 `log` prints the short ID, age, author, changed-path count, and message. Add `--json` for full IDs and structured paths. Recognized agent signals render concisely (`signal <from> -> <to> <kind> about <short-id>: <body>`) instead of raw protocol JSON; the `--json` history shape is unchanged. `undo` accepts a reachable full ID or an unambiguous prefix with at least eight characters, then records the restored tree as a new snapshot.
 
+A workspace keeps its whole history until it passes 250,000 stored objects, or about 16 million folder entries on a computer publishing for the first time after joining or updating. Past that point syncing and signals continue, but the files of the oldest snapshots are no longer protected from the hub's cleanup, and those snapshots can stop being available to `log` and `undo`.
+
 ### Global flags
 
 | Flag | Description |
@@ -838,7 +840,7 @@ feanorfs agent guard <PATH>... [--for <NAME>] [--require-scope] [--hook]
 | Subcommand | Description |
 |---|---|
 | `status` | List all agents (enriched when server reachable; names-only offline). Hidden `agent list` returns legacy JSON `{"agents": ["name"]}`. |
-| `spawn` | APFS clonefile/copy snapshot with server base hashes |
+| `spawn` | Copy-on-write clone on APFS, byte copy elsewhere, with server base hashes; ignored paths such as `node_modules/` are not copied |
 | `refresh` | Pull cloud changes the agent hasn't touched. `--replace` discards agent-local edits after preserving them as a parent snapshot. |
 | `land` | Apply clean work, upload, register conflicts |
 | `clean` | Remove agent dir and snapshot rows |

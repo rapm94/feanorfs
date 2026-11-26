@@ -131,12 +131,20 @@ pub(super) async fn land_agent_with_ctx(
         crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?
     };
     if !recovering_committed_land {
-        let (_, blocked, _) = negotiate_sync_with_conflict_gate(ctx, &gate_local, false).await?;
+        let (response, blocked, _) =
+            negotiate_sync_with_conflict_gate(ctx, &gate_local, false).await?;
         if !blocked.is_empty() {
             return Err(super::continuous::conflict_failure(format!(
                 "Your folder changed during land and needs attention: {}",
                 blocked.into_iter().collect::<Vec<_>>().join(", ")
             )));
+        }
+        // The pass above did not publish edits made while it ran. Accepting
+        // them as the gate would let the agent's version replace them.
+        if !response.upload_required.is_empty() {
+            return Err(super::continuous::retryable_volatility_failure(
+                "your folder changed while the land was starting; retry",
+            ));
         }
     }
     let materialization = feanorfs_common::SyncResponse {

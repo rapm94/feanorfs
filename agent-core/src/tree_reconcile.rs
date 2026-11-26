@@ -26,6 +26,15 @@ pub(crate) async fn reconcile(
             remote,
         ));
     };
+    if let Some(h) = server_head {
+        if snapshots
+            .head_is_rollback(&base_id, h)
+            .await
+            .unwrap_or(false)
+        {
+            tracing::warn!("hub head is older than the snapshot this machine last synced; run `feanorfs sync --up` instead of accepting stale files");
+        }
+    }
     // A restored/fresh hub has no authoritative state while the client holds
     // an agreed view. The empty remote is an absence of data, not a deletion
     // of every file: treat it as "upload the whole local view" instead of
@@ -58,7 +67,15 @@ pub(crate) async fn reconcile(
         }
     }
     let local_changes = snapshots.diff_file_view(&base_id, local).await?.changes;
-    let remote_changes = snapshots.diff_file_view(&base_id, remote).await?.changes;
+    // `remote` is the head's own view, so an unmoved head has no changes. A
+    // conflicted tree flattens differently and keeps the ordinary diff.
+    let unmoved = server_head == Some(base_id.as_str())
+        && snapshots.load_state(&base_id).await?.conflicts.is_empty();
+    let remote_changes = if unmoved {
+        Vec::new()
+    } else {
+        snapshots.diff_file_view(&base_id, remote).await?.changes
+    };
     Ok(reconcile_changes(
         &local_changes,
         &remote_changes,

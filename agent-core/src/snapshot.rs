@@ -333,7 +333,7 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
         }
     }
 
-    pub(crate) async fn last_synced_id(&self) -> Result<Option<String>> {
+    pub async fn last_synced_id(&self) -> Result<Option<String>> {
         self.read_ref(LAST_SYNCED_REF).await
     }
 
@@ -465,6 +465,34 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
             kind: feanorfs_common::ResolutionStaleKind::HeadChanged,
             detail: "workspace advanced beyond the bounded signal-only history of this resolution; review again".into(),
         }))
+    }
+
+    const MAX_ROLLBACK_WALK: usize = 64;
+
+    /// True when the hub's `head` is a strict ancestor of this machine's
+    /// `refs/last-synced`: the hub served history this machine already moved past.
+    /// Head CAS, undo, and land only append, so honest history never matches.
+    /// Advisory: a bound miss or clock-skewed timestamps return false.
+    pub async fn head_is_rollback(&self, last_synced: &str, head: &str) -> Result<bool> {
+        if last_synced == head {
+            return Ok(false);
+        }
+        let last = self.load_snapshot(last_synced).await?;
+        if self.load_snapshot(head).await?.created_at_ms > last.created_at_ms {
+            return Ok(false); // ponytail: timestamp prefilter skips the walk on normal advance
+        }
+        let mut frontier = last.parents;
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = frontier.pop() {
+            if id == head {
+                return Ok(true);
+            }
+            if seen.len() >= Self::MAX_ROLLBACK_WALK || !seen.insert(id.clone()) {
+                continue;
+            }
+            frontier.extend(self.load_snapshot(&id).await?.parents);
+        }
+        Ok(false)
     }
 
     /// Computes the full guarded-publication plan without swapping the head:
@@ -713,14 +741,14 @@ impl<'ctx, 'a> SnapshotEngine<'ctx, 'a> {
                 message: input.message,
             })
             .await?;
-        let hashes = self
-            .objects
-            .snapshot_reachability(&id, upload_manifest)
+        let hashes = if upload_manifest {
+            self.objects.publish_reachability(&id).await?
+        } else {
+            self.objects.snapshot_reachability(&id, false).await?
+        };
+        self.objects
+            .cache_manifest(&id, &hashes, upload_manifest)
             .await?;
-        if upload_manifest {
-            self.objects.publish_manifest(&id, &hashes).await?;
-        }
-        self.objects.cache_manifest(&id, &hashes).await?;
         Ok(id)
     }
 

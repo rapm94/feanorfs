@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use super::process_tree;
-use super::start::{finish_sync_watch, SetupStageError, WatchMode};
+use super::start::SetupStageError;
 use super::supervisor::{self};
 use super::util::output_json;
 use feanorfs_common::tray_contract::{SetupCommitted, SetupRecovery, SetupResult, SetupStage};
@@ -125,7 +125,7 @@ pub async fn run(current_dir: &Path, action: ServiceAction, json: bool) -> anyho
             std::env::set_current_dir(&folder)
                 .with_context(|| format!("open background workspace {}", folder.display()))?;
             let workspace = std::env::current_dir()?;
-            finish_sync_watch(&workspace, WatchMode::Foreground).await
+            super::start::run_supervised_watch(&workspace).await
         }
         ServiceAction::RunnerRun { workspace } => {
             super::agent_runner::run_worker(

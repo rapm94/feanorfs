@@ -433,9 +433,8 @@ async fn write_message_snapshot(
             message: Some(message.to_string()),
         })
         .await?;
-    let hashes = engine.objects.snapshot_reachability(&id, true).await?;
-    engine.objects.publish_manifest(&id, &hashes).await?;
-    engine.objects.cache_manifest(&id, &hashes).await?;
+    let hashes = engine.objects.publish_reachability(&id).await?;
+    engine.objects.cache_manifest(&id, &hashes, true).await?;
     Ok(id)
 }
 

@@ -111,7 +111,8 @@ pub use resolution::{
     ResolutionStatusProjection, ResolutionStore,
 };
 pub use workspace_state_registry::{
-    retire_workspace_state, sweep_retired_state, RetirementSweep, TombstoneRecord,
+    release_state_leases_except, retire_workspace_state, sweep_retired_state, RetirementSweep,
+    TombstoneRecord,
 };
 
 pub use resolution_protocol::{
@@ -126,7 +127,7 @@ pub use work::{
     work_yield,
 };
 pub use workspace_layout::{
-    ensure_workspace_state, global_state_root, maintain_workspace_state,
+    ensure_workspace_state, find_workspace_state, global_state_root, maintain_workspace_state,
     workspace_has_preferred_state, workspace_is_configured, workspace_state_id,
     workspace_state_path,
 };

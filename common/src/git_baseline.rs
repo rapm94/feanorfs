@@ -67,7 +67,7 @@ impl GitBaseline {
     /// Short human form: `main@1a2b3c4` or `1a2b3c4` when detached.
     #[must_use]
     pub fn short(&self) -> String {
-        let commit = &self.commit[..7];
+        let commit = self.commit.get(..7).unwrap_or(&self.commit);
         match &self.branch {
             Some(branch) => format!("{branch}@{commit}"),
             None => commit.to_string(),
@@ -108,5 +108,19 @@ mod tests {
         assert!(GitBaseline::parse("ffmsg1:{}").is_none());
         assert!(GitBaseline::parse(&format!("ffbase1:{commit}:bad\nname")).is_none());
         assert!(GitBaseline::parse(&format!("ffbase1:{}:main", "A".repeat(40))).is_none());
+    }
+
+    #[test]
+    fn short_never_panics_on_unvalidated_commits() {
+        let tiny = GitBaseline {
+            commit: "abc".into(),
+            branch: None,
+        };
+        assert_eq!(tiny.short(), "abc");
+        let wide = GitBaseline {
+            commit: "ééééé".into(),
+            branch: Some("main".into()),
+        };
+        assert_eq!(wide.short(), "main@ééééé");
     }
 }

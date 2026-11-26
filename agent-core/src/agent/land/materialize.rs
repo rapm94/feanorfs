@@ -105,9 +105,23 @@ pub(super) async fn materialize_land(
             local_after.insert(change.path.clone(), change.clone());
         }
         crate::sync_pass::process_uploads(input.ctx, &upload_response, &local_after, false).await?;
-        SnapshotEngine::new(input.ctx)
-            .record_last_synced(&local_after, "land")
-            .await?;
+        // Only the landed paths became agreed. Recording the whole folder
+        // would also mark unsynced edits as agreed, and the next pass would
+        // replace them with the hub's older version.
+        let snapshots = SnapshotEngine::new(input.ctx);
+        let mut agreed = snapshots.load_last_synced().await?;
+        for change in landed_states.values() {
+            if change.deleted {
+                agreed.remove(&change.path);
+                continue;
+            }
+            let state = local_after
+                .get(&change.path)
+                .filter(|state| !state.deleted && state.hash == change.hash)
+                .unwrap_or(change);
+            agreed.insert(change.path.clone(), state.clone());
+        }
+        snapshots.record_last_synced(&agreed, "land").await?;
     }
     Ok(landed)
 }

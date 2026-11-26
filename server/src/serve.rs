@@ -4,6 +4,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+const HEADER_READ_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct ServeOptions {
     pub data_dir: PathBuf,
@@ -91,6 +99,8 @@ fn gc_duration(count: u64, seconds_per_unit: u64, option: &'static str) -> Resul
         .ok_or_else(|| GcDurationOverflow { option }.into())
 }
 
+const MIN_GC_GRACE_MINUTES: u64 = 1;
+
 struct GcDurations {
     grace: Duration,
     tombstone_retention: Duration,
@@ -99,6 +109,10 @@ struct GcDurations {
 
 impl GcDurations {
     fn from_options(opts: &ServeOptions) -> Result<Self> {
+        anyhow::ensure!(
+            opts.gc_grace_minutes >= MIN_GC_GRACE_MINUTES,
+            "--gc-grace-minutes must be at least {MIN_GC_GRACE_MINUTES}; unpublished uploads need a grace window"
+        );
         Ok(Self {
             grace: gc_duration(opts.gc_grace_minutes, 60, "gc_grace_minutes")?,
             tombstone_retention: gc_duration(
@@ -398,6 +412,20 @@ pub async fn run_http_server_guarded(
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let mut server = axum_server::from_tcp(listener.into_std()?)?;
+    server
+        .http_builder()
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    server
+        .http_builder()
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT);
+    let make = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
     let server: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> =
         if let Some(identity) = tls {
             let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
@@ -406,10 +434,10 @@ pub async fn run_http_server_guarded(
             )
             .await
             .context("load TLS server identity")?;
-            let server = axum_server::from_tcp_rustls(listener.into_std()?, config)?;
-            Box::pin(server.serve(app.into_make_service()))
+            let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(config);
+            Box::pin(server.acceptor(acceptor).serve(make))
         } else {
-            Box::pin(async move { axum::serve(listener, app).await })
+            Box::pin(server.serve(make))
         };
 
     let gc_task = if opts.gc_interval_secs > 0 {
@@ -536,6 +564,62 @@ mod tests {
                 "validation must precede runtime state writes"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn zero_gc_grace_is_rejected_before_creating_server_state() {
+        let data = tempfile::tempdir().unwrap();
+        let opts = ServeOptions {
+            data_dir: data.path().join("zero"),
+            allow_http: true,
+            gc_grace_minutes: 0,
+            ..ServeOptions::default()
+        };
+        assert!(run_http_server(opts.clone()).await.is_err());
+        assert!(run_gc(&opts).await.is_err());
+        assert!(!opts.data_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn slow_header_connections_are_closed() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let data = tempfile::tempdir().unwrap();
+        let port = {
+            let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let opts = ServeOptions {
+            data_dir: data.path().join("slow"),
+            allow_http: true,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            token: Some("slow-header-test-token".to_string()),
+            ..ServeOptions::default()
+        };
+        let server = tokio::spawn(run_http_server(opts));
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let mut stream = None;
+        for _ in 0..50 {
+            if let Ok(connected) = tokio::net::TcpStream::connect(addr).await {
+                stream = Some(connected);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut stream = stream.expect("server must accept connections");
+        stream
+            .write_all(b"GET /api/version HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 1];
+        let closed = tokio::time::timeout(
+            HEADER_READ_TIMEOUT + Duration::from_secs(2),
+            stream.read(&mut buf),
+        )
+        .await
+        .expect("server must close a stalled request head within the header timeout");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        server.abort();
     }
 
     #[tokio::test]

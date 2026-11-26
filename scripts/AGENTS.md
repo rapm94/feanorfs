@@ -20,9 +20,9 @@ tests used by local verification and GitHub release workflows.
 
 ## Local Contracts
 
-- A listed desktop artifact must pass checksum, payload, architecture, signature/attestation, and platform-specific validation. Verification failure never falls back to a weaker product.
+- A listed desktop artifact must pass checksum, payload, architecture, signature/attestation, and platform-specific validation. Verification failure never falls back to a weaker product. On Linux, `install.sh` verifies the GitHub build attestation automatically when an authenticated `gh` CLI is available.
 - Package scripts emit only the documented CLI, tray, launcher/icon, license, and README payloads. Keep native dependency metadata synchronized with the tray implementation. The Linux tray must have no `libxdo` dependency because the app uses no predefined editing actions and Debian/Arch publish incompatible SONAMEs.
-- `smoke-linux-packages.sh` mounts only the exact package read-only into digest-pinned Debian/Fedora images on both architectures and official Arch on x86-64, requires normal dependency resolution, creates an idle format-v3 encrypted workspace, and proves the tray remains alive under Xvfb/D-Bus. Official Arch has no ARM64 container; that leg combines exact Arch metadata/payload verification with native ARM64 execution in Debian/Fedora. Docker is the CI default; Podman is equivalent.
+- `smoke-linux-packages.sh` mounts only the exact package read-only into digest-pinned Debian/Fedora images on both architectures and official Arch on x86-64, requires normal dependency resolution, creates an idle format-v3 encrypted workspace, and proves the tray remains alive under Xvfb/D-Bus. Official Arch has no ARM64 container; that leg combines exact Arch metadata/payload verification with native ARM64 execution in Debian/Fedora. Docker is the CI default; Kiri is equivalent.
 - Product smoke tests use isolated homes/data, clean up services/processes on every exit, and never print or place credentials, recovery passphrases, pairing capabilities, invites, routes, or private keys in argv/environment/logs.
 - Product-smoke failure diagnostics must remain bounded and redact capability
   shapes plus 64-hex secrets/hashes before writing CI output.
@@ -49,7 +49,7 @@ tests used by local verification and GitHub release workflows.
 - `scripts/test-install-routing.sh`
 - `scripts/smoke-upgrade.sh OLD_BIN NEW_BIN` (CI: `upgrade-smoke` job builds the previous release tag as OLD_BIN)
 - `scripts/test-install-routing.ps1` on Windows
-- `scripts/smoke-linux-packages.sh FEANORFS_DEB FEANORFS_RPM FEANORFS_ARCH_PACKAGE` on a Docker/Podman host
+- `scripts/smoke-linux-packages.sh FEANORFS_DEB FEANORFS_RPM FEANORFS_ARCH_PACKAGE` on a Docker/Kiri host
 - `scripts/smoke-windows-installer.ps1 SETUP_EXE FEANORFS_BIN FEANORFS_TRAY_BIN` on Windows; add `-RequireAuthenticode` for publication
 - `scripts/smoke-windows-product.ps1 FEANORFS_BIN FEANORFS_TRAY_BIN` on Windows; add `-RequireAuthenticode` for publishable binaries
 - Platform-specific macOS and relay smoke commands documented in `.github/AGENTS.md`

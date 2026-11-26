@@ -31,8 +31,9 @@ and per-attempt counters persist locally in bounded `mesh-state.json`
 
 ## D4 — WAN reachability
 
-UPnP IGD / NAT-PMP / PCP mapping runs on the hub host with a short bounded
-gateway search and produces `mapped` TCP candidates; absence of a gateway is
+UPnP IGD mapping runs on the hub host with a short bounded
+gateway search and produces `mapped` TCP candidates; the private hub renews
+its mapping every 15 minutes while supervised. Absence of a gateway is
 normal and non-fatal. STUN binding (RFC 5389) against a small fixed server
 list, raced from the hub's advertised UDP port, produces `reflexive` QUIC
 candidates. Both fail gracefully to fewer candidates, never to errors.
@@ -41,15 +42,16 @@ candidates. Both fail gracefully to fewer candidates, never to errors.
 
 The hub binds one QUIC endpoint on its advertised UDP port and bridges
 authenticated streams to its local TLS port. A client punches by connecting
-QUIC to a reflexive/mapped/LAN candidate, then authenticates by signing a
-domain-separated message with its machine key before any bytes bridge.
+QUIC to a reflexive/mapped/LAN candidate, then answers a fresh 32-byte hub
+nonce with an Ed25519 signature plus a BLAKE3 keyed proof of the hub bearer
+token; only token holders can bridge.
 The inner hub TLS session keeps its own CA pinning, SNI hostname, and bearer
-token end-to-end; the punch is pure byte transport.
+token end-to-end; the punch is pure byte transport. 0.12.x punch peers fail
+closed within 5 s and fall back to TCP/relay candidates.
 
-Ceiling: today any correctly signed machine identity may punch. Admission by
-workspace membership is deferred until membership is queryable without new
-hub endpoints; bridged traffic still terminates at the token-authenticated
-hub.
+Per-identity membership admission remains deferred until membership is
+queryable without new hub endpoints; bridged traffic still terminates at the
+token-authenticated hub.
 
 ## D6 — Relay demotion
 

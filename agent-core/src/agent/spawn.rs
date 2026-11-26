@@ -1,6 +1,6 @@
 use anyhow::{bail, Context as _, Result};
-use std::collections::BTreeSet;
-use std::io::Write as _;
+use feanorfs_common::FileState;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -107,23 +107,36 @@ fn replacement_backup_path(target: &Path) -> PathBuf {
     target.with_file_name(format!("{file_name}.replace-backup-{stamp}"))
 }
 
+/// Copy one opened workspace file into the new worktree.
+///
+/// Each copy is only handed to the device here. [`flush_worktree`] makes the
+/// whole worktree durable at once, before the base ref is published.
 fn copy_opened_source(
     mut source: std::fs::File,
     destination: &Path,
     logical_path: &str,
 ) -> Result<()> {
     let before = source.metadata()?;
-    if let Some(parent) = destination.parent() {
+    if let Some(parent) = destination.parent().filter(|parent| !parent.is_dir()) {
         std::fs::create_dir_all(parent)?;
     }
-    let mut output = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination)
-        .with_context(|| format!("create agent copy for {logical_path}"))?;
-    let copied = std::io::copy(&mut source, &mut output)?;
-    output.flush()?;
-    output.sync_all()?;
+    let (output, copied) = match clone_opened_source(&source, &before, destination)
+        .with_context(|| format!("open agent clone for {logical_path}"))?
+    {
+        Some(clone) => {
+            let length = clone.metadata()?.len();
+            (clone, length)
+        }
+        None => {
+            let mut output = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(destination)
+                .with_context(|| format!("create agent copy for {logical_path}"))?;
+            let copied = std::io::copy(&mut source, &mut output)?;
+            (output, copied)
+        }
+    };
     let after = source.metadata()?;
     if copied != before.len()
         || before.len() != after.len()
@@ -134,8 +147,98 @@ fn copy_opened_source(
         )));
     }
     output.set_permissions(before.permissions())?;
-    output.sync_all()?;
+    sync_to_device(&output)?;
     Ok(())
+}
+
+/// Clone an opened file copy-on-write, or return `None` to request a byte copy.
+///
+/// The source stays descriptor-anchored. A failed clone creates nothing, so the
+/// byte copy can always follow and report the real error. Linux needs no
+/// equivalent: `std::io::copy` already uses `copy_file_range` there.
+#[cfg(target_os = "macos")]
+fn clone_opened_source(
+    source: &std::fs::File,
+    metadata: &std::fs::Metadata,
+    destination: &Path,
+) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::macos::fs::MetadataExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    /// `<sys/clonefile.h>`; not exported by the `libc` crate.
+    const CLONE_NOOWNERCOPY: u32 = 0x0002;
+
+    // A clone inherits file flags. An immutable one could not be edited or
+    // cleaned, and a dataless one would stay a cloud placeholder.
+    if metadata.st_flags() != 0 {
+        return Ok(None);
+    }
+    let name = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+    // SAFETY: the source descriptor and NUL-terminated path outlive the call.
+    let status = unsafe {
+        libc::fclonefileat(
+            source.as_raw_fd(),
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            CLONE_NOOWNERCOPY,
+        )
+    };
+    if status != 0 {
+        return Ok(None);
+    }
+    std::fs::File::open(destination).map(Some)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_opened_source(
+    _source: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+    _destination: &Path,
+) -> std::io::Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
+/// Hand a file to the device without draining the device write cache.
+///
+/// `sync_all` is `F_FULLFSYNC` on macOS and drains the whole device queue, which
+/// costs milliseconds per file. Elsewhere it is an ordinary flush.
+fn sync_to_device(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        loop {
+            // SAFETY: the descriptor is open for the duration of the call.
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
+    }
+}
+
+/// Make every copied file durable before the agent base ref can name it.
+///
+/// On macOS one `F_FULLFSYNC` persists all data already passed to `fsync` on
+/// the same device. Elsewhere [`sync_to_device`] flushed each file already.
+fn flush_worktree(worktree: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(worktree)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = worktree;
+        Ok(())
+    }
 }
 
 fn remove_directory_if_present(path: &Path) -> std::io::Result<()> {
@@ -225,25 +328,8 @@ async fn spawn_agent_with_ctx(
             .last_synced_id()
             .await?
             .context("Cannot spawn with --no-sync before this folder has completed a sync")?;
-        let local = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
         let last = snapshots.load_files_local(&last_synced_id).await?;
-        let paths = local
-            .keys()
-            .chain(last.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let dirty = paths
-            .into_iter()
-            .filter(|path| {
-                !matches!(
-                    (local.get(path), last.get(path)),
-                    (Some(local), Some(last))
-                        if local.hash == last.hash
-                            && local.deleted == last.deleted
-                            && local.mode == last.mode
-                )
-            })
-            .collect::<Vec<_>>();
+        let dirty = paths_differing_from(ctx, &last).await?;
         if !dirty.is_empty() {
             bail!(
                 "Folder is not in sync with last agreed state. Dirty paths: {}",
@@ -278,7 +364,14 @@ async fn spawn_agent_with_ctx(
         )
         .await?;
 
+        // The pass did not publish edits made while it ran; copying them would
+        // hand the agent changes it never made.
         let server_files = crate::conflicts::load_server_view(ctx).await?;
+        if !paths_differing_from(ctx, &server_files).await?.is_empty() {
+            return Err(super::continuous::retryable_volatility_failure(
+                "your folder changed while the agent workspace was starting; retry",
+            ));
+        }
         snapshots
             .publish_server_view(&server_files, "folder")
             .await?
@@ -330,6 +423,7 @@ async fn spawn_agent_with_ctx(
 
         let mut copied = 0;
         let read_root = crate::workspace_read::WorkspaceReadRoot::open(ctx.base)?;
+        let mut sources = crate::workspace_read::WalkCursor::new(read_root);
         for entry in build_workspace_walker(ctx.base, false).build() {
             let entry = entry.context("walk workspace while spawning agent")?;
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -345,13 +439,14 @@ async fn spawn_agent_with_ctx(
             let Some(normalized) = portable_rel_path(relative_text) else {
                 continue;
             };
-            let source = read_root
-                .open_regular_path(relative)
+            let source = sources
+                .open_regular(relative)
                 .with_context(|| format!("open agent source {normalized}"))?;
             copy_opened_source(source, &target.join(&normalized), &normalized)?;
             copied += 1;
         }
 
+        flush_worktree(&target).context("flush agent worktree before publishing its base")?;
         snapshots.write_agent_base(name, &base_snapshot).await?;
         Ok(copied)
     }
@@ -373,6 +468,31 @@ async fn spawn_agent_with_ctx(
     }
 }
 
+/// Paths whose folder content differs from `expected`.
+async fn paths_differing_from(
+    ctx: &SyncCtx<'_>,
+    expected: &HashMap<String, FileState>,
+) -> Result<Vec<String>> {
+    let local = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+    let paths = local
+        .keys()
+        .chain(expected.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    Ok(paths
+        .into_iter()
+        .filter(|path| {
+            !matches!(
+                (local.get(path), expected.get(path)),
+                (Some(local), Some(expected))
+                    if local.hash == expected.hash
+                        && local.deleted == expected.deleted
+                        && local.mode == expected.mode
+            )
+        })
+        .collect())
+}
+
 async fn inject_spawn_failure(base: &Path, name: &str, point: &str) -> Result<()> {
     let path = crate::workspace_layout::ensure_workspace_state(base)?
         .join(format!("test-spawn-failpoint-{name}"));
@@ -381,4 +501,98 @@ async fn inject_spawn_failure(base: &Path, name: &str, point: &str) -> Result<()
         bail!("injected agent spawn failure at {point}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn copy(source: &Path, destination: &Path) -> Result<()> {
+        copy_opened_source(std::fs::File::open(source)?, destination, "file")
+    }
+
+    #[test]
+    fn copies_are_independent_of_their_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, destination) = (dir.path().join("source"), dir.path().join("a/b/copy"));
+        std::fs::write(&source, b"original").unwrap();
+
+        copy(&source, &destination).unwrap();
+        flush_worktree(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+
+        std::fs::write(&destination, b"agent edit").unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        std::fs::write(&source, b"human edit").unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"agent edit");
+    }
+
+    #[test]
+    fn empty_files_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, destination) = (dir.path().join("source"), dir.path().join("copy"));
+        std::fs::write(&source, b"").unwrap();
+        copy(&source, &destination).unwrap();
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn an_existing_destination_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, destination) = (dir.path().join("source"), dir.path().join("copy"));
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&destination, b"keep").unwrap();
+        assert!(copy(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissions_follow_the_source() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o755, 0o444, 0o600] {
+            let source = dir.path().join(format!("source-{mode:o}"));
+            let destination = dir.path().join(format!("copy-{mode:o}"));
+            std::fs::write(&source, b"x").unwrap();
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode)).unwrap();
+            copy(&source, &destination).unwrap();
+            let copied = std::fs::metadata(&destination).unwrap().permissions();
+            assert_eq!(copied.mode() & 0o7777, mode);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ordinary_files_clone_and_flagged_files_fall_back() {
+        use std::os::macos::fs::MetadataExt as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"x").unwrap();
+        let opened = std::fs::File::open(&source).unwrap();
+        let clone = dir.path().join("clone");
+        assert!(
+            clone_opened_source(&opened, &opened.metadata().unwrap(), &clone)
+                .unwrap()
+                .is_some(),
+            "temporary directory must be on APFS"
+        );
+
+        let name = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and outlives both calls.
+        assert_eq!(
+            unsafe { libc::chflags(name.as_ptr(), libc::UF_IMMUTABLE) },
+            0
+        );
+        let destination = dir.path().join("copy");
+        let result = copy(&source, &destination);
+        // Clear the flag before asserting so the directory can be removed.
+        assert_eq!(unsafe { libc::chflags(name.as_ptr(), 0) }, 0);
+        result.unwrap();
+        assert_eq!(std::fs::metadata(&destination).unwrap().st_flags(), 0);
+        std::fs::write(&destination, b"editable").unwrap();
+    }
 }

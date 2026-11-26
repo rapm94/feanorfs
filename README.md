@@ -186,7 +186,7 @@ and reversible stop/resume; the signed release repeats that smoke after
 Authenticode verification. The first credentialed Windows
 release remains proof pending; there is no unsigned release fallback.
 
-All release artifacts also carry [GitHub Artifact Attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds). To verify before running: `gh attestation verify <artifact> --repo rapm94/feanorfs`. See [SECURITY.md](SECURITY.md#verifying-release-artifacts) for Apple signature, notarization, checksum, and build-from-source verification.
+All release artifacts also carry [GitHub Artifact Attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds). On Linux, `install.sh` verifies the GitHub build attestation automatically when an authenticated `gh` CLI is available. To verify before running on other platforms: `gh attestation verify <artifact> --repo rapm94/feanorfs`. See [SECURITY.md](SECURITY.md#verifying-release-artifacts) for Apple signature, notarization, checksum, and build-from-source verification.
 
 Trusted tags also publish the self-hostable opaque relay image at
 `ghcr.io/rapm94/feanorfs-relay:<version>`. It is separate from desktop release

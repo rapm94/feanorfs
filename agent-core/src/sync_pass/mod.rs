@@ -49,16 +49,43 @@ pub fn build_ctx_or_fallback<'a>(
     }
 }
 
+/// The working copy this pass agreed on: its own scan plus the remote changes
+/// it applied (all of them, or the pass failed). Publishing a second scan
+/// instead would name edits made meanwhile whose content was never uploaded;
+/// the hub rejects that manifest, which forces a full re-upload. Those edits
+/// belong to the next pass.
+fn agreed_view(
+    scanned: &HashMap<String, FileState>,
+    response: &SyncResponse,
+    mode: SyncMode,
+) -> HashMap<String, FileState> {
+    let mut files = scanned
+        .iter()
+        .filter(|(_, state)| !state.deleted)
+        .map(|(path, state)| (path.clone(), state.clone()))
+        .collect::<HashMap<_, _>>();
+    if mode != SyncMode::Push {
+        for path in &response.delete_local {
+            files.remove(path);
+        }
+        for file in &response.download_required {
+            files.insert(file.path.clone(), file.clone());
+        }
+    }
+    files
+}
+
+/// Publishes the finished pass and returns the head it agreed on (format v3).
 async fn finish_sync_pass(
     ctx: &SyncCtx<'_>,
     local_files_before: &HashMap<String, FileState>,
+    response: &SyncResponse,
     conflict_paths: &HashSet<String>,
     mode: SyncMode,
     negotiated_head: Option<&str>,
-) -> Result<()> {
-    let current_files =
-        crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
+) -> Result<Option<String>> {
     if ctx.format_version() >= 3 {
+        let current_files = agreed_view(local_files_before, response, mode);
         let snapshots = crate::snapshot::SnapshotEngine::new(ctx);
         let expected = negotiated_head.map(str::to_owned);
         let (head_files, head_conflicts, current_root) = match &expected {
@@ -82,7 +109,7 @@ async fn finish_sync_pass(
             } else {
                 snapshots.snapshot_local_view(&current_files, "you").await?;
             }
-            return Ok(());
+            return Ok(expected);
         }
         let mut candidate_files = current_files.clone();
         for path in conflict_paths {
@@ -129,8 +156,10 @@ async fn finish_sync_pass(
             snapshots.snapshot_local_view(&current_files, "you").await?;
             snapshots.record_last_synced_ref(&committed).await?;
         }
-        return Ok(());
+        return Ok(Some(committed));
     }
+    let current_files =
+        crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
     let server_files = conflicts::load_server_view(ctx).await?;
     let snapshots = crate::snapshot::SnapshotEngine::new(ctx);
     let mut agreed = snapshots.load_last_synced().await?;
@@ -172,7 +201,7 @@ async fn finish_sync_pass(
     snapshots.record_last_synced(&agreed, "sync").await?;
     snapshots.snapshot_local_view(&current_files, "you").await?;
     snapshots.publish_server_view(&server_files, "sync").await?;
-    Ok(())
+    Ok(None)
 }
 
 fn states_agree(local: Option<&FileState>, remote: Option<&FileState>) -> bool {
@@ -203,6 +232,9 @@ pub struct SyncPassOutcome {
     pub remote_still_pending: bool,
     pub large_file_count: usize,
     pub large_file_examples: Vec<String>,
+    /// Workspace head this pass applied or published (format v3). Observers
+    /// acknowledge it instead of syncing again for their own publication.
+    pub head: Option<String>,
 }
 
 pub async fn run_sync_pass(
@@ -256,6 +288,25 @@ fn is_manifest_rejection(error: &anyhow::Error) -> bool {
     )
 }
 
+/// A forced recovery re-uploads every file. If the hub keeps rejecting
+/// manifests anyway (blobs vanish between passes), repeating it each pass turns
+/// one fault into continuous bulk uploads. Allow one per window; in between the
+/// rejection surfaces as an ordinary sync failure and the watcher backs off.
+const MANIFEST_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const MANIFEST_RECOVERY_STAMP: &str = "manifest-recovery.stamp";
+
+/// True when a forced manifest recovery ran within the interval. A stamp in
+/// the future (clock moved back) counts as recent so the bound still holds.
+fn manifest_recovery_is_recent(state_dir: &Path) -> bool {
+    std::fs::metadata(state_dir.join(MANIFEST_RECOVERY_STAMP))
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| {
+            modified
+                .elapsed()
+                .map_or(true, |age| age < MANIFEST_RECOVERY_INTERVAL)
+        })
+}
+
 pub(crate) async fn run_sync_pass_locked(
     ctx: &SyncCtx<'_>,
     mode: SyncMode,
@@ -263,12 +314,20 @@ pub(crate) async fn run_sync_pass_locked(
 ) -> Result<(SyncPassOutcome, HashSet<String>)> {
     match run_sync_pass_once(ctx, mode, lazy, false).await {
         Err(error) if is_manifest_rejection(&error) => {
+            let state_dir = ctx.state_dir()?;
+            if manifest_recovery_is_recent(&state_dir) {
+                return Err(error.context(
+                    "hub rejected the reachability manifest again; the full re-upload recovery runs at most once per hour",
+                ));
+            }
+            let now = chrono::Utc::now().timestamp().to_string();
+            tokio::fs::write(state_dir.join(MANIFEST_RECOVERY_STAMP), now)
+                .await
+                .context("record manifest recovery attempt")?;
             tracing::warn!(
                 "Hub rejected a reachability manifest; clearing the uploaded-object registry and retrying with full uploads"
             );
-            if let Ok(state_dir) = ctx.state_dir() {
-                let _ = crate::upload_registry::clear(&state_dir).await;
-            }
+            let _ = crate::upload_registry::clear(&state_dir).await;
             run_sync_pass_once(ctx, mode, lazy, true).await
         }
         result => result,
@@ -407,9 +466,10 @@ async fn run_sync_pass_once(
         outcome.deletes_remote
     );
 
-    finish_sync_pass(
+    outcome.head = finish_sync_pass(
         ctx,
         &local_files,
+        &response,
         &blocked,
         mode,
         negotiated_head.as_deref(),
@@ -650,4 +710,34 @@ pub(crate) async fn cleanup_deleted_cache(
     db.delete_cache_entries(&paths).await?;
     tracing::info!("Cleaned {} deleted cache entries", paths.len());
     Ok(u32::try_from(paths.len()).unwrap_or(u32::MAX))
+}
+
+#[cfg(test)]
+mod manifest_recovery_tests {
+    use super::{manifest_recovery_is_recent, MANIFEST_RECOVERY_INTERVAL, MANIFEST_RECOVERY_STAMP};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn forced_manifest_recovery_runs_at_most_once_per_interval() {
+        let state = tempfile::tempdir().expect("create state dir");
+        assert!(!manifest_recovery_is_recent(state.path()), "no stamp yet");
+        let stamp = state.path().join(MANIFEST_RECOVERY_STAMP);
+        std::fs::write(&stamp, b"1").expect("write stamp");
+        assert!(manifest_recovery_is_recent(state.path()), "fresh stamp");
+
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&stamp)
+            .expect("open stamp");
+        let old = SystemTime::now() - MANIFEST_RECOVERY_INTERVAL - Duration::from_secs(1);
+        file.set_modified(old).expect("age stamp");
+        assert!(!manifest_recovery_is_recent(state.path()), "expired stamp");
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        file.set_modified(future).expect("future stamp");
+        assert!(
+            manifest_recovery_is_recent(state.path()),
+            "future stamp keeps the bound"
+        );
+    }
 }

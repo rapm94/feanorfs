@@ -106,7 +106,8 @@ concurrent changes advance the head while the signal is being appended.
 
 A successful send returns only after the encrypted snapshot object, the
 reachability manifest, and the head swap succeed. Offline or exhausted-CAS
-sends fail clearly; there is no local outgoing queue.
+sends fail clearly; there is no local outgoing queue. A hub that is busy with
+other publications is retried for up to about 11 seconds first.
 
 ## Inbox semantics
 

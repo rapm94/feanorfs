@@ -874,7 +874,9 @@ pub(crate) fn is_managed_watcher(workspace: &Path) -> anyhow::Result<bool> {
 
 pub(super) fn stray_workspace_watcher(canonical: &str) -> Option<u32> {
     let workspace = Path::new(canonical);
-    let state = feanorfs_agent_core::ensure_workspace_state(workspace).ok()?;
+    // Read-only lookup: this runs inside the long-lived supervisor, and a
+    // lifetime lease here would keep a stopped workspace's state unretirable.
+    let state = feanorfs_agent_core::find_workspace_state(workspace).ok()??;
     let marker = state.join("watch.pid");
     let metadata = fs::metadata(&marker).ok()?;
     let age = metadata.modified().ok()?.elapsed().ok()?;

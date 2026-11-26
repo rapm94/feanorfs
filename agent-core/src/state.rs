@@ -16,7 +16,7 @@ const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const ACCESS_LOG_MAX_ENTRIES: usize = 10_000;
 pub const ACCESS_LOG_MIN_WEIGHT: f64 = 0.001;
 pub(crate) const MAX_LOCAL_STATE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_LOCAL_STATE_RECORDS: usize = feanorfs_common::MAX_TREE_OUTPUT_PATHS;
+pub(crate) const MAX_LOCAL_STATE_RECORDS: usize = feanorfs_common::MAX_TREE_OUTPUT_PATHS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalStateV1 {
@@ -62,7 +62,10 @@ impl LocalStateV1 {
 
     fn write_json_with_limit<W: Write>(&self, writer: W, max_bytes: usize) -> Result<usize> {
         let canonical = self.canonical_for_serialize()?;
-        let mut writer = BoundedWriter::new(writer, max_bytes);
+        // serde_json writes every token separately; unbuffered, one commit of a
+        // 9k-file workspace costs hundreds of thousands of write(2) calls.
+        let buffered = io::BufWriter::with_capacity(64 * 1024, writer);
+        let mut writer = BoundedWriter::new(buffered, max_bytes);
         let serialization = serde_json::to_writer_pretty(&mut writer, &canonical);
         if writer.exceeded() {
             bail!("local_state.json exceeds {max_bytes} byte limit");

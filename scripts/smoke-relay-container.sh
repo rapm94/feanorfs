@@ -5,10 +5,10 @@ engine="${CONTAINER_ENGINE:-}"
 if [ -z "$engine" ]; then
     if command -v docker >/dev/null 2>&1; then
         engine=docker
-    elif command -v podman >/dev/null 2>&1; then
-        engine=podman
+    elif command -v kiri >/dev/null 2>&1; then
+        engine=kiri
     else
-        echo "error: Docker or Podman is required" >&2
+        echo "error: Docker or Kiri is required" >&2
         exit 2
     fi
 fi
@@ -28,11 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-if [ "$(basename "$engine")" = podman ]; then
-    "$engine" build --format docker --file "$root/Dockerfile.relay" --tag "$image" "$root"
-else
-    "$engine" build --file "$root/Dockerfile.relay" --tag "$image" "$root"
-fi
+"$engine" build --file "$root/Dockerfile.relay" --tag "$image" "$root"
 "$engine" volume create "$volume" >/dev/null
 
 start_container() {

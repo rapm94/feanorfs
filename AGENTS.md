@@ -38,7 +38,7 @@ products wait on founder credentials ([TODO.md](TODO.md) F1).
 4. **Lazy hydration:** `--lazy` writes 0-byte placeholders; `hydrate`/`cat` fetch bytes.
 5. **Agents:** `agent spawn` clones a worktree with one base snapshot ref; land commits through head CAS; conflicts persist in encrypted tree entries plus private artifacts. Agent workspaces isolate data, not processes.
 6. **Coordination:** signals are no-file-change snapshots; reducers project work intent, integrator assignment, and resolution; `agent next` derives one lifecycle with prefilled actions; `agent guard` checks writes; `cap:<capability>` routes requests.
-7. **History:** `log` walks reachable parents; `undo` appends a two-parent snapshot; complete reachability manifests drive server and local GC.
+7. **History:** `log` walks reachable parents; `undo` appends a two-parent snapshot; complete reachability manifests drive server and local GC, each extending its ancestors' accepted closures, cut at a recorded `history-floor` where the hub already pruned older history and at the oldest snapshots past the manifest limits.
 8. **Lifecycle:** one supervisor job (`com.feanorfs.agent`) spawns the private hub, one watcher per workspace, configured runners, and the tray. Workers receive only canonical paths; keys, tokens, invites, and passphrases never appear in argv, environment, logs, or discovery.
 9. **Pairing and reachability:** SPAKE2 + AEAD pairing (`fnp1` LAN, `fnp2` relay rendezvous); signed mesh candidates race ahead of mDNS; the opaque relay forwards inner TLS only.
 10. **Recovery and credentials:** Argon2id + XChaCha20-Poly1305 workspace kits and hub identity bundles; OS credential stores with protected-file fallback that never spills back once migrated.
@@ -89,7 +89,7 @@ scripts/       installers, packaging, smoke tests
 5. **Library-first results:** commands return `Serialize` structs shared by `--json` and library callers; no `println!` in engine code.
 6. **No auto-merge:** conflicts produce `.original`/`.local`/`.cloud` artifacts in private state; consumers resolve with `conflicts keep`.
 7. **Data isolation ≠ sandbox:** never claim process sandboxing; link [docs/threat-model.md](docs/threat-model.md).
-8. **Sync scope:** mirror disk contents including gitignored paths; hard-skip `.git/`, `.jj/`, legacy metadata, symlinks, nested valid `CACHEDIR.TAG` trees; keep `DEFAULT_IGNORES` small and frozen; custom rules live in global state via `feanorfs ignore`. Never write `.git`; read only `HEAD` and the ref it names.
+8. **Sync scope:** mirror disk contents including gitignored paths; hard-skip `.git/`, `.jj/`, legacy metadata, symlinks, nested valid `CACHEDIR.TAG` trees, nested linked Git worktrees; keep `DEFAULT_IGNORES` small and frozen; custom rules live in global state via `feanorfs ignore`. Never write `.git`; read only `HEAD` and the ref it names.
 9. **One operation, every surface:** new agent operations land on Rust, CLI, C FFI, napi/JS/d.ts, MCP, docs, and skill together and join `client/tests/operation_matrix.rs`.
 10. **CI/CD:** pin actions to SHAs, keep permissions least-privilege, validate with actionlint/zizmor; never hand-edit cargo-dist's generated `release.yml`.
 11. **Changelog:** root `CHANGELOG.md` only (`changelog_path = "./CHANGELOG.md"`).

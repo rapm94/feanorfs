@@ -890,6 +890,18 @@ pub(crate) async fn run_supervisor() -> anyhow::Result<()> {
                 continue;
             }
         };
+        // Configured-workspace and runner checks pin each slot they resolve;
+        // release every slot outside the current roster so a stopped folder
+        // can be retired without restarting the supervisor.
+        let managed = registry
+            .workspaces
+            .iter()
+            .chain(registry.runners.iter())
+            .map(|path| path.as_path())
+            .collect::<Vec<_>>();
+        if let Err(error) = feanorfs_agent_core::release_state_leases_except(&managed) {
+            tracing::warn!("releasing unmanaged workspace-state leases failed: {error:#}");
+        }
         let digest = match runner_reconcile_projection_digest(&children, &registry) {
             Ok(digest) => digest,
             Err(error) => {

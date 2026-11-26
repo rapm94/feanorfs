@@ -775,6 +775,43 @@ pub fn workspace_has_preferred_state(workspace: &Path) -> bool {
             .is_file()
 }
 
+/// Locates a workspace's existing state slot for read-only inspection, without
+/// creating state or taking the full-lifetime lease. Long-lived observers such
+/// as the supervisor use it so a workspace they stop managing stays
+/// retirable. A slot is found at its path-hash location or, after a move,
+/// through a fresh identity index; tombstoned and stale-index cases read as
+/// absent. Callers that write slot bytes must use [`ensure_workspace_state`].
+pub fn find_workspace_state(workspace: &Path) -> Result<Option<PathBuf>> {
+    find_workspace_state_in(workspace, &global_state_root()?)
+}
+
+pub(crate) fn find_workspace_state_in(workspace: &Path, root: &Path) -> Result<Option<PathBuf>> {
+    let workspaces = root.join("workspaces");
+    let preferred = workspaces.join(workspace_state_id(workspace)?);
+    let Some(identity) = current_workspace_identity(workspace)? else {
+        return Ok(state_directory_exists(&preferred)?.then_some(preferred));
+    };
+    let candidate = if state_directory_exists(&preferred)?
+        && identity.matches(read_workspace_identity(&preferred)?.as_deref())
+    {
+        Some(preferred)
+    } else if crate::workspace_state_registry::identity_index_fresh(root, &workspaces)? {
+        crate::workspace_state_registry::index_lookup(root, &identity)?
+    } else {
+        None
+    };
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    if !state_directory_exists(&candidate)?
+        || !identity.matches(read_workspace_identity(&candidate)?.as_deref())
+        || crate::workspace_state_registry::slot_tombstoned(&candidate)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
+}
+
 pub fn workspace_is_configured(workspace: &Path) -> bool {
     workspace_state_path(workspace).is_ok_and(|state| state.join("config.json").is_file())
         || workspace
@@ -846,7 +883,7 @@ pub(crate) fn ensure_workspace_state_in(workspace: &Path, root: &Path) -> Result
     write_location(&state, workspace)?;
     let mut index_record = None;
     if let Some(identity) = identity.as_ref() {
-        write_private(&state.join("identity"), identity.stable.as_bytes())?;
+        write_private_if_changed(&state.join("identity"), identity.stable.as_bytes())?;
         let canonical = canonical_workspace(workspace)?
             .to_str()
             .context("workspace path is not valid UTF-8 and cannot be recorded portably")?
@@ -1195,7 +1232,26 @@ fn write_location(state: &Path, workspace: &Path) -> Result<()> {
     let canonical = canonical
         .to_str()
         .context("workspace path is not valid UTF-8 and cannot be persisted portably")?;
-    write_private(&state.join("location"), canonical.as_bytes())
+    write_private_if_changed(&state.join("location"), canonical.as_bytes())
+}
+
+/// [`write_private`] for records re-asserted on every state resolution: an
+/// already identical private file costs a read instead of two disk flushes.
+fn write_private_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
+    let unchanged = fs::symlink_metadata(path).is_ok_and(|metadata| {
+        #[cfg(unix)]
+        let private = {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode() & 0o777 == 0o600
+        };
+        #[cfg(not(unix))]
+        let private = true;
+        private && metadata.is_file() && metadata.len() == bytes.len() as u64
+    }) && fs::read(path).is_ok_and(|current| current == bytes);
+    if unchanged {
+        return Ok(());
+    }
+    write_private(path, bytes)
 }
 
 /// Private durable replacement: writes `bytes` to `path`

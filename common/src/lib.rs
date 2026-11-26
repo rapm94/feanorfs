@@ -446,6 +446,10 @@ pub fn normalize_path(path: &str) -> String {
 
 fn is_windows_reserved_component(component: &str) -> bool {
     let stem = component.split('.').next().unwrap_or(component);
+    // Every reserved name is 3 to 7 bytes; skip the allocation for the rest.
+    if !(3..=7).contains(&stem.len()) {
+        return false;
+    }
     matches!(
         stem.to_ascii_uppercase().as_str(),
         "CON"
@@ -493,7 +497,7 @@ pub fn is_safe_rel_path(path: &str) -> bool {
         || path.len() > MAX_PORTABLE_PATH_BYTES
         || path.starts_with('/')
         || path.contains('\\')
-        || !path.nfc().eq(path.chars())
+        || !(path.is_ascii() || path.nfc().eq(path.chars()))
     {
         return false;
     }
@@ -506,9 +510,10 @@ pub fn is_safe_rel_path(path: &str) -> bool {
             && !component.eq_ignore_ascii_case(".git")
             && !component.eq_ignore_ascii_case(".jj")
             && !component.ends_with([' ', '.'])
-            && !component
-                .chars()
-                .any(|character| character.is_control() || r#"<>:"|?*"#.contains(character))
+            && !component.chars().any(|character| {
+                character.is_control()
+                    || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+            })
             && !is_windows_reserved_component(component)
     })
 }

@@ -48,6 +48,7 @@ Machine-generated build output is handled by `DEFAULT_IGNORES` or explicit
 | `.feanorfs-tmp-*` | Crash-safe sibling write staging; stale files are cleaned automatically |
 | Symlinks | Reported by `status` as sorted, deduplicated skipped paths; links are never followed |
 | Valid `CACHEDIR.TAG` directories | Regeneratable cache trees declared by their owning tools; contents remain untouched on disk |
+| Linked Git worktrees | Nested directories whose `.git` file points at `<repo>/.git/worktrees/<name>` (`git worktree add`, agent tools such as `.claude/worktrees/`); duplicate checkouts, untouched on disk |
 
 ## Default ignores (`DEFAULT_IGNORES`)
 
@@ -87,6 +88,12 @@ Use `feanorfs ignore <pattern>` for a project-specific artifact directory not in
 - **Not required** for typical Rust/Node/Python projects — defaults cover the heavy dirs.
 - **Not a substitute for git** — duplicating an entire `.gitignore` defeats the product goal (sync what git ignores).
 - Pruning removes excluded paths from encrypted mirror state without deleting the local files. Hard-excluded VCS and legacy metadata are cleaned from transport/conflict state automatically.
+
+## Linked Git worktrees
+
+Agent tools create one `git worktree` checkout per task inside the project. Each is a full duplicate of the repository, and dozens of them can push a workspace past the 250,000-entry tree and local-state limits. FeanorFS skips any nested directory whose `.git` is a regular file starting with `gitdir:` and naming a path whose parent directory is `worktrees`. The check is structural, so it covers every tool and location without growing `DEFAULT_IGNORES`.
+
+Submodules also use a `.git` file but point at `.git/modules/`; they stay synced. A workspace root that is itself a linked worktree is exempt, as with root `CACHEDIR.TAG`. Uncommitted edits inside a skipped worktree are not mirrored; use `feanorfs agent spawn` for isolated agent work that syncs. Worktree paths tracked before this rule are frozen like newly ignored paths; `prune-ignored` does not yet cover structural skips.
 
 ## `CACHEDIR.TAG`
 
