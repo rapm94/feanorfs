@@ -1,9 +1,10 @@
 use crate::api::ApiClient;
 use crate::local::{ClientDb, Config};
+use crate::objects::LoadedTree;
 use anyhow::Result;
 use feanorfs_common::LegacyPolicy;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 static WARNED_EMPTY_PASSWORD: OnceLock<()> = OnceLock::new();
 
@@ -17,6 +18,9 @@ pub struct SyncCtx<'a> {
     password: std::borrow::Cow<'a, str>,
     format_version: u32,
     state_dir_cache: Mutex<Option<std::path::PathBuf>>,
+    /// Last tree resolved through this context. Trees are immutable, and one
+    /// pass reads the same head tree as base, server view, and candidate.
+    tree_memo: Mutex<Option<(String, Arc<LoadedTree>)>>,
 }
 
 impl<'a> SyncCtx<'a> {
@@ -63,6 +67,23 @@ impl<'a> SyncCtx<'a> {
         Ok(state_dir)
     }
 
+    pub(crate) fn memoized_tree(&self, root: &str) -> Option<Arc<LoadedTree>> {
+        self.tree_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(id, _)| id == root)
+            .map(|(_, tree)| Arc::clone(tree))
+    }
+
+    pub(crate) fn memoize_tree(&self, root: &str, tree: &LoadedTree) {
+        *self
+            .tree_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((root.to_string(), Arc::new(tree.clone())));
+    }
+
     /// Build a context from an explicit policy.
     #[must_use]
     pub fn new(
@@ -82,6 +103,7 @@ impl<'a> SyncCtx<'a> {
             password: std::borrow::Cow::Owned(password.unwrap_or("").to_string()),
             format_version: 2,
             state_dir_cache: Mutex::new(None),
+            tree_memo: Mutex::new(None),
         }
     }
 
@@ -120,6 +142,7 @@ impl<'a> SyncCtx<'a> {
             ),
             format_version: config.format_version,
             state_dir_cache: Mutex::new(None),
+            tree_memo: Mutex::new(None),
         })
     }
 

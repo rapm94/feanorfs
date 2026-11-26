@@ -172,6 +172,28 @@ pub(crate) fn ensure_shared_state_lease(root: &Path, slot: &str) -> Result<()> {
     Ok(())
 }
 
+/// Drops this process's shared lifetime leases on every slot except the
+/// path-hash slots of `keep`. A long-lived manager (the supervisor) calls this
+/// after each roster pass so a workspace it stopped managing becomes
+/// retirable without a restart. Nothing is moved or deleted; a kept workspace
+/// whose state lives in a relocated slot simply re-takes its hold on the next
+/// resolution.
+pub fn release_state_leases_except(keep: &[&Path]) -> Result<()> {
+    release_state_leases_except_in(&crate::workspace_layout::global_state_root()?, keep);
+    Ok(())
+}
+
+pub(crate) fn release_state_leases_except_in(root: &Path, keep: &[&Path]) {
+    let keep = keep
+        .iter()
+        .filter_map(|workspace| workspace_state_id(workspace).ok())
+        .collect::<std::collections::BTreeSet<_>>();
+    shared_leases()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(lease_root, slot), _| lease_root != root || keep.contains(slot));
+}
+
 /// A child forked by any thread of this process holds copies of every
 /// descriptor until it execs, so a shared hold this process just released can
 /// linger for that instant. Exclusive acquisition retries contention for at
@@ -407,6 +429,19 @@ pub(crate) fn upsert_index_entry(
         bail!("workspace identity index slot is invalid");
     }
     let mut index = load_identity_index(root)?;
+    let recorded = index.version == 1
+        && index
+            .entries
+            .get(identity)
+            .is_some_and(|known| known == slot)
+        && index
+            .locations
+            .iter()
+            .all(|(path, known)| (known == slot) == (path == canonical_path))
+        && index.locations.contains_key(canonical_path);
+    if recorded && identity_index_fresh(root, &root.join("workspaces"))? {
+        return Ok(());
+    }
     index.version = 1;
     if !index.entries.contains_key(identity) && index.entries.len() >= MAX_WORKSPACE_STATE_SLOTS {
         return Ok(());
@@ -1363,6 +1398,80 @@ mod tests {
         let exclusive = ExclusiveStateLease::try_acquire(root.path(), "slot").unwrap();
         release.join().unwrap();
         drop(exclusive);
+    }
+
+    #[test]
+    fn read_only_lookup_never_pins_or_creates_state() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("before");
+        let relocated = parent.path().join("after");
+        fs::create_dir(&original).unwrap();
+        let state =
+            crate::workspace_layout::ensure_workspace_state_in(&original, root.path()).unwrap();
+        let slot = state.file_name().unwrap().to_str().unwrap().to_string();
+        let key = (root.path().to_path_buf(), slot.clone());
+        let held = || {
+            shared_leases()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&key)
+        };
+        // A long-lived observer process that never ran `ensure` itself.
+        shared_leases()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+
+        let find = crate::workspace_layout::find_workspace_state_in;
+        assert_eq!(find(&original, root.path()).unwrap(), Some(state.clone()));
+        fs::rename(&original, &relocated).unwrap();
+        assert_eq!(find(&relocated, root.path()).unwrap(), Some(state.clone()));
+        assert!(
+            !held(),
+            "a read-only lookup must not take the lifetime lease"
+        );
+        // With no other holder, the slot stays retirable after observation.
+        drop(ExclusiveStateLease::try_acquire(root.path(), &slot).unwrap());
+
+        let unconfigured = parent.path().join("unconfigured");
+        fs::create_dir(&unconfigured).unwrap();
+        assert_eq!(find(&unconfigured, root.path()).unwrap(), None);
+        let id = crate::workspace_layout::workspace_state_id(&unconfigured).unwrap();
+        assert!(!root.path().join("workspaces").join(id).exists());
+    }
+
+    #[test]
+    fn released_leases_free_only_workspaces_no_longer_managed() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let managed = parent.path().join("managed");
+        let stopped = parent.path().join("stopped");
+        fs::create_dir(&managed).unwrap();
+        fs::create_dir(&stopped).unwrap();
+        let slot = |workspace: &Path| {
+            let state =
+                crate::workspace_layout::ensure_workspace_state_in(workspace, root.path()).unwrap();
+            (
+                root.path().to_path_buf(),
+                state.file_name().unwrap().to_str().unwrap().to_string(),
+            )
+        };
+        let (managed_key, stopped_key) = (slot(&managed), slot(&stopped));
+        let held = |key: &(PathBuf, String)| {
+            shared_leases()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(key)
+        };
+        assert!(held(&managed_key) && held(&stopped_key));
+
+        release_state_leases_except_in(root.path(), &[managed.as_path()]);
+        assert!(held(&managed_key), "a managed workspace keeps its lease");
+        assert!(!held(&stopped_key), "a stopped workspace is released");
+        // Another process can now take the stopped slot exclusively.
+        let contender = open_lease_file(&root.path().join("workspaces"), &stopped_key.1).unwrap();
+        FileExt::try_lock_exclusive(&contender).unwrap();
     }
 
     #[test]

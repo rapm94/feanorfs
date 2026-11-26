@@ -60,8 +60,10 @@ relay.example.com {
 ```
 
 Caddy obtains and renews the public certificate and forwards WebSocket upgrades
-without extra directives. Expose only ports 80/443 from the proxy. Other
-proxies must support long-lived WebSockets and must not buffer binary frames.
+without extra directives, and sets X-Forwarded-For by default for per-source relay
+connection limits. Expose only ports 80/443 from the proxy. Other proxies must
+support long-lived WebSockets, must not buffer binary frames, and should set
+X-Forwarded-For to enable per-source connection caps.
 
 Do not enable request-path access logs at the proxy. Pairing session IDs and
 tunnel routes are high-entropy reachability capabilities; FeanorFS deliberately

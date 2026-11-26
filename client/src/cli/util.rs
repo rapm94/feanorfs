@@ -399,16 +399,18 @@ pub(crate) fn terminal_line(value: &str) -> String {
 }
 
 fn output_json_to<T: serde::Serialize>(
-    mut writer: impl std::io::Write,
+    writer: impl std::io::Write,
     value: &T,
 ) -> anyhow::Result<()> {
+    // Stdout is line buffered: pretty JSON would cost one write per line.
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, writer);
     if let Err(error) = serde_json::to_writer_pretty(&mut writer, value) {
         if error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe) {
             return Ok(());
         }
         return Err(error.into());
     }
-    match writeln!(writer) {
+    match writeln!(writer).and_then(|()| writer.flush()) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(error) => Err(error.into()),

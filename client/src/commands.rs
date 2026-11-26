@@ -119,6 +119,9 @@ pub struct SyncResult {
     pub deletes_remote: u32,
     pub large_file_count: usize,
     pub large_file_examples: Vec<String>,
+    /// Head the pass applied or published; lets the watcher acknowledge it.
+    #[serde(skip)]
+    pub head: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,6 +240,7 @@ pub async fn do_sync(
         deletes_remote: outcome.deletes_remote,
         large_file_count: outcome.large_file_count,
         large_file_examples: outcome.large_file_examples,
+        head: outcome.head,
     })
 }
 
@@ -261,6 +265,7 @@ pub async fn do_sync_guarded(
         deletes_remote: outcome.deletes_remote,
         large_file_count: outcome.large_file_count,
         large_file_examples: outcome.large_file_examples,
+        head: outcome.head,
     })
 }
 
@@ -453,8 +458,8 @@ pub async fn do_status(
 
 async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
     let activity = crate::tray::load_worker_status(ctx.base);
-    let local_files = crate::local::scan_local_directory(ctx.base, ctx.db, ctx.password()).await?;
-    let skipped_symlinks = crate::local::collect_symlink_warnings(ctx.base);
+    let (local_files, skipped_symlinks) =
+        crate::local::scan_local_directory_with_symlinks(ctx.base, ctx.db, ctx.password()).await?;
     let pending = conflicts::pending_conflict_paths(ctx.db).await?;
     let last = conflicts::load_last_synced_snapshot(ctx).await?;
 
@@ -485,10 +490,30 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
             })
         }
         Ok((response, blocked, _)) => {
-            let server_files: Vec<FileState> = conflicts::load_server_view(ctx)
-                .await?
-                .into_values()
-                .collect();
+            let (server_head, server_view_map) = conflicts::load_server_view_with_head(ctx).await?;
+            let server_files: Vec<FileState> = server_view_map.into_values().collect();
+            let server_rollback_warning = if ctx.format_version() >= 3 {
+                let snapshots = feanorfs_agent_core::snapshot::SnapshotEngine::new(ctx);
+                if let Some(base_id) = snapshots.last_synced_id().await.ok().flatten() {
+                    if let Some(head) = server_head {
+                        if snapshots
+                            .head_is_rollback(&base_id, &head)
+                            .await
+                            .unwrap_or(false)
+                        {
+                            Some("Hub head is older than the snapshot this machine last synced; run `feanorfs sync --up` instead of accepting stale files.".to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                conflicts::detect_server_rollback(&last, &server_files)
+            };
             Ok(StatusResult {
                 reported_at_ms: activity.as_ref().map(|s| s.published_at_ms),
                 continuous: activity.as_ref().and_then(|s| s.continuous),
@@ -500,7 +525,7 @@ async fn do_status_with_ctx(ctx: &SyncCtx<'_>) -> Result<StatusResult> {
                 local_files,
                 pending_conflicts: blocked.into_iter().collect(),
                 offline_backlog: 0,
-                server_rollback_warning: conflicts::detect_server_rollback(&last, &server_files),
+                server_rollback_warning,
                 skipped_symlinks,
                 // Advisory: an unreadable label never fails status.
                 git_baseline_mismatch: if ctx.format_version() >= 3 {

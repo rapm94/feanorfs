@@ -47,6 +47,33 @@ fn streaming_serialization_matches_to_json_bytes() {
 }
 
 #[test]
+fn streaming_serialization_is_buffered() {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut state = empty_state();
+    for index in 0..1_000 {
+        state
+            .local_files
+            .insert(format!("{index}.txt"), cache_entry("a", index));
+    }
+    let mut writer = CountingWriter(0);
+    let bytes = state.write_json(&mut writer).expect("stream state");
+    assert!(
+        writer.0 <= bytes / (32 * 1024) + 2,
+        "{} writes for {bytes} bytes",
+        writer.0
+    );
+}
+
+#[test]
 fn streaming_serialization_rejects_overflow_without_writing_past_limit() {
     let mut state = empty_state();
     state

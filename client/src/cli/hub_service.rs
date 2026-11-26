@@ -464,8 +464,28 @@ pub(crate) async fn run_supervised(data_dir: PathBuf) -> anyhow::Result<()> {
         }
     };
     start_punch_bridge(&spec.data_dir, port);
-    let server = run_http_server(automatic_options(spec.data_dir, port));
+    let server = run_http_server(automatic_options(spec.data_dir.clone(), port));
     tokio::pin!(server);
+
+    // Spawn UPnP mapping renewal task
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(feanorfs_agent_core::mesh::MAPPING_RENEW_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // Skip the first tick
+        loop {
+            interval.tick().await;
+            if let (Some(internal), Some(external)) =
+                (internal_lan_ipv4(), advertised_mapped_port())
+            {
+                if let Err(error) =
+                    feanorfs_agent_core::mesh::map_tcp_port(internal, port, Some(external)).await
+                {
+                    tracing::info!("could not renew UPnP mapping; the mapped candidate will go stale: {error:#}");
+                }
+            }
+        }
+    });
+
     let Some(relay) = relay else {
         return server.await;
     };
@@ -513,6 +533,17 @@ fn start_punch_bridge(data_dir: &Path, port: u16) {
             return;
         }
     };
+    let token = match feanorfs_server::resolve_or_create_auth_token(data_dir, None, false) {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            tracing::debug!("mesh punch disabled; no authentication token");
+            return;
+        }
+        Err(error) => {
+            tracing::debug!("mesh punch disabled; token unavailable: {error:#}");
+            return;
+        }
+    };
     let bind: SocketAddr = ([0, 0, 0, 0], port).into();
     let upstream: SocketAddr = ([127, 0, 0, 1], port).into();
     let data_dir = data_dir.to_path_buf();
@@ -521,7 +552,10 @@ fn start_punch_bridge(data_dir: &Path, port: u16) {
             bind,
             cert,
             key,
-            feanorfs_agent_core::mesh::PunchPeer { identity },
+            feanorfs_agent_core::mesh::PunchPeer {
+                identity,
+                token: std::sync::Arc::new(zeroize::Zeroizing::new(token)),
+            },
             upstream,
         )
         .await
@@ -579,6 +613,23 @@ pub(crate) fn load_reflexive(data_dir: &Path) -> Option<SocketAddr> {
     (!address.ip().is_loopback() && !address.ip().is_unspecified()).then_some(address)
 }
 
+fn internal_lan_ipv4() -> Option<std::net::IpAddr> {
+    let mut addresses = if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .map(|interface| interface.ip());
+    addresses.find(|addr| addr.is_ipv4() && !addr.is_loopback() && !addr.is_unspecified())
+}
+
+fn advertised_mapped_port() -> Option<u16> {
+    let config = feanorfs_client::load_global_config().ok()?;
+    let mesh = config.mesh?;
+    mesh.candidates()
+        .iter()
+        .find(|candidate| candidate.kind() == MeshCandidateKind::Mapped)
+        .map(|candidate| candidate.address().port())
+}
+
 async fn automatic_mesh_config(port: u16) -> anyhow::Result<MeshConfig> {
     let identity = feanorfs_agent_core::mesh::MachineIdentity::load_or_create()?;
     let addresses = if_addrs::get_if_addrs()?
@@ -592,8 +643,21 @@ async fn automatic_mesh_config(port: u16) -> anyhow::Result<MeshConfig> {
         })
         .map(|candidate| candidate.address().ip());
     if let Some(internal) = internal {
-        match feanorfs_agent_core::mesh::map_tcp_port(internal, port).await {
-            Ok(mapped) => candidates.push(mapped),
+        // Re-request the external port already advertised so renewal and
+        // restart keep one stable mapped candidate; fall back to any port.
+        let advertised = advertised_mapped_port();
+        let mut mapped = feanorfs_agent_core::mesh::map_tcp_port(internal, port, advertised).await;
+        if mapped.is_err() && advertised.is_some() {
+            mapped = feanorfs_agent_core::mesh::map_tcp_port(internal, port, None).await;
+        }
+        match mapped {
+            Ok(mapped) => {
+                tracing::info!(
+                    "UPnP gateway mapped hub TCP port {port} for {} minutes; the hub is reachable from the internet through it",
+                    feanorfs_agent_core::mesh::MAPPING_LEASE_SECS / 60
+                );
+                candidates.push(mapped);
+            }
             Err(error) => {
                 tracing::debug!("private-hub NAT port mapping unavailable: {error:#}");
             }

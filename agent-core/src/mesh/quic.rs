@@ -6,17 +6,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use zeroize::Zeroizing;
 
-const AUTH_DOMAIN: &[u8] = b"feanorfs-mesh-auth-v1";
+const AUTH_DOMAIN: &[u8] = b"feanorfs-mesh-auth-v2";
+const AUTH_VERSION: u8 = 2;
+const AUTH_NONCE_BYTES: usize = 32;
+const AUTH_MESSAGE_BYTES: usize = 64 + 32 + 32;
 const AUTH_OK: &[u8; 2] = b"ok";
-const PUNCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-const MAX_AUTH_MESSAGE_BYTES: usize = 96;
+const PUNCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 64;
 const MAX_STREAMS: usize = 64;
 
 #[derive(Clone)]
 pub struct PunchPeer {
     pub identity: MachineIdentity,
+    /// Hub bearer token. Both sides prove knowledge of it; it never crosses the wire.
+    pub token: Arc<Zeroizing<String>>,
 }
 
 fn tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -88,7 +93,7 @@ pub async fn serve_punch_bridge(
     bind: SocketAddr,
     cert_pem: String,
     key_pem: String,
-    _peer: PunchPeer,
+    peer: PunchPeer,
     upstream: SocketAddr,
 ) -> Result<PunchBridgeHandle> {
     let socket = tokio::net::UdpSocket::bind(bind)
@@ -117,45 +122,48 @@ pub async fn serve_punch_bridge(
         Arc::new(quinn::TokioRuntime),
     )
     .context("start QUIC punch endpoint")?;
-    eprintln!("DBG endpoint-live");
     let auth_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let connection = match incoming.await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    tracing::debug!("mesh punch handshake rejected: {error}");
-                    continue;
-                }
+            // Reject, never queue: a full table must not grow parked tasks.
+            let Ok(permit) = auth_slots.clone().try_acquire_owned() else {
+                incoming.refuse();
+                continue;
             };
-            let auth = auth_slots.clone();
+            let token = peer.token.clone();
             tokio::spawn(async move {
-                // Bounded concurrent authentication keeps slow peers from
-                // consuming unbounded accept capacity.
-                let Ok(_permit) = auth.acquire_owned().await else {
-                    return;
-                };
-                if let Err(error) = authenticate_inbound(&connection).await {
-                    tracing::debug!("mesh punch authentication failed: {error:#}");
-                } else {
-                    let upstream = upstream;
-                    let streams = Arc::new(Semaphore::new(MAX_STREAMS));
-                    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-                        let Ok(permit) = streams.clone().acquire_owned().await else {
-                            break;
-                        };
-                        let Ok(tcp) = tokio::net::TcpStream::connect(upstream).await else {
-                            break;
-                        };
-                        tokio::spawn(async move {
-                            let (mut read_half, mut write_half) = tokio::io::split(tcp);
-                            let upstream_to_peer = tokio::io::copy(&mut read_half, &mut send);
-                            let peer_to_upstream = tokio::io::copy(&mut recv, &mut write_half);
-                            let _ = tokio::join!(upstream_to_peer, peer_to_upstream);
-                            let _ = send.finish();
-                            drop(permit);
-                        });
+                let _permit = permit;
+                // Handshake per task so a stalled Initial cannot block accepts.
+                let connection = match tokio::time::timeout(PUNCH_CONNECT_TIMEOUT, incoming).await {
+                    Ok(Ok(connection)) => connection,
+                    Ok(Err(error)) => {
+                        tracing::debug!("mesh punch handshake rejected: {error}");
+                        return;
                     }
+                    Err(_) => return,
+                };
+                if let Err(error) = authenticate_inbound(&connection, &token).await {
+                    tracing::debug!("mesh punch authentication failed: {error:#}");
+                    connection.close(1_u32.into(), b"auth");
+                    return;
+                }
+                let upstream = upstream;
+                let streams = Arc::new(Semaphore::new(MAX_STREAMS));
+                while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                    let Ok(permit) = streams.clone().acquire_owned().await else {
+                        break;
+                    };
+                    let Ok(tcp) = tokio::net::TcpStream::connect(upstream).await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        let (mut read_half, mut write_half) = tokio::io::split(tcp);
+                        let upstream_to_peer = tokio::io::copy(&mut read_half, &mut send);
+                        let peer_to_upstream = tokio::io::copy(&mut recv, &mut write_half);
+                        let _ = tokio::join!(upstream_to_peer, peer_to_upstream);
+                        let _ = send.finish();
+                        drop(permit);
+                    });
                 }
             });
         }
@@ -188,38 +196,66 @@ async fn probe_reflexive(socket: &tokio::net::UdpSocket) -> Option<SocketAddr> {
     .and_then(Result::ok)
 }
 
-async fn authenticate_inbound(connection: &quinn::Connection) -> Result<()> {
-    // ponytail: any signed Ed25519 identity may punch today; admission by
-    // workspace member list once membership is queryable without new endpoints
+fn auth_transcript(nonce: &[u8; AUTH_NONCE_BYTES]) -> Vec<u8> {
+    [AUTH_DOMAIN, nonce.as_slice()].concat()
+}
+
+fn token_proof(token: &str, nonce: &[u8; AUTH_NONCE_BYTES]) -> blake3::Hash {
+    let key = blake3::derive_key("feanorfs mesh punch token proof v2", token.as_bytes());
+    blake3::keyed_hash(&key, &auth_transcript(nonce))
+}
+
+fn decode_auth_message(
+    message: &[u8],
+    nonce: &[u8; AUTH_NONCE_BYTES],
+    token: &str,
+) -> Result<NodeId> {
+    ensure!(
+        message.len() == AUTH_MESSAGE_BYTES,
+        "mesh auth message has the wrong length"
+    );
+    let signature: [u8; 64] = message[..64].try_into().expect("exact signature slice");
+    let claimed = NodeId::from_public_key(message[64..96].try_into().expect("32 bytes"));
+    let proof = blake3::Hash::from_bytes(message[96..].try_into().expect("32 bytes"));
+    // blake3::Hash equality is constant-time.
+    ensure!(
+        proof == token_proof(token, nonce),
+        "mesh auth token proof is invalid"
+    );
+    ensure!(
+        MachineIdentity::verify(claimed, &auth_transcript(nonce), &signature),
+        "mesh auth signature is invalid"
+    );
+    Ok(claimed)
+}
+
+async fn authenticate_inbound(connection: &quinn::Connection, token: &str) -> Result<NodeId> {
     let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), connection.accept_bi())
         .await
         .context("mesh auth stream timed out")?
         .context("accept mesh auth stream")?;
 
-    let buffer = tokio::time::timeout(
-        Duration::from_secs(5),
-        recv.read_to_end(MAX_AUTH_MESSAGE_BYTES),
-    )
-    .await
-    .context("mesh auth reply timed out")?
-    .context("read bounded mesh auth reply")?;
-    let _claimed = decode_auth_message(&buffer)?;
+    // Read hello version byte
+    let mut hello = [0_u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut hello))
+        .await
+        .context("mesh auth hello timed out")??;
+    ensure!(hello[0] == AUTH_VERSION, "unsupported mesh auth version");
+
+    // Generate and send nonce
+    let mut nonce = [0_u8; AUTH_NONCE_BYTES];
+    getrandom::fill(&mut nonce).context("generate mesh auth nonce")?;
+    send.write_all(&nonce).await?;
+
+    // Read auth message
+    let buffer = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(AUTH_MESSAGE_BYTES))
+        .await
+        .context("mesh auth message timed out")?
+        .context("read bounded mesh auth message")?;
+
+    let claimed = decode_auth_message(&buffer, &nonce, token)?;
     send.write_all(AUTH_OK).await?;
     send.finish()?;
-    Ok(())
-}
-
-fn decode_auth_message(message: &[u8]) -> Result<NodeId> {
-    ensure!(
-        message.len() == MAX_AUTH_MESSAGE_BYTES,
-        "mesh auth message has the wrong length"
-    );
-    let signature: [u8; 64] = message[..64].try_into().expect("exact signature slice");
-    let claimed = NodeId::from_public_key(message[64..96].try_into().expect("32 bytes"));
-    ensure!(
-        MachineIdentity::verify(claimed, AUTH_DOMAIN, &signature),
-        "mesh auth signature is invalid"
-    );
     Ok(claimed)
 }
 
@@ -235,12 +271,26 @@ async fn open_auth_stream(
 
 async fn authenticate_outbound(connection: &quinn::Connection, peer: &PunchPeer) -> Result<()> {
     let (mut send, mut recv) = open_auth_stream(connection).await?;
-    let signature = peer.identity.sign(AUTH_DOMAIN);
-    let mut message = Vec::with_capacity(96);
+
+    // Send version byte
+    send.write_all(&[AUTH_VERSION]).await?;
+
+    // Read nonce
+    let mut nonce = [0_u8; AUTH_NONCE_BYTES];
+    tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut nonce))
+        .await
+        .context("mesh auth nonce timed out")??;
+
+    // Build and send auth message
+    let signature = peer.identity.sign(&auth_transcript(&nonce));
+    let mut message = Vec::with_capacity(AUTH_MESSAGE_BYTES);
     message.extend_from_slice(&signature);
     message.extend_from_slice(peer.identity.node_id().as_bytes());
+    message.extend_from_slice(token_proof(&peer.token, &nonce).as_bytes());
     send.write_all(&message).await?;
     send.finish()?;
+
+    // Read ack
     let mut ack = [0_u8; 2];
     tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut ack))
         .await
@@ -376,6 +426,7 @@ mod tests {
         let client_identity =
             MachineIdentity::load_or_create_private(&dir.path().join("client-machine.json"))
                 .unwrap();
+        let token = "test-token-secret".to_string();
 
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let advertised = serve_punch_bridge(
@@ -384,6 +435,7 @@ mod tests {
             key_pem,
             PunchPeer {
                 identity: host_identity.clone(),
+                token: Arc::new(Zeroizing::new(token.clone())),
             },
             upstream_addr,
         )
@@ -396,6 +448,7 @@ mod tests {
             &server_name,
             PunchPeer {
                 identity: client_identity.clone(),
+                token: Arc::new(Zeroizing::new(token.clone())),
             },
         )
         .await
@@ -409,18 +462,85 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let identity = MachineIdentity::load_or_create_private(&dir.path().join("a.json")).unwrap();
         let stranger = MachineIdentity::load_or_create_private(&dir.path().join("b.json")).unwrap();
+        let token = "test-token";
 
-        let signature = identity.sign(AUTH_DOMAIN);
-        let mut message = Vec::with_capacity(96);
+        let mut nonce = [0_u8; AUTH_NONCE_BYTES];
+        nonce[0] = 42;
+
+        // Build valid message
+        let signature = identity.sign(&auth_transcript(&nonce));
+        let mut message = Vec::with_capacity(AUTH_MESSAGE_BYTES);
         message.extend_from_slice(&signature);
         message.extend_from_slice(identity.node_id().as_bytes());
-        assert_eq!(decode_auth_message(&message).unwrap(), identity.node_id());
+        message.extend_from_slice(token_proof(token, &nonce).as_bytes());
+        assert_eq!(
+            decode_auth_message(&message, &nonce, token).unwrap(),
+            identity.node_id()
+        );
 
-        *message.last_mut().unwrap() ^= 1;
-        assert!(decode_auth_message(&message).is_err());
+        // Flipped signature bit
+        *message.first_mut().unwrap() ^= 1;
+        assert!(decode_auth_message(&message, &nonce, token).is_err());
 
-        *message.last_mut().unwrap() ^= 1;
+        // Restore and test substituted node id
+        *message.first_mut().unwrap() ^= 1;
         message[64..96].copy_from_slice(stranger.node_id().as_bytes());
-        assert!(decode_auth_message(&message).is_err());
+        assert!(decode_auth_message(&message, &nonce, token).is_err());
+
+        // Wrong token
+        message[64..96].copy_from_slice(identity.node_id().as_bytes());
+        assert!(decode_auth_message(&message, &nonce, "different-token").is_err());
+
+        // Different nonce
+        let mut different_nonce = [0_u8; AUTH_NONCE_BYTES];
+        different_nonce[0] = 99;
+        assert!(decode_auth_message(&message, &different_nonce, token).is_err());
+    }
+
+    #[tokio::test]
+    async fn punch_with_wrong_token_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem, server_name) = pem_material(dir.path()).await;
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut buf = vec![0_u8; 512];
+            let _ = socket.read(&mut buf).await;
+        });
+
+        let host_identity =
+            MachineIdentity::load_or_create_private(&dir.path().join("host-machine.json")).unwrap();
+        let client_identity =
+            MachineIdentity::load_or_create_private(&dir.path().join("client-machine.json"))
+                .unwrap();
+
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let advertised = serve_punch_bridge(
+            bind,
+            cert_pem.clone(),
+            key_pem,
+            PunchPeer {
+                identity: host_identity.clone(),
+                token: Arc::new(Zeroizing::new("server-token".to_string())),
+            },
+            upstream_addr,
+        )
+        .await
+        .unwrap();
+
+        let result = dial_punch_bridge(
+            advertised.local,
+            &cert_pem,
+            &server_name,
+            PunchPeer {
+                identity: client_identity.clone(),
+                token: Arc::new(Zeroizing::new("client-token-different".to_string())),
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 }

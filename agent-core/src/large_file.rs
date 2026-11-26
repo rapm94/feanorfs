@@ -4,6 +4,7 @@ use crate::SyncCtx;
 use anyhow::{bail, Context as _, Result};
 use feanorfs_common::{
     hash_bytes, is_valid_hash, pack_bytes, unpack_bytes_checked, unpack_bytes_with_policy,
+    LegacyPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -251,12 +252,14 @@ pub(crate) async fn materialize_to(
     destination: &Path,
 ) -> Result<MaterializedFile> {
     let root = download_verified(ctx, encrypted_hash, root_download_limit(expected_size)).await?;
-    if root.first() != Some(&CHUNKED_PREFIX_BYTE) {
+    if ctx.policy == LegacyPolicy::AllowXorFallback || root.first() != Some(&CHUNKED_PREFIX_BYTE) {
         let plaintext = unpack_bytes_checked(
             &root,
             ctx.password_str(),
             relative_path,
             ctx.policy,
+            // 0 is the "unknown size" sentinel for legacy entries hydrated
+            // through the public `materialize` API; see its cache lookup.
             (expected_size != 0).then_some(expected_size),
         )?;
         if expected_size != 0 && plaintext.len() as u64 != expected_size {
@@ -315,7 +318,8 @@ pub async fn read_bytes(
     expected_size: u64,
 ) -> Result<Vec<u8>> {
     let root = download_verified(ctx, encrypted_hash, root_download_limit(expected_size)).await?;
-    if root.first() != Some(&CHUNKED_PREFIX_BYTE) {
+    if ctx.policy == LegacyPolicy::AllowXorFallback || root.first() != Some(&CHUNKED_PREFIX_BYTE) {
+        // 0 is the "not recorded" sentinel for conflict legs; see resolution.rs.
         let plaintext = unpack_bytes_checked(
             &root,
             ctx.password_str(),
@@ -364,6 +368,9 @@ pub async fn reachable_chunks(
     size: Option<u64>,
 ) -> Result<Vec<String>> {
     if size.is_some_and(|size| !uses_chunk_transport(size)) {
+        return Ok(Vec::new());
+    }
+    if ctx.policy == LegacyPolicy::AllowXorFallback {
         return Ok(Vec::new());
     }
     let root = download_verified(
@@ -717,5 +724,72 @@ mod tests {
             std::fs::read(workspace.path().join(absent_path)).unwrap(),
             absent_plaintext
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_blob_starting_with_chunk_prefix_byte_decrypts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let hub_dir = tempfile::tempdir().unwrap();
+        let hub = crate::LocalHub::open(hub_dir.path().to_path_buf(), None)
+            .await
+            .unwrap();
+        let api = crate::ApiClient::local(hub, None);
+        let db = crate::ClientDb::new(state.path()).await.unwrap();
+
+        let password = "password123";
+        let path = "legacy.bin";
+
+        // Find a plaintext whose XOR ciphertext starts with CHUNKED_PREFIX_BYTE (0x02)
+        let mut target_plaintext = vec![0u8];
+        for first_byte in 0u8..=255u8 {
+            target_plaintext[0] = first_byte;
+            let ciphertext = feanorfs_common::crypt_bytes(&target_plaintext, password, path);
+            if ciphertext[0] == CHUNKED_PREFIX_BYTE {
+                break;
+            }
+        }
+
+        let ciphertext = feanorfs_common::crypt_bytes(&target_plaintext, password, path);
+        assert_eq!(ciphertext[0], CHUNKED_PREFIX_BYTE);
+
+        let encrypted_hash = hash_bytes(&ciphertext);
+        let config = crate::Config {
+            server_url: crate::local::LOCAL_HUB_URL.to_string(),
+            workspace_id: "legacy-test".to_string(),
+            encryption_password: Some(password.to_string()),
+            server_password: None,
+            tls_ca_pem: None,
+            format_version: 3,
+            hub_local: true,
+            relay: None,
+            mesh: None,
+        };
+        let mut ctx = crate::SyncCtx::from_config(&api, &db, workspace.path(), &config).unwrap();
+        ctx.policy = LegacyPolicy::AllowXorFallback;
+
+        api.upload_object(ctx.workspace_id(), &encrypted_hash, ciphertext)
+            .await
+            .unwrap();
+
+        // Test materialize_to
+        let destination = workspace.path().join("legacy-mat.bin");
+        let result = materialize_to(
+            &ctx,
+            path,
+            &encrypted_hash,
+            target_plaintext.len() as u64,
+            &destination,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), target_plaintext);
+        assert_eq!(result.size, target_plaintext.len() as u64);
+
+        // Test read_bytes
+        let read_result = read_bytes(&ctx, path, &encrypted_hash, target_plaintext.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(read_result, target_plaintext);
     }
 }

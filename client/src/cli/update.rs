@@ -232,7 +232,7 @@ fn is_cargo_managed(exe: &Path) -> bool {
     // The home directory is literally named `.cargo`; match the separator
     // spelling per platform instead of component names.
     let text = exe.to_string_lossy();
-    text.contains("/.cargo/bin/") || text.contains("\\\\.cargo\\bin\\")
+    text.contains("/.cargo/bin/") || text.contains("\\.cargo\\bin\\")
 }
 
 fn apply_guards(exe: &Path) -> anyhow::Result<()> {
@@ -853,6 +853,12 @@ mod tests {
         assert!(is_cargo_managed(cargo_managed));
         assert!(!is_cargo_managed(Path::new(
             "/Applications/FeanorFS/feanorfs"
+        )));
+        assert!(is_cargo_managed(Path::new(
+            r"C:\Users\x\.cargo\bin\feanorfs.exe"
+        )));
+        assert!(!is_cargo_managed(Path::new(
+            r"C:\Program Files\FeanorFS\feanorfs.exe"
         )));
         #[cfg(target_os = "macos")]
         {

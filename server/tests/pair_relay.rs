@@ -127,3 +127,79 @@ async fn pair_relay_is_disabled_unless_explicitly_enabled() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn pair_offers_are_capped_per_source() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let server = tokio::spawn(run_http_server(ServeOptions {
+        data_dir: data.path().to_path_buf(),
+        port,
+        token: Some("hub-api-token".into()),
+        allow_http: true,
+        relay: true,
+        ..ServeOptions::default()
+    }));
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready, "pair relay did not become ready");
+
+    // Open 8 offers with distinct session IDs from the same source (loopback)
+    let mut offers = Vec::new();
+    for i in 0..8 {
+        let session = format!("{:032x}", i);
+        let result = tokio_tungstenite::connect_async(format!(
+            "ws://127.0.0.1:{port}/api/pair-relay/{session}/offer"
+        ))
+        .await;
+        assert!(result.is_ok(), "offer {i} should succeed");
+        offers.push(result.unwrap());
+    }
+
+    // The 9th offer from the same source should be rejected with 429
+    let ninth_session = format!("{:032x}", 8);
+    let ninth_result = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/api/pair-relay/{ninth_session}/offer"
+    ))
+    .await;
+
+    match ninth_result {
+        Err(e) => {
+            // tokio-tungstenite should return an error with HTTP 429
+            let error_msg = e.to_string();
+            assert!(
+                error_msg.contains("429") || error_msg.contains("TOO_MANY_REQUESTS"),
+                "ninth offer should fail with 429, got: {error_msg}"
+            );
+        }
+        Ok(_) => panic!("ninth offer should fail with 429 but succeeded"),
+    }
+
+    // Drop one offer
+    drop(offers.pop());
+
+    // Now a new offer should succeed (the 9th one)
+    let retry_result = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/api/pair-relay/{ninth_session}/offer"
+    ))
+    .await;
+    assert!(
+        retry_result.is_ok(),
+        "after dropping one offer, a new one should succeed"
+    );
+
+    server.abort();
+}

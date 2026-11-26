@@ -29,13 +29,19 @@ pub(crate) async fn prune(base: &Path) -> Result<()> {
     }
     let retention = crate::workspace_layout::retention_age();
     let state = crate::workspace_layout::ensure_workspace_state(base)?;
+    prune_state(&state, retention).await
+}
+
+/// Agents and watchers prune the same workspace from separate processes, so
+/// any listed file may already be gone.
+async fn prune_state(state: &Path, retention: Duration) -> Result<()> {
     let manifests_dir = state.join("manifests");
     let mut entries = match fs::read_dir(&manifests_dir).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("read local manifests"),
     };
-    let refs = referenced_snapshots(&state).await?;
+    let refs = referenced_snapshots(state).await?;
     let mut manifests = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
@@ -46,7 +52,10 @@ pub(crate) async fn prune(base: &Path) -> Result<()> {
         else {
             continue;
         };
-        let modified = entry.metadata().await?.modified()?;
+        let Some(metadata) = present(entry.metadata().await)? else {
+            continue;
+        };
+        let modified = metadata.modified()?;
         manifests.push((modified, id.to_string(), path));
     }
     manifests.sort_by_key(|entry| std::cmp::Reverse(entry.0));
@@ -58,7 +67,9 @@ pub(crate) async fn prune(base: &Path) -> Result<()> {
     for (index, (modified, id, path)) in manifests.into_iter().enumerate() {
         let recent = modified.elapsed().is_ok_and(|age| age <= retention);
         if index < KEEP_LAST || recent || refs.contains(&id) {
-            let manifest = fs::read_to_string(path).await?;
+            let Some(manifest) = present(fs::read_to_string(path).await)? else {
+                continue;
+            };
             live.extend(
                 manifest
                     .lines()
@@ -66,7 +77,7 @@ pub(crate) async fn prune(base: &Path) -> Result<()> {
                     .map(str::to_string),
             );
         } else {
-            fs::remove_file(path).await?;
+            present(fs::remove_file(path).await)?;
         }
     }
     let objects_dir = state.join("objects");
@@ -81,10 +92,18 @@ pub(crate) async fn prune(base: &Path) -> Result<()> {
             continue;
         };
         if is_valid_hash(id) && !live.contains(id) {
-            fs::remove_file(path).await?;
+            present(fs::remove_file(path).await)?;
         }
     }
     Ok(())
+}
+
+fn present<T>(result: std::io::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("prune local object cache"),
+    }
 }
 
 async fn referenced_snapshots(state: &Path) -> Result<HashSet<String>> {
@@ -113,4 +132,34 @@ async fn referenced_snapshots(state: &Path) -> Result<HashSet<String>> {
         }
     }
     Ok(refs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_prunes_of_one_workspace_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        for sub in ["manifests", "objects", "refs"] {
+            std::fs::create_dir_all(state.join(sub)).unwrap();
+        }
+        let id = |index: usize| feanorfs_common::hash_bytes(index.to_string().as_bytes());
+        let live = id(0);
+        std::fs::write(state.join("manifests").join(&live), format!("{live}\n")).unwrap();
+        std::fs::write(state.join("refs/last-synced"), &live).unwrap();
+        for index in 0..500 {
+            std::fs::write(state.join("objects").join(id(index)), b"x").unwrap();
+        }
+        let prunes = (0..8).map(|_| {
+            let state = state.to_path_buf();
+            tokio::spawn(async move { prune_state(&state, Duration::ZERO).await })
+        });
+        for result in futures_util::future::join_all(prunes).await {
+            result.unwrap().unwrap();
+        }
+        let left = std::fs::read_dir(state.join("objects")).unwrap().count();
+        assert_eq!(left, 1);
+    }
 }

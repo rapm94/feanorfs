@@ -4,8 +4,8 @@ use std::path::Path;
 
 use super::super::walker::CACHEDIR_TAG_SIGNATURE;
 use super::super::{
-    build_workspace_walker, collect_symlink_warnings, scan_local_directory,
-    scan_local_directory_with_policy, ClientDb,
+    build_workspace_walker, scan_local_directory, scan_local_directory_with_policy,
+    scan_local_directory_with_symlinks, ClientDb,
 };
 
 fn walked_files(root: &Path) -> HashSet<String> {
@@ -135,8 +135,8 @@ fn vcs_and_legacy_metadata_are_hard_excluded() {
 }
 
 #[cfg(unix)]
-#[test]
-fn symlink_warnings_are_sorted_and_links_are_never_followed() {
+#[tokio::test]
+async fn symlink_warnings_are_sorted_and_links_are_never_followed() {
     use std::os::unix::fs::symlink;
 
     let workspace = tempfile::tempdir().expect("create workspace");
@@ -146,11 +146,95 @@ fn symlink_warnings_are_sorted_and_links_are_never_followed() {
     symlink("real-file", workspace.path().join("z-file-link")).expect("create file link");
     symlink("real-dir", workspace.path().join("a-dir-link")).expect("create directory link");
 
-    assert_eq!(
-        collect_symlink_warnings(workspace.path()),
-        vec!["a-dir-link", "z-file-link"]
-    );
+    let state = tempfile::tempdir().expect("create scanner state");
+    let db = ClientDb::new(state.path()).await.expect("open scanner db");
+    let (files, symlinks) =
+        scan_local_directory_with_symlinks(workspace.path(), &db, Some("password"))
+            .await
+            .expect("scan workspace");
+    assert_eq!(symlinks, vec!["a-dir-link", "z-file-link"]);
+    assert_eq!(files.len(), 2, "only the two real files: {files:?}");
     assert!(!walked_files(workspace.path()).contains("a-dir-link/secret.txt"));
+}
+
+#[tokio::test]
+async fn unchanged_files_are_cache_hits_and_changed_ones_are_rehashed() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    let deep = (0..40).map(|level| format!("d{level}")).collect::<Vec<_>>();
+    let deep = deep.join("/");
+    for directory in ["a", "a/b", "c", deep.as_str()] {
+        fs::create_dir_all(workspace.path().join(directory)).unwrap();
+        fs::write(workspace.path().join(directory).join("f.txt"), b"one").unwrap();
+    }
+    let state = tempfile::tempdir().expect("create scanner state");
+    let db = ClientDb::new(state.path()).await.expect("open scanner db");
+    let scan = async || {
+        scan_local_directory(workspace.path(), &db, Some("password"))
+            .await
+            .expect("scan workspace")
+    };
+    let first = scan().await;
+    assert_eq!(first.len(), 4);
+    let committed = fs::metadata(state.path().join("local_state.json")).unwrap();
+    let second = scan().await;
+    assert_eq!(second.len(), 4);
+    // Metadata read without opening must agree with metadata read through a
+    // descriptor; otherwise every scan rehashes and rewrites everything.
+    assert_eq!(
+        fs::metadata(state.path().join("local_state.json"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        committed.modified().unwrap(),
+        "an idle scan must not rewrite local state"
+    );
+
+    fs::write(workspace.path().join("a/b/f.txt"), b"changed").unwrap();
+    let third = scan().await;
+    for (path, state) in &third {
+        assert_eq!(
+            state.hash != first[path].hash,
+            path == "a/b/f.txt",
+            "{path}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn walk_cursor_stays_anchored_and_recovers_replaced_directories() {
+    use crate::workspace_read::{WalkCursor, WorkspaceReadRoot};
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().expect("create workspace");
+    let outside = tempfile::tempdir().expect("create outside");
+    let root = workspace.path();
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/b/f.txt"), b"inside").unwrap();
+    fs::write(outside.path().join("f.txt"), b"outside secret").unwrap();
+    let mut cursor = WalkCursor::new(WorkspaceReadRoot::open(root).unwrap());
+    assert_eq!(
+        cursor.stat_regular(Path::new("a/b/f.txt")).unwrap().st_size,
+        6
+    );
+
+    // A replaced directory is found again instead of reported missing.
+    fs::remove_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/b/f.txt"), b"replaced").unwrap();
+    assert_eq!(
+        cursor.stat_regular(Path::new("a/b/f.txt")).unwrap().st_size,
+        8
+    );
+
+    // Links are never followed, neither as a directory nor as the file.
+    symlink(outside.path(), root.join("link")).unwrap();
+    symlink(outside.path().join("f.txt"), root.join("file-link")).unwrap();
+    for path in ["link/f.txt", "file-link", "a/b", "../f.txt", "a//b/f.txt"] {
+        assert!(cursor.stat_regular(Path::new(path)).is_err(), "{path}");
+        assert!(cursor.open_regular(Path::new(path)).is_err(), "{path}");
+    }
+    assert!(cursor.open_regular(Path::new("a/b/f.txt")).is_ok());
 }
 
 #[tokio::test]
@@ -310,4 +394,102 @@ async fn ignored_paths_with_cached_state_are_frozen_not_tombstoned() {
         entry.deleted_at.is_none(),
         "ignored tracked file must not receive a tombstone"
     );
+}
+
+#[tokio::test]
+async fn linked_git_worktrees_are_skipped_but_submodules_and_root_sync() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    let root = workspace.path();
+    fs::write(root.join(".git"), "gitdir: /repo/.git/worktrees/root\n")
+        .expect("write root worktree marker");
+    fs::write(root.join("keep.txt"), b"workspace").expect("write root file");
+    fs::create_dir_all(root.join(".claude/worktrees/agent")).expect("create worktree");
+    fs::write(
+        root.join(".claude/worktrees/agent/.git"),
+        "gitdir: /repo/.git/worktrees/agent\n",
+    )
+    .expect("write worktree marker");
+    fs::write(root.join(".claude/worktrees/agent/copy.txt"), b"dup").expect("write copy");
+    fs::create_dir_all(root.join("vendor/sub")).expect("create submodule");
+    fs::write(
+        root.join("vendor/sub/.git"),
+        "gitdir: ../../.git/modules/vendor/sub\n",
+    )
+    .expect("write submodule marker");
+    fs::write(root.join("vendor/sub/lib.rs"), b"real").expect("write submodule file");
+
+    let files = scanned_files(root).await;
+    assert!(files.contains("keep.txt"));
+    assert!(files.contains("vendor/sub/lib.rs"));
+    assert!(!files.contains(".claude/worktrees/agent/copy.txt"));
+    assert!(!files.contains(".claude/worktrees/agent/.git"));
+}
+
+#[tokio::test]
+async fn tombstone_stays_deleted_when_its_directory_becomes_a_worktree() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    let root = workspace.path();
+    fs::create_dir_all(root.join("wt")).expect("create directory");
+    fs::write(root.join("wt/live.txt"), b"live").expect("write live file");
+    fs::write(root.join("wt/gone.txt"), b"gone").expect("write doomed file");
+    let state = tempfile::tempdir().expect("create scanner state");
+    let db = ClientDb::new(state.path())
+        .await
+        .expect("create scanner DB");
+    scan_local_directory(root, &db, Some("test-key"))
+        .await
+        .expect("first scan");
+    fs::remove_file(root.join("wt/gone.txt")).expect("delete file");
+    scan_local_directory(root, &db, Some("test-key"))
+        .await
+        .expect("tombstone scan");
+    fs::write(root.join("wt/.git"), "gitdir: /repo/.git/worktrees/wt\n").expect("mark worktree");
+
+    let files = scan_local_directory(root, &db, Some("test-key"))
+        .await
+        .expect("excluded scan");
+    assert!(
+        files["wt/gone.txt"].deleted,
+        "tombstone must not be frozen live"
+    );
+    assert!(
+        !files["wt/live.txt"].deleted,
+        "tracked file on disk stays frozen"
+    );
+}
+
+#[tokio::test]
+async fn scan_drops_tombstones_instead_of_failing_at_the_record_cap() {
+    let workspace = tempfile::tempdir().expect("create workspace");
+    fs::write(workspace.path().join("keep.txt"), b"keep").expect("write live file");
+    let state = tempfile::tempdir().expect("create scanner state");
+    let cap = crate::state::MAX_LOCAL_STATE_RECORDS;
+    let mut local_files = serde_json::Map::with_capacity(cap);
+    for index in 0..cap {
+        local_files.insert(
+            format!("gone/{index}"),
+            serde_json::json!({
+                "plaintext_hash": "p", "encrypted_hash": "e", "size": 1, "mtime": 1,
+                "server_mtime": 1, "mode": 0, "hydrated": true, "deleted_at": 2
+            }),
+        );
+    }
+    fs::write(
+        state.path().join("local_state.json"),
+        serde_json::to_vec(&serde_json::json!({"schema_version": 1, "local_files": local_files}))
+            .expect("encode full state"),
+    )
+    .expect("write full state");
+    let db = ClientDb::new(state.path()).await.expect("open full state");
+
+    let files = scan_local_directory(workspace.path(), &db, Some("test-key"))
+        .await
+        .expect("scan at the cap must not fail");
+    assert!(!files["keep.txt"].deleted);
+    assert!(
+        files["gone/0"].deleted,
+        "this pass still reports the deletion"
+    );
+    let cache = db.get_cache_entries().await.expect("read pruned state");
+    assert_eq!(cache.keys().collect::<Vec<_>>(), vec!["keep.txt"]);
 }

@@ -1,4 +1,4 @@
-use crate::workspace_read::WorkspaceReadRoot;
+use crate::workspace_read::{WalkCursor, WorkspaceReadRoot};
 use anyhow::{Context as _, Result};
 use feanorfs_common::FileState;
 use std::collections::{HashMap, HashSet};
@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use super::walker::{
-    build_ignore_matcher, build_workspace_walker_with_read_root, path_under_tagged_directory,
-    portable_mode, portable_rel_path,
+    build_ignore_matcher, build_workspace_walker_with_cursor, path_under_skipped_subtree,
+    portable_mode, portable_rel_path, SharedCursor,
 };
 use super::{CacheEntry, ClientDb};
 
@@ -17,9 +17,9 @@ static WARNED_LEGACY_PASSWORD_SCAN: OnceLock<()> = OnceLock::new();
 
 /// True when `relative` is skipped by the same policy the walker applies:
 /// hard excludes, the ignore matcher (including ancestor directory patterns),
-/// or a valid CACHEDIR.TAG ancestor.
+/// or a valid CACHEDIR.TAG / linked Git worktree ancestor.
 fn path_is_policy_excluded(
-    read_root: &WorkspaceReadRoot,
+    cursor: &SharedCursor,
     relative: &str,
     ignores: &Option<ignore::gitignore::Gitignore>,
 ) -> bool {
@@ -27,7 +27,7 @@ fn path_is_policy_excluded(
     if super::walker::is_always_excluded(relative_path) {
         return true;
     }
-    if path_under_tagged_directory(read_root, relative_path) {
+    if path_under_skipped_subtree(&mut cursor.lock(), relative_path) {
         return true;
     }
     let Some(matcher) = ignores.as_ref() else {
@@ -77,11 +77,33 @@ pub async fn scan_local_directory_with_policy(
     no_default_ignores: bool,
     ignore_policy: Option<&str>,
 ) -> Result<HashMap<String, FileState>> {
+    let (files, _) = scan(base_path, db, password, no_default_ignores, ignore_policy).await?;
+    Ok(files)
+}
+
+/// Ordinary scan plus the sorted symlinks it skipped, from one walk.
+pub async fn scan_local_directory_with_symlinks(
+    base_path: &Path,
+    db: &ClientDb,
+    password: Option<&str>,
+) -> Result<(HashMap<String, FileState>, Vec<String>)> {
+    scan(base_path, db, password, false, None).await
+}
+
+async fn scan(
+    base_path: &Path,
+    db: &ClientDb,
+    password: Option<&str>,
+    no_default_ignores: bool,
+    ignore_policy: Option<&str>,
+) -> Result<(HashMap<String, FileState>, Vec<String>)> {
     let read_root = WorkspaceReadRoot::open(base_path)
         .with_context(|| format!("open workspace scan root {}", base_path.display()))?;
+    let cursor = SharedCursor::new(read_root);
     let mut cached_entries = db.get_cache_entries().await?;
     let mut cache_hits = HashSet::new();
     let mut disk_files = HashMap::new();
+    let mut symlinks = Vec::new();
     let password = password.unwrap_or_else(|| {
         WARNED_LEGACY_PASSWORD_SCAN.get_or_init(|| {
             tracing::warn!(
@@ -91,11 +113,11 @@ pub async fn scan_local_directory_with_policy(
         feanorfs_common::LEGACY_DEFAULT_PASSWORD
     });
 
-    for result in build_workspace_walker_with_read_root(
+    for result in build_workspace_walker_with_cursor(
         base_path,
         no_default_ignores,
         ignore_policy,
-        read_root.clone(),
+        cursor.clone(),
     )
     .build()
     {
@@ -106,7 +128,7 @@ pub async fn scan_local_directory_with_policy(
                 entry.path().display()
             )
         })?;
-        if !file_type.is_file() {
+        if !file_type.is_file() && !file_type.is_symlink() {
             continue;
         }
         let absolute = entry.path();
@@ -122,11 +144,13 @@ pub async fn scan_local_directory_with_policy(
         let Some(path) = portable_rel_path(relative) else {
             continue;
         };
-        let mut file = read_root
-            .open_regular_path(native_relative)
+        if file_type.is_symlink() {
+            symlinks.push(path);
+            continue;
+        }
+        let mut admitted = AdmittedFile::inspect(&cursor, native_relative)
             .with_context(|| format!("open admitted workspace file {path}"))?;
-        let metadata = DiskMetadata::read(&file)
-            .with_context(|| format!("inspect admitted workspace file {path}"))?;
+        let metadata = admitted.metadata;
 
         let observed = if let Some(cached) = cached_entries.get(&path) {
             // A tombstoned entry that reappears on disk with the identical
@@ -148,14 +172,10 @@ pub async fn scan_local_directory_with_policy(
                 cache_hits.insert(path.clone());
                 ObservedFile::cached(cached, cached.size, cached.mtime, cached.mode, false)
             } else {
-                match hash_stable_file(
-                    &mut file,
-                    EncryptionContext {
-                        password,
-                        relative_path: &path,
-                    },
-                    metadata,
-                )? {
+                match admitted.hash_stable(EncryptionContext {
+                    password,
+                    relative_path: &path,
+                })? {
                     Some(observed) => {
                         #[cfg(unix)]
                         {
@@ -182,14 +202,10 @@ pub async fn scan_local_directory_with_policy(
                 }
             }
         } else {
-            let Some(observed) = hash_stable_file(
-                &mut file,
-                EncryptionContext {
-                    password,
-                    relative_path: &path,
-                },
-                metadata,
-            )?
+            let Some(observed) = admitted.hash_stable(EncryptionContext {
+                password,
+                relative_path: &path,
+            })?
             else {
                 continue;
             };
@@ -218,17 +234,29 @@ pub async fn scan_local_directory_with_policy(
         disk_files.insert(path, (cache_entry, file_state));
     }
 
+    let projected_records = cached_entries.len().saturating_add(
+        disk_files
+            .keys()
+            .filter(|path| !cached_entries.contains_key(*path))
+            .count(),
+    );
     let mut final_files = HashMap::new();
     let mut dirty_entries = Vec::new();
+    let mut tombstone_paths = Vec::new();
     let ignores = build_ignore_matcher(base_path, no_default_ignores, ignore_policy);
     for (path, cached) in cached_entries.drain() {
         if !disk_files.contains_key(&path) {
-            let excluded = path_is_policy_excluded(&read_root, &path, &ignores);
+            // An existing tombstone keeps projecting a deletion even once its
+            // path becomes excluded: freezing it would publish a live entry
+            // whose bytes are gone from disk.
+            let excluded =
+                cached.deleted_at.is_none() && path_is_policy_excluded(&cursor, &path, &ignores);
             if excluded {
-                // Previously-tracked path is now skipped by an ignore rule or
-                // a CACHEDIR.TAG. Freeze it: report the cached state unchanged
-                // so the remote copy survives and nothing is re-downloaded,
-                // and never tombstone a path that still exists on disk.
+                // Previously-tracked path is now skipped by an ignore rule, a
+                // CACHEDIR.TAG, or a linked worktree. Freeze it: report the
+                // cached state unchanged so the remote copy survives and
+                // nothing is re-downloaded, and never tombstone a path that
+                // still exists on disk.
                 final_files.insert(
                     path.clone(),
                     FileState {
@@ -250,6 +278,7 @@ pub async fn scan_local_directory_with_policy(
                 tombstone.deleted_at = Some(tombstone_mtime);
                 dirty_entries.push(tombstone);
             }
+            tombstone_paths.push(path.clone());
             final_files.insert(
                 path.clone(),
                 FileState {
@@ -269,10 +298,26 @@ pub async fn scan_local_directory_with_policy(
         }
         final_files.insert(path, file_state);
     }
-    if !dirty_entries.is_empty() {
+    // Tombstones are cleared only after a successful push, so a pass that
+    // cannot persist its scan would never shrink state again. At the record
+    // cap, drop persisted tombstones; this pass still reports the deletions.
+    // ponytail: evicts every tombstone at the cap; a format-v<3 pass that
+    // then fails forgets those deletes and the hub copy returns on next sync.
+    if projected_records > crate::state::MAX_LOCAL_STATE_RECORDS && !tombstone_paths.is_empty() {
+        tracing::warn!(
+            "Local state reached {} records; dropping {} deletion records so sync can continue",
+            projected_records,
+            tombstone_paths.len()
+        );
+        dirty_entries.retain(|entry| entry.deleted_at.is_none());
+        db.apply_cache_changes(&dirty_entries, &tombstone_paths)
+            .await?;
+    } else if !dirty_entries.is_empty() {
         db.bulk_upsert_cache_entries(&dirty_entries).await?;
     }
-    Ok(final_files)
+    symlinks.sort_unstable();
+    symlinks.dedup();
+    Ok((final_files, symlinks))
 }
 
 struct ObservedFile {
@@ -285,6 +330,46 @@ struct ObservedFile {
     hydrated: bool,
 }
 
+/// One walked file. Unchanged files are recognized from no-follow metadata
+/// alone; a file is opened only when its bytes must be read, and everything
+/// derived from those bytes uses metadata of that same descriptor.
+struct AdmittedFile<'a> {
+    cursor: &'a SharedCursor,
+    relative: &'a Path,
+    metadata: DiskMetadata,
+    opened: Option<fs::File>,
+}
+
+impl<'a> AdmittedFile<'a> {
+    fn inspect(cursor: &'a SharedCursor, relative: &'a Path) -> Result<Self> {
+        let (metadata, opened) = DiskMetadata::inspect(&mut cursor.lock(), relative)?;
+        Ok(Self {
+            cursor,
+            relative,
+            metadata,
+            opened,
+        })
+    }
+
+    fn hash_stable(&mut self, encryption: EncryptionContext<'_>) -> Result<Option<ObservedFile>> {
+        let mut file = match self.opened.take() {
+            Some(file) => file,
+            None => {
+                let file = self
+                    .cursor
+                    .lock()
+                    .open_regular(self.relative)
+                    .with_context(|| {
+                        format!("open admitted workspace file {}", encryption.relative_path)
+                    })?;
+                self.metadata = DiskMetadata::read(&file)?;
+                file
+            }
+        };
+        hash_stable_file(&mut file, encryption, self.metadata)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DiskMetadata {
     size: u64,
@@ -293,6 +378,26 @@ struct DiskMetadata {
 }
 
 impl DiskMetadata {
+    /// Metadata of one regular file, plus the descriptor on platforms that
+    /// must open it to inspect it without following links.
+    fn inspect(cursor: &mut WalkCursor, relative: &Path) -> Result<(Self, Option<fs::File>)> {
+        #[cfg(unix)]
+        {
+            let stat = cursor.stat_regular(relative)?;
+            let metadata = Self {
+                size: u64::try_from(stat.st_size).context("negative file size")?,
+                mtime: stat_millis(&stat),
+                mode: u32::from(stat.st_mode & 0o111 != 0),
+            };
+            Ok((metadata, None))
+        }
+        #[cfg(not(unix))]
+        {
+            let file = cursor.open_regular(relative)?;
+            Ok((Self::read(&file)?, Some(file)))
+        }
+    }
+
     fn read(file: &fs::File) -> Result<Self> {
         let metadata = file.metadata()?;
         Ok(Self {
@@ -381,6 +486,19 @@ fn hash_stable_file(
         mode: expected.mode,
         hydrated: true,
     }))
+}
+
+/// Must agree with [`modified_millis`]: a difference would rehash every file.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // `stat` field widths differ by platform
+fn stat_millis(stat: &libc::stat) -> i64 {
+    let seconds = stat.st_mtime as i64;
+    if seconds < 0 {
+        return 0;
+    }
+    seconds
+        .saturating_mul(1000)
+        .saturating_add(stat.st_mtime_nsec as i64 / 1_000_000)
 }
 
 fn modified_millis(metadata: &fs::Metadata) -> i64 {
