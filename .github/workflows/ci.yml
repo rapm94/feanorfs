@@ -17,6 +17,9 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # ponytail: one LRU cap for every per-job kache store; raise per job if
+  # hit rates drop, lower if the 10 GB repository cache quota thrashes.
+  KACHE_MAX_SIZE: 2GiB
   RUST_BACKTRACE: "1"
 
 jobs:
@@ -51,7 +54,11 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-clippy
+          pr-comment: false
       - name: Run Clippy
         run: >-
           cargo clippy --workspace --exclude feanorfs-tray
@@ -71,7 +78,11 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.88.0"
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-msrv
+          pr-comment: false
       - name: Check minimum supported Rust version
         run: >-
           cargo check --workspace --exclude feanorfs-tray
@@ -90,7 +101,11 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-test
+          pr-comment: false
       - name: Run tests
         run: >-
           cargo test --workspace --exclude feanorfs-tray
@@ -114,7 +129,12 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-cross-platform
+          cache-dir: ${{ runner.temp }}/kache
+          pr-comment: false
       - name: Run tests
         run: >-
           cargo test --workspace --exclude feanorfs-tray
@@ -135,7 +155,11 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-upgrade-smoke
+          pr-comment: false
       - name: Build current CLI
         run: cargo build -p feanorfs-client --bin feanorfs --locked
       - name: Checkout previous release
@@ -174,7 +198,11 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-source-smoke
+          pr-comment: false
       - name: Install Linux desktop dependencies
         run: >-
           sudo apt-get update &&
@@ -199,7 +227,11 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-agent-eval
+          pr-comment: false
       - name: Build CLI
         run: cargo build --locked --bin feanorfs
       # Two simulated machines per scenario; FeanorFS runs must finish with
@@ -234,7 +266,11 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-docs
+          pr-comment: false
       - name: Build documentation
         run: >-
           cargo doc --workspace --exclude feanorfs-tray
@@ -256,7 +292,11 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-build
+          pr-comment: false
       - name: Build optimized workspace
         run: >-
           cargo build --release --workspace --exclude feanorfs-tray --locked
@@ -279,7 +319,11 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-sdk
+          pr-comment: false
       - name: Build CLI (release)
         run: cargo build --release -p feanorfs-client --locked
       # Debug FFI matches zig build.zig profile_dir (.Debug => target/debug).
@@ -376,7 +420,11 @@ jobs:
           components: clippy
       - name: Install MSRV Rust
         run: rustup toolchain install 1.88.0 --profile minimal
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-tray
+          pr-comment: false
       - name: Check tray MSRV
         run: cargo +1.88.0 check -p feanorfs-tray --all-targets --locked
       - name: Run tray Clippy
@@ -504,7 +552,12 @@ jobs:
           components: clippy
       - name: Install MSRV Rust
         run: rustup toolchain install 1.88.0 --profile minimal
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029 # v1
+        with:
+          version: v2.2.0
+          cache-key-prefix: kache-desktop-tray
+          cache-dir: ${{ runner.temp }}/kache
+          pr-comment: false
       - name: Check tray MSRV
         run: cargo +1.88.0 check -p feanorfs-tray --all-targets --locked
       - name: Run tray Clippy
