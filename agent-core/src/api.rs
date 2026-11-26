@@ -1,5 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
-use axum::body::HttpBody as _;
+use axum::body::{Bytes, HttpBody as _};
 use feanorfs_common::{RelayConfig, SyncRequest, SyncResponse};
 use futures_util::StreamExt as _;
 use reqwest::{Certificate, Client};
@@ -58,6 +58,16 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// bound instead of wedging sync, the watcher, and CLI commands forever.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_IN_FLIGHT_UPLOAD_REQUESTS: usize = 4;
+/// The hub answers 503 before reading a body when its upload or manifest slots
+/// are taken, which is normal while several agents publish at once; a client
+/// still sending the body can see that as a dropped connection instead. Object
+/// and manifest uploads are idempotent, so they wait and retry: ten delays
+/// doubling from 50 ms to 2 s, at most 11.15 s in total, before the failure
+/// surfaces. Legacy file and tombstone uploads overwrite a row and never retry
+/// here.
+const BUSY_RETRIES: u32 = 10;
+const BUSY_RETRY_BASE: Duration = Duration::from_millis(if cfg!(test) { 1 } else { 50 });
+const BUSY_RETRY_CAP_FACTOR: u32 = 40;
 
 #[derive(Debug)]
 struct RequestStatusError {
@@ -153,6 +163,30 @@ const fn retryable_server_status(status: http::StatusCode) -> bool {
             | http::StatusCode::SERVICE_UNAVAILABLE
             | http::StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+/// An established connection broke while the request was in flight. An
+/// unreachable or silent hub is not included: those fail without waiting.
+fn connection_dropped(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            (error.is_request() || error.is_body()) && !error.is_connect() && !error.is_timeout()
+        })
+    })
+}
+
+/// Delay before busy retry `attempt` (from 0): a random point in the upper half
+/// of the doubled, capped step, so competing clients spread out.
+fn busy_retry_delay(attempt: u32) -> Duration {
+    let factor = 1_u32
+        .checked_shl(attempt)
+        .unwrap_or(u32::MAX)
+        .min(BUSY_RETRY_CAP_FACTOR);
+    let half = BUSY_RETRY_BASE.saturating_mul(factor) / 2;
+    let mut random = [0_u8; 2];
+    // Without randomness the delay is merely unjittered.
+    let _ = getrandom::fill(&mut random);
+    half + half.mul_f64(f64::from(u16::from_le_bytes(random)) / f64::from(u16::MAX))
 }
 
 pub(crate) fn request_status_error(
@@ -345,7 +379,8 @@ impl ApiClient {
         if let Some(pem) = tls_ca_pem {
             let certificate = Certificate::from_pem(pem.as_bytes())
                 .context("parse FeanorFS hub CA certificate")?;
-            builder = builder.add_root_certificate(certificate);
+            // A pinned hub CA replaces, never extends, the system roots.
+            builder = builder.tls_certs_only([certificate]);
         }
         if let Some((hostname, addresses)) = resolution {
             builder = builder.resolve_to_addrs(hostname, addresses);
@@ -474,7 +509,7 @@ impl ApiClient {
         limit: usize,
     ) -> Result<T> {
         let (status, body) = self
-            .raw_request(http::Method::GET, path, query, Vec::new(), None)
+            .raw_request(http::Method::GET, path, query, Bytes::new(), None)
             .await?;
         if status == http::StatusCode::UNAUTHORIZED {
             bail!(
@@ -508,7 +543,7 @@ impl ApiClient {
                 http::Method::POST,
                 path,
                 "",
-                payload,
+                payload.into(),
                 Some("application/json"),
             )
             .await?;
@@ -525,6 +560,16 @@ impl ApiClient {
     }
 
     async fn post_bytes(&self, path: &str, query: &str, body: Vec<u8>) -> Result<()> {
+        self.post_bytes_retrying(path, query, body, 0).await
+    }
+
+    async fn post_bytes_retrying(
+        &self,
+        path: &str,
+        query: &str,
+        body: Vec<u8>,
+        retries: u32,
+    ) -> Result<()> {
         let _upload_permit = if path == "/api/upload" {
             Some(
                 Arc::clone(&self.upload_requests)
@@ -535,9 +580,31 @@ impl ApiClient {
         } else {
             None
         };
-        let (status, bytes) = self
-            .raw_request(http::Method::POST, path, query, body, None)
-            .await?;
+        // The embedded hub has no admission limits to wait out.
+        let retries = if self.is_local() { 0 } else { retries };
+        let mut body = Bytes::from(body);
+        let mut attempt = 0;
+        let (status, bytes) = loop {
+            let payload = if attempt < retries {
+                body.clone()
+            } else {
+                std::mem::take(&mut body)
+            };
+            let response = self
+                .raw_request(http::Method::POST, path, query, payload, None)
+                .await;
+            let busy = match &response {
+                Ok((status, _)) => *status == http::StatusCode::SERVICE_UNAVAILABLE,
+                Err(error) => connection_dropped(error),
+            };
+            if !busy || attempt >= retries {
+                break response?;
+            }
+            let delay = busy_retry_delay(attempt);
+            attempt += 1;
+            tracing::debug!(path, attempt, ?delay, "hub is busy; retrying");
+            tokio::time::sleep(delay).await;
+        };
         if status == http::StatusCode::UNAUTHORIZED {
             bail!(
                 "Server requires a valid access token. Paste its fnh1/fnr1 invite into `feanorfs start`, or set one with `feanorfs connect <URL> --token <TOKEN>`"
@@ -554,7 +621,7 @@ impl ApiClient {
         method: http::Method,
         path: &str,
         query: &str,
-        body: Vec<u8>,
+        body: Bytes,
         content_type: Option<&str>,
     ) -> Result<(http::StatusCode, Vec<u8>)> {
         match &self.backend {
@@ -594,7 +661,7 @@ impl ApiClient {
                         method,
                         path,
                         query,
-                        body,
+                        body.into(),
                         (
                             self.server_password.as_deref(),
                             self.migration_token.as_deref(),
@@ -733,7 +800,8 @@ impl ApiClient {
             urlencoding_path(hash),
             content.len()
         );
-        self.post_bytes("/api/upload", &query, content).await
+        self.post_bytes_retrying("/api/upload", &query, content, BUSY_RETRIES)
+            .await
     }
 
     pub async fn upload_manifest(
@@ -750,7 +818,8 @@ impl ApiClient {
         let canonical = feanorfs_common::canonical_manifest_hash_list(snapshot_id, hashes)?;
         let mut manifest = canonical.join("\n").into_bytes();
         manifest.push(b'\n');
-        self.post_bytes("/api/manifest", &query, manifest).await
+        self.post_bytes_retrying("/api/manifest", &query, manifest, BUSY_RETRIES)
+            .await
     }
 
     pub async fn set_workspace_format(&self, workspace_id: &str, version: u32) -> Result<()> {
@@ -999,8 +1068,9 @@ fn check_server_version(advertised: &str) -> Result<()> {
 #[cfg(test)]
 mod version_tests {
     use super::{
-        api_failure_kind, check_server_version, is_retryable_transport_error, request_status_error,
-        ApiClient, ApiFailureKind, MAX_IN_FLIGHT_UPLOAD_REQUESTS,
+        api_failure_kind, busy_retry_delay, check_server_version, is_retryable_transport_error,
+        request_status_error, ApiClient, ApiFailureKind, BUSY_RETRIES, BUSY_RETRY_BASE,
+        MAX_IN_FLIGHT_UPLOAD_REQUESTS,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1063,6 +1133,127 @@ mod version_tests {
             probe.peak.load(Ordering::SeqCst),
             MAX_IN_FLIGHT_UPLOAD_REQUESTS
         );
+    }
+
+    /// Serves 503 for the first `busy` requests, then 200.
+    async fn busy_hub(path: &str, busy: usize) -> (String, Arc<AtomicUsize>, impl Drop) {
+        struct Stop(tokio::task::JoinHandle<()>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let router = axum::Router::new().route(
+            path,
+            axum::routing::post(move |body: axum::body::Bytes| async move {
+                if seen.fetch_add(1, Ordering::SeqCst) < busy {
+                    (http::StatusCode::SERVICE_UNAVAILABLE, Vec::new())
+                } else {
+                    (http::StatusCode::OK, body.to_vec())
+                }
+            }),
+        );
+        let (url, task) = serve(router).await;
+        (url, requests, Stop(task))
+    }
+
+    #[tokio::test]
+    async fn busy_hub_uploads_and_manifests_wait_and_retry() {
+        let hash = "a".repeat(64);
+        let (url, requests, _stop) = busy_hub("/api/manifest", 3).await;
+        ApiClient::new(&url, None)
+            .upload_manifest("workspace", &hash, std::slice::from_ref(&hash))
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
+
+        let (url, requests, _stop) = busy_hub("/api/upload", 2).await;
+        ApiClient::new(&url, None)
+            .upload_object("workspace", &hash, vec![1])
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn uploads_retry_a_dropped_connection_but_not_an_unreachable_hub() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hub = tokio::spawn(async move {
+            // Rejects the first upload without reading its body.
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.read_exact(&mut [0_u8; 16]).await.unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut received = 0;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            while received < BODY {
+                received += second.read(&mut buffer).await.unwrap();
+            }
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            listener
+        });
+        const BODY: usize = 4 * 1024 * 1024;
+        let hash = "a".repeat(64);
+        let client = ApiClient::new(&format!("http://{address}"), None);
+        client
+            .upload_object("workspace", &hash, vec![1; BODY])
+            .await
+            .unwrap();
+
+        drop(hub.await.unwrap());
+        let error = client
+            .upload_object("workspace", &hash, vec![1])
+            .await
+            .unwrap_err();
+        assert!(!super::connection_dropped(&error), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn busy_hub_retries_are_bounded_and_limited_to_idempotent_publication() {
+        let hash = "a".repeat(64);
+        let (url, requests, _stop) = busy_hub("/api/manifest", usize::MAX).await;
+        let error = ApiClient::new(&url, None)
+            .upload_manifest("workspace", &hash, std::slice::from_ref(&hash))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("503"), "{error:#}");
+        assert!(is_retryable_transport_error(&error));
+        assert_eq!(requests.load(Ordering::SeqCst), BUSY_RETRIES as usize + 1);
+
+        let (url, requests, _stop) = busy_hub("/api/workspace/format", usize::MAX).await;
+        ApiClient::new(&url, None)
+            .set_workspace_format("workspace", 3)
+            .await
+            .unwrap_err();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        // A legacy row upload repeated later could overwrite a newer version.
+        let (url, requests, _stop) = busy_hub("/api/upload", usize::MAX).await;
+        ApiClient::new(&url, None)
+            .upload_tombstone("workspace", "a.txt", &hash, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn busy_retry_delays_grow_to_a_cap_without_overflow() {
+        for (attempt, factor) in [(0, 1), (1, 2), (5, 32), (6, 40), (40, 40), (u32::MAX, 40)] {
+            let ceiling = BUSY_RETRY_BASE * factor;
+            let delay = busy_retry_delay(attempt);
+            assert!(
+                delay >= ceiling / 2 && delay <= ceiling,
+                "{attempt}: {delay:?}"
+            );
+        }
     }
 
     #[test]

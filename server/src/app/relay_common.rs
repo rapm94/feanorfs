@@ -9,7 +9,10 @@
 //! only parameterizes the shared machinery.
 
 use axum::extract::ws::{Message, WebSocket};
+use axum::http::HeaderMap;
 use futures_util::{SinkExt as _, StreamExt as _};
+use std::collections::{hash_map::Entry, HashMap};
+use std::net::Ipv6Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,6 +27,81 @@ pub(crate) fn valid_lower_hex(value: &str, expected_len: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Admission key: TCP peer, or the proxy-appended (rightmost) X-Forwarded-For
+/// entry only when the peer is a loopback reverse proxy. IPv6 buckets by /64.
+pub(crate) fn relay_source(
+    peer: Option<std::net::SocketAddr>,
+    headers: &HeaderMap,
+) -> std::net::IpAddr {
+    let peer = peer.map_or(std::net::IpAddr::from([0, 0, 0, 0]), |address| {
+        address.ip().to_canonical()
+    });
+    let source = if peer.is_loopback() {
+        headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .next_back()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit(',').next())
+            .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
+            .map_or(peer, |address| address.to_canonical())
+    } else {
+        peer
+    };
+    match source {
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            std::net::IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
+
+/// Per-source live-socket counts. Entries never outnumber live permits, which
+/// the global connection semaphores bound; zero-count sources are evicted.
+#[derive(Clone, Default)]
+pub(crate) struct SourceLimiter(Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>);
+
+pub(crate) struct SourcePermit {
+    limiter: SourceLimiter,
+    source: std::net::IpAddr,
+}
+
+impl SourceLimiter {
+    pub(crate) fn try_acquire(
+        &self,
+        source: std::net::IpAddr,
+        limit: usize,
+    ) -> Option<SourcePermit> {
+        let mut counts = self.0.lock().expect("relay source limiter poisoned");
+        let count = counts.entry(source).or_default();
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(SourcePermit {
+            limiter: self.clone(),
+            source,
+        })
+    }
+}
+
+impl Drop for SourcePermit {
+    fn drop(&mut self) {
+        let mut counts = self
+            .limiter
+            .0
+            .lock()
+            .expect("relay source limiter poisoned");
+        if let Entry::Occupied(mut entry) = counts.entry(self.source) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
 }
 
 /// Policy for [`wait_for_peer`]: how long an offer waits for its peer, and
@@ -220,6 +298,7 @@ mod tests {
     use axum::extract::State;
     use axum::routing::get;
     use axum::Router;
+    use std::net::IpAddr;
     use std::net::SocketAddr;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::tungstenite::Message as WireMessage;
@@ -471,5 +550,80 @@ mod tests {
             .await
             .expect("relay must finish")
             .expect("relay must not panic");
+    }
+
+    #[test]
+    fn relay_source_ignores_xff_from_non_loopback_peer() {
+        let peer = Some(SocketAddr::from(([192, 0, 2, 1], 12345)));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
+        let source = relay_source(peer, &headers);
+        assert_eq!(source, IpAddr::from([192, 0, 2, 1]));
+    }
+
+    #[test]
+    fn relay_source_takes_rightmost_xff_entry_from_loopback_peer() {
+        let peer = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.0.0.1, 10.0.0.2".parse().unwrap());
+        let source = relay_source(peer, &headers);
+        assert_eq!(source, IpAddr::from([10, 0, 0, 2]));
+    }
+
+    #[test]
+    fn relay_source_canonicalizes_ipv6_to_v4() {
+        let peer = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "::ffff:1.2.3.4".parse().unwrap());
+        let source = relay_source(peer, &headers);
+        assert_eq!(source, IpAddr::from([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn relay_source_buckets_ipv6_to_slash64() {
+        let peer = Some(SocketAddr::from(([127, 0, 0, 1], 12345)));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "2001:db8:85a3::8a2e:370:7334".parse().unwrap(),
+        );
+        let source = relay_source(peer, &headers);
+        match source {
+            IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                assert_eq!(
+                    [segments[0], segments[1], segments[2], segments[3]],
+                    [0x2001, 0xdb8, 0x85a3, 0]
+                );
+                assert_eq!(
+                    [segments[4], segments[5], segments[6], segments[7]],
+                    [0, 0, 0, 0]
+                );
+            }
+            _ => panic!("expected IPv6"),
+        }
+    }
+
+    #[test]
+    fn source_limiter_refuses_at_limit_and_map_is_empty_after_all_permits_drop() {
+        let limiter = SourceLimiter::default();
+        let source = IpAddr::from([10, 0, 0, 1]);
+        let limit = 2;
+
+        // Acquire up to the limit
+        let permit1 = limiter.try_acquire(source, limit).unwrap();
+        let permit2 = limiter.try_acquire(source, limit).unwrap();
+        assert!(limiter.try_acquire(source, limit).is_none());
+
+        // Drop one permit
+        drop(permit1);
+        let permit3 = limiter.try_acquire(source, limit).unwrap();
+        assert!(limiter.try_acquire(source, limit).is_none());
+
+        // Drop all permits and check map is empty
+        drop(permit2);
+        drop(permit3);
+        let map = limiter.0.lock().unwrap();
+        assert!(map.is_empty());
     }
 }

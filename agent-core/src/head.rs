@@ -50,7 +50,13 @@ pub async fn wait_for_head_change(
     }
     query.push_str(&format!("&wait_ms={wait_ms}"));
     let (status, bytes) = api
-        .raw_request(http::Method::GET, "/api/head", &query, Vec::new(), None)
+        .raw_request(
+            http::Method::GET,
+            "/api/head",
+            &query,
+            Default::default(),
+            None,
+        )
         .await?;
     ensure_authorized(status)?;
     if !status.is_success() {
@@ -151,7 +157,11 @@ impl<'a> HeadObserver<'a> {
                 return Ok(HeadObservation {
                     head: self.known.clone(),
                     changed: false,
-                    unsupported: self.wait_supported == Some(false),
+                    // Without a known head or a recent answer the hub did not
+                    // watch this window, so callers keep their periodic pass.
+                    unsupported: self.wait_supported == Some(false)
+                        || self.known.is_none()
+                        || self.consecutive_failures > 0,
                 });
             }
             let supported = self.wait_supported.unwrap_or(true);
@@ -193,14 +203,19 @@ impl<'a> HeadObserver<'a> {
                         });
                     }
                     Ok(Ok(HeadWaitOutcome::Unsupported(head))) => {
-                        self.wait_supported = Some(false);
+                        // Hubs wait only when `after` names a head, so the
+                        // first answer of a new observer proves nothing.
+                        // Latching it kept every observer polling forever.
+                        if self.known.is_some() {
+                            self.wait_supported = Some(false);
+                        }
                         self.consecutive_failures = 0;
                         if head != self.known {
                             self.known = head.clone();
                             return Ok(HeadObservation {
                                 head,
                                 changed: true,
-                                unsupported: false,
+                                unsupported: self.wait_supported == Some(false),
                             });
                         }
                     }
@@ -271,7 +286,13 @@ impl ApiClient {
     pub async fn get_head(&self, workspace_id: &str) -> Result<Option<String>> {
         let query = format!("workspace_id={}", urlencoding::encode(workspace_id));
         let (status, bytes) = self
-            .raw_request(http::Method::GET, "/api/head", &query, Vec::new(), None)
+            .raw_request(
+                http::Method::GET,
+                "/api/head",
+                &query,
+                Default::default(),
+                None,
+            )
             .await?;
         ensure_authorized(status)?;
         if !status.is_success() {
@@ -303,7 +324,7 @@ impl ApiClient {
                 http::Method::PUT,
                 "/api/head",
                 "",
-                body,
+                body.into(),
                 Some("application/json"),
             )
             .await?;
@@ -450,6 +471,10 @@ mod tests {
         // observation, never an error: watchers treat Err as fail-closed.
         let observed = result.expect("retryable failures stay observable");
         assert!(!observed.changed);
+        assert!(
+            observed.unsupported,
+            "an unreachable hub did not watch the window"
+        );
         task.abort();
     }
 
@@ -466,6 +491,54 @@ mod tests {
             }),
         );
         serve(router).await
+    }
+
+    #[tokio::test]
+    async fn fresh_observer_long_polls_after_learning_the_head() {
+        // Mirrors the real hub: a request without `after` gets the plain shape.
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let router = axum::Router::new().route(
+            "/api/head",
+            axum::routing::get(move |Query(query): Query<HashMap<String, String>>| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let waits = query.contains_key("after");
+                    if waits {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    axum::Json(serde_json::json!({
+                        "snapshot_id": "a".repeat(64), "wait_supported": waits
+                    }))
+                }
+            }),
+        );
+        let (url, task) = serve(router).await;
+        let api = ApiClient::new(&url, Some("token"));
+        let mut observer = HeadObserver::new(&api, "ws");
+
+        let first = observer.observe(Duration::from_secs(5)).await.unwrap();
+        assert!(first.changed && !first.unsupported, "{first:?}");
+        let second = observer.observe(Duration::from_secs(5)).await.unwrap();
+        assert!(!second.changed && !second.unsupported, "{second:?}");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_without_a_head_keeps_the_periodic_backstop() {
+        let router = axum::Router::new().route(
+            "/api/head",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({ "snapshot_id": null, "wait_supported": false }))
+            }),
+        );
+        let (url, task) = serve(router).await;
+        let api = ApiClient::new(&url, Some("token"));
+        let mut observer = HeadObserver::new(&api, "ws");
+        let observed = observer.observe(Duration::from_millis(300)).await.unwrap();
+        assert!(!observed.changed && observed.unsupported, "{observed:?}");
+        task.abort();
     }
 
     #[tokio::test]

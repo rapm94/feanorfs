@@ -53,7 +53,9 @@ verifies the checksum, package name, native architecture, and absence of install
 scripts before invoking the system package manager. Package metadata declares
 the required desktop libraries, and a listed native package with a missing or
 invalid checksum fails closed. The exact-content tar product remains available
-for custom prefixes and is rejected when runtime linkage is missing.
+for custom prefixes and is rejected when runtime linkage is missing. The installer
+also verifies the GitHub build attestation automatically when an authenticated `gh`
+CLI is available, providing additional provenance verification beyond checksums.
 
 On Windows, the normal Inno Setup EXE and both embedded executables must carry
 valid Authenticode signatures. CI proves exact installed hashes, per-user PATH

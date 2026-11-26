@@ -957,9 +957,18 @@ async fn run_mesh_checks(result: &mut DoctorResult) {
                 .map(tokio::net::TcpListener::local_addr)
             {
                 Some(Ok(probe)) => {
-                    feanorfs_agent_core::mesh::map_tcp_port(IpAddr::V4(lan), probe.port())
-                        .await
-                        .is_ok()
+                    let result = feanorfs_agent_core::mesh::map_tcp_port(
+                        IpAddr::V4(lan),
+                        probe.port(),
+                        None,
+                    )
+                    .await;
+                    if let Ok(candidate) = &result {
+                        let _ =
+                            feanorfs_agent_core::mesh::release_tcp_port(candidate.address().port())
+                                .await;
+                    }
+                    result.is_ok()
                 }
                 _ => false,
             };
@@ -975,7 +984,7 @@ async fn run_mesh_checks(result: &mut DoctorResult) {
                 result.add(
                     "upnp_mapping",
                     DoctorCheckStatus::Info,
-                    "the gateway does not grant UPnP/NAT-PMP mappings; punched paths still work when available",
+                    "the gateway does not grant UPnP IGD mappings; punched paths still work when available",
                     None,
                 );
             }

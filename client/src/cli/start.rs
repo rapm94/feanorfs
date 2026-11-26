@@ -140,6 +140,27 @@ fn parse_target(raw: &str) -> anyhow::Result<ParsedTarget> {
     Ok(ParsedTarget::Folder(PathBuf::from(expanded)))
 }
 
+/// Supervised `service run` worker. `run_watch` owns the initial sync and
+/// retries failures with in-process backoff, so a pass that fails every time
+/// (unreachable hub, oversized state) never exits the worker into a supervisor
+/// restart loop that rescans the whole folder on each respawn.
+pub(crate) async fn run_supervised_watch(work_dir: &Path) -> anyhow::Result<()> {
+    let config = load_config(work_dir)?;
+    let db = crate::open_client_db(work_dir).await?;
+    let api = crate::open_api_client(work_dir, &config).await?;
+    watch::run_watch(
+        watch::WatchTarget {
+            api: &api,
+            db: &db,
+            dir: work_dir,
+            workspace_id: &config.workspace_id,
+            password: config.encryption_password.as_deref(),
+        },
+        false,
+    )
+    .await
+}
+
 pub(crate) async fn finish_sync_watch(
     work_dir: &Path,
     watch_mode: WatchMode,

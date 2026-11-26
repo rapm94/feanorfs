@@ -41,7 +41,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::process_tree;
 use feanorfs_client::backoff::{BackoffGrowth, BackoffReset, ExponentialBackoff};
-use feanorfs_client::watch::event_warrants_sync_under;
+use feanorfs_client::watch::event_can_change_scan;
 use notify::Watcher;
 
 /// Quiet period after the last filesystem event before reconciliation starts.
@@ -1642,10 +1642,14 @@ async fn prepare_controller(
         .canonicalize()
         .context("canonicalize agent worktree for watching")?;
     let event_root = watched_dir.clone();
+    let mut ignore_rules = feanorfs_agent_core::local::IgnoreRules::load(&watched_dir);
     let mut watcher =
         notify::recommended_watcher(move |result: std::result::Result<notify::Event, _>| {
             if let Ok(event) = result {
-                if event_warrants_sync_under(&event, &event_root) && fs_tx.try_send(()).is_err() {
+                ignore_rules.refresh();
+                if event_can_change_scan(&event, &event_root, &mut ignore_rules)
+                    && fs_tx.try_send(()).is_err()
+                {
                     burst_dirty_watch.store(true, Ordering::Release);
                 }
             }

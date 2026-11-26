@@ -219,40 +219,10 @@ impl WorkspaceReadRoot {
             .root
             .try_clone()
             .context("duplicate workspace read root descriptor")?;
-
         for component in directories.iter().copied() {
-            let name = unix_component(component, relative)?;
-            parent = open_at(
-                &parent,
-                &name,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-            .map_err(|error| {
-                anyhow::Error::new(classify_open_error(
-                    &error,
-                    format!(
-                        "open no-follow directory component {:?} while resolving workspace path {}",
-                        component,
-                        relative.display()
-                    ),
-                ))
-            })?;
+            parent = open_directory_at(&parent, component, relative)?;
         }
-
-        let name = unix_component(file_name, relative)?;
-        let file = open_at(
-            &parent,
-            &name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-        .map_err(|error| {
-            anyhow::Error::new(classify_open_error(
-                &error,
-                format!("open no-follow workspace file {}", relative.display()),
-            ))
-        })?;
-        require_regular(&file, relative).map_err(anyhow::Error::new)?;
-        Ok(file)
+        open_regular_at(&parent, file_name, relative)
     }
 
     #[cfg(windows)]
@@ -341,6 +311,119 @@ impl WorkspaceReadRoot {
         })?;
         require_regular(&file, relative).map_err(anyhow::Error::new)?;
         Ok(file)
+    }
+}
+
+/// Descriptors kept open by a [`WalkCursor`]; deeper directories are reopened.
+#[cfg(unix)]
+const MAX_CURSOR_DIRECTORIES: usize = 32;
+
+/// Root-anchored lookups for one directory walk. Walks visit a directory's
+/// entries together, so keeping the current directory chain open turns one
+/// `openat` per path component into one call per file. Create one per walk:
+/// a long-lived cursor would keep reading directories that were since replaced.
+pub(crate) struct WalkCursor {
+    root: WorkspaceReadRoot,
+    #[cfg(unix)]
+    chain: Vec<(std::ffi::OsString, File)>,
+}
+
+impl WalkCursor {
+    pub(crate) const fn new(root: WorkspaceReadRoot) -> Self {
+        Self {
+            root,
+            #[cfg(unix)]
+            chain: Vec::new(),
+        }
+    }
+
+    /// Same contract as [`WorkspaceReadRoot::open_regular_path`].
+    pub(crate) fn open_regular(&mut self, relative: &Path) -> Result<File> {
+        #[cfg(unix)]
+        {
+            let components = validated_relative_components(relative)?;
+            self.at_parent(relative, &components, |parent, name| {
+                open_regular_at(parent, name, relative)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            self.root.open_regular_path(relative)
+        }
+    }
+
+    /// No-follow metadata of one walked regular file without opening it.
+    #[cfg(unix)]
+    pub(crate) fn stat_regular(&mut self, relative: &Path) -> Result<libc::stat> {
+        let components = validated_relative_components(relative)?;
+        let reused = !self.chain.is_empty();
+        let result = self.at_parent(relative, &components, |parent, name| {
+            stat_regular_at(parent, name, relative)
+        });
+        let missing = matches!(
+            result.as_ref().map_err(|error| error.downcast_ref()),
+            Err(Some(CandidateOpenError::NotFound(_)))
+        );
+        if !(reused && missing) {
+            return result;
+        }
+        // The walk just listed this file, so a kept directory was replaced.
+        self.chain.clear();
+        self.at_parent(relative, &components, |parent, name| {
+            stat_regular_at(parent, name, relative)
+        })
+    }
+
+    #[cfg(unix)]
+    fn at_parent<T>(
+        &mut self,
+        relative: &Path,
+        components: &[&OsStr],
+        operation: impl FnOnce(&File, &OsStr) -> Result<T>,
+    ) -> Result<T> {
+        let (name, directories) = components
+            .split_last()
+            .expect("validated paths have a final component");
+        let shared = self
+            .chain
+            .iter()
+            .zip(directories)
+            .take_while(|((kept, _), component)| kept.as_os_str() == **component)
+            .count();
+        self.chain.truncate(shared);
+        let deeper = match self.extend_chain(&directories[shared..], relative) {
+            // A kept directory may have been replaced since it was opened.
+            Err(_) if shared > 0 => {
+                self.chain.clear();
+                self.extend_chain(directories, relative)?
+            }
+            result => result?,
+        };
+        let parent = deeper
+            .as_ref()
+            .or_else(|| self.chain.last().map(|(_, directory)| directory))
+            .unwrap_or(&self.root.root);
+        operation(parent, name)
+    }
+
+    /// Opens `directories` below the kept chain, returning the last one when
+    /// it lies deeper than the chain may grow.
+    #[cfg(unix)]
+    fn extend_chain(&mut self, directories: &[&OsStr], relative: &Path) -> Result<Option<File>> {
+        let mut deeper: Option<File> = None;
+        for component in directories {
+            let parent = deeper
+                .as_ref()
+                .or_else(|| self.chain.last().map(|(_, directory)| directory))
+                .unwrap_or(&self.root.root);
+            let directory = open_directory_at(parent, component, relative)?;
+            if self.chain.len() < MAX_CURSOR_DIRECTORIES {
+                self.chain.push((component.to_os_string(), directory));
+            } else {
+                deeper = Some(directory);
+            }
+        }
+        Ok(deeper)
     }
 }
 
@@ -461,6 +544,82 @@ fn open_at(parent: &File, name: &std::ffi::CStr, flags: libc::c_int) -> std::io:
     }
     // SAFETY: a successful `openat` returned a new descriptor owned by this call.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &File, component: &OsStr, relative: &Path) -> Result<File> {
+    let name = unix_component(component, relative)?;
+    open_at(
+        parent,
+        &name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+    .map_err(|error| {
+        anyhow::Error::new(classify_open_error(
+            &error,
+            format!(
+                "open no-follow directory component {component:?} while resolving workspace path {}",
+                relative.display()
+            ),
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn open_regular_at(parent: &File, file_name: &OsStr, relative: &Path) -> Result<File> {
+    let name = unix_component(file_name, relative)?;
+    let file = open_at(
+        parent,
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+    )
+    .map_err(|error| {
+        anyhow::Error::new(classify_open_error(
+            &error,
+            format!("open no-follow workspace file {}", relative.display()),
+        ))
+    })?;
+    require_regular(&file, relative).map_err(anyhow::Error::new)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn stat_regular_at(parent: &File, file_name: &OsStr, relative: &Path) -> Result<libc::stat> {
+    use std::os::fd::AsRawFd as _;
+
+    let name = unix_component(file_name, relative)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is NUL-terminated, `parent` stays open for the call, and
+    // `metadata` points to writable storage for one `stat`.
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(anyhow::Error::new(classify_open_error(
+            &std::io::Error::last_os_error(),
+            format!("inspect no-follow workspace file {}", relative.display()),
+        )));
+    }
+    // SAFETY: `fstatat` succeeded and initialized the complete structure.
+    let metadata = unsafe { metadata.assume_init() };
+    let detail = || {
+        format!(
+            "workspace path {} is not a regular file",
+            relative.display()
+        )
+    };
+    match metadata.st_mode & libc::S_IFMT {
+        libc::S_IFREG => Ok(metadata),
+        libc::S_IFLNK => Err(anyhow::Error::new(CandidateOpenError::Symlink(detail()))),
+        _ => Err(anyhow::Error::new(
+            CandidateOpenError::InvalidType(detail()),
+        )),
+    }
 }
 
 #[cfg(unix)]

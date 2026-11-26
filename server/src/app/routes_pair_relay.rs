@@ -1,19 +1,23 @@
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 
-use super::relay_common::{relay, valid_lower_hex, wait_for_peer, ForwardPolicy, PeerWaitPolicy};
+use super::relay_common::{
+    relay, relay_source, valid_lower_hex, wait_for_peer, ForwardPolicy, PeerWaitPolicy,
+    SourceLimiter, SourcePermit,
+};
 use super::AppState;
 
 const SESSION_HEX_BYTES: usize = 16;
 const SESSION_HEX_LEN: usize = SESSION_HEX_BYTES * 2;
 const MAX_PENDING_OFFERS: usize = 1024;
 const MAX_RELAY_CONNECTIONS: usize = 4096;
+const MAX_SOCKETS_PER_SOURCE: usize = 8;
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_RELAYED_FRAMES: usize = 8;
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -44,6 +48,7 @@ const PAIR_FORWARD: ForwardPolicy = ForwardPolicy {
 pub(crate) struct PairRelayState {
     pending: Arc<Mutex<HashMap<String, PendingOffer>>>,
     connections: Arc<Semaphore>,
+    sources: SourceLimiter,
 }
 
 impl Default for PairRelayState {
@@ -51,6 +56,7 @@ impl Default for PairRelayState {
         Self {
             pending: Arc::new(Mutex::new(HashMap::new())),
             connections: Arc::new(Semaphore::new(MAX_RELAY_CONNECTIONS)),
+            sources: SourceLimiter::default(),
         }
     }
 }
@@ -63,11 +69,14 @@ struct PendingOffer {
 struct AdmittedSocket {
     socket: WebSocket,
     _permit: OwnedSemaphorePermit,
+    _source: SourcePermit,
 }
 
 pub(crate) async fn handle_pair_relay(
     Path((session, role)): Path<(String, String)>,
     State(state): State<AppState>,
+    connect: Option<axum::Extension<ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     if !valid_session_id(&session) {
@@ -80,6 +89,13 @@ pub(crate) async fn handle_pair_relay(
     let Ok(permit) = relay.connections.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let source = relay_source(
+        connect.map(|axum::Extension(ConnectInfo(addr))| addr),
+        &headers,
+    );
+    let Some(source_permit) = relay.sources.try_acquire(source, MAX_SOCKETS_PER_SOURCE) else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
     let upgrade = upgrade
         .max_frame_size(MAX_FRAME_BYTES)
         .max_message_size(MAX_FRAME_BYTES)
@@ -90,6 +106,7 @@ pub(crate) async fn handle_pair_relay(
             let admitted = AdmittedSocket {
                 socket,
                 _permit: permit,
+                _source: source_permit,
             };
             if role == "offer" {
                 relay.offer(session, admitted).await;

@@ -58,7 +58,7 @@ decision: the receiving client still performs normal TLS chain and hostname
 verification with the capability-pinned public CA and authenticates with the
 existing bearer token. A numeric legacy endpoint is persisted as the stable
 name only after that authenticated probe succeeds. The CA private key never
-leaves the hub data directory.
+leaves the hub data directory. When a UPnP gateway is present the private hub requests a 30-minute TCP mapping on start and renews it while supervised; this exposes the token-authenticated, CA-pinned TLS port to the internet, and the gateway's UPnP setting is the operator's control.
 
 ## Adversary model
 
@@ -84,7 +84,7 @@ leaves the hub data directory.
 - **Legacy downgrade (v1 workspaces only)**: Format-v2 and format-v3 workspaces reject non-AEAD blobs. Unmigrated v1 workspaces still fall back to the legacy XOR stream on decrypt. Run `feanorfs migrate`; removing XOR entirely requires separately approved representative field evidence.
 - **Metadata lies**: a malicious server can still lie in `SyncResponse` (supply a hash matching substituted ciphertext); AEAD limits this to replaying validly-encrypted blobs for that same path.
 - **Replay attacks**: The server can replay an older valid snapshot head or blob. Compare-and-swap prevents honest concurrent writers from silently replacing each other, but it does not authenticate a malicious server's head response.
-- **Metadata manipulation**: A malicious server can hide snapshots, omit objects, or return an older head. Authenticated encryption detects modified ciphertext, not omission or rollback.
+- **Metadata manipulation**: A malicious server can hide snapshots, omit objects, or return an older head. Authenticated encryption detects modified ciphertext, not omission or rollback. Format-v3 `status` warns when the hub head is a strict ancestor of `refs/last-synced` (bounded walk); omission or forks that do not revisit an ancestor are not detected.
 - **Migration races**: A durable workspace fence rejects writes without the migration token from the initial pull through format stamping. The stamp, flat-row deletion, and fence release share one SQLite transaction.
 
 ### Adversary C: Network attacker (MITM)
@@ -98,7 +98,7 @@ requires bearer authentication unless `--allow-open` is explicit, and creates a
 durable private CA when no public certificate is supplied. `fnh1` hub invites
 and encrypted `fnr1` workspace invites distribute only the public CA;
 reqwest/Rustls performs normal chain and hostname verification. FeanorFS never
-uses an accept-any-certificate verifier.
+uses an accept-any-certificate verifier. A pinned hub CA replaces the system trust store for that hub connection, so a publicly issued certificate for the same name cannot impersonate it.
 
 `--allow-http` explicitly removes this defense. It is intended only for a
 private loopback listener behind a correctly configured TLS reverse proxy or a

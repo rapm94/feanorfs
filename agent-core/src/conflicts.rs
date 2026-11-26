@@ -39,7 +39,7 @@ fn same_content(left: Option<&FileState>, right: Option<&FileState>) -> bool {
     }
 }
 
-async fn load_server_view_with_head(
+pub async fn load_server_view_with_head(
     ctx: &SyncCtx<'_>,
 ) -> Result<(Option<String>, HashMap<String, FileState>)> {
     if ctx.format_version() >= 3 {

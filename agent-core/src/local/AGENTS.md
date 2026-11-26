@@ -13,15 +13,16 @@ Own local workspace configuration, JSON-backed `ClientDb` operations, filesystem
 - `cache.rs` — cache CRUD plus migration import/export.
 - `conflicts.rs` — pending conflict registry and resolution history.
 - `access.rs` — predictive access weights and session keys.
-- `walker.rs` — path normalization, ignore rules, symlink reporting, and `CACHEDIR.TAG` pruning.
-- `scan.rs` — stable file observation, encrypted hash caching, and tombstone projection.
+- `walker.rs` — path normalization, skip policy (`IgnoreRules` applies the same rules and markers to filesystem events), and `CACHEDIR.TAG` / linked-worktree pruning.
+- `scan.rs` — stable file observation, encrypted hash caching, symlink reporting, and tombstone projection.
 - `tests/` — focused behavior tests grouped by responsibility.
 
 ## Local Contracts
 
 - Keep public names re-exported from `../local.rs`; consumers must not depend on private submodule paths.
-- Preserve scanner race behavior: open admitted files through one shared `WorkspaceReadRoot`, compare size and mtime from that same descriptor before/after reading, and retain metadata observed before the read when stable. Admission/open/type mismatches abort rather than becoming tombstones.
-- Never follow symlinks. Validate nested `CACHEDIR.TAG` signatures through the shared descriptor root before pruning; never reopen a tag by pathname. A tagged workspace root remains exempt.
+- Preserve scanner race behavior: one walk shares one `WalkCursor` (a `WorkspaceReadRoot` plus the open descriptors of the current directory chain). Unchanged files are recognized from no-follow `fstatat` metadata alone; a file whose bytes are needed is opened through the cursor, and size and mtime are compared from that same descriptor before/after reading, retaining metadata observed before the read when stable. Never keep a cursor beyond one walk. `fstatat` and descriptor mtimes must agree, or every scan rehashes everything. Admission/open/type mismatches abort rather than becoming tombstones.
+- Never follow symlinks. Validate nested `CACHEDIR.TAG` signatures and linked-worktree `.git` files (`gitdir:` whose parent is `worktrees`) through the shared descriptor root before pruning; never reopen a marker by pathname. The workspace root remains exempt; submodule `.git` files (`.git/modules/`) do not prune.
+- Excluded paths with cached state are frozen, except existing tombstones, which keep projecting deletions. When a scan's projected records exceed `MAX_LOCAL_STATE_RECORDS`, persisted tombstones are dropped (the pass still reports them) so state cannot deadlock above the cap.
 - Convert native relative paths with `portable_rel_path` before publishing or joining them. Unix backslashes are filename bytes and must be rejected rather than rewritten into `/`; Windows separator backslashes are normalized before the portable validator runs.
 - Safe join preview may supply an in-memory ignore-policy override so the encrypted sender policy can govern the first scan before any destination file is written; ordinary scans read only the private global workspace policy.
 - Batch scanner cache changes through `bulk_upsert_cache_entries`. Staged materialization applies its cache deletes and upserts together through one `apply_cache_changes` durable-state commit.

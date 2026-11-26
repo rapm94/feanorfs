@@ -242,10 +242,11 @@ claim.
 P0–P3 shipped (see `docs/mesh-transport.md`); remaining before calling the
 direct path production-default on real networks:
 
-- [ ] Renew or release UPnP/PCP mappings on hub stop and supervisor shutdown;
-  leases currently expire naturally after 30 minutes.
+- [ ] Release UPnP mappings on hub stop and supervisor shutdown (renewal
+  shipped; leases otherwise expire after 30 minutes).
 - [ ] Restrict punch admission to workspace members once membership is
-  queryable without new hub endpoints; any signed identity is accepted today
+  queryable without new hub endpoints; any token holder may punch today
+  (nonce-bound token proof); per-identity membership admission remains deferred
   (bridged traffic still terminates at the token-authenticated hub).
 - [x] Add last-path TTL to `mesh-state.json` projection so stale punched paths
   re-probe instead of pinning; QUIC keepalives shipped during the field test,

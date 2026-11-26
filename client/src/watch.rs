@@ -58,8 +58,23 @@ pub fn event_warrants_sync_under(event: &Event, root: &Path) -> bool {
         && event_paths_warrant_sync_under(root, &event.paths)
 }
 
+/// Whether an event can change what a scan reports. Rescan notices mean the
+/// operating system dropped events and usually name no path.
+pub fn event_can_change_scan(
+    event: &Event,
+    root: &Path,
+    rules: &mut feanorfs_agent_core::local::IgnoreRules,
+) -> bool {
+    event.need_rescan()
+        || (event_warrants_sync_under(event, root)
+            && !event.paths.iter().all(|path| rules.ignores(path)))
+}
+
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
+/// Longest a watcher trusts filesystem events and head waits alone. A pass is
+/// a full scan, so this only covers events the operating system dropped.
+const RESCAN_BACKSTOP: Duration = Duration::from_secs(600);
 
 /// Watcher sync-retry backoff: base 5 s doubling from the first failure,
 /// 300 s cap. Sequence (failures 0..): 0, 10, 20, 40, 80, 160, 300, 300, ...
@@ -71,6 +86,21 @@ const WATCH_BACKOFF: ExponentialBackoff =
 async fn drain_event_burst(rx: &mut tokio::sync::mpsc::Receiver<()>, delay: Duration) {
     tokio::time::sleep(delay).await;
     while rx.try_recv().is_ok() {}
+}
+
+/// The last successful pass, which an idle window may rely on.
+struct CompletedPass {
+    finished: Instant,
+    mirror_state: crate::commands::MirrorState,
+    /// Format v3: every remote change moves the head. Legacy flat rows can
+    /// change without it, so they keep the periodic pass.
+    head_is_authoritative: bool,
+}
+
+impl CompletedPass {
+    fn can_stand_in(&self) -> bool {
+        self.head_is_authoritative && self.finished.elapsed() < RESCAN_BACKSTOP
+    }
 }
 
 /// Borrowed per-workspace watcher identity shared by every sync attempt.
@@ -95,13 +125,17 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(100);
 
     let tx_clone = tx.clone();
+    let mut ignore_rules = feanorfs_agent_core::local::IgnoreRules::load(current_dir);
+    let mut event_rules = feanorfs_agent_core::local::IgnoreRules::load(current_dir);
+    let event_root = current_dir.to_path_buf();
     let mut watcher =
         notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
-                if event_warrants_sync(&event) {
-                    tracing::debug!("FS event: {:?}", event);
-                    let _ = tx_clone.try_send(());
-                }
+            event_rules.refresh();
+            // A watch error can hide changes, so it warrants a pass too.
+            if res.map_or(true, |event| {
+                event_can_change_scan(&event, &event_root, &mut event_rules)
+            }) {
+                let _ = tx_clone.try_send(());
             }
         })?;
 
@@ -123,6 +157,7 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
     // as the opaque head changes; the periodic window remains the recovery
     // backstop for unsupported hubs and transient transport failures.
     let mut head_observer = feanorfs_agent_core::HeadObserver::new(api, workspace_id);
+    let mut last_pass: Option<CompletedPass> = None;
 
     println!("Performing initial sync...");
     if !is_paused(current_dir) {
@@ -135,14 +170,14 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
             "initial sync",
             false,
             lazy,
+            &mut head_observer,
+            &mut last_pass,
         )
         .await
         {
             Ok(applied) => {
                 dirty = !applied;
                 retry.noted_success();
-                // Never acknowledge a freshly read post-sync head: it may
-                // contain changes published after this pass completed.
             }
             Err(e) => {
                 consecutive_errors = consecutive_errors.saturating_add(1);
@@ -190,6 +225,8 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                     "Changes detected! Syncing",
                     true,
                     lazy,
+                    &mut head_observer,
+                    &mut last_pass,
                 )
                 .await
                 {
@@ -229,7 +266,15 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                     observation.as_ref(),
                     Ok(observed) if !observed.changed && !observed.unsupported
                 );
-                if unchanged_on_supported_hub && !dirty {
+                let rules_changed = ignore_rules.refresh();
+                let recent = last_pass.as_ref().filter(|pass| pass.can_stand_in());
+                if let Some(pass) = recent
+                    .filter(|_| unchanged_on_supported_hub && !dirty && !rules_changed)
+                {
+                    // Status also projects agents, resolutions, and reachability,
+                    // which change without any file or head change.
+                    let _ =
+                        crate::tray::publish_worker_status(current_dir, &pass.mirror_state, db).await;
                     continue;
                 }
                 let label = if observation
@@ -241,8 +286,19 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                 } else {
                     "Periodic sync"
                 };
-                match sync_once(api, db, current_dir, workspace_id, password, label, true, lazy)
-                    .await
+                match sync_once(
+                    api,
+                    db,
+                    current_dir,
+                    workspace_id,
+                    password,
+                    label,
+                    true,
+                    lazy,
+                    &mut head_observer,
+                    &mut last_pass,
+                )
+                .await
                 {
                     Ok(applied) => {
                         dirty = !applied;
@@ -278,6 +334,8 @@ pub async fn run_watch(target: WatchTarget<'_>, lazy: bool) -> Result<()> {
                     "Retrying sync",
                     true,
                     lazy,
+                    &mut head_observer,
+                    &mut last_pass,
                 )
                 .await
                 {
@@ -384,10 +442,14 @@ async fn sync_once(
     label: &str,
     announce: bool,
     lazy: bool,
+    head_observer: &mut feanorfs_agent_core::HeadObserver<'_>,
+    last_pass: &mut Option<CompletedPass>,
 ) -> Result<bool> {
     let Some(guard) = acquire_watcher_sync_guard(current_dir)? else {
         return Ok(false);
     };
+    // A pass that fails leaves nothing for an idle window to rely on.
+    *last_pass = None;
     tracing::info!("{label}");
     if announce {
         println!("{label}...");
@@ -405,15 +467,27 @@ async fn sync_once(
     // Publish the bounded secret-free tray status snapshot so routine tray
     // refreshes never scan the project or take the sync lock.
     let _ = crate::tray::publish_worker_status(current_dir, &result.mirror_state, db).await;
+    // The exact head this pass agreed on, so its own publication does not wake
+    // it again. Never a freshly read head: that may hold changes published
+    // after the pass, which must still be observed.
+    *last_pass = Some(CompletedPass {
+        finished: Instant::now(),
+        mirror_state: result.mirror_state,
+        head_is_authoritative: result.head.is_some(),
+    });
+    if result.head.is_some() {
+        head_observer.acknowledge(result.head);
+    }
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_watcher_sync_guard, drain_event_burst, event_paths_warrant_sync,
-        event_paths_warrant_sync_under, event_warrants_sync, event_warrants_sync_under,
-        wait_for_retry, SyncRetryGate, WATCH_BACKOFF,
+        acquire_watcher_sync_guard, drain_event_burst, event_can_change_scan,
+        event_paths_warrant_sync, event_paths_warrant_sync_under, event_warrants_sync,
+        event_warrants_sync_under, wait_for_retry, CompletedPass, SyncRetryGate, RESCAN_BACKSTOP,
+        WATCH_BACKOFF,
     };
     use notify::event::{AccessKind, AccessMode, ModifyKind};
     use notify::{Event, EventKind};
@@ -449,6 +523,46 @@ mod tests {
         let event = Event::new(EventKind::Modify(ModifyKind::Any))
             .add_path(PathBuf::from("/workspace/src/main.rs"));
         assert!(event_warrants_sync(&event));
+    }
+
+    #[test]
+    fn build_output_is_filtered_but_rescan_notices_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut rules = feanorfs_agent_core::local::IgnoreRules::load(&root);
+        let modified =
+            |path: &str| Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(path));
+        let warrants = |rules: &mut _, event: &Event| event_can_change_scan(event, &root, rules);
+
+        assert!(!warrants(&mut rules, &modified("target/debug/deps/a.o")));
+        assert!(!warrants(
+            &mut rules,
+            &modified("web/node_modules/x/index.js")
+        ));
+        assert!(warrants(&mut rules, &modified("src/main.rs")));
+        // A regular file may share a directory pattern's name.
+        assert!(warrants(&mut rules, &modified("target")));
+        // An allowlist ignores `src` as a file but the scan descends into it.
+        let state = feanorfs_agent_core::ensure_workspace_state(&root).unwrap();
+        std::fs::write(state.join("ignore"), "*\n!*/\n!*.rs\n").unwrap();
+        assert!(rules.refresh());
+        assert!(warrants(&mut rules, &modified("src")));
+        assert!(warrants(&mut rules, &modified("src/main.rs")));
+        std::fs::remove_file(state.join("ignore")).unwrap();
+        assert!(rules.refresh());
+
+        let mixed = modified("target/a").add_path(root.join("src/b.rs"));
+        assert!(warrants(&mut rules, &mixed));
+
+        let mut overflow = Event::new(EventKind::Other);
+        overflow.attrs.set_flag(notify::event::Flag::Rescan);
+        assert!(overflow.paths.is_empty() && warrants(&mut rules, &overflow));
+
+        // `feanorfs ignore` applies to a running watcher.
+        assert!(warrants(&mut rules, &modified("logs/out.txt")));
+        std::fs::write(state.join("ignore"), "logs/\n").unwrap();
+        assert!(rules.refresh() && !rules.refresh());
+        assert!(!warrants(&mut rules, &modified("logs/out.txt")));
     }
 
     #[test]
@@ -513,6 +627,57 @@ mod tests {
         assert!(!event_paths_warrant_sync(&[PathBuf::from(
             "/workspace/.feanorfsignore"
         )]));
+    }
+
+    #[test]
+    fn events_in_structurally_skipped_folders_are_filtered_like_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let write = |path: &str, content: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write(
+            ".claude/worktrees/a/.git",
+            "gitdir: /repo/.git/worktrees/a\n",
+        );
+        write("vendor/sub/.git", "gitdir: ../../.git/modules/sub\n");
+        write(
+            "out/CACHEDIR.TAG",
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        );
+        // The workspace root itself may be a linked worktree and stays synced.
+        write(".git", "gitdir: /repo/.git/worktrees/root\n");
+        let mut rules = feanorfs_agent_core::local::IgnoreRules::load(&root);
+        let mut warrants = |path: &str| {
+            let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(path));
+            event_can_change_scan(&event, &root, &mut rules)
+        };
+        assert!(!warrants(".claude/worktrees/a/src/deep/main.rs"));
+        assert!(!warrants(".claude/worktrees/a/other.rs"));
+        assert!(!warrants("out/deep/object.o"));
+        assert!(warrants("src/main.rs"));
+        assert!(warrants("vendor/sub/lib.c"));
+        assert!(warrants(".claude/worktrees/b/main.rs"));
+        // Creating or removing the skipped folder itself still reports.
+        assert!(warrants(".claude/worktrees/a"));
+        // The marker decides at event time, not once.
+        assert!(!warrants("out/deep/object.o"));
+        std::fs::remove_file(root.join("out/CACHEDIR.TAG")).unwrap();
+        assert!(warrants("out/deep/object.o"));
+    }
+
+    #[test]
+    fn idle_windows_rely_only_on_a_recent_snapshot_pass() {
+        let pass = |age: Duration, head_is_authoritative| CompletedPass {
+            finished: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+            mirror_state: crate::commands::MirrorState::Idle,
+            head_is_authoritative,
+        };
+        assert!(pass(Duration::ZERO, true).can_stand_in());
+        assert!(!pass(Duration::ZERO, false).can_stand_in());
+        assert!(!pass(RESCAN_BACKSTOP, true).can_stand_in());
     }
 
     #[test]

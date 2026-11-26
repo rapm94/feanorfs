@@ -209,6 +209,14 @@ chmod 755 "$FEANORFS_NATIVE_BIN_DIR/feanorfs" "$FEANORFS_NATIVE_BIN_DIR/feanorfs
 EOF
 chmod 755 "$STUBS/pacman"
 
+cat >"$STUBS/gh" <<'EOF'
+#!/bin/sh
+case "$1" in auth) exit 0 ;; attestation) printf '%s\n' "$*" >>"$FAKE_GH_LOG"; exit 0 ;; esac
+exit 1
+EOF
+chmod 755 "$STUBS/gh"
+export FAKE_GH_LOG="$ROOT/gh.log"
+
 export PATH="$STUBS:$PATH"
 export FEANORFS_RELEASE_API="https://example.invalid/releases/latest"
 export FEANORFS_BASE_URL="https://example.invalid/download/v9.9.9"
@@ -301,6 +309,8 @@ sh scripts/install.sh >"$ROOT/linux.log"
 grep -Fq 'CLI + system tray' "$ROOT/linux.log"
 grep -Fq 'Headless setup: feanorfs start' "$ROOT/linux.log"
 [[ ! -f "$FEANORFS_TEST_TRAY_MARKER" ]]
+grep -Fq 'attestation verify' "$FAKE_GH_LOG"
+grep -Fq -- '--repo rapm94/feanorfs' "$FAKE_GH_LOG"
 
 tray_before="$(shasum -a 256 "$BINDIR/feanorfs-tray" | awk '{print $1}')"
 export FAKE_LDCONFIG_MISSING=1
@@ -358,6 +368,8 @@ grep -Fq 'automatic desktop dependencies' "$ROOT/deb.log"
 [[ ! -e "$HOME/.local/bin/feanorfs" && ! -e "$HOME/.local/bin/feanorfs-tray" ]]
 [[ -x "$XDG_DATA_HOME/feanorfs/legacy-bin-backup/v9.9.9/feanorfs" ]]
 [[ -x "$XDG_DATA_HOME/feanorfs/legacy-bin-backup/v9.9.9/feanorfs-tray" ]]
+grep -Fq 'attestation verify' "$FAKE_GH_LOG"
+grep -Fq -- '--repo rapm94/feanorfs' "$FAKE_GH_LOG"
 
 rm -f "$FAKE_APT_MARKER"
 export FAKE_DNF_MARKER="$ROOT/dnf-installed"
@@ -383,6 +395,8 @@ sh scripts/install.sh >"$ROOT/rpm.log"
 [[ ! -f "$FAKE_APT_MARKER" ]]
 [[ ! -f "$FEANORFS_TEST_CLI_MARKER" ]]
 grep -Fq 'automatic desktop dependencies' "$ROOT/rpm.log"
+grep -Fq 'attestation verify' "$FAKE_GH_LOG"
+grep -Fq -- '--repo rapm94/feanorfs' "$FAKE_GH_LOG"
 
 rm -f "$FAKE_DNF_MARKER"
 export FAKE_PACMAN_MARKER="$ROOT/pacman-installed"
@@ -409,5 +423,7 @@ sh scripts/install.sh >"$ROOT/arch.log"
 [[ ! -f "$FAKE_APT_MARKER" ]]
 [[ ! -f "$FEANORFS_TEST_CLI_MARKER" ]]
 grep -Fq 'automatic desktop dependencies' "$ROOT/arch.log"
+grep -Fq 'attestation verify' "$FAKE_GH_LOG"
+grep -Fq -- '--repo rapm94/feanorfs' "$FAKE_GH_LOG"
 
 echo "Installer routing passed: no CLI-only downgrade, fail-closed macOS/Linux trust, headless opt-out, verified Linux tray launch, migration, and deb/rpm/Arch routing."

@@ -1,6 +1,6 @@
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 
-use super::relay_common::{relay, valid_lower_hex, wait_for_peer, ForwardPolicy, PeerWaitPolicy};
+use super::relay_common::{
+    relay, relay_source, valid_lower_hex, wait_for_peer, ForwardPolicy, PeerWaitPolicy,
+    SourceLimiter, SourcePermit,
+};
 use super::AppState;
 
 const ROUTE_HEX_LEN: usize = 64;
@@ -16,6 +19,7 @@ const MAX_PENDING_HOSTS: usize = 4096;
 const MAX_PENDING_PER_ROUTE: usize = 8;
 const MAX_ACTIVE_TUNNELS: usize = 1024;
 const MAX_RELAY_CONNECTIONS: usize = MAX_PENDING_HOSTS + MAX_ACTIVE_TUNNELS * 2;
+const MAX_SOCKETS_PER_SOURCE: usize = 64;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TUNNEL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const HOST_OFFER_TTL: Duration = Duration::from_secs(90);
@@ -51,6 +55,7 @@ pub(crate) struct TunnelRelayState {
     active: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     next_id: Arc<AtomicU64>,
+    sources: SourceLimiter,
 }
 
 impl Default for TunnelRelayState {
@@ -60,6 +65,7 @@ impl Default for TunnelRelayState {
             active: Arc::new(Semaphore::new(MAX_ACTIVE_TUNNELS)),
             connections: Arc::new(Semaphore::new(MAX_RELAY_CONNECTIONS)),
             next_id: Arc::new(AtomicU64::new(1)),
+            sources: SourceLimiter::default(),
         }
     }
 }
@@ -73,11 +79,14 @@ struct PendingHost {
 struct AdmittedSocket {
     socket: WebSocket,
     _permit: OwnedSemaphorePermit,
+    _source: SourcePermit,
 }
 
 pub(crate) async fn handle_tunnel_relay(
     Path((route, role)): Path<(String, String)>,
     State(state): State<AppState>,
+    connect: Option<axum::Extension<ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     if !valid_route(&route) {
@@ -90,6 +99,13 @@ pub(crate) async fn handle_tunnel_relay(
     let Ok(permit) = relay.connections.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let source = relay_source(
+        connect.map(|axum::Extension(ConnectInfo(addr))| addr),
+        &headers,
+    );
+    let Some(source_permit) = relay.sources.try_acquire(source, MAX_SOCKETS_PER_SOURCE) else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
     let upgrade = upgrade
         .max_frame_size(MAX_FRAME_BYTES)
         .max_message_size(MAX_FRAME_BYTES)
@@ -100,6 +116,7 @@ pub(crate) async fn handle_tunnel_relay(
             let admitted = AdmittedSocket {
                 socket,
                 _permit: permit,
+                _source: source_permit,
             };
             if role == "host" {
                 relay.host(route, admitted).await;

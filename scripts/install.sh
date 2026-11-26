@@ -16,6 +16,15 @@ RELEASE_API="${FEANORFS_RELEASE_API:-https://api.github.com/repos/${REPO}/releas
 err() { echo "error: $*" >&2; exit 1; }
 fetch() { curl --proto '=https' --tlsv1.2 -fLsS "$@"; }
 
+verify_attestation() {
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        gh attestation verify "$1" --repo "$REPO" >/dev/null || \
+            err "GitHub attestation verification failed for $(basename "$1")"
+    else
+        echo "Warning: install and log in to the GitHub CLI (gh) to verify release attestations; continuing with checksum verification only." >&2
+    fi
+}
+
 launch_desktop_tray() {
     platform="$1"
     tray="$2"
@@ -246,6 +255,7 @@ install_linux_native_package() {
         cd "$temp_dir"
         sha256sum -c "$asset.sha256"
     )
+    verify_attestation "$temp_dir/$asset"
 
     if [ "$format" = deb ]; then
         [ "$(dpkg-deb -f "$temp_dir/$asset" Package)" = feanorfs ] || \
@@ -312,6 +322,7 @@ install_linux_bundle() {
         cd "$temp_dir"
         sha256sum -c "$asset.sha256"
     )
+    verify_attestation "$temp_dir/$asset"
 
     contents="$(tar -tJf "$temp_dir/$asset" | LC_ALL=C sort)"
     expected="$(printf '%s\n' \
