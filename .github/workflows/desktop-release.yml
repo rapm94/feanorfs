@@ -221,7 +221,7 @@ jobs:
           "$RUNNER_TEMP/nfpm/nfpm" --version | grep -F "${NFPM_VERSION}"
           echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.88.0
       - name: Build CLI and tray
@@ -267,7 +267,7 @@ jobs:
           "FeanorFS-linux-$ASSET_ARCH.rpm"
           "FeanorFS-linux-$ASSET_ARCH.pkg.tar.zst"
       - name: Upload unsigned Linux bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: feanorfs-linux-${{ matrix.asset_arch }}
           path: |
@@ -301,7 +301,7 @@ jobs:
         asset_arch: [x86_64, aarch64]
     steps:
       - name: Download Linux bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: feanorfs-linux-${{ matrix.asset_arch }}
           path: release
@@ -328,7 +328,7 @@ jobs:
             release/FeanorFS-linux-${{ matrix.asset_arch }}.pkg.tar.zst.sha256
             release/FeanorFS-linux-${{ matrix.asset_arch }}.linkage.txt
       - name: Stage Linux release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-linux-${{ matrix.asset_arch }}-${{ needs.verify-release.outputs.sha }}
           path: |
@@ -357,7 +357,7 @@ jobs:
           ref: ${{ needs.verify-release.outputs.sha }}
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: 1.88.0
       - name: Build CLI and tray
@@ -390,7 +390,7 @@ jobs:
           target/release/feanorfs-tray.exe
           -HeadlessRunner
       - name: Upload unsigned Windows binaries
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: feanorfs-windows-x86_64-unsigned
           path: |
@@ -420,7 +420,7 @@ jobs:
           ref: ${{ needs.verify-release.outputs.sha }}
           persist-credentials: false
       - name: Download unsigned Windows binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: feanorfs-windows-x86_64-unsigned
           path: native
@@ -553,7 +553,7 @@ jobs:
             FeanorFS-windows-x86_64-setup.exe.sha256
             feanorfs-windows-installer.ps1
       - name: Stage Windows release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-windows-x86_64-${{ needs.verify-release.outputs.sha }}
           path: |

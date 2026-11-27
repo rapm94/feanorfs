@@ -129,7 +129,7 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.trust.outputs.sha }}
       - name: Install Rust target
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -165,7 +165,7 @@ jobs:
           mkdir artifact
           cp "$ARTIFACT" artifact/
       - name: Upload immutable native artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.id }}-${{ needs.trust.outputs.sha }}
           path: bindings/ts/artifact/${{ matrix.artifact }}
@@ -187,7 +187,7 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.trust.outputs.sha }}
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
       - name: Install Node
@@ -196,7 +196,7 @@ jobs:
           node-version: "22"
           package-manager-cache: false
       - name: Download native artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           merge-multiple: true
           path: bindings/ts/artifacts
@@ -244,7 +244,7 @@ jobs:
         working-directory: bindings/ts
         run: npm run publish-packages -- --tarball-dir dist/npm --dry-run
       - name: Upload immutable npm tarballs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: npm-tarballs-${{ needs.trust.outputs.sha }}
           path: bindings/ts/dist/npm/*.tgz
@@ -275,7 +275,7 @@ jobs:
           package-manager-cache: false
           registry-url: https://registry.npmjs.org
       - name: Download verified npm tarballs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: npm-tarballs-${{ needs.trust.outputs.sha }}
           path: bindings/ts/dist/npm

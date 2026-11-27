@@ -114,7 +114,7 @@ jobs:
           fi
           done
       - name: Retain exact validated upload guard
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned-release-guard-${{ github.sha }}
           path: scripts/check-unsigned-release.sh
@@ -142,7 +142,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -162,7 +162,7 @@ jobs:
           lipo "target/$TARGET/release/feanorfs" -verify_arch "$expected"
           lipo "target/$TARGET/release/feanorfs-tray" -verify_arch "$expected"
       - name: Upload native binaries
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned-macos-${{ matrix.target }}
           path: |
@@ -192,12 +192,12 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Download arm64 binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: unsigned-macos-aarch64-apple-darwin
           path: native/arm64
       - name: Download x86_64 binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: unsigned-macos-x86_64-apple-darwin
           path: native/x86_64
@@ -254,7 +254,7 @@ jobs:
             FeanorFS-macOS-unsigned.dmg.sha256
             FeanorFS-macOS-UNSIGNED.txt
       - name: Download validated upload guard
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: unsigned-release-guard-${{ github.sha }}
           path: upload-guard
@@ -295,7 +295,7 @@ jobs:
           ref: ${{ needs.validate-release.outputs.sha }}
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
       - name: Build CLI and tray
