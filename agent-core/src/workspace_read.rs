@@ -151,6 +151,32 @@ impl WorkspaceReadRoot {
     }
 
     /// Open a regular file at a lexical relative path beneath this root.
+    /// Opens the `.git` file directly inside `directory` (a linked-worktree or
+    /// submodule marker). `.git` is never portable content, so the portable
+    /// spelling check behind [`Self::open_regular_path`] rejects it on Windows;
+    /// `directory` is still validated and every component is opened no-follow.
+    /// Unix walks reach the marker through [`WalkCursor`]'s descriptor chain.
+    #[cfg(not(unix))]
+    pub(crate) fn open_git_marker(&self, directory: &Path) -> Result<File> {
+        let mut components = if directory.as_os_str().is_empty() {
+            Vec::new()
+        } else {
+            validated_relative_components(directory)?
+        };
+        components.push(OsStr::new(".git"));
+        let relative = directory.join(".git");
+
+        #[cfg(windows)]
+        {
+            self.open_regular_windows(&relative, &components)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.open_regular_checked(&relative, &components)
+        }
+    }
+
     pub fn open_regular_path(&self, relative: &Path) -> Result<File> {
         let components = validated_relative_components(relative)?;
 
@@ -334,6 +360,18 @@ impl WalkCursor {
             root,
             #[cfg(unix)]
             chain: Vec::new(),
+        }
+    }
+
+    /// Same contract as [`WorkspaceReadRoot::open_git_marker`].
+    pub(crate) fn open_git_marker(&mut self, directory: &Path) -> Result<File> {
+        #[cfg(unix)]
+        {
+            self.open_regular(&directory.join(".git"))
+        }
+        #[cfg(not(unix))]
+        {
+            self.root.open_git_marker(directory)
         }
     }
 

@@ -172,7 +172,7 @@ fn is_skipped_subtree(cursor: &mut WalkCursor, directory: &Path) -> bool {
 /// file naming `<repo>/.git/worktrees/<name>`. It is a disposable duplicate
 /// checkout. Submodule `.git` files point at `.git/modules/` and stay synced.
 fn is_linked_git_worktree(cursor: &mut WalkCursor, directory: &Path) -> bool {
-    let Ok(file) = cursor.open_regular(&directory.join(".git")) else {
+    let Ok(file) = cursor.open_git_marker(directory) else {
         return false;
     };
     let mut content = String::new();
