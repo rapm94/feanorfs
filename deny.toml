@@ -41,13 +41,17 @@ highlight = "all"
 # (0.19 removed severity levels like "warn"; workspace flags direct deps only)
 unmaintained = "workspace"
 yanked = "deny"
-# wayland-scanner 0.31.10 pins quick-xml 0.39 and uses it only as a proc macro
-# over trusted, vendored Wayland protocol XML at build time. The vulnerable
-# untrusted-runtime XML paths are not present in the shipped tray. Remove these
-# exceptions when wayland-scanner accepts quick-xml >= 0.41.
 ignore = [
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    # Bundled SQLite in libsqlite3-sys 0.30 (via sqlx 0.8). Exposure needs a
+    # process to open a database file and its -wal that a less trusted party
+    # wrote; FeanorFS opens only its own hub db.sqlite and the user's legacy
+    # local_cache.db. The fix (libsqlite3-sys >= 0.39) needs SQLx 0.9, held for
+    # the Rust 1.88 MSRV. Remove when SQLx 0.9 is adopted.
+    "RUSTSEC-2026-0459",
+    # chrono is unmaintained with no fixed release. FeanorFS uses it almost
+    # only for Utc::now(); remove when the TODO.md replacement with std::time
+    # lands.
+    "RUSTSEC-2026-0543",
 ]
 
 [sources]
