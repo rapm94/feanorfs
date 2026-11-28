@@ -271,3 +271,14 @@ with recorded stats, no relay configured, and no secret-bearing surface added.
 Done: publication walks the bounded parent DAG and one typed missing-blob
 repair re-uploads hash-verified cached ciphertext; live two-machine evidence in
 `docs/mesh-field-evidence.md` ("Fixes shipped after the field test").
+
+### AI-11. Replace chrono with std::time
+
+- [ ] Replace the `chrono` dependency (RUSTSEC-2026-0543, unmaintained) with
+  `std::time` across `common`, `agent-core`, `client`, and `server`; it is used
+  almost only for `Utc::now()` timestamps.
+- [ ] Remove the `RUSTSEC-2026-0543` exception from `deny.toml`.
+
+Acceptance: `chrono` is gone from `Cargo.lock`, `cargo deny check` passes without
+that exception, and stored or wire timestamps are byte-identical before and
+after.

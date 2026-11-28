@@ -240,21 +240,20 @@ pub(super) fn recorded_process_is_alive(pid: Option<u32>, started_at: u64) -> bo
 }
 
 pub(super) fn status_supervisor_alive(status: &SupervisorStatus) -> bool {
-    if !recorded_process_is_alive(status.pid, status.started_at) {
-        return false;
-    }
+    let alive = recorded_process_is_alive(status.pid, status.started_at);
     #[cfg(target_os = "windows")]
     {
         let Some(pid) = status.pid else {
             return false;
         };
-        return status
-            .process_start_id
-            .as_deref()
-            .is_some_and(|identity| process_tree::process_start_matches(pid, identity));
+        return alive
+            && status
+                .process_start_id
+                .as_deref()
+                .is_some_and(|identity| process_tree::process_start_matches(pid, identity));
     }
     #[cfg(not(target_os = "windows"))]
-    true
+    alive
 }
 
 /// A child counts as running only when the reporting supervisor and the exact
