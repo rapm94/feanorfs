@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/rapm94/feanorfs/compare/v0.12.1...v0.13.0) - 2026-11-28
+
+### Added
+
+- *(release)* carry product changes
+- sync robustness, performance, and hub hardening
+- *(coordination)* one-call claim/done, auto-coordinator, claim hooks
+- *(eval)* multi-agent evaluation harness
+- agent-first coordination surface
+
+### Other
+
+- cut AGENTS.md to rules; guard hook leaves no state
+- fuzz every untrusted-input parser
+- cargo fmt pre-existing WIP files
+- AI-10 review-fix batch (in progress, pre-existing working tree)
+
 ## [0.12.1](https://github.com/rapm94/feanorfs/compare/v0.12.0...v0.12.1) - 2026-09-03
 
 ### Fixed
