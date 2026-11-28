@@ -2,7 +2,7 @@
 
 # Build with the project's tested MSRV so the container cannot accidentally
 # depend on a newer compiler than the downloadable desktop product.
-FROM docker.io/library/rust:1.88.0-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
+FROM docker.io/library/rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS builder
 
 WORKDIR /src
 COPY . .
