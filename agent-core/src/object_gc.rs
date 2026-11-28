@@ -102,6 +102,11 @@ fn present<T>(result: std::io::Result<T>) -> Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Windows reports a file that a concurrent prune is already deleting
+        // as access denied (delete pending), not as missing. Leaving a cache
+        // file behind is harmless; the next prune retries it.
+        #[cfg(windows)]
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
         Err(error) => Err(error).context("prune local object cache"),
     }
 }
