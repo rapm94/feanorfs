@@ -282,3 +282,15 @@ repair re-uploads hash-verified cached ciphertext; live two-machine evidence in
 Acceptance: `chrono` is gone from `Cargo.lock`, `cargo deny check` passes without
 that exception, and stored or wire timestamps are byte-identical before and
 after.
+
+### AI-12. Windows dropped-connection upload retries
+
+- [ ] Find out why a loopback connection the hub drops mid-upload surfaces on
+  Windows as a reqwest read timeout (after `HTTP_READ_TIMEOUT`, 60 s) instead of
+  a reset, so `connection_dropped` never retries it. Check whether a hub that
+  answers 503 before reading the body makes Windows clients wait the same way.
+- [ ] Re-enable `uploads_retry_a_dropped_connection_but_not_an_unreachable_hub`
+  on Windows (its `cfg_attr(windows, ignore)` in `agent-core/src/api.rs`).
+
+Acceptance: the test passes on `windows-latest` without the ignore, and a
+Windows client retries a dropped upload within the 11.15 s busy-retry bound.
