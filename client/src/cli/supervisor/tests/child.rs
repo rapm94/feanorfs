@@ -198,15 +198,31 @@ async fn owned_child_falls_back_to_direct_kill_when_identity_probe_is_unavailabl
     assert_pid_reaped(pid).await;
 }
 
+/// A child that another test thread just forked holds copies of this
+/// process's descriptors until it execs, so a runner lock released here can
+/// still look held for a moment. The supervisor retries runner exit cleanup on
+/// its next pass; this test retries for a bounded window instead.
+async fn retry_through_lock_handoff<T>(mut attempt: impl FnMut() -> anyhow::Result<T>) -> T {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match attempt() {
+            Ok(value) => return value,
+            Err(error) if tokio::time::Instant::now() >= deadline => panic!("{error:#}"),
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+}
+
 #[tokio::test]
 async fn runner_exit_cleanup_waits_for_the_exact_session_then_checkpoints() {
     let (_dir, workspace, store) = configured_runner_fixture();
-    let session = store
-        .execution_session(
+    let session = retry_through_lock_handoff(|| {
+        store.execution_session(
             &workspace,
             feanorfs_agent_core::RunnerExecutionMode::Foreground,
         )
-        .unwrap();
+    })
+    .await;
     let request_id = id('b');
     session
         .admit_inbox(&feanorfs_common::AgentInboxResult {
@@ -240,12 +256,17 @@ async fn runner_exit_cleanup_waits_for_the_exact_session_then_checkpoints() {
     );
 
     drop(session);
-    let _ = finish_runner_workspace_exit(&workspace);
-    let status = store.status().unwrap();
-    assert_eq!(
-        status.phase,
-        feanorfs_agent_core::RunnerPhase::NeedsAttention
-    );
+    let status = retry_through_lock_handoff(|| {
+        finish_runner_workspace_exit(&workspace)?;
+        let status = store.status()?;
+        anyhow::ensure!(
+            status.phase == feanorfs_agent_core::RunnerPhase::NeedsAttention,
+            "runner phase is still {:?} after exit cleanup",
+            status.phase
+        );
+        Ok(status)
+    })
+    .await;
     assert_eq!(
         status.attention,
         Some(feanorfs_agent_core::RunnerAttention::AmbiguousExecution)
